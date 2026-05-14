@@ -1,0 +1,75 @@
+{
+  "items": [
+    {
+      "review_id": "rev_9c3aa42a7ab7",
+      "event_id": "evt_2117be6c323c",
+      "task_text": "帮我重启 OpenClaw 服务\n",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "reversible": "partial",
+        "side_effects": [
+          "service interruption"
+        ],
+        "safer_alternatives": [
+          "check status and logs before restart"
+        ]
+      },
+      "guardian_decision": {
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "Action needs confirmation because it may alter service, files, or data.",
+        "foresight": {
+          "risk_level": "R4",
+          "reversible": "partial",
+          "side_effects": [
+            "service interruption"
+          ],
+          "safer_alternatives": [
+            "check status and logs before restart"
+          ]
+        }
+      },
+      "created_at": "2026-05-14T06:27:42.081498+00:00",
+      "decided_at": "2026-05-14T06:28:01.288430+00:00",
+      "decision_reason": "console_approve"
+    },
+    {
+      "review_id": "rev_dc8153b751d6",
+      "event_id": "evt_b0121def3407",
+      "task_text": "帮我重启 OpenClaw 服务\n",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "reversible": "partial",
+        "side_effects": [
+          "service interruption"
+        ],
+        "safer_alternatives": [
+          "check status and logs before restart"
+        ]
+      },
+      "guardian_decision": {
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "Action needs confirmation because it may alter service, files, or data.",
+        "foresight": {
+          "risk_level": "R4",
+          "reversible": "partial",
+          "side_effects": [
+            "service interruption"
+          ],
+          "safer_alternatives": [
+            "check status and logs before restart"
+          ]
+        }
+      },
+      "created_at": "2026-05-14T06:30:24.589538+00:00",
+      "decided_at": "2026-05-14T06:30:30.752687+00:00",
+      "decision_reason": "console_approve"
+    }
+  ],
+  "updated_at": "2026-05-14T06:27:42.081886+00:00"
+}

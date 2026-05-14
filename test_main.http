@@ -1,0 +1,23 @@
+# Test Veyra FastAPI endpoints
+
+GET http://127.0.0.1:8000/
+Accept: application/json
+
+###
+
+POST http://127.0.0.1:8000/events/message
+Content-Type: application/json
+
+{
+  "text": "帮我看 18789 端口有没有被占用",
+  "channel": "webhook",
+  "user_id": "local-user",
+  "session_id": "local-session"
+}
+
+###
+
+GET http://127.0.0.1:8000/state
+Accept: application/json
+
+###

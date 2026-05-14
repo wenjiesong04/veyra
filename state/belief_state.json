@@ -1,0 +1,40 @@
+{
+  "claims": [
+    {
+      "claim": "received user_message from console",
+      "confidence": 1.0,
+      "source": "event",
+      "ttl_seconds": 300,
+      "status": "fresh"
+    },
+    {
+      "claim": "port 18789 is closed",
+      "confidence": 0.9,
+      "source": "port_probe",
+      "ttl_seconds": 60,
+      "status": "fresh"
+    },
+    {
+      "claim": "received user_message from console",
+      "confidence": 1.0,
+      "source": "event",
+      "ttl_seconds": 300,
+      "status": "fresh"
+    },
+    {
+      "claim": "received user_message from console",
+      "confidence": 1.0,
+      "source": "event",
+      "ttl_seconds": 300,
+      "status": "fresh"
+    },
+    {
+      "claim": "received user_message from console",
+      "confidence": 1.0,
+      "source": "event",
+      "ttl_seconds": 300,
+      "status": "fresh"
+    }
+  ],
+  "updated_at": "2026-05-14T06:26:53.508724+00:00"
+}

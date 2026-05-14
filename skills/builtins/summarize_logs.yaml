@@ -1,0 +1,3 @@
+name: summarize_logs
+risk_level: R1
+description: Summarize a bounded log tail.

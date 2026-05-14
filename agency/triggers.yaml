@@ -1,0 +1,3 @@
+triggers:
+  - name: selected_agent_unavailable
+    action: probe_executor_status

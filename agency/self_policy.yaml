@@ -1,0 +1,3 @@
+default:
+  observe_before_act: true
+  govern_before_execute: true
