@@ -1,1 +1,53 @@
-{"snapshots": []}
+{
+  "snapshots": [
+    {
+      "snapshot_id": "snap_e1700df9f7a9",
+      "status": "created",
+      "source": "/Users/spectre/PycharmProjects/veyra/state/mvp_self_test.txt",
+      "snapshot": "state/snapshots/snap_e1700df9f7a9_mvp_self_test.txt",
+      "reason": "manual_snapshot",
+      "created_at": "2026-05-14T10:09:14.346223+00:00"
+    },
+    {
+      "snapshot_id": "snap_c683f944d6a0",
+      "status": "created",
+      "source": "/Users/spectre/PycharmProjects/veyra/state/mvp_self_test.txt",
+      "snapshot": "state/snapshots/snap_c683f944d6a0_mvp_self_test.txt",
+      "reason": "manual_snapshot",
+      "created_at": "2026-05-17T11:58:21.440000+00:00"
+    },
+    {
+      "snapshot_id": "snap_165a31c1df24",
+      "status": "created",
+      "source": "/Users/spectre/PycharmProjects/veyra/state/mvp_self_test.txt",
+      "snapshot": "state/snapshots/snap_165a31c1df24_mvp_self_test.txt",
+      "reason": "manual_snapshot",
+      "created_at": "2026-05-17T12:05:50.919489+00:00"
+    },
+    {
+      "snapshot_id": "snap_18f67b9bd35e",
+      "status": "created",
+      "source": "/Users/spectre/PycharmProjects/veyra/state/mvp_self_test.txt",
+      "snapshot": "state/snapshots/snap_18f67b9bd35e_mvp_self_test.txt",
+      "reason": "manual_snapshot",
+      "created_at": "2026-05-17T12:08:59.306789+00:00"
+    },
+    {
+      "snapshot_id": "snap_42a6331096ae",
+      "status": "created",
+      "source": "/Users/spectre/PycharmProjects/veyra/state/mvp_self_test.txt",
+      "snapshot": "state/snapshots/snap_42a6331096ae_mvp_self_test.txt",
+      "reason": "manual_snapshot",
+      "created_at": "2026-05-17T12:11:18.302829+00:00"
+    },
+    {
+      "snapshot_id": "snap_b289e51c45c6",
+      "status": "created",
+      "source": "/Users/spectre/PycharmProjects/veyra/state/mvp_self_test.txt",
+      "snapshot": "state/snapshots/snap_b289e51c45c6_mvp_self_test.txt",
+      "reason": "manual_snapshot",
+      "created_at": "2026-05-17T12:14:12.580130+00:00"
+    }
+  ],
+  "updated_at": "2026-05-14T09:02:44.433920+00:00"
+}

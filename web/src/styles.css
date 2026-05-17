@@ -21,7 +21,8 @@ body {
 }
 
 button,
-textarea {
+textarea,
+input {
   font: inherit;
 }
 
@@ -126,10 +127,16 @@ h2 {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 14px;
+  margin-bottom: 14px;
+}
+
+.logGrid.single {
+  grid-template-columns: 1fr;
 }
 
 .panel {
   min-width: 0;
+  overflow: hidden;
 }
 
 .panelHeader {
@@ -155,6 +162,22 @@ h2 {
   border: 1px solid #ccd4d2;
   border-radius: 8px;
   padding: 12px;
+  color: #1f2630;
+  background: #fbfcfb;
+}
+
+.rollbackControls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  padding: 14px;
+}
+
+.rollbackControls input {
+  min-width: 0;
+  border: 1px solid #ccd4d2;
+  border-radius: 8px;
+  padding: 0 12px;
   color: #1f2630;
   background: #fbfcfb;
 }
@@ -187,6 +210,11 @@ h2 {
   font-weight: 700;
 }
 
+.compactButton {
+  min-height: 30px;
+  padding: 0 9px;
+}
+
 .primaryButton {
   color: #ffffff;
   background: #245c56;
@@ -210,6 +238,17 @@ h2 {
   color: #26323d;
   background: #ffffff;
   border-color: #d4d9d6;
+}
+
+.smallIconButton {
+  width: 30px;
+  min-height: 30px;
+}
+
+.inlineActions {
+  display: flex;
+  gap: 7px;
+  align-items: center;
 }
 
 .pill {
@@ -300,6 +339,23 @@ h2 {
   overflow-wrap: anywhere;
 }
 
+.executionResult {
+  display: grid;
+  gap: 6px;
+}
+
+.executionResult > span {
+  color: #65707d;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.executionResult .jsonBlock {
+  min-height: 80px;
+  max-height: 180px;
+  border-radius: 8px;
+}
+
 .buttonRow.compact {
   padding: 0;
 }
@@ -353,7 +409,7 @@ code {
 }
 
 .jsonBlock {
-  min-height: 220px;
+  min-height: 180px;
   max-height: 420px;
   overflow: auto;
   margin: 0;
@@ -383,9 +439,239 @@ code {
   color: #68727d;
 }
 
+.dataTable {
+  display: grid;
+  gap: 8px;
+  padding: 0 14px 14px;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+.dataTableHead,
+.dataTableRow {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.8fr) minmax(100px, 0.7fr) minmax(180px, 1.5fr) minmax(120px, 0.8fr);
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+}
+
+.dataTableHead {
+  color: #68727d;
+  font-size: 12px;
+  font-weight: 800;
+  padding: 0 10px;
+}
+
+.dataTableRow {
+  border: 1px solid #e3e7e3;
+  border-radius: 8px;
+  padding: 10px;
+  background: #fbfcfb;
+}
+
+.dataTableRow > *,
+.dataTableHead > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.toolTable .dataTableRow {
+  grid-template-columns:
+    minmax(82px, 0.6fr)
+    minmax(86px, 0.6fr)
+    minmax(82px, 0.55fr)
+    minmax(170px, 1.35fr)
+    minmax(90px, 0.7fr)
+    minmax(110px, 0.8fr)
+    minmax(120px, 0.85fr);
+}
+
+.toolTable .dataTableHead,
+.toolTable .dataTableRow {
+  min-width: 920px;
+}
+
+.toolTable .dataTableHead {
+  grid-template-columns:
+    minmax(82px, 0.6fr)
+    minmax(86px, 0.6fr)
+    minmax(82px, 0.55fr)
+    minmax(170px, 1.35fr)
+    minmax(90px, 0.7fr)
+    minmax(110px, 0.8fr)
+    minmax(120px, 0.85fr);
+}
+
+.memoryTable .dataTableHead,
+.memoryTable .dataTableRow {
+  grid-template-columns:
+    minmax(150px, 1.1fr)
+    minmax(90px, 0.65fr)
+    minmax(80px, 0.55fr)
+    minmax(130px, 0.8fr)
+    minmax(160px, 1.15fr);
+}
+
+.memoryTable .dataTableHead,
+.memoryTable .dataTableRow {
+  min-width: 760px;
+}
+
+.miniBlock {
+  display: grid;
+  gap: 8px;
+  margin: 0 14px 14px;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid #e3e7e3;
+  background: #fbfcfb;
+}
+
+.miniBlock > span {
+  color: #68727d;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.memoryList {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+}
+
+.memoryItem {
+  display: grid;
+  gap: 5px;
+  border: 1px solid #e3e7e3;
+  border-radius: 8px;
+  padding: 10px;
+  background: #fbfcfb;
+}
+
+.memoryItem small {
+  color: #68727d;
+}
+
+.writeLogList {
+  display: grid;
+  gap: 8px;
+  padding: 0 14px 14px;
+}
+
+.writeLogItem {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) minmax(120px, 0.7fr);
+  gap: 10px;
+  align-items: center;
+  border: 1px solid #e3e7e3;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #fbfcfb;
+}
+
+.writeLogItem small {
+  color: #68727d;
+}
+
+.diffPreview {
+  display: grid;
+  gap: 8px;
+  margin: 0 14px 14px;
+  border: 1px solid #d9ded7;
+  border-radius: 8px;
+  background: #fbfcfb;
+  overflow: hidden;
+}
+
+.diffPreviewHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border-bottom: 1px solid #e3e7e3;
+}
+
+.diffPreview pre {
+  max-height: 220px;
+  overflow: auto;
+  margin: 0;
+  padding: 12px;
+  background: #15191e;
+  color: #dbe7df;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.operationsGrid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.operationsGrid > .panel:first-child {
+  grid-column: 1 / -1;
+}
+
+.agentRuntimePanel {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.agentRuntimePanel .jsonBlock {
+  min-height: 150px;
+  max-height: 280px;
+  border-radius: 8px;
+}
+
+.segmentedControl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid #d8dedb;
+  border-radius: 8px;
+  background: #f4f7f5;
+}
+
+.segmentedControl button {
+  min-width: 0;
+  min-height: 32px;
+  border: 0;
+  border-radius: 6px;
+  color: #384452;
+  background: transparent;
+  font-weight: 800;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.segmentedControl button.selected {
+  color: #ffffff;
+  background: #245c56;
+}
+
+.agentUrlRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.agentUrlRow input {
+  min-width: 0;
+  border: 1px solid #ccd4d2;
+  border-radius: 8px;
+  padding: 0 10px;
+  color: #1f2630;
+  background: #fbfcfb;
+}
+
 @media (max-width: 1100px) {
   .overviewGrid,
-  .logGrid {
+  .logGrid,
+  .operationsGrid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -406,11 +692,35 @@ code {
   }
 
   .overviewGrid,
-  .logGrid {
+  .logGrid,
+  .operationsGrid {
     grid-template-columns: 1fr;
   }
 
   .tableRow {
+    grid-template-columns: 1fr;
+  }
+
+  .rollbackControls,
+  .dataTableHead,
+  .dataTableRow,
+  .toolTable .dataTableHead,
+  .toolTable .dataTableRow,
+  .memoryTable .dataTableHead,
+  .memoryTable .dataTableRow,
+  .writeLogItem {
+    grid-template-columns: 1fr;
+  }
+
+  .toolTable .dataTableHead,
+  .toolTable .dataTableRow,
+  .memoryTable .dataTableHead,
+  .memoryTable .dataTableRow {
+    min-width: 0;
+  }
+
+  .segmentedControl,
+  .agentUrlRow {
     grid-template-columns: 1fr;
   }
 }

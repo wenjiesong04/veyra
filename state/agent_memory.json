@@ -1,1 +1,89 @@
-{"items": []}
+{
+  "items": [
+    {
+      "patch": {
+        "session_id": "mvp-self-test",
+        "task": "MVP self-test memory write",
+        "executor": "self-test",
+        "status": "success",
+        "result": {
+          "checked": true
+        }
+      },
+      "created_at": "2026-05-14T09:02:44.436345+00:00"
+    },
+    {
+      "patch": {
+        "session_id": "mvp-self-test",
+        "task": "MVP self-test memory write",
+        "executor": "self-test",
+        "status": "success",
+        "result": {
+          "checked": true
+        }
+      },
+      "created_at": "2026-05-14T10:09:14.348749+00:00"
+    },
+    {
+      "patch": {
+        "session_id": "mvp-self-test",
+        "task": "MVP self-test memory write",
+        "executor": "self-test",
+        "status": "success",
+        "result": {
+          "checked": true
+        }
+      },
+      "created_at": "2026-05-17T11:58:21.442681+00:00"
+    },
+    {
+      "patch": {
+        "session_id": "mvp-self-test",
+        "task": "MVP self-test memory write",
+        "executor": "self-test",
+        "status": "success",
+        "result": {
+          "checked": true
+        }
+      },
+      "created_at": "2026-05-17T12:05:50.921856+00:00"
+    },
+    {
+      "patch": {
+        "session_id": "mvp-self-test",
+        "task": "MVP self-test memory write",
+        "executor": "self-test",
+        "status": "success",
+        "result": {
+          "checked": true
+        }
+      },
+      "created_at": "2026-05-17T12:08:59.309173+00:00"
+    },
+    {
+      "patch": {
+        "session_id": "mvp-self-test",
+        "task": "MVP self-test memory write",
+        "executor": "self-test",
+        "status": "success",
+        "result": {
+          "checked": true
+        }
+      },
+      "created_at": "2026-05-17T12:11:18.306877+00:00"
+    },
+    {
+      "patch": {
+        "session_id": "mvp-self-test",
+        "task": "MVP self-test memory write",
+        "executor": "self-test",
+        "status": "success",
+        "result": {
+          "checked": true
+        }
+      },
+      "created_at": "2026-05-17T12:14:12.582664+00:00"
+    }
+  ],
+  "updated_at": "2026-05-14T09:02:44.436348+00:00"
+}

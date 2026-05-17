@@ -9,14 +9,25 @@ class SafeShell:
         self.policy = policy or ToolPolicy()
         self.state_store = state_store
 
-    def run(self, command: list[str]) -> dict:
+    def run(self, command: list[str], approved_by: str | None = None) -> dict:
         review = self.policy.review_command(command)
-        if review["decision"] != "allow":
+        if review["decision"] == "block":
             result = {"status": review["decision"], "review": review, "command": command}
             self._record(result)
             return result
+        if review["decision"] == "ask_user" and not approved_by:
+            result = {"status": "needs_confirmation", "review": review, "command": command}
+            self._record(result)
+            return result
         result = subprocess.run(command, capture_output=True, text=True, check=False)
-        payload = {"status": "ok" if result.returncode == 0 else "error", "stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode, "command": command}
+        payload = {
+            "status": "ok" if result.returncode == 0 else "error",
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode,
+            "command": command,
+            "approved_by": approved_by,
+        }
         self._record(payload)
         return payload
 

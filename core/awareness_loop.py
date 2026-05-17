@@ -15,13 +15,15 @@ from core.task_packet_builder import TaskPacketBuilder
 from core.verifier import Verifier
 from core.world_state import WorldStateStore
 from guardian.review_queue import ReviewQueue
+from interface.agent_registry import AgentRegistry
 from interface.event_schema import LoopResult, RiskLevel, Route, VeyraEvent
-from interface.openclaw_adapter import OpenClawAdapter
 from memory_bridge.local_memory_bridge import LocalMemoryBridge
 from probes.git_probe import GitProbe
 from probes.port_probe import PortProbe
 from probes.process_probe import ProcessProbe
 from probes.system_probe import SystemProbe
+from skills.skill_loader import SkillLoader
+from skills.skill_runtime import SkillRuntime
 
 
 class AwarenessLoop:
@@ -40,9 +42,13 @@ class AwarenessLoop:
         self.context_builder = ContextPatchBuilder(state_store)
         self.task_packet_builder = TaskPacketBuilder(state_store)
         self.verifier = Verifier()
-        self.agent_adapter = OpenClawAdapter()
+        self.agent_registry = AgentRegistry(state_store)
+        self.runtime_entity.set_selected_agent(self.agent_registry.selected_name())
+        self.agent_adapter = self.agent_registry.selected()
         self.review_queue = ReviewQueue(state_store)
         self.memory_bridge = LocalMemoryBridge(state_store)
+        self.skill_loader = SkillLoader()
+        self.skill_runtime = SkillRuntime(state_store)
         self.probes = {
             "system": SystemProbe(),
             "git": GitProbe(),
@@ -107,7 +113,11 @@ class AwarenessLoop:
             )
         elif decision.route == Route.PROBE:
             result = self._run_probe(event, decision.selected_probe or "system")
+        elif decision.route == Route.SKILL:
+            result = self._run_skill(event, decision.selected_probe or "")
         elif decision.route == Route.AGENT:
+            self.agent_adapter = self.agent_registry.selected()
+            selected_agent = decision.target_agent or self.agent_registry.selected_name()
             memory_summary = self.memory_bridge.read_summary(event.source.session_id)
             context_patch = self.context_builder.build(text, attention_focus)
             context_patch["memory_summary"] = memory_summary
@@ -116,7 +126,7 @@ class AwarenessLoop:
                 context_patch["agent_memory_summary"] = agent_memory_summary
             packet = self.task_packet_builder.build(
                 event=event,
-                target_agent=decision.target_agent or self.runtime_entity.identity.selected_agent,
+                target_agent=selected_agent,
                 persona_patch=self.persona_engine.patch_for(text, decision.risk_level),
                 policy_patch=self.guardian.policy_patch(decision.risk_level),
                 context_patch=context_patch,
@@ -154,6 +164,38 @@ class AwarenessLoop:
         self._update(event, result)
         return result
 
+    def _run_skill(self, event: VeyraEvent, skill_name: str) -> LoopResult:
+        skill = self.skill_loader.load(skill_name)
+        raw = self.skill_runtime.run(skill, {"text": event.payload.get("text", ""), "event": event.to_dict()})
+        status = str(raw.get("status", "unknown"))
+        risk = RiskLevel.R2 if skill_name == "safe_git_commit" else RiskLevel.R1
+        response = str(raw.get("summary") or raw.get("status") or f"Skill {skill_name} completed.")
+        if status == "needs_confirmation":
+            review = self.review_queue.create(
+                event_id=event.event_id,
+                task_text=str(event.payload.get("text", "")),
+                risk_level=RiskLevel.R2.value,
+                foresight={"risk_level": "R2", "reversible": "partial", "side_effects": ["git history change"], "safer_alternatives": ["review git diff first"]},
+                guardian_decision={"decision": "ask_user", "risk_level": "R2", "reason": "Skill requires confirmation before write action."},
+                proposal={"agent": "skill", "action": {"type": "skill", "name": skill_name}, "risk_guess": "R2"},
+            )
+            return LoopResult(
+                event_id=event.event_id,
+                route=Route.HUMAN_REVIEW,
+                status="needs_confirmation",
+                response=response,
+                risk_level=RiskLevel.R2,
+                artifacts={"skill_result": raw, "review": review},
+            )
+        return LoopResult(
+            event_id=event.event_id,
+            route=Route.SKILL,
+            status="success" if status == "success" else status,
+            response=response,
+            risk_level=risk,
+            artifacts={"skill_result": raw},
+        )
+
     def _run_probe(self, event: VeyraEvent, probe_name: str) -> LoopResult:
         text = event.payload.get("text", "")
         probe = self.probes.get(probe_name, self.probes["system"])
@@ -185,5 +227,6 @@ class AwarenessLoop:
             "action_record.jsonl",
             {"event_id": event.event_id, "route": result.route.value, "status": result.status, "artifacts": result.artifacts},
         )
-        self.state_store.patch_json("executor_state.json", self.agent_adapter.connection_status())
+        self.agent_adapter = self.agent_registry.selected()
+        self.state_store.patch_json("executor_state.json", {"selected_agent": self.agent_registry.selected_name(), **self.agent_adapter.connection_status()})
         self.runtime_entity.set_status("idle")

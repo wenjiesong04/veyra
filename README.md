@@ -40,8 +40,11 @@ Endpoints:
 - `POST /tool-proxy/shell` execute a command through SafeShell policy
 - `POST /tool-proxy/file/read` read a file through SafeFile policy
 - `POST /tool-proxy/file/write` write a file with snapshot support
+- `POST /actions/proposals` submit an Agent or Tool action proposal through Guardian review
 - `POST /rollback/snapshot` create a file snapshot
 - `POST /rollback/{snapshot_id}/restore` restore a file snapshot
+- `GET /agent/status` inspect selected Agent adapter connection status
+- `GET /memory/summary` read local Memory Bridge summary
 - `GET /console/` open the Veyra control console after the frontend is built
 
 Example:
@@ -88,6 +91,14 @@ npm run dev
 
 The Vite dev server proxies API calls to `http://127.0.0.1:8000`.
 
+## MVP Self-Test
+
+Run the core governance loop, review approval, Tool Proxy, rollback, Memory Bridge, proactive check, and readiness checks in one command:
+
+```bash
+python3 scripts/mvp_self_test.py
+```
+
 ## MVP Governance Workflow
 
 ```text
@@ -113,26 +124,52 @@ R3/R4 action
   -> action_record.jsonl
 ```
 
+Executable action proposal flow:
+
+```text
+Agent / Tool ActionProposal
+  -> POST /actions/proposals
+  -> R0-R2: execute through ActionExecutor
+  -> R3-R4: write ReviewQueue and wait for approval
+  -> Approve: execute proposal through SafeShell / SafeFile
+  -> ToolTrace + ActionRecord
+  -> Reject: audit only, no execution
+```
+
 Agent flow:
 
 ```text
 Complex task
   -> ContextPatch + PolicyPatch + PersonaPatch
   -> VeyraTaskPacket
-  -> OpenClawAdapter
+  -> selected AgentAdapter
   -> ExecutionResult
   -> Verifier
   -> MemoryBridge
 ```
 
-OpenClaw is connected only when `OPENCLAW_BASE_URL` is set:
+Agent runtimes are selected through `state/agent_config.json` or the console Agent Runtime panel. The MVP ships a native OpenClaw Gateway adapter plus compatible HTTP adapters for Hermes and a Custom Agent endpoint. OpenClaw remains the default:
 
 ```bash
 export OPENCLAW_BASE_URL=http://127.0.0.1:18789
-export OPENCLAW_API_KEY=optional-token
+export OPENCLAW_GATEWAY_TOKEN=optional-token
+export OPENCLAW_SCOPES=operator.read,operator.write
+export HERMES_BASE_URL=http://127.0.0.1:18889
+export CUSTOM_AGENT_BASE_URL=http://127.0.0.1:18989
 ```
 
-The adapter expects these runtime endpoints:
+Useful endpoints:
+
+- `GET /agents`
+- `POST /agents/select`
+- `POST /agents/{name}/config`
+- `GET /agent/status`
+
+OpenClaw uses the same WebSocket Gateway protocol as the local OpenClaw Control UI. Veyra converts `http://127.0.0.1:18789` to `ws://127.0.0.1:18789`, sends `connect`, checks `health` / `status`, and submits Agent work with `chat.send`. If OpenClaw is reachable but requires device pairing or a gateway token, `/agent/status` reports that explicitly instead of treating the control UI HTML as a working Agent API.
+
+For OpenClaw deployments with Control UI auth enabled, set `OPENCLAW_GATEWAY_TOKEN` to the dashboard token. Veyra stores its generated OpenClaw device identity in `state/openclaw_device.json` and ignores that file in git because it contains local signing material.
+
+Hermes and Custom HTTP adapters expect these runtime endpoints by default:
 
 - `POST /tasks`
 - `GET /capabilities`
@@ -140,7 +177,7 @@ The adapter expects these runtime endpoints:
 - `POST /memory/patch`
 - `POST /tasks/{task_id}/stop`
 
-Without `OPENCLAW_BASE_URL`, Veyra still builds the task packet but returns `adapter_unconfigured` instead of pretending that an Agent task was sent.
+Without a configured base URL, Veyra still builds the task packet but returns `adapter_unconfigured` instead of pretending that an Agent task was sent.
 
 ## Implemented Architecture Slices
 

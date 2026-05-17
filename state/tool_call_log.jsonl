@@ -1,1 +1,15 @@
 
+{"tool": "safe_shell", "status": "ok", "stdout": "veyra-approved\n", "stderr": "", "returncode": 0, "command": ["echo", "veyra-approved"], "approved_by": "rev_e559aab9c29b", "timestamp": "2026-05-14T09:02:44.426887+00:00"}
+{"tool": "safe_shell", "status": "ok", "stdout": "veyra-tool-proxy\n", "stderr": "", "returncode": 0, "command": ["echo", "veyra-tool-proxy"], "approved_by": null, "timestamp": "2026-05-14T09:02:44.431821+00:00"}
+{"tool": "safe_shell", "status": "ok", "stdout": "veyra-approved\n", "stderr": "", "returncode": 0, "command": ["echo", "veyra-approved"], "approved_by": "rev_ed5de6acb6ff", "timestamp": "2026-05-14T10:09:14.340599+00:00"}
+{"tool": "safe_shell", "status": "ok", "stdout": "veyra-tool-proxy\n", "stderr": "", "returncode": 0, "command": ["echo", "veyra-tool-proxy"], "approved_by": null, "timestamp": "2026-05-14T10:09:14.344556+00:00"}
+{"tool": "safe_shell", "status": "ok", "stdout": "veyra-approved\n", "stderr": "", "returncode": 0, "command": ["echo", "veyra-approved"], "approved_by": "rev_3d9761e3d91a", "timestamp": "2026-05-17T11:58:21.434199+00:00"}
+{"tool": "safe_shell", "status": "ok", "stdout": "veyra-tool-proxy\n", "stderr": "", "returncode": 0, "command": ["echo", "veyra-tool-proxy"], "approved_by": null, "timestamp": "2026-05-17T11:58:21.438029+00:00"}
+{"tool": "safe_shell", "status": "ok", "stdout": "veyra-approved\n", "stderr": "", "returncode": 0, "command": ["echo", "veyra-approved"], "approved_by": "rev_6299a0d4ff89", "timestamp": "2026-05-17T12:05:50.913748+00:00"}
+{"tool": "safe_shell", "status": "ok", "stdout": "veyra-tool-proxy\n", "stderr": "", "returncode": 0, "command": ["echo", "veyra-tool-proxy"], "approved_by": null, "timestamp": "2026-05-17T12:05:50.917918+00:00"}
+{"tool": "safe_shell", "status": "ok", "stdout": "veyra-approved\n", "stderr": "", "returncode": 0, "command": ["echo", "veyra-approved"], "approved_by": "rev_1fa582c3a79f", "timestamp": "2026-05-17T12:08:59.300245+00:00"}
+{"tool": "safe_shell", "status": "ok", "stdout": "veyra-tool-proxy\n", "stderr": "", "returncode": 0, "command": ["echo", "veyra-tool-proxy"], "approved_by": null, "timestamp": "2026-05-17T12:08:59.304367+00:00"}
+{"tool": "safe_shell", "status": "ok", "stdout": "veyra-approved\n", "stderr": "", "returncode": 0, "command": ["echo", "veyra-approved"], "approved_by": "rev_9ac4a8594a59", "timestamp": "2026-05-17T12:11:18.293551+00:00"}
+{"tool": "safe_shell", "status": "ok", "stdout": "veyra-tool-proxy\n", "stderr": "", "returncode": 0, "command": ["echo", "veyra-tool-proxy"], "approved_by": null, "timestamp": "2026-05-17T12:11:18.300221+00:00"}
+{"tool": "safe_shell", "status": "ok", "stdout": "veyra-approved\n", "stderr": "", "returncode": 0, "command": ["echo", "veyra-approved"], "approved_by": "rev_47f6daa406c1", "timestamp": "2026-05-17T12:14:12.573493+00:00"}
+{"tool": "safe_shell", "status": "ok", "stdout": "veyra-tool-proxy\n", "stderr": "", "returncode": 0, "command": ["echo", "veyra-tool-proxy"], "approved_by": null, "timestamp": "2026-05-17T12:14:12.577887+00:00"}

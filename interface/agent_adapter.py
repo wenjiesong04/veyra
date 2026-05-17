@@ -52,3 +52,6 @@ class AgentAdapter(ABC):
 
     def stop_task(self, task_id: str) -> bool:
         return False
+
+    def connection_status(self) -> dict[str, Any]:
+        return {"connected": False, "status": "adapter_unconfigured", "base_url": None}

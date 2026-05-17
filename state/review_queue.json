@@ -1,75 +1,334 @@
 {
   "items": [
     {
-      "review_id": "rev_9c3aa42a7ab7",
-      "event_id": "evt_2117be6c323c",
-      "task_text": "帮我重启 OpenClaw 服务\n",
+      "review_id": "rev_e559aab9c29b",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
       "risk_level": "R4",
       "status": "approved",
       "foresight": {
         "risk_level": "R4",
-        "reversible": "partial",
-        "side_effects": [
-          "service interruption"
-        ],
-        "safer_alternatives": [
-          "check status and logs before restart"
-        ]
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
       },
       "guardian_decision": {
         "decision": "ask_user",
         "risk_level": "R4",
-        "reason": "Action needs confirmation because it may alter service, files, or data.",
-        "foresight": {
-          "risk_level": "R4",
-          "reversible": "partial",
-          "side_effects": [
-            "service interruption"
-          ],
-          "safer_alternatives": [
-            "check status and logs before restart"
-          ]
-        }
+        "reason": "ActionProposal requires human confirmation."
       },
-      "created_at": "2026-05-14T06:27:42.081498+00:00",
-      "decided_at": "2026-05-14T06:28:01.288430+00:00",
-      "decision_reason": "console_approve"
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_e559aab9c29b"
+      },
+      "created_at": "2026-05-14T09:02:44.422063+00:00",
+      "decided_at": "2026-05-14T09:02:44.422952+00:00",
+      "decision_reason": "mvp_self_test"
     },
     {
-      "review_id": "rev_dc8153b751d6",
-      "event_id": "evt_b0121def3407",
-      "task_text": "帮我重启 OpenClaw 服务\n",
+      "review_id": "rev_ed5de6acb6ff",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
       "risk_level": "R4",
       "status": "approved",
       "foresight": {
         "risk_level": "R4",
-        "reversible": "partial",
-        "side_effects": [
-          "service interruption"
-        ],
-        "safer_alternatives": [
-          "check status and logs before restart"
-        ]
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
       },
       "guardian_decision": {
         "decision": "ask_user",
         "risk_level": "R4",
-        "reason": "Action needs confirmation because it may alter service, files, or data.",
-        "foresight": {
-          "risk_level": "R4",
-          "reversible": "partial",
-          "side_effects": [
-            "service interruption"
-          ],
-          "safer_alternatives": [
-            "check status and logs before restart"
-          ]
-        }
+        "reason": "ActionProposal requires human confirmation."
       },
-      "created_at": "2026-05-14T06:30:24.589538+00:00",
-      "decided_at": "2026-05-14T06:30:30.752687+00:00",
-      "decision_reason": "console_approve"
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_ed5de6acb6ff"
+      },
+      "created_at": "2026-05-14T10:09:14.335694+00:00",
+      "decided_at": "2026-05-14T10:09:14.336769+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_3d9761e3d91a",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "ActionProposal requires human confirmation."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_3d9761e3d91a"
+      },
+      "created_at": "2026-05-17T11:58:21.428153+00:00",
+      "decided_at": "2026-05-17T11:58:21.429177+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_6299a0d4ff89",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "ActionProposal requires human confirmation."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_6299a0d4ff89"
+      },
+      "created_at": "2026-05-17T12:05:50.908817+00:00",
+      "decided_at": "2026-05-17T12:05:50.909717+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_1fa582c3a79f",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "ActionProposal requires human confirmation."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_1fa582c3a79f"
+      },
+      "created_at": "2026-05-17T12:08:59.294590+00:00",
+      "decided_at": "2026-05-17T12:08:59.295615+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_9ac4a8594a59",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "ActionProposal requires human confirmation."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_9ac4a8594a59"
+      },
+      "created_at": "2026-05-17T12:11:18.285790+00:00",
+      "decided_at": "2026-05-17T12:11:18.288555+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_47f6daa406c1",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "ActionProposal requires human confirmation."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_47f6daa406c1"
+      },
+      "created_at": "2026-05-17T12:14:12.567818+00:00",
+      "decided_at": "2026-05-17T12:14:12.569193+00:00",
+      "decision_reason": "mvp_self_test"
     }
   ],
-  "updated_at": "2026-05-14T06:27:42.081886+00:00"
+  "updated_at": "2026-05-14T09:02:44.422096+00:00"
 }

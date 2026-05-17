@@ -25,6 +25,14 @@ class WorldStateStore:
             "attention_state.json": {"focus": [], "ignored_noise": []},
             "review_queue.json": {"items": []},
             "agent_memory.json": {"items": []},
+            "agent_config.json": {
+                "selected_agent": "openclaw",
+                "agents": {
+                    "openclaw": {"kind": "openclaw", "base_url": "", "api_key_env": "OPENCLAW_GATEWAY_TOKEN", "enabled": True},
+                    "hermes": {"kind": "hermes", "base_url": "", "api_key_env": "HERMES_API_KEY", "enabled": True},
+                    "custom": {"kind": "custom", "base_url": "", "api_key_env": "CUSTOM_AGENT_API_KEY", "enabled": True},
+                },
+            },
             "rollback_state.json": {"snapshots": []},
         }
         for name, payload in defaults.items():
@@ -91,4 +99,8 @@ class WorldStateStore:
             "belief_state": self.read_json("belief_state.json"),
             "task_state": self.read_json("task_state.json"),
             "attention_state": self.read_json("attention_state.json"),
+            "review_queue": self.read_json("review_queue.json"),
+            "rollback_state": self.read_json("rollback_state.json"),
+            "agent_memory": self.read_json("agent_memory.json"),
+            "agent_config": self.read_json("agent_config.json"),
         }

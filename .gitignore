@@ -7,3 +7,4 @@ web/*.tsbuildinfo
 web/vite.config.js
 web/vite.config.d.ts
 
+state/openclaw_device.json

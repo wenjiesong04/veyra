@@ -1,0 +1,24 @@
+{
+  "selected_agent": "openclaw",
+  "agents": {
+    "openclaw": {
+      "kind": "openclaw",
+      "base_url": "http://127.0.0.1:18789",
+      "api_key_env": "OPENCLAW_GATEWAY_TOKEN",
+      "enabled": true
+    },
+    "hermes": {
+      "kind": "hermes",
+      "base_url": "",
+      "api_key_env": "HERMES_API_KEY",
+      "enabled": true
+    },
+    "custom": {
+      "kind": "custom",
+      "base_url": "",
+      "api_key_env": "CUSTOM_AGENT_API_KEY",
+      "enabled": true
+    }
+  },
+  "updated_at": "2026-05-14T10:09:14.257768+00:00"
+}

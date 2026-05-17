@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 from pathlib import Path
 from shutil import copy2
 from typing import Any
@@ -49,3 +50,37 @@ class RollbackManager:
             result = {"status": "restored", "snapshot_id": snapshot_id, "source": snapshot["source"], "restored_at": utc_now_iso()}
         self.state_store.append_jsonl("rollback_log.jsonl", {"action": "restore", "result": result})
         return result
+
+    def diff(self, snapshot_id: str) -> dict[str, Any]:
+        snapshots = self.state_store.read_json("rollback_state.json").get("snapshots", [])
+        snapshot = next((item for item in snapshots if item.get("snapshot_id") == snapshot_id), None)
+        if not snapshot:
+            raise KeyError(f"Snapshot not found: {snapshot_id}")
+        if snapshot.get("status") != "created":
+            return {"status": "not_available", "reason": "snapshot is not restorable", "snapshot": snapshot}
+
+        snapshot_path = Path(str(snapshot["snapshot"]))
+        source_path = Path(str(snapshot["source"]))
+        if not snapshot_path.exists():
+            return {"status": "missing_snapshot", "snapshot": snapshot}
+        if not source_path.exists():
+            return {"status": "missing_source", "snapshot": snapshot}
+
+        before = snapshot_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        after = source_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        diff = "\n".join(
+            difflib.unified_diff(
+                before,
+                after,
+                fromfile=f"snapshot:{snapshot_path.name}",
+                tofile=str(source_path),
+                lineterm="",
+            )
+        )
+        return {
+            "status": "ok",
+            "snapshot_id": snapshot_id,
+            "source": str(source_path),
+            "changed": bool(diff),
+            "diff": diff or "No changes between snapshot and current file.",
+        }

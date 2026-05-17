@@ -18,6 +18,7 @@ class ReviewQueue:
         risk_level: str,
         foresight: dict[str, Any],
         guardian_decision: dict[str, Any],
+        proposal: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         review = {
             "review_id": f"rev_{uuid4().hex[:12]}",
@@ -27,6 +28,8 @@ class ReviewQueue:
             "status": "pending",
             "foresight": foresight,
             "guardian_decision": guardian_decision,
+            "proposal": proposal,
+            "execution_result": None,
             "created_at": utc_now_iso(),
             "decided_at": None,
             "decision_reason": None,
@@ -66,5 +69,23 @@ class ReviewQueue:
                     },
                 )
                 self.state_store.patch_json("risk_state.json", {"current_risk": item.get("risk_level", "R0") if decision == "approved" else "R0"})
+                return item
+        raise KeyError(f"Review not found: {review_id}")
+
+    def update_execution(self, review_id: str, execution_result: dict[str, Any]) -> dict[str, Any]:
+        state = self.state_store.read_json("review_queue.json") or {"items": []}
+        for item in state.setdefault("items", []):
+            if item.get("review_id") == review_id:
+                item["execution_result"] = execution_result
+                self.state_store.write_json("review_queue.json", state)
+                self.state_store.append_jsonl(
+                    "action_record.jsonl",
+                    {
+                        "event_id": item.get("event_id"),
+                        "route": "human_review",
+                        "status": "executed" if execution_result.get("status") in {"ok", "success"} else "execution_failed",
+                        "artifacts": {"review_id": review_id, "execution_result": execution_result},
+                    },
+                )
                 return item
         raise KeyError(f"Review not found: {review_id}")

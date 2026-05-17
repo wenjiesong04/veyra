@@ -1,7 +1,64 @@
 {
   "selected_agent": "openclaw",
-  "status": "adapter_unconfigured",
+  "status": "auth_required",
   "connected": false,
-  "base_url": null,
-  "updated_at": "2026-05-14T06:26:53.511559+00:00"
+  "base_url": "ws://127.0.0.1:18789",
+  "updated_at": "2026-05-14T08:57:05.919375+00:00",
+  "name": "openclaw",
+  "agents": {
+    "openclaw": {
+      "name": "openclaw",
+      "connected": false,
+      "status": "auth_required",
+      "base_url": "ws://127.0.0.1:18789",
+      "protocol": "openclaw_gateway_ws",
+      "capabilities": {
+        "runtime": "openclaw",
+        "status": "auth_required",
+        "base_url": "ws://127.0.0.1:18789",
+        "protocol": "openclaw_gateway_ws",
+        "connected": false,
+        "error": "unauthorized: gateway token missing (open the dashboard URL and paste the token in Control UI settings)",
+        "details": {
+          "code": "AUTH_TOKEN_MISSING",
+          "details": {
+            "code": "AUTH_TOKEN_MISSING",
+            "authReason": "token_missing",
+            "canRetryWithDeviceToken": false,
+            "recommendedNextStep": "update_auth_configuration"
+          }
+        }
+      }
+    },
+    "hermes": {
+      "name": "hermes",
+      "connected": false,
+      "status": "adapter_unconfigured",
+      "base_url": null
+    },
+    "custom": {
+      "name": "custom",
+      "connected": false,
+      "status": "adapter_unconfigured",
+      "base_url": null
+    }
+  },
+  "capabilities": {
+    "runtime": "openclaw",
+    "status": "auth_required",
+    "base_url": "ws://127.0.0.1:18789",
+    "protocol": "openclaw_gateway_ws",
+    "connected": false,
+    "error": "unauthorized: gateway token missing (open the dashboard URL and paste the token in Control UI settings)",
+    "details": {
+      "code": "AUTH_TOKEN_MISSING",
+      "details": {
+        "code": "AUTH_TOKEN_MISSING",
+        "authReason": "token_missing",
+        "canRetryWithDeviceToken": false,
+        "recommendedNextStep": "update_auth_configuration"
+      }
+    }
+  },
+  "protocol": "openclaw_gateway_ws"
 }
