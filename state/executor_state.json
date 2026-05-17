@@ -1,33 +1,21 @@
 {
   "selected_agent": "openclaw",
-  "status": "auth_required",
+  "status": "unavailable",
   "connected": false,
-  "base_url": "ws://127.0.0.1:18789",
+  "base_url": "http://127.0.0.1:18789",
   "updated_at": "2026-05-14T08:57:05.919375+00:00",
   "name": "openclaw",
   "agents": {
     "openclaw": {
       "name": "openclaw",
       "connected": false,
-      "status": "auth_required",
-      "base_url": "ws://127.0.0.1:18789",
-      "protocol": "openclaw_gateway_ws",
+      "status": "unavailable",
+      "base_url": "http://127.0.0.1:18789",
       "capabilities": {
         "runtime": "openclaw",
-        "status": "auth_required",
-        "base_url": "ws://127.0.0.1:18789",
-        "protocol": "openclaw_gateway_ws",
-        "connected": false,
-        "error": "unauthorized: gateway token missing (open the dashboard URL and paste the token in Control UI settings)",
-        "details": {
-          "code": "AUTH_TOKEN_MISSING",
-          "details": {
-            "code": "AUTH_TOKEN_MISSING",
-            "authReason": "token_missing",
-            "canRetryWithDeviceToken": false,
-            "recommendedNextStep": "update_auth_configuration"
-          }
-        }
+        "status": "unavailable",
+        "base_url": "http://127.0.0.1:18789",
+        "error": "openclaw request failed: <urlopen error [Errno 61] Connection refused>"
       }
     },
     "hermes": {
@@ -45,20 +33,9 @@
   },
   "capabilities": {
     "runtime": "openclaw",
-    "status": "auth_required",
-    "base_url": "ws://127.0.0.1:18789",
-    "protocol": "openclaw_gateway_ws",
-    "connected": false,
-    "error": "unauthorized: gateway token missing (open the dashboard URL and paste the token in Control UI settings)",
-    "details": {
-      "code": "AUTH_TOKEN_MISSING",
-      "details": {
-        "code": "AUTH_TOKEN_MISSING",
-        "authReason": "token_missing",
-        "canRetryWithDeviceToken": false,
-        "recommendedNextStep": "update_auth_configuration"
-      }
-    }
+    "status": "unavailable",
+    "base_url": "http://127.0.0.1:18789",
+    "error": "openclaw request failed: <urlopen error [Errno 61] Connection refused>"
   },
   "protocol": "openclaw_gateway_ws"
 }

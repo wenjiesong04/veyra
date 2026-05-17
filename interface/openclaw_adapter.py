@@ -39,7 +39,7 @@ class OpenClawAdapter(AgentAdapter):
         raw_url = base_url or os.getenv("OPENCLAW_GATEWAY_URL") or os.getenv("OPENCLAW_BASE_URL", "")
         self.gateway_url = self._gateway_url(raw_url)
         self.origin = self._origin_for_gateway(self.gateway_url)
-        self.api_key = api_key or os.getenv("OPENCLAW_GATEWAY_TOKEN") or os.getenv("OPENCLAW_API_KEY", "")
+        self.api_key = api_key or os.getenv("OPENCLAW_GATEWAY_TOKEN") or os.getenv("OPENCLAW_API_KEY", "") or self._local_gateway_token()
         self.password = os.getenv("OPENCLAW_GATEWAY_PASSWORD", "")
         self.timeout = timeout
         self.connect_timeout = min(max(timeout, 1.0), 5.0)
@@ -61,7 +61,7 @@ class OpenClawAdapter(AgentAdapter):
                 status=exc.status,
                 result=f"OpenClaw gateway request failed: {exc.message}",
                 logs=prompt,
-                raw={"task_packet": task_packet.to_dict(), "gateway_url": self.gateway_url, "error": exc.details},
+                raw=self._redact_payload({"task_packet": task_packet.to_dict(), "gateway_url": self.gateway_url, "error": exc.details}),
             )
         final = raw.get("final_event") or {}
         text = self._message_text(final.get("message"))
@@ -72,7 +72,7 @@ class OpenClawAdapter(AgentAdapter):
                 executor="openclaw",
                 status="success",
                 result=text or "OpenClaw finished with no text.",
-                raw=raw,
+                raw=self._redact_payload(raw),
             )
         if final.get("state") == "error":
             return ExecutionResult(
@@ -80,14 +80,14 @@ class OpenClawAdapter(AgentAdapter):
                 executor="openclaw",
                 status="error",
                 result=str(final.get("errorMessage") or "OpenClaw task failed."),
-                raw=raw,
+                raw=self._redact_payload(raw),
             )
         return ExecutionResult(
             task_id=run_id,
             executor="openclaw",
             status="submitted",
             result=f"Task submitted to OpenClaw. run_id={run_id}",
-            raw=raw,
+            raw=self._redact_payload(raw),
         )
 
     def fetch_capabilities(self) -> dict[str, Any]:
@@ -110,7 +110,7 @@ class OpenClawAdapter(AgentAdapter):
                 "protocol": "openclaw_gateway_ws",
                 "connected": False,
                 "error": exc.message,
-                "details": exc.details,
+                "details": self._redact_payload(exc.details),
             }
 
     def fetch_memory_summary(self, session_id: str) -> dict[str, Any]:
@@ -163,7 +163,15 @@ class OpenClawAdapter(AgentAdapter):
             )
             run_id = str(chat_send.get("runId") or idempotency_key)
             final_event = self._wait_for_chat_final(ws, run_id, events)
-        return {"hello": hello, "chat_send": chat_send, "run_id": run_id, "final_event": final_event, "events": events[-20:]}
+        return self._redact_payload(
+            {
+                "hello": self._hello_summary(hello),
+                "chat_send": chat_send,
+                "run_id": run_id,
+                "final_event": final_event,
+                "events": events[-20:],
+            }
+        )
 
     def _gateway_snapshot(self) -> dict[str, Any]:
         events: list[dict[str, Any]] = []
@@ -173,17 +181,18 @@ class OpenClawAdapter(AgentAdapter):
             status = self._request_on_socket(ws, "status", {}, events)
             tools = self._optional_request(ws, "tools.catalog", {}, events)
             skills = self._optional_request(ws, "skills.status", {}, events)
-        return {
+        return self._redact_payload({
             "runtime": "openclaw",
             "status": "available",
             "base_url": self.gateway_url,
             "protocol": "openclaw_gateway_ws",
-            "hello": hello,
-            "health": health,
-            "gateway_status": status,
-            "tools": tools.get("tools", tools) if isinstance(tools, dict) else [],
-            "skills": skills.get("skills", skills) if isinstance(skills, dict) else [],
-        }
+            "server": self._server_summary(hello),
+            "auth": self._auth_summary(hello),
+            "health": self._health_summary(health),
+            "gateway_status": self._status_summary(status),
+            "tools": self._tools_summary(tools),
+            "skills": self._skills_summary(skills),
+        })
 
     def _gateway_request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         events: list[dict[str, Any]] = []
@@ -286,7 +295,7 @@ class OpenClawAdapter(AgentAdapter):
         try:
             return self._request_on_socket(ws, method, params, events)
         except OpenClawGatewayError as exc:
-            return {"status": exc.status, "error": exc.message, "details": exc.details}
+            return {"status": exc.status, "error": exc.message, "details": self._redact_payload(exc.details)}
 
     def _wait_for_chat_final(self, ws: Any, run_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
         deadline = time.monotonic() + self.task_wait_timeout
@@ -334,7 +343,7 @@ class OpenClawAdapter(AgentAdapter):
         details = error.get("details") if isinstance(error.get("details"), dict) else {}
         code = str(details.get("code") or error.get("code") or "")
         message = str(error.get("message") or f"{method} failed")
-        return OpenClawGatewayError(self._classify_text(f"{code} {message}"), message, {"code": code, "details": details})
+        return OpenClawGatewayError(self._classify_text(f"{code} {message}"), message, {"code": code, "details": self._redact_payload(details)})
 
     def _connect_client(self) -> dict[str, str]:
         return {
@@ -356,6 +365,33 @@ class OpenClawAdapter(AgentAdapter):
         if self.password:
             payload["password"] = self.password
         return payload
+
+    def _local_gateway_token(self) -> str:
+        if os.getenv("VEYRA_OPENCLAW_USE_LOCAL_CONFIG", "1").strip().lower() in {"0", "false", "no"}:
+            return ""
+        path = Path.home() / ".openclaw" / "openclaw.json"
+        if not path.exists():
+            return ""
+        try:
+            config = json.loads(path.read_text(encoding="utf-8") or "{}")
+        except (OSError, json.JSONDecodeError):
+            return ""
+        return self._find_token(config)
+
+    def _find_token(self, value: Any) -> str:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key).lower() == "token" and isinstance(item, str) and len(item) >= 20:
+                    return item
+                found = self._find_token(item)
+                if found:
+                    return found
+        if isinstance(value, list):
+            for item in value:
+                found = self._find_token(item)
+                if found:
+                    return found
+        return ""
 
     def _device_identity(self) -> dict[str, Any] | None:
         if Ed25519PrivateKey is None or serialization is None:
@@ -444,6 +480,99 @@ class OpenClawAdapter(AgentAdapter):
 
     def _write_device_store(self, store: dict[str, Any]) -> None:
         self.device_store.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _hello_summary(self, hello: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "type": hello.get("type"),
+            "protocol": hello.get("protocol"),
+            "server": self._server_summary(hello),
+            "auth": self._auth_summary(hello),
+        }
+
+    def _server_summary(self, hello: dict[str, Any]) -> dict[str, Any]:
+        server = hello.get("server") if isinstance(hello.get("server"), dict) else {}
+        features = hello.get("features") if isinstance(hello.get("features"), dict) else {}
+        methods = features.get("methods") if isinstance(features.get("methods"), list) else []
+        events = features.get("events") if isinstance(features.get("events"), list) else []
+        return {
+            "version": server.get("version"),
+            "method_count": len(methods),
+            "event_count": len(events),
+        }
+
+    def _auth_summary(self, hello: dict[str, Any]) -> dict[str, Any]:
+        auth = hello.get("auth") if isinstance(hello.get("auth"), dict) else {}
+        scopes = auth.get("scopes") if isinstance(auth.get("scopes"), list) else []
+        return {
+            "role": auth.get("role"),
+            "scopes": [str(scope) for scope in scopes],
+        }
+
+    def _health_summary(self, health: dict[str, Any]) -> dict[str, Any]:
+        plugins = health.get("plugins") if isinstance(health.get("plugins"), dict) else {}
+        loaded = plugins.get("loaded") if isinstance(plugins.get("loaded"), list) else []
+        errors = plugins.get("errors") if isinstance(plugins.get("errors"), list) else []
+        return {
+            "ok": bool(health.get("ok")),
+            "duration_ms": health.get("durationMs"),
+            "plugin_count": len(loaded),
+            "plugin_error_count": len(errors),
+            "heartbeat_seconds": health.get("heartbeatSeconds"),
+        }
+
+    def _status_summary(self, status: dict[str, Any]) -> dict[str, Any]:
+        tasks = status.get("tasks") if isinstance(status.get("tasks"), dict) else {}
+        task_audit = status.get("taskAudit") if isinstance(status.get("taskAudit"), dict) else {}
+        return {
+            "runtime_version": status.get("runtimeVersion"),
+            "tasks": {
+                "total": tasks.get("total"),
+                "active": tasks.get("active"),
+                "failures": tasks.get("failures"),
+            },
+            "task_audit": {
+                "warnings": task_audit.get("warnings"),
+                "errors": task_audit.get("errors"),
+            },
+        }
+
+    def _tools_summary(self, tools: dict[str, Any]) -> dict[str, Any]:
+        groups = tools.get("groups") if isinstance(tools.get("groups"), list) else []
+        tool_count = 0
+        group_ids: list[str] = []
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            group_ids.append(str(group.get("id") or "unknown"))
+            entries = group.get("tools") if isinstance(group.get("tools"), list) else []
+            tool_count += len(entries)
+        return {"group_count": len(group_ids), "tool_count": tool_count, "groups": group_ids}
+
+    def _skills_summary(self, skills: dict[str, Any]) -> dict[str, Any]:
+        items = skills.get("skills") if isinstance(skills.get("skills"), list) else []
+        enabled = [item for item in items if isinstance(item, dict) and item.get("disabled") is not True]
+        eligible = [item for item in items if isinstance(item, dict) and item.get("eligible") is True]
+        return {"skill_count": len(items), "enabled_count": len(enabled), "eligible_count": len(eligible)}
+
+    def _redact_payload(self, value: Any) -> Any:
+        sensitive_keys = {
+            "authorization",
+            "devicetoken",
+            "password",
+            "privatekey",
+            "secret",
+            "signature",
+            "token",
+        }
+        if isinstance(value, dict):
+            redacted: dict[str, Any] = {}
+            for key, item in value.items():
+                normalized = str(key).replace("_", "").replace("-", "").lower()
+                redacted[key] = "__REDACTED__" if normalized in sensitive_keys else self._redact_payload(item)
+            return redacted
+        if isinstance(value, list):
+            return [self._redact_payload(item) for item in value]
+        return value
 
     def _unconfigured_result(self, task_packet: VeyraTaskPacket) -> ExecutionResult:
         prompt = self.render_prompt(task_packet)
