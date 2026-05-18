@@ -14,6 +14,7 @@ from core.runtime_entity import RuntimeEntity
 from core.world_state import WorldStateStore
 from execution.action_executor import ActionExecutor
 from guardian.review_queue import ReviewQueue
+from interface.agent_contract import contract_summary
 from interface.event_normalizer import EventNormalizer
 from interface.event_schema import Decision, Route, utc_now_iso
 from pydantic import Field
@@ -374,6 +375,11 @@ async def agent_status():
     return status
 
 
+@app.get("/agent/contract")
+async def agent_contract():
+    return contract_summary()
+
+
 @app.get("/agents")
 async def agents():
     status = awareness_loop.agent_registry.list_status()
@@ -429,6 +435,7 @@ async def mvp_status():
             "memory_bridge_local": True,
             "proactive_read_only_checks": True,
             "multi_agent_registry": True,
+            "agent_adapter_contract": True,
             "web_console": console_dir.exists(),
         },
         "agent_runtime": {

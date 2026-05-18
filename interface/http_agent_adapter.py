@@ -8,6 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from interface.agent_contract import AGENT_CONTRACT_VERSION, normalize_capabilities, normalize_execution_payload, validate_task_packet_payload
 from interface.agent_adapter import AgentAdapter, ExecutionResult
 from interface.event_schema import VeyraTaskPacket
 
@@ -52,28 +53,48 @@ class HttpAgentAdapter(AgentAdapter):
     def send_task(self, task_packet: VeyraTaskPacket) -> ExecutionResult:
         if not self.base_url:
             return self._unconfigured_result(task_packet)
-        payload = task_packet.to_dict()
-        payload["rendered_prompt"] = self.render_prompt(task_packet)
+        task_payload = task_packet.to_dict()
+        validation_errors = validate_task_packet_payload(task_payload)
+        if validation_errors:
+            return ExecutionResult(
+                task_id=task_packet.task_id,
+                executor=self.config.name,
+                status="failed",
+                result="Invalid VeyraTaskPacket for Agent adapter.",
+                raw={"validation_errors": validation_errors, "task_packet": task_payload},
+            )
+        payload = {
+            "contract_version": AGENT_CONTRACT_VERSION,
+            "task_packet": task_payload,
+            "rendered_prompt": self.render_prompt(task_packet),
+        }
         response = self._request("POST", self.config.task_path, payload)
         return self.receive_result({**response, "task_id": response.get("task_id", task_packet.task_id), "executor": self.config.name})
 
     def fetch_capabilities(self) -> dict[str, Any]:
         if not self.base_url:
-            return {
-                "runtime": self.config.name,
-                "status": "adapter_unconfigured",
-                "base_url": None,
-                "tools": [],
-                "skills": [],
-                "requires_tool_proxy": True,
-            }
+            return normalize_capabilities(
+                {
+                    "runtime": self.config.name,
+                    "status": "adapter_unconfigured",
+                    "base_url": None,
+                    "tools": [],
+                    "skills": [],
+                    "requires_tool_proxy": True,
+                },
+                runtime=self.config.name,
+                base_url=None,
+            )
         try:
             response = self._request("GET", self.config.capabilities_path)
-            response.setdefault("runtime", self.config.name)
             response.setdefault("status", "available")
-            return response
+            return normalize_capabilities(response, runtime=self.config.name, base_url=self.base_url)
         except RuntimeError as exc:
-            return {"runtime": self.config.name, "status": "unavailable", "base_url": self.base_url, "error": str(exc)}
+            return normalize_capabilities(
+                {"runtime": self.config.name, "status": "unavailable", "base_url": self.base_url, "error": str(exc)},
+                runtime=self.config.name,
+                base_url=self.base_url,
+            )
 
     def fetch_memory_summary(self, session_id: str) -> dict[str, Any]:
         if not self.base_url:
@@ -94,33 +115,31 @@ class HttpAgentAdapter(AgentAdapter):
         return bool(response.get("stopped", True))
 
     def receive_result(self, raw_result: dict[str, Any]) -> ExecutionResult:
-        return ExecutionResult(
-            task_id=str(raw_result.get("task_id", "unknown")),
-            executor=str(raw_result.get("executor", self.config.name)),
-            status=str(raw_result.get("status", "submitted")),
-            result=str(raw_result.get("result") or raw_result.get("message") or f"Task submitted to {self.config.name}."),
-            logs=str(raw_result.get("logs", "")),
-            changed_files=list(raw_result.get("changed_files", [])),
-            tool_calls=list(raw_result.get("tool_calls", [])),
-            raw=raw_result,
+        payload = normalize_execution_payload(
+            raw_result,
+            default_task_id="unknown",
+            default_executor=self.config.name,
+            default_status="submitted",
         )
+        if not payload["result"]:
+            payload["result"] = f"Task submitted to {self.config.name}."
+        return ExecutionResult(**payload)
 
     def connection_status(self) -> dict[str, Any]:
         if not self.base_url:
-            return {
-                "name": self.config.name,
-                "connected": False,
-                "status": "adapter_unconfigured",
-                "base_url": None,
-            }
+            status = self.fetch_capabilities()
+            status["name"] = self.config.name
+            return status
         capabilities = self.fetch_capabilities()
-        return {
+        status = {
             "name": self.config.name,
             "connected": capabilities.get("status") not in {"unavailable", "adapter_unconfigured"},
             "status": capabilities.get("status", "available"),
             "base_url": self.base_url,
             "capabilities": capabilities,
         }
+        status["contract_version"] = AGENT_CONTRACT_VERSION
+        return status
 
     def _unconfigured_result(self, task_packet: VeyraTaskPacket) -> ExecutionResult:
         prompt = self.render_prompt(task_packet)
@@ -130,7 +149,7 @@ class HttpAgentAdapter(AgentAdapter):
             status="adapter_unconfigured",
             result=f"{self.config.name} adapter is not connected. Configure its base_url before submitting real tasks.",
             logs=prompt,
-            raw={"task_packet": task_packet.to_dict(), "configured": False},
+            raw={"contract_version": AGENT_CONTRACT_VERSION, "task_packet": task_packet.to_dict(), "configured": False},
         )
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:

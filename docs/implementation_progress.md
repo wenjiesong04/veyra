@@ -146,6 +146,26 @@ P2 已将 Tool Proxy 接入统一策略审查：
 | P0 | Foundation definitions | Completed |
 | P1 | State and probe hardening | Completed |
 | P2 | Decision, Guardian, and Tool Proxy policy depth | Completed |
-| P3 | Agent adapter execution contracts | Pending |
+| P3 | Agent adapter execution contracts | Completed |
 | P4 | Rollback, audit, and verifier depth | Pending |
 | P5 | Web Control Console completeness | Pending |
+| P6 | End-to-end runtime hardening | Pending |
+| P7 | Production operations and safety validation | Pending |
+
+## Agent Adapter Contract
+
+P3 已定义 `veyra.agent_adapter.v1`：
+
+- `VeyraTaskPacket`: 保持结构化 JSON，同时提供 rendered prompt fallback。
+- `ExecutionResult`: 统一 `task_id`、`executor`、`status`、`result`、`logs`、`changed_files`、`tool_calls`、`raw`。
+- `Capabilities`: 统一 `runtime`、`status`、`connected`、`tools`、`skills`、`requires_tool_proxy`、`features`。
+- `HTTP adapters`: Hermes / Custom 使用统一 contract wrapper 发送任务。
+- `OpenClaw adapter`: 保持 WebSocket Gateway 协议，但对外输出同一 capability/status contract。
+- `/agent/contract`: 暴露当前 AgentAdapter contract 摘要。
+
+## P5 之后
+
+P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块：
+
+- P6：端到端真实运行硬化，包括 OpenClaw/Hermes/Custom Agent 真实连接测试、失败恢复、长任务停止、结果回传、状态过期刷新。
+- P7：生产运维和安全验证，包括高危动作红队测试、敏感信息泄露测试、日志留存策略、部署配置、监控告警和长期 heartbeat。

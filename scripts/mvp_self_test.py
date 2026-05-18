@@ -52,6 +52,9 @@ def main() -> int:
     runtime = get_json("/runtime")
     expect(bool(runtime.get("identity", {}).get("name")), "runtime identity", runtime)
 
+    contract = get_json("/agent/contract")
+    expect(contract.get("contract_version") == "veyra.agent_adapter.v1", "agent adapter contract", contract)
+
     direct = send_message("Veyra 是什么")
     expect(direct.get("route") == "direct_answer", "direct answer route", direct)
     expect(direct.get("status") == "success", "direct answer success", direct)

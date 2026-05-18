@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - optional runtime dependency
     serialization = None  # type: ignore[assignment]
 
 from interface.agent_adapter import AgentAdapter, ExecutionResult
+from interface.agent_contract import AGENT_CONTRACT_VERSION, normalize_capabilities, validate_task_packet_payload
 from interface.event_schema import VeyraTaskPacket
 
 
@@ -56,6 +57,15 @@ class OpenClawAdapter(AgentAdapter):
         self.protocol_max = max(self.protocol_min, self._int_env("OPENCLAW_PROTOCOL_MAX", DEFAULT_OPENCLAW_PROTOCOL))
 
     def send_task(self, task_packet: VeyraTaskPacket) -> ExecutionResult:
+        validation_errors = validate_task_packet_payload(task_packet.to_dict())
+        if validation_errors:
+            return ExecutionResult(
+                task_id=task_packet.task_id,
+                executor="openclaw",
+                status="failed",
+                result="Invalid VeyraTaskPacket for OpenClaw adapter.",
+                raw={"validation_errors": validation_errors, "task_packet": task_packet.to_dict()},
+            )
         if not self.gateway_url:
             return self._unconfigured_result(task_packet)
         prompt = self.render_prompt(task_packet)
@@ -68,7 +78,7 @@ class OpenClawAdapter(AgentAdapter):
                 status=exc.status,
                 result=f"OpenClaw gateway request failed: {exc.message}",
                 logs=prompt,
-                raw=self._redact_payload({"task_packet": task_packet.to_dict(), "gateway_url": self.gateway_url, "error": exc.details}),
+            raw=self._redact_payload({"task_packet": task_packet.to_dict(), "gateway_url": self.gateway_url, "error": exc.details}),
             )
         final = raw.get("final_event") or {}
         text = self._message_text(final.get("message"))
@@ -99,26 +109,35 @@ class OpenClawAdapter(AgentAdapter):
 
     def fetch_capabilities(self) -> dict[str, Any]:
         if not self.gateway_url:
-            return {
-                "runtime": "openclaw",
-                "status": "adapter_unconfigured",
-                "base_url": None,
-                "protocol": "openclaw_gateway_ws",
-                "tools": [],
-                "skills": [],
-            }
+            return normalize_capabilities(
+                {
+                    "runtime": "openclaw",
+                    "status": "adapter_unconfigured",
+                    "base_url": None,
+                    "protocol": "openclaw_gateway_ws",
+                    "tools": [],
+                    "skills": [],
+                    "requires_tool_proxy": True,
+                },
+                runtime="openclaw",
+                base_url=None,
+            )
         try:
-            return self._gateway_snapshot()
+            return normalize_capabilities(self._gateway_snapshot(), runtime="openclaw", base_url=self.gateway_url)
         except OpenClawGatewayError as exc:
-            return {
-                "runtime": "openclaw",
-                "status": exc.status,
-                "base_url": self.gateway_url,
-                "protocol": "openclaw_gateway_ws",
-                "connected": False,
-                "error": exc.message,
-                "details": self._redact_payload(exc.details),
-            }
+            return normalize_capabilities(
+                {
+                    "runtime": "openclaw",
+                    "status": exc.status,
+                    "base_url": self.gateway_url,
+                    "protocol": "openclaw_gateway_ws",
+                    "connected": False,
+                    "error": exc.message,
+                    "details": self._redact_payload(exc.details),
+                },
+                runtime="openclaw",
+                base_url=self.gateway_url,
+            )
 
     def fetch_memory_summary(self, session_id: str) -> dict[str, Any]:
         return {
@@ -150,6 +169,7 @@ class OpenClawAdapter(AgentAdapter):
             "status": "available" if connected else status,
             "base_url": self.gateway_url,
             "protocol": "openclaw_gateway_ws",
+            "contract_version": AGENT_CONTRACT_VERSION,
             "capabilities": capabilities,
         }
 
@@ -616,7 +636,7 @@ class OpenClawAdapter(AgentAdapter):
             status="adapter_unconfigured",
             result="OpenClaw adapter is not connected. Configure OPENCLAW_GATEWAY_URL or OPENCLAW_BASE_URL before submitting real tasks.",
             logs=prompt,
-            raw={"task_packet": task_packet.to_dict(), "configured": False},
+            raw={"contract_version": AGENT_CONTRACT_VERSION, "task_packet": task_packet.to_dict(), "configured": False},
         )
 
     @staticmethod
