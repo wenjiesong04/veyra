@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from core.definitions import RiskLevel
 from interface.agent_adapter import ExecutionResult
-from interface.event_schema import RiskLevel
 
 
 class Verifier:

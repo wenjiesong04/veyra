@@ -1,16 +1,8 @@
+from core.definitions import lifecycle_statuses
+
+
 class Lifecycle:
-    VALID_STATUSES = {
-        "online",
-        "idle",
-        "monitoring",
-        "thinking",
-        "acting",
-        "waiting_confirmation",
-        "blocked",
-        "recovering",
-        "degraded",
-        "offline",
-    }
+    VALID_STATUSES = set(lifecycle_statuses())
 
     def validate(self, status: str) -> str:
         if status not in self.VALID_STATUSES:

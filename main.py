@@ -6,14 +6,16 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from core.architecture import architecture_snapshot
 from core.awareness_loop import AwarenessLoop
+from core.definitions import RiskLevel, lifecycle_statuses, normalize_risk, operational_modes, risk_catalog
 from core.foresight_engine import ForesightEngine
 from core.runtime_entity import RuntimeEntity
 from core.world_state import WorldStateStore
 from execution.action_executor import ActionExecutor
 from guardian.review_queue import ReviewQueue
 from interface.event_normalizer import EventNormalizer
-from interface.event_schema import RiskLevel, utc_now_iso
+from interface.event_schema import Decision, Route, utc_now_iso
 from pydantic import Field
 from rollback_audit.rollback_manager import RollbackManager
 from rollback_audit.diff_tracker import DiffTracker
@@ -129,6 +131,20 @@ async def message(request: MessageRequest):
 @app.get("/state")
 async def state():
     return state_store.read_all()
+
+
+@app.get("/architecture")
+async def architecture():
+    return architecture_snapshot()
+
+
+@app.get("/definitions")
+async def definitions():
+    return {
+        "risk_levels": risk_catalog(),
+        "lifecycle_statuses": lifecycle_statuses(),
+        "operational_modes": operational_modes(),
+    }
 
 
 @app.get("/heartbeat")
@@ -250,7 +266,18 @@ async def rollback_diff(full: bool = False):
 @app.post("/actions/proposals")
 async def action_proposal(request: ActionProposalRequest):
     action_text = str(request.action.get("command") or request.action.get("path") or request.action)
-    risk = request.risk_guess if request.risk_guess in {"R0", "R1", "R2", "R3", "R4", "R5"} else "R2"
+    try:
+        risk_level = normalize_risk(request.risk_guess)
+    except ValueError:
+        risk_level = RiskLevel.R2
+    risk = risk_level.value
+    proposal_decision = _proposal_decision(risk_level, action_text, request)
+    foresight = foresight_engine.predict_text_action(action_text, risk_level)
+    guardian_decision = awareness_loop.guardian.review_text_action(
+        text=action_text,
+        decision=proposal_decision,
+        foresight=foresight,
+    )
     if risk == "R5":
         state_store.append_jsonl(
             "action_record.jsonl",
@@ -258,27 +285,58 @@ async def action_proposal(request: ActionProposalRequest):
                 "event_id": request.proposal_id or "proposal",
                 "route": "block",
                 "status": "blocked",
-                "artifacts": {"proposal": request.model_dump(), "reason": "R5 proposals are blocked"},
+                "artifacts": {"proposal": request.model_dump(), "guardian_decision": guardian_decision},
             },
         )
-        return {"status": "blocked", "decision": "block", "risk_level": risk}
+        return {"status": "blocked", "decision": "block", "risk_level": risk, "guardian_decision": guardian_decision}
     if risk in {"R3", "R4"}:
         review = review_queue.create(
             event_id=request.proposal_id or f"proposal_{utc_now_iso()}",
             task_text=request.reason or action_text,
             risk_level=risk,
-            foresight=foresight_engine.predict_text_action(action_text, RiskLevel(risk)),
-            guardian_decision={"decision": "ask_user", "risk_level": risk, "reason": "ActionProposal requires human confirmation."},
+            foresight=foresight,
+            guardian_decision=guardian_decision,
             proposal=request.model_dump(),
         )
-        return {"status": "needs_confirmation", "decision": "ask_user", "review": review}
+        return {"status": "needs_confirmation", "decision": "ask_user", "guardian_decision": guardian_decision, "review": review}
     execution = action_executor.execute_review(
         {
             "review_id": request.proposal_id or "direct_action",
             "proposal": request.model_dump(),
         }
     )
-    return {"status": execution.get("status", "unknown"), "decision": "allow", "execution_result": execution}
+    return {
+        "status": execution.get("status", "unknown"),
+        "decision": guardian_decision.get("decision", "allow"),
+        "guardian_decision": guardian_decision,
+        "execution_result": execution,
+    }
+
+
+def _proposal_decision(risk_level: RiskLevel, action_text: str, request: ActionProposalRequest) -> Decision:
+    if risk_level == RiskLevel.R5:
+        route = Route.BLOCK
+        capability = "guardian"
+        constraints = ["block unsafe action", "require safer alternative"]
+    elif risk_level in {RiskLevel.R3, RiskLevel.R4}:
+        route = Route.HUMAN_REVIEW
+        capability = "human_review"
+        constraints = ["explain impact", "wait for explicit approval"]
+    else:
+        route = Route.NATIVE_TOOL
+        capability = "tool_proxy"
+        constraints = ["record tool trace", "return evidence"]
+    return Decision(
+        route=route,
+        risk_level=risk_level,
+        reason=request.reason or f"ActionProposal from {request.agent}: {action_text}",
+        requires_confirmation=risk_level in {RiskLevel.R3, RiskLevel.R4, RiskLevel.R5},
+        intent="action",
+        complexity="simple" if risk_level in {RiskLevel.R0, RiskLevel.R1, RiskLevel.R2} else "moderate",
+        capability=capability,
+        signals=[f"risk:{risk_level.value}", f"agent:{request.agent}", "action_proposal"],
+        constraints=constraints,
+    )
 
 
 @app.get("/agent/status")

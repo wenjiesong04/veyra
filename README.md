@@ -30,6 +30,8 @@ Endpoints:
 - `GET /` runtime identity and status
 - `POST /events/message` normalize a message and run the Awareness Loop
 - `GET /state` read current Veyra state cache
+- `GET /architecture` read architecture blocks, core module progress, state definitions, and implementation phases
+- `GET /definitions` read lifecycle statuses, operational modes, and risk-level catalog
 - `GET /heartbeat` read the runtime heartbeat
 - `GET /runtime` read runtime identity/lifecycle
 - `GET /logs/events` read event log entries
@@ -100,6 +102,9 @@ python3 scripts/mvp_self_test.py
 ```
 
 ## MVP Governance Workflow
+
+Implementation progress and the current architecture map are tracked in
+[`docs/implementation_progress.md`](docs/implementation_progress.md).
 
 ```text
 User message

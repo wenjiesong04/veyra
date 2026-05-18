@@ -6,6 +6,8 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
+from core.definitions import RiskLevel
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -28,15 +30,6 @@ class Route(str, Enum):
     HUMAN_REVIEW = "human_review"
     BLOCK = "block"
     ROLLBACK = "rollback"
-
-
-class RiskLevel(str, Enum):
-    R0 = "R0"
-    R1 = "R1"
-    R2 = "R2"
-    R3 = "R3"
-    R4 = "R4"
-    R5 = "R5"
 
 
 @dataclass(slots=True)
@@ -68,6 +61,11 @@ class Decision:
     requires_confirmation: bool = False
     selected_probe: str | None = None
     target_agent: str | None = None
+    intent: str = "unknown"
+    complexity: str = "unknown"
+    capability: str = "unknown"
+    signals: list[str] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

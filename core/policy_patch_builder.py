@@ -1,5 +1,5 @@
 from core.guardian_controller import GuardianController
-from interface.event_schema import RiskLevel
+from core.definitions import RiskLevel
 
 
 class PolicyPatchBuilder:

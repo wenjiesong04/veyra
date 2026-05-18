@@ -1,6 +1,6 @@
-from core.decision_core import DecisionCore
+from core.definitions import classify_text_risk
 
 
 class RiskClassifier:
     def classify(self, text: str):
-        return DecisionCore()._risk_for_text(text.lower())
+        return classify_text_risk(text)

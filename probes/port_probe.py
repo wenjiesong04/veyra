@@ -1,7 +1,7 @@
 import re
 import socket
 
-from interface.event_schema import utc_now_iso
+from probes.schema import probe_payload
 
 
 class PortProbe:
@@ -11,14 +11,15 @@ class PortProbe:
             sock.settimeout(0.3)
             listening = sock.connect_ex(("127.0.0.1", port)) == 0
         status = "listening" if listening else "closed"
-        return {
-            "probe": "port_probe",
-            "port": port,
-            "host": "127.0.0.1",
-            "status": status,
-            "timestamp": utc_now_iso(),
-            "summary": f"Port {port} is {status}.",
-        }
+        return probe_payload(
+            probe="port_probe",
+            target=f"127.0.0.1:{port}",
+            status=status,
+            summary=f"Port {port} is {status}.",
+            confidence=0.92,
+            ttl_seconds=30,
+            details={"port": port, "host": "127.0.0.1"},
+        )
 
     def _extract_port(self, text: str) -> int | None:
         match = re.search(r"\b([1-9][0-9]{1,4})\b", text)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from core.world_state import WorldStateStore
+from interface.event_schema import utc_now_iso
 
 
 class AttentionCore:
@@ -24,5 +25,27 @@ class AttentionCore:
         for marker, item in mapping.items():
             if marker in lowered and item not in focus:
                 focus.append(item)
-        self.state_store.write_json("attention_state.json", {"focus": focus, "ignored_noise": []})
+        self.state_store.write_json(
+            "attention_state.json",
+            {
+                "focus": focus,
+                "ignored_noise": [],
+                "context_scope": self._context_scope(focus),
+                "updated_at": utc_now_iso(),
+            },
+        )
         return focus
+
+    def _context_scope(self, focus: list[str]) -> dict[str, list[str]]:
+        probe_priority: list[str] = []
+        if "ports" in focus:
+            probe_priority.append("port_probe")
+        if "git_workspace" in focus:
+            probe_priority.append("git_probe")
+        if "openclaw_runtime" in focus:
+            probe_priority.extend(["openclaw_probe", "port_probe"])
+        if "hermes_runtime" in focus:
+            probe_priority.append("hermes_probe")
+        if "logs" in focus:
+            probe_priority.append("log_probe")
+        return {"probe_priority": list(dict.fromkeys(probe_priority))}

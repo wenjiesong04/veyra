@@ -1,4 +1,4 @@
-from interface.event_schema import RiskLevel
+from core.definitions import RiskLevel, risk_policy
 
 
 class ForesightEngine:
@@ -17,6 +17,7 @@ class ForesightEngine:
             safer_alternatives.append("create snapshot and list targets before deletion")
         return {
             "risk_level": risk_level.value,
+            "risk_policy": risk_policy(risk_level).to_dict(),
             "reversible": reversible,
             "side_effects": side_effects,
             "safer_alternatives": safer_alternatives,

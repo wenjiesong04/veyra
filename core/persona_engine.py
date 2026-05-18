@@ -1,4 +1,4 @@
-from interface.event_schema import RiskLevel
+from core.definitions import RiskLevel
 
 
 class PersonaEngine:

@@ -4,7 +4,9 @@ from dataclasses import asdict
 
 from awareness.attention_core import AttentionCore
 from awareness.belief_core import BeliefCore
+from awareness.uncertainty_core import UncertaintyCore
 from core.context_patch_builder import ContextPatchBuilder
+from core.definitions import GuardianDecision, LifecycleStatus, RiskLevel
 from core.decision_core import DecisionCore
 from core.foresight_engine import ForesightEngine
 from core.guardian_controller import GuardianController
@@ -16,7 +18,7 @@ from core.verifier import Verifier
 from core.world_state import WorldStateStore
 from guardian.review_queue import ReviewQueue
 from interface.agent_registry import AgentRegistry
-from interface.event_schema import LoopResult, RiskLevel, Route, VeyraEvent
+from interface.event_schema import LoopResult, Route, VeyraEvent
 from memory_bridge.local_memory_bridge import LocalMemoryBridge
 from probes.git_probe import GitProbe
 from probes.port_probe import PortProbe
@@ -35,6 +37,7 @@ class AwarenessLoop:
         self.perception = PerceptionLayer(state_store)
         self.attention = AttentionCore(state_store)
         self.belief = BeliefCore(state_store)
+        self.uncertainty = UncertaintyCore()
         self.decision_core = DecisionCore()
         self.foresight = ForesightEngine()
         self.guardian = GuardianController()
@@ -57,19 +60,20 @@ class AwarenessLoop:
         }
 
     def handle_event(self, event: VeyraEvent) -> LoopResult:
-        self.runtime_entity.set_status("thinking")
+        self.runtime_entity.set_status(LifecycleStatus.THINKING.value)
         text = event.payload.get("text", "")
         self.state_store.append_jsonl("event_log.jsonl", {"event": event.to_dict(), "phase": "sense"})
 
         attention_focus = self.attention.focus_for_text(text)
         self.belief.update_from_event(event)
+        belief_state = self.belief.refresh()
         decision = self.decision_core.decide(text=text, attention_focus=attention_focus)
         self.state_store.patch_json("risk_state.json", {"current_risk": decision.risk_level.value})
         foresight = self.foresight.predict_text_action(text, decision.risk_level)
         guardian_decision = self.guardian.review_text_action(text=text, decision=decision, foresight=foresight)
 
-        if guardian_decision["decision"] == "block":
-            self.runtime_entity.set_status("blocked")
+        if guardian_decision["decision"] == GuardianDecision.BLOCK.value:
+            self.runtime_entity.set_status(LifecycleStatus.BLOCKED.value)
             result = LoopResult(
                 event_id=event.event_id,
                 route=Route.BLOCK,
@@ -81,8 +85,8 @@ class AwarenessLoop:
             self._update(event, result)
             return result
 
-        if guardian_decision["decision"] == "ask_user":
-            self.runtime_entity.set_status("waiting_confirmation")
+        if guardian_decision["decision"] == GuardianDecision.ASK_USER.value:
+            self.runtime_entity.set_status(LifecycleStatus.WAITING_CONFIRMATION.value)
             review = self.review_queue.create(
                 event_id=event.event_id,
                 task_text=text,
@@ -101,7 +105,7 @@ class AwarenessLoop:
             self._update(event, result)
             return result
 
-        self.runtime_entity.set_status("acting")
+        self.runtime_entity.set_status(LifecycleStatus.ACTING.value)
         if decision.route == Route.DIRECT_ANSWER:
             result = LoopResult(
                 event_id=event.event_id,
@@ -109,7 +113,11 @@ class AwarenessLoop:
                 status="success",
                 response=self._direct_answer(text),
                 risk_level=decision.risk_level,
-                artifacts={"attention": attention_focus, "decision": decision.to_dict()},
+                artifacts={
+                    "attention": attention_focus,
+                    "decision": decision.to_dict(),
+                    "uncertainty": self.uncertainty.uncertainty_summary(belief_state.get("claims", [])),
+                },
             )
         elif decision.route == Route.PROBE:
             result = self._run_probe(event, decision.selected_probe or "system")
@@ -201,6 +209,7 @@ class AwarenessLoop:
         probe = self.probes.get(probe_name, self.probes["system"])
         raw = probe.run(text)
         state_patch = self.perception.interpret_probe_result(raw)
+        belief_state = self.belief.refresh()
         verified = self.verifier.verify_probe_result(raw)
         return LoopResult(
             event_id=event.event_id,
@@ -208,7 +217,12 @@ class AwarenessLoop:
             status=verified["status"],
             response=verified["message"],
             risk_level=RiskLevel.R1,
-            artifacts={"probe_result": raw, "state_patch": state_patch, "verification": verified},
+            artifacts={
+                "probe_result": raw,
+                "state_patch": state_patch,
+                "verification": verified,
+                "uncertainty": self.uncertainty.uncertainty_summary(belief_state.get("claims", [])),
+            },
         )
 
     def _direct_answer(self, text: str) -> str:
@@ -229,4 +243,4 @@ class AwarenessLoop:
         )
         self.agent_adapter = self.agent_registry.selected()
         self.state_store.patch_json("executor_state.json", {"selected_agent": self.agent_registry.selected_name(), **self.agent_adapter.connection_status()})
-        self.runtime_entity.set_status("idle")
+        self.runtime_entity.set_idle()

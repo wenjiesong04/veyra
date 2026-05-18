@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from core.architecture import STATE_DEFINITIONS
+from core.definitions import lifecycle_statuses, operational_modes, risk_catalog
 from interface.event_schema import utc_now_iso
 
 
@@ -16,13 +18,19 @@ class WorldStateStore:
     def _ensure_defaults(self) -> None:
         defaults: dict[str, Any] = {
             "user_world.json": {"preferences": {"language": "zh-CN", "style": "direct_structured"}, "current_goal": ""},
-            "local_world.json": {"current_project": str(Path.cwd()), "probes": {}, "updated_at": utc_now_iso()},
+            "local_world.json": {"current_project": str(Path.cwd()), "probes": {}, "last_probe_at": None, "updated_at": utc_now_iso()},
             "external_world.json": {"watchlist": [], "summaries": []},
             "executor_state.json": {"selected_agent": "openclaw", "status": "unknown"},
-            "risk_state.json": {"current_risk": "R0", "signals": []},
-            "belief_state.json": {"claims": []},
+            "risk_state.json": {"current_risk": "R0", "signals": [], "levels": risk_catalog()},
+            "belief_state.json": {"claims": [], "summary": {"fresh": 0, "stale": 0, "conflict": 0, "total": 0}},
             "task_state.json": {"current_task": None, "history": []},
             "attention_state.json": {"focus": [], "ignored_noise": []},
+            "state_schema.json": {
+                "version": 1,
+                "state_definitions": STATE_DEFINITIONS,
+                "lifecycle_statuses": lifecycle_statuses(),
+                "operational_modes": operational_modes(),
+            },
             "review_queue.json": {"items": []},
             "agent_memory.json": {"items": []},
             "agent_config.json": {
@@ -39,6 +47,11 @@ class WorldStateStore:
             path = self.root / name
             if not path.exists():
                 path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                continue
+            current = self.read_json(name)
+            merged = self._merge_missing(current, payload)
+            if merged != current:
+                path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
         for name in ["event_log.jsonl", "action_record.jsonl", "tool_call_log.jsonl", "rollback_log.jsonl", "memory_log.jsonl"]:
             path = self.root / name
             if not path.exists():
@@ -52,6 +65,15 @@ class WorldStateStore:
         if not path.exists():
             return {}
         return json.loads(path.read_text(encoding="utf-8") or "{}")
+
+    def _merge_missing(self, current: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(current)
+        for key, value in defaults.items():
+            if key not in merged:
+                merged[key] = value
+            elif isinstance(merged[key], dict) and isinstance(value, dict):
+                merged[key] = self._merge_missing(merged[key], value)
+        return merged
 
     def write_json(self, name: str, payload: dict[str, Any]) -> None:
         payload.setdefault("updated_at", utc_now_iso())
@@ -99,6 +121,7 @@ class WorldStateStore:
             "belief_state": self.read_json("belief_state.json"),
             "task_state": self.read_json("task_state.json"),
             "attention_state": self.read_json("attention_state.json"),
+            "state_schema": self.read_json("state_schema.json"),
             "review_queue": self.read_json("review_queue.json"),
             "rollback_state": self.read_json("rollback_state.json"),
             "agent_memory": self.read_json("agent_memory.json"),

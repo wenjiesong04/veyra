@@ -1,5 +1,5 @@
+from core.definitions import RiskLevel
 from core.persona_engine import PersonaEngine
-from interface.event_schema import RiskLevel
 
 
 class PersonaPatchBuilder:

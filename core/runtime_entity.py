@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from core.definitions import LifecycleStatus, OperationalMode
+from core.lifecycle import Lifecycle
 from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
 
@@ -26,7 +28,8 @@ class RuntimeEntity:
         config = state_store.read_json("agent_config.json")
         self.identity = VeyraIdentity(selected_agent=str(config.get("selected_agent") or "openclaw"))
         self.lifecycle = LifecycleState()
-        self.operational_mode: list[str] = ["Minimalist"]
+        self.lifecycle_validator = Lifecycle()
+        self.operational_mode: list[str] = [OperationalMode.MINIMALIST.value]
 
     def set_selected_agent(self, selected_agent: str) -> None:
         self.identity.selected_agent = selected_agent
@@ -35,9 +38,13 @@ class RuntimeEntity:
         self.state_store.write_json("agent_config.json", config)
 
     def set_status(self, status: str) -> None:
-        self.lifecycle.status = status
+        validated = self.lifecycle_validator.validate(status)
+        self.lifecycle.status = validated
         self.lifecycle.last_heartbeat_at = utc_now_iso()
         self.state_store.write_text(
             "heartbeat.md",
-            f"# Veyra Heartbeat\n\nstatus: {status}\nupdated_at: {self.lifecycle.last_heartbeat_at}\n",
+            f"# Veyra Heartbeat\n\nstatus: {validated}\nupdated_at: {self.lifecycle.last_heartbeat_at}\n",
         )
+
+    def set_idle(self) -> None:
+        self.set_status(LifecycleStatus.IDLE.value)
