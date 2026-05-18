@@ -25,7 +25,8 @@ from interface.agent_contract import AGENT_CONTRACT_VERSION, normalize_capabilit
 from interface.event_schema import VeyraTaskPacket
 
 
-DEFAULT_OPENCLAW_PROTOCOL = 3
+DEFAULT_OPENCLAW_PROTOCOL_MIN = 3
+DEFAULT_OPENCLAW_PROTOCOL_MAX = 4
 OPENCLAW_REQUIRED_METHODS = ("chat.send",)
 OPENCLAW_OPTIONAL_METHODS = ("health", "status", "tools.catalog", "skills.status")
 
@@ -53,8 +54,8 @@ class OpenClawAdapter(AgentAdapter):
         self.task_wait_timeout = float(os.getenv("OPENCLAW_TASK_WAIT_TIMEOUT", "30"))
         self.scopes = self._scopes(os.getenv("OPENCLAW_SCOPES", "operator.read,operator.write"))
         self.device_store = Path(os.getenv("OPENCLAW_DEVICE_STORE", "state/openclaw_device.json"))
-        self.protocol_min = self._int_env("OPENCLAW_PROTOCOL_MIN", DEFAULT_OPENCLAW_PROTOCOL)
-        self.protocol_max = max(self.protocol_min, self._int_env("OPENCLAW_PROTOCOL_MAX", DEFAULT_OPENCLAW_PROTOCOL))
+        self.protocol_min = self._int_env("OPENCLAW_PROTOCOL_MIN", DEFAULT_OPENCLAW_PROTOCOL_MIN)
+        self.protocol_max = max(self.protocol_min, self._int_env("OPENCLAW_PROTOCOL_MAX", DEFAULT_OPENCLAW_PROTOCOL_MAX))
 
     def send_task(self, task_packet: VeyraTaskPacket) -> ExecutionResult:
         validation_errors = validate_task_packet_payload(task_packet.to_dict())
