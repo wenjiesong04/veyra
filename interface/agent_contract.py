@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from interface.agent_compatibility import compatibility_policy_summary, evaluate_agent_compatibility
+
 
 AGENT_CONTRACT_VERSION = "veyra.agent_adapter.v1"
 
@@ -24,8 +26,9 @@ def contract_summary() -> dict[str, Any]:
             "known_statuses": sorted(KNOWN_STATUSES),
         },
         "capabilities": {
-            "required": ["runtime", "status", "connected", "tools", "skills", "requires_tool_proxy"],
+            "required": ["runtime", "status", "connected", "tools", "skills", "requires_tool_proxy", "compatibility"],
         },
+        "compatibility": compatibility_policy_summary(),
     }
 
 
@@ -68,6 +71,20 @@ def normalize_capabilities(
     data = dict(raw or {})
     status = str(data.get("status") or default_status)
     connected = bool(data.get("connected")) if "connected" in data else status in {"available", "ok", "success"}
+    features = {
+        "structured_task_packet": True,
+        "rendered_prompt_fallback": True,
+        "memory_summary": True,
+        "memory_patch": True,
+        "stop_task": True,
+        **(data.get("features") if isinstance(data.get("features"), dict) else {}),
+    }
+    compatibility = evaluate_agent_compatibility(
+        data,
+        runtime=str(data.get("runtime") or runtime),
+        expected_contract_version=AGENT_CONTRACT_VERSION,
+        connected=connected,
+    )
     return {
         "contract_version": AGENT_CONTRACT_VERSION,
         "runtime": str(data.get("runtime") or runtime),
@@ -79,14 +96,8 @@ def normalize_capabilities(
         "skills": _list(data.get("skills")),
         "permissions": data.get("permissions", "unknown"),
         "requires_tool_proxy": bool(data.get("requires_tool_proxy", True)),
-        "features": {
-            "structured_task_packet": True,
-            "rendered_prompt_fallback": True,
-            "memory_summary": True,
-            "memory_patch": True,
-            "stop_task": True,
-            **(data.get("features") if isinstance(data.get("features"), dict) else {}),
-        },
+        "features": features,
+        "compatibility": compatibility,
         "raw": data,
     }
 

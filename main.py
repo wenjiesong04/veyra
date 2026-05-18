@@ -99,6 +99,8 @@ class AgentConfigRequest(BaseModel):
     memory_summary_path: str | None = None
     memory_patch_path: str | None = None
     stop_path_template: str | None = None
+    protocol_min: int | None = None
+    protocol_max: int | None = None
 
 
 class ActionProposalRequest(BaseModel):

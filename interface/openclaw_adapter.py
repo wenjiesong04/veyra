@@ -42,7 +42,15 @@ class OpenClawGatewayError(RuntimeError):
 class OpenClawAdapter(AgentAdapter):
     """WebSocket Gateway adapter for a local OpenClaw runtime."""
 
-    def __init__(self, base_url: str | None = None, api_key: str | None = None, timeout: float = 20.0, **_: Any) -> None:
+    def __init__(
+        self,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        timeout: float = 20.0,
+        protocol_min: int | None = None,
+        protocol_max: int | None = None,
+        **_: Any,
+    ) -> None:
         raw_url = base_url or os.getenv("OPENCLAW_GATEWAY_URL") or os.getenv("OPENCLAW_BASE_URL", "")
         self.gateway_url = self._gateway_url(raw_url)
         self.origin = self._origin_for_gateway(self.gateway_url)
@@ -54,8 +62,9 @@ class OpenClawAdapter(AgentAdapter):
         self.task_wait_timeout = float(os.getenv("OPENCLAW_TASK_WAIT_TIMEOUT", "30"))
         self.scopes = self._scopes(os.getenv("OPENCLAW_SCOPES", "operator.read,operator.write"))
         self.device_store = Path(os.getenv("OPENCLAW_DEVICE_STORE", "state/openclaw_device.json"))
-        self.protocol_min = self._int_env("OPENCLAW_PROTOCOL_MIN", DEFAULT_OPENCLAW_PROTOCOL_MIN)
-        self.protocol_max = max(self.protocol_min, self._int_env("OPENCLAW_PROTOCOL_MAX", DEFAULT_OPENCLAW_PROTOCOL_MAX))
+        self.protocol_min = protocol_min if protocol_min is not None else self._int_env("OPENCLAW_PROTOCOL_MIN", DEFAULT_OPENCLAW_PROTOCOL_MIN)
+        configured_max = protocol_max if protocol_max is not None else self._int_env("OPENCLAW_PROTOCOL_MAX", DEFAULT_OPENCLAW_PROTOCOL_MAX)
+        self.protocol_max = max(self.protocol_min, configured_max)
 
     def send_task(self, task_packet: VeyraTaskPacket) -> ExecutionResult:
         validation_errors = validate_task_packet_payload(task_packet.to_dict())
@@ -221,6 +230,14 @@ class OpenClawAdapter(AgentAdapter):
             "server": self._server_summary(hello),
             "compatibility": compatibility,
             "auth": self._auth_summary(hello),
+            "features": {
+                "structured_task_packet": True,
+                "rendered_prompt_fallback": True,
+                "memory_summary": True,
+                "memory_patch": True,
+                "stop_task": True,
+                "tool_proxy_enforced": True,
+            },
             "health": self._health_summary(health),
             "gateway_status": self._status_summary(status),
             "tools": self._tools_summary(tools),
@@ -536,16 +553,23 @@ class OpenClawAdapter(AgentAdapter):
         events = features.get("events") if isinstance(features.get("events"), list) else []
         return {
             "version": server.get("version"),
+            "protocol": hello.get("protocol"),
             "method_count": len(methods),
             "event_count": len(events),
         }
 
     def _compatibility_summary(self, hello: dict[str, Any]) -> dict[str, Any]:
         methods = set(self._feature_methods(hello))
+        required = {method: (not methods or method in methods) for method in OPENCLAW_REQUIRED_METHODS}
+        optional = {method: (not methods or method in methods) for method in OPENCLAW_OPTIONAL_METHODS}
         return {
+            "native_adapter": True,
+            "transport": "openclaw_gateway_ws",
+            "status": "compatible" if all(required.values()) else "incompatible",
             "requested_protocol": {"min": self.protocol_min, "max": self.protocol_max},
-            "required_methods": {method: (not methods or method in methods) for method in OPENCLAW_REQUIRED_METHODS},
-            "optional_methods": {method: (not methods or method in methods) for method in OPENCLAW_OPTIONAL_METHODS},
+            "server_protocol": hello.get("protocol"),
+            "required_methods": required,
+            "optional_methods": optional,
         }
 
     def _feature_methods(self, hello: dict[str, Any]) -> list[str]:
@@ -704,6 +728,8 @@ class OpenClawAdapter(AgentAdapter):
             return "auth_required"
         if "missing scope" in lowered or "scope" in lowered:
             return "scope_required"
+        if "protocol" in lowered and ("mismatch" in lowered or "unsupported" in lowered or "incompatible" in lowered):
+            return "protocol_mismatch"
         if "timed out" in lowered or "timeout" in lowered:
             return "timeout"
         if "connection refused" in lowered or "connect call failed" in lowered or "operation not permitted" in lowered:

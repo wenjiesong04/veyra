@@ -131,9 +131,15 @@ class HttpAgentAdapter(AgentAdapter):
             status["name"] = self.config.name
             return status
         capabilities = self.fetch_capabilities()
+        compatibility_status = (
+            capabilities.get("compatibility", {}).get("status")
+            if isinstance(capabilities.get("compatibility"), dict)
+            else "unknown"
+        )
         status = {
             "name": self.config.name,
-            "connected": capabilities.get("status") not in {"unavailable", "adapter_unconfigured"},
+            "connected": capabilities.get("status") not in {"unavailable", "adapter_unconfigured"}
+            and compatibility_status not in {"incompatible", "unavailable", "unconfigured"},
             "status": capabilities.get("status", "available"),
             "base_url": self.base_url,
             "capabilities": capabilities,

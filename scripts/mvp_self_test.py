@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from main import app  # noqa: E402
+from interface.agent_contract import normalize_capabilities  # noqa: E402
 
 
 client = TestClient(app)
@@ -54,6 +55,30 @@ def main() -> int:
 
     contract = get_json("/agent/contract")
     expect(contract.get("contract_version") == "veyra.agent_adapter.v1", "agent adapter contract", contract)
+    expect(
+        contract.get("compatibility", {}).get("policy_version") == "veyra.agent_compatibility.v1",
+        "agent compatibility policy",
+        contract,
+    )
+    future_agent = normalize_capabilities(
+        {
+            "runtime": "custom",
+            "status": "available",
+            "contract_version": "veyra.agent_adapter.v2",
+            "features": {"rendered_prompt_fallback": True},
+        },
+        runtime="custom",
+    )
+    expect(future_agent.get("compatibility", {}).get("status") == "unverified", "future agent contract fallback", future_agent)
+    incompatible_agent = normalize_capabilities(
+        {
+            "runtime": "custom",
+            "status": "available",
+            "features": {"rendered_prompt_fallback": False},
+        },
+        runtime="custom",
+    )
+    expect(incompatible_agent.get("compatibility", {}).get("status") == "incompatible", "agent compatibility block", incompatible_agent)
 
     direct = send_message("Veyra 是什么")
     expect(direct.get("route") == "direct_answer", "direct answer route", direct)

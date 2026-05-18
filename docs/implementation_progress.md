@@ -159,9 +159,20 @@ P3 已定义 `veyra.agent_adapter.v1`：
 - `VeyraTaskPacket`: 保持结构化 JSON，同时提供 rendered prompt fallback。
 - `ExecutionResult`: 统一 `task_id`、`executor`、`status`、`result`、`logs`、`changed_files`、`tool_calls`、`raw`。
 - `Capabilities`: 统一 `runtime`、`status`、`connected`、`tools`、`skills`、`requires_tool_proxy`、`features`。
+- `Compatibility`: 统一输出 `veyra.agent_compatibility.v1`，按 contract / protocol / feature / required method 判断 compatible、unverified、incompatible。
 - `HTTP adapters`: Hermes / Custom 使用统一 contract wrapper 发送任务。
 - `OpenClaw adapter`: 保持 WebSocket Gateway 协议，但对外输出同一 capability/status contract。
 - `/agent/contract`: 暴露当前 AgentAdapter contract 摘要。
+
+## Agent 版本兼容策略
+
+OpenClaw 这次“协议不匹配”属于运行中的 Gateway 与 Control UI 版本漂移，不是 Veyra 消息入口设计问题。Veyra 的后续策略是：
+
+- 优先通过能力探测判断，而不是只盯版本号。
+- OpenClaw 使用 `OPENCLAW_PROTOCOL_MIN/MAX` 或 agent config 的 `protocol_min/protocol_max` 做协议区间协商。
+- Hermes / Custom 通过 `/capabilities` 暴露 `contract_version`、`features`、`tools`、`skills`，Veyra 将未知新版本标记为 `unverified` 并继续使用 rendered prompt fallback。
+- 只有传输协议、认证方式、任务包结构或必需方法发生破坏性变化时，才需要维护并发布新版 adapter。
+- 如果只是 Agent app/runtime 版本号更新，但 contract 与必需能力保持兼容，Veyra 不需要跟着每个版本改代码。
 
 ## P5 之后
 

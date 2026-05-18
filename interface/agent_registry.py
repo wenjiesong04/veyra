@@ -120,9 +120,25 @@ class AgentRegistry:
             "stop_path_template": config.get("stop_path_template") or "/tasks/{task_id}/stop",
         }
         if kind == "openclaw":
-            return OpenClawAdapter(base_url=base_url, api_key=api_key, timeout=timeout, **paths)
+            return OpenClawAdapter(
+                base_url=base_url,
+                api_key=api_key,
+                timeout=timeout,
+                protocol_min=self._optional_int(config.get("protocol_min")),
+                protocol_max=self._optional_int(config.get("protocol_max")),
+                **paths,
+            )
         if kind == "hermes":
             return HermesAdapter(base_url=base_url, api_key=api_key, timeout=timeout, **paths)
         if kind == "custom":
             return CustomAgentAdapter(base_url=base_url, api_key=api_key, timeout=timeout, **paths)
         return CustomAgentAdapter(base_url=base_url, api_key=api_key, timeout=timeout, **paths)
+
+    @staticmethod
+    def _optional_int(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
