@@ -6,17 +6,17 @@
       "port": 18789,
       "host": "127.0.0.1",
       "status": "closed",
-      "timestamp": "2026-05-17T12:24:45.559144+00:00",
+      "timestamp": "2026-05-18T06:14:26.934731+00:00",
       "summary": "Port 18789 is closed."
     },
     "system_probe": {
       "probe": "system_probe",
       "status": "ok",
       "os": "Darwin",
-      "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
-      "python": "3.13.3",
-      "timestamp": "2026-05-17T12:24:45.592407+00:00",
-      "summary": "System is Darwin with Python 3.13.3."
+      "platform": "macOS-26.4.1-arm64-arm-64bit",
+      "python": "3.12.2",
+      "timestamp": "2026-05-18T06:14:27.037757+00:00",
+      "summary": "System is Darwin with Python 3.12.2."
     },
     "git_probe": {
       "probe": "git_probe",
@@ -39,11 +39,11 @@
         " M state/rollback_state.json",
         " M state/task_state.json",
         " M state/tool_call_log.jsonl",
-        "?? state/snapshots/snap_8375f4629553_mvp_self_test.txt",
-        "?? state/snapshots/snap_ca0e0c98ca2d_mvp_self_test.txt"
+        "?? state/snapshots/snap_0b147b95cf1d_mvp_self_test.txt",
+        "?? state/snapshots/snap_30187fa3d8b3_mvp_self_test.txt"
       ],
       "stderr": "",
-      "timestamp": "2026-05-17T12:24:45.603911+00:00",
+      "timestamp": "2026-05-18T06:14:27.065254+00:00",
       "summary": "Git workspace has changes."
     },
     "openclaw_probe": {
@@ -51,7 +51,7 @@
       "port": 18789,
       "host": "127.0.0.1",
       "status": "closed",
-      "timestamp": "2026-05-17T12:24:45.604020+00:00",
+      "timestamp": "2026-05-18T06:14:27.065586+00:00",
       "summary": "Port 18789 is closed.",
       "runtime": "openclaw"
     }

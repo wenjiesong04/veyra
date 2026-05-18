@@ -24,6 +24,11 @@ from interface.agent_adapter import AgentAdapter, ExecutionResult
 from interface.event_schema import VeyraTaskPacket
 
 
+DEFAULT_OPENCLAW_PROTOCOL = 3
+OPENCLAW_REQUIRED_METHODS = ("chat.send",)
+OPENCLAW_OPTIONAL_METHODS = ("health", "status", "tools.catalog", "skills.status")
+
+
 class OpenClawGatewayError(RuntimeError):
     def __init__(self, status: str, message: str, details: dict[str, Any] | None = None) -> None:
         super().__init__(message)
@@ -47,6 +52,8 @@ class OpenClawAdapter(AgentAdapter):
         self.task_wait_timeout = float(os.getenv("OPENCLAW_TASK_WAIT_TIMEOUT", "30"))
         self.scopes = self._scopes(os.getenv("OPENCLAW_SCOPES", "operator.read,operator.write"))
         self.device_store = Path(os.getenv("OPENCLAW_DEVICE_STORE", "state/openclaw_device.json"))
+        self.protocol_min = self._int_env("OPENCLAW_PROTOCOL_MIN", DEFAULT_OPENCLAW_PROTOCOL)
+        self.protocol_max = max(self.protocol_min, self._int_env("OPENCLAW_PROTOCOL_MAX", DEFAULT_OPENCLAW_PROTOCOL))
 
     def send_task(self, task_packet: VeyraTaskPacket) -> ExecutionResult:
         if not self.gateway_url:
@@ -177,16 +184,21 @@ class OpenClawAdapter(AgentAdapter):
         events: list[dict[str, Any]] = []
         with self._open_socket() as ws:
             hello = self._connect(ws, events)
-            health = self._request_on_socket(ws, "health", {}, events)
-            status = self._request_on_socket(ws, "status", {}, events)
-            tools = self._optional_request(ws, "tools.catalog", {}, events)
-            skills = self._optional_request(ws, "skills.status", {}, events)
+            health = self._compat_request(ws, hello, "health", {}, events)
+            status = self._compat_request(ws, hello, "status", {}, events)
+            tools = self._compat_request(ws, hello, "tools.catalog", {}, events)
+            skills = self._compat_request(ws, hello, "skills.status", {}, events)
+        compatibility = self._compatibility_summary(hello)
+        compatible = all(compatibility["required_methods"].values())
+        # Raw gateway payloads can include host paths, device tokens, and plugin details.
+        # Veyra exposes only a stable summary contract to state endpoints and audit logs.
         return self._redact_payload({
             "runtime": "openclaw",
-            "status": "available",
+            "status": "available" if compatible else "incompatible_gateway",
             "base_url": self.gateway_url,
             "protocol": "openclaw_gateway_ws",
             "server": self._server_summary(hello),
+            "compatibility": compatibility,
             "auth": self._auth_summary(hello),
             "health": self._health_summary(health),
             "gateway_status": self._status_summary(status),
@@ -217,6 +229,8 @@ class OpenClawAdapter(AgentAdapter):
             message = self._parse_message(raw)
             if message.get("type") == "event":
                 events.append(message)
+                # OpenClaw may require a nonce-bound device signature after the first connect.
+                # Keep that retry inside the adapter so VeyraCore does not depend on auth shape.
                 if message.get("event") == "connect.challenge":
                     payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
                     nonce = str(payload.get("nonce") or "")
@@ -235,8 +249,8 @@ class OpenClawAdapter(AgentAdapter):
 
     def _connect_params(self, nonce: str) -> dict[str, Any]:
         params: dict[str, Any] = {
-            "minProtocol": 3,
-            "maxProtocol": 3,
+            "minProtocol": self.protocol_min,
+            "maxProtocol": self.protocol_max,
             "client": self._connect_client(),
             "role": "operator",
             "scopes": self.scopes,
@@ -291,7 +305,10 @@ class OpenClawAdapter(AgentAdapter):
         ws.send(json.dumps({"type": "req", "id": request_id, "method": method, "params": params}, ensure_ascii=False))
         return request_id
 
-    def _optional_request(self, ws: Any, method: str, params: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
+    def _compat_request(self, ws: Any, hello: dict[str, Any], method: str, params: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
+        methods = self._feature_methods(hello)
+        if methods and method not in methods:
+            return {"status": "method_unavailable", "method": method}
         try:
             return self._request_on_socket(ws, method, params, events)
         except OpenClawGatewayError as exc:
@@ -396,6 +413,8 @@ class OpenClawAdapter(AgentAdapter):
     def _device_identity(self) -> dict[str, Any] | None:
         if Ed25519PrivateKey is None or serialization is None:
             return None
+        # This file contains local signing material and must remain gitignored.
+        # Only short summaries of device-auth state may leave the adapter boundary.
         self.device_store.parent.mkdir(parents=True, exist_ok=True)
         store = self._read_device_store()
         if not store:
@@ -492,13 +511,26 @@ class OpenClawAdapter(AgentAdapter):
     def _server_summary(self, hello: dict[str, Any]) -> dict[str, Any]:
         server = hello.get("server") if isinstance(hello.get("server"), dict) else {}
         features = hello.get("features") if isinstance(hello.get("features"), dict) else {}
-        methods = features.get("methods") if isinstance(features.get("methods"), list) else []
+        methods = self._feature_methods(hello)
         events = features.get("events") if isinstance(features.get("events"), list) else []
         return {
             "version": server.get("version"),
             "method_count": len(methods),
             "event_count": len(events),
         }
+
+    def _compatibility_summary(self, hello: dict[str, Any]) -> dict[str, Any]:
+        methods = set(self._feature_methods(hello))
+        return {
+            "requested_protocol": {"min": self.protocol_min, "max": self.protocol_max},
+            "required_methods": {method: (not methods or method in methods) for method in OPENCLAW_REQUIRED_METHODS},
+            "optional_methods": {method: (not methods or method in methods) for method in OPENCLAW_OPTIONAL_METHODS},
+        }
+
+    def _feature_methods(self, hello: dict[str, Any]) -> list[str]:
+        features = hello.get("features") if isinstance(hello.get("features"), dict) else {}
+        methods = features.get("methods") if isinstance(features.get("methods"), list) else []
+        return [str(method) for method in methods]
 
     def _auth_summary(self, hello: dict[str, Any]) -> dict[str, Any]:
         auth = hello.get("auth") if isinstance(hello.get("auth"), dict) else {}
@@ -555,6 +587,8 @@ class OpenClawAdapter(AgentAdapter):
         return {"skill_count": len(items), "enabled_count": len(enabled), "eligible_count": len(eligible)}
 
     def _redact_payload(self, value: Any) -> Any:
+        # Treat gateway payloads as hostile-by-default: recurse through nested events
+        # before anything is stored in Veyra state or returned through public APIs.
         sensitive_keys = {
             "authorization",
             "devicetoken",
@@ -608,6 +642,13 @@ class OpenClawAdapter(AgentAdapter):
     def _scopes(raw: str) -> list[str]:
         scopes = [item.strip() for item in raw.split(",") if item.strip()]
         return scopes or ["operator.read", "operator.write"]
+
+    @staticmethod
+    def _int_env(name: str, default: int) -> int:
+        try:
+            return int(os.getenv(name, str(default)))
+        except ValueError:
+            return default
 
     @staticmethod
     def _message_text(message: Any) -> str:
