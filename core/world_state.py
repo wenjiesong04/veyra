@@ -52,7 +52,7 @@ class WorldStateStore:
             merged = self._merge_missing(current, payload)
             if merged != current:
                 path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
-        for name in ["event_log.jsonl", "action_record.jsonl", "tool_call_log.jsonl", "rollback_log.jsonl", "memory_log.jsonl"]:
+        for name in ["event_log.jsonl", "action_record.jsonl", "tool_call_log.jsonl", "policy_trace.jsonl", "rollback_log.jsonl", "memory_log.jsonl"]:
             path = self.root / name
             if not path.exists():
                 path.write_text("", encoding="utf-8")

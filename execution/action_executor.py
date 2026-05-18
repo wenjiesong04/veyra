@@ -4,6 +4,8 @@ import shlex
 from typing import Any
 
 from core.world_state import WorldStateStore
+from tool_proxy.safe_api import SafeAPI
+from tool_proxy.safe_browser import SafeBrowser
 from tool_proxy.safe_file import SafeFile
 from tool_proxy.safe_shell import SafeShell
 
@@ -13,6 +15,8 @@ class ActionExecutor:
         self.state_store = state_store
         self.safe_shell = SafeShell(state_store=state_store)
         self.safe_file = SafeFile(state_store=state_store)
+        self.safe_browser = SafeBrowser(state_store=state_store)
+        self.safe_api = SafeAPI(state_store=state_store)
 
     def execute_review(self, review: dict[str, Any]) -> dict[str, Any]:
         proposal = review.get("proposal")
@@ -36,10 +40,20 @@ class ActionExecutor:
             content = str(action.get("content", ""))
             if not path:
                 return {"status": "error", "reason": "file_write action requires path"}
-            return self.safe_file.write_text(path, content, reason=f"approved review {approval_id}")
+            return self.safe_file.write_text(path, content, reason=f"approved review {approval_id}", approved_by=approval_id)
         if action_type == "file_read":
             path = str(action.get("path", ""))
             if not path:
                 return {"status": "error", "reason": "file_read action requires path"}
             return self.safe_file.read_text(path)
+        if action_type == "browser_open":
+            url = str(action.get("url", ""))
+            if not url:
+                return {"status": "error", "reason": "browser_open action requires url"}
+            return self.safe_browser.open(url, approved_by=approval_id)
+        if action_type == "api_request":
+            payload = action.get("payload", {})
+            if not isinstance(payload, dict):
+                return {"status": "error", "reason": "api_request action requires payload object"}
+            return self.safe_api.request(payload, approved_by=approval_id)
         return {"status": "not_supported", "reason": f"Unsupported action type: {action_type}", "proposal": proposal}

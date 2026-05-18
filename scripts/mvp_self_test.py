@@ -83,6 +83,15 @@ def main() -> int:
     tool = post_json("/tool-proxy/shell", {"command": ["echo", "veyra-tool-proxy"]})
     expect(tool.get("status") == "ok", "tool proxy shell", tool)
 
+    browser = post_json("/tool-proxy/browser/open", {"url": "http://127.0.0.1:8000/console/"})
+    expect(browser.get("status") == "not_configured", "tool proxy browser policy", browser)
+
+    api = post_json("/tool-proxy/api/request", {"payload": {"method": "GET", "url": "http://127.0.0.1:8000/state"}})
+    expect(api.get("status") == "not_configured", "tool proxy api policy", api)
+
+    policy_logs = get_json("/logs/policy")
+    expect(bool(policy_logs.get("items")), "policy trace log", policy_logs)
+
     scratch = ROOT / "state" / "mvp_self_test.txt"
     scratch.write_text("before\n", encoding="utf-8")
     snapshot = post_json("/rollback/snapshot", {"path": str(scratch)})

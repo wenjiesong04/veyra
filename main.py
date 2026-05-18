@@ -20,6 +20,8 @@ from pydantic import Field
 from rollback_audit.rollback_manager import RollbackManager
 from rollback_audit.diff_tracker import DiffTracker
 from runtime.proactive_checks import ProactiveChecks
+from tool_proxy.safe_api import SafeAPI
+from tool_proxy.safe_browser import SafeBrowser
 from tool_proxy.safe_file import SafeFile
 from tool_proxy.safe_shell import SafeShell
 
@@ -35,6 +37,8 @@ review_queue = ReviewQueue(state_store)
 rollback_manager = RollbackManager(state_store)
 safe_shell = SafeShell(state_store=state_store)
 safe_file = SafeFile(state_store=state_store)
+safe_browser = SafeBrowser(state_store=state_store)
+safe_api = SafeAPI(state_store=state_store)
 action_executor = ActionExecutor(state_store=state_store)
 foresight_engine = ForesightEngine()
 proactive_checks = ProactiveChecks(state_store)
@@ -64,6 +68,14 @@ class FileWriteRequest(BaseModel):
     path: str
     content: str
     reason: str = ""
+
+
+class BrowserOpenRequest(BaseModel):
+    url: str
+
+
+class APIProxyRequest(BaseModel):
+    payload: dict[str, Any]
 
 
 class MemoryPatchRequest(BaseModel):
@@ -217,6 +229,16 @@ async def tool_proxy_file_write(request: FileWriteRequest):
     return safe_file.write_text(request.path, request.content, request.reason)
 
 
+@app.post("/tool-proxy/browser/open")
+async def tool_proxy_browser_open(request: BrowserOpenRequest):
+    return safe_browser.open(request.url)
+
+
+@app.post("/tool-proxy/api/request")
+async def tool_proxy_api_request(request: APIProxyRequest):
+    return safe_api.request(request.payload)
+
+
 @app.post("/rollback/snapshot")
 async def rollback_snapshot(request: FileReadRequest):
     return rollback_manager.snapshot_file(request.path, reason="manual_snapshot")
@@ -241,6 +263,11 @@ async def rollback_snapshot_diff(snapshot_id: str):
 @app.get("/logs/tools")
 async def tool_logs(limit: int = 100):
     return {"items": state_store.read_jsonl("tool_call_log.jsonl", limit=limit)}
+
+
+@app.get("/logs/policy")
+async def policy_logs(limit: int = 100):
+    return {"items": state_store.read_jsonl("policy_trace.jsonl", limit=limit)}
 
 
 @app.get("/logs/rollback")
@@ -397,6 +424,7 @@ async def mvp_status():
             "approve_reject": True,
             "approved_action_execution": True,
             "tool_proxy": True,
+            "policy_trace": True,
             "rollback_snapshot_restore": True,
             "memory_bridge_local": True,
             "proactive_read_only_checks": True,

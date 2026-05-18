@@ -42,6 +42,9 @@ Endpoints:
 - `POST /tool-proxy/shell` execute a command through SafeShell policy
 - `POST /tool-proxy/file/read` read a file through SafeFile policy
 - `POST /tool-proxy/file/write` write a file with snapshot support
+- `POST /tool-proxy/browser/open` review a browser-open request through SafeBrowser policy
+- `POST /tool-proxy/api/request` review an API request through SafeAPI policy
+- `GET /logs/policy` read policy trace records
 - `POST /actions/proposals` submit an Agent or Tool action proposal through Guardian review
 - `POST /rollback/snapshot` create a file snapshot
 - `POST /rollback/{snapshot_id}/restore` restore a file snapshot

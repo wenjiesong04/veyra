@@ -14,7 +14,7 @@
 | Probe Tools | `probes/` | MVP foundation | 扩展更多真实 runtime probe 和异常模式识别 |
 | Memory Bridge | `memory_bridge/` | MVP foundation | 加敏感信息过滤和过期 memory 标记 |
 | Skill | `skills/` | MVP foundation | 把内置 skill 输出统一成 ExecutionResult |
-| Tool Proxy | `tool_proxy/` | MVP foundation | shell/file/browser/api 全量接入统一风险策略 |
+| Tool Proxy | `tool_proxy/` | MVP foundation | 扩展真实 Browser/API 执行适配器 |
 | Rollback / Audit | `rollback_audit/` | MVP foundation | 扩展 Action Journal 和 policy trace |
 | Web Control UI | `web/`, `ui/` | MVP foundation | 接入 `/architecture` 和 `/definitions` |
 
@@ -129,13 +129,23 @@ Guardian review 现在返回：
 - `forbidden`
 - `message_to_executor`
 
+## Tool Proxy 策略审计
+
+P2 已将 Tool Proxy 接入统一策略审查：
+
+- `SafeShell`: shell 命令审查、policy trace、tool trace
+- `SafeFile`: 文件读写审查、敏感路径阻断、写入前 snapshot
+- `SafeBrowser`: URL scheme / 本地文件 / 外部目标审查，执行器未配置时只返回审查结果
+- `SafeAPI`: HTTP method / 敏感字段 / 状态变更请求审查，执行器未配置时只返回审查结果
+- `PolicyTrace`: 将 allow / allow_with_constraints / ask_user / block 写入 `policy_trace.jsonl`
+
 ## 当前实施阶段
 
 | Phase | 名称 | 状态 |
 | --- | --- | --- |
 | P0 | Foundation definitions | Completed |
 | P1 | State and probe hardening | Completed |
-| P2 | Decision, Guardian, and Tool Proxy policy depth | In progress |
+| P2 | Decision, Guardian, and Tool Proxy policy depth | Completed |
 | P3 | Agent adapter execution contracts | Pending |
 | P4 | Rollback, audit, and verifier depth | Pending |
 | P5 | Web Control Console completeness | Pending |
