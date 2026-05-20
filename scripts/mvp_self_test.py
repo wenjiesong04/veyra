@@ -11,7 +11,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from main import app  # noqa: E402
+from core.verifier import Verifier  # noqa: E402
 from interface.agent_contract import normalize_capabilities  # noqa: E402
+from interface.agent_adapter import ExecutionResult  # noqa: E402
 
 
 client = TestClient(app)
@@ -86,6 +88,7 @@ def main() -> int:
 
     probe = send_message("帮我看 18789 端口有没有被占用")
     expect(probe.get("route") == "probe", "probe route", probe)
+    expect(probe.get("artifacts", {}).get("execution_trace", {}).get("trace_id"), "probe execution trace", probe)
 
     blocked = send_message("请执行 rm -rf /")
     expect(blocked.get("route") == "block", "R5 block route", blocked)
@@ -110,15 +113,30 @@ def main() -> int:
 
     tool = post_json("/tool-proxy/shell", {"command": ["echo", "veyra-tool-proxy"]})
     expect(tool.get("status") == "ok", "tool proxy shell", tool)
+    expect(bool(tool.get("tool_trace", {}).get("trace_id")), "tool proxy shell trace", tool)
 
     browser = post_json("/tool-proxy/browser/open", {"url": "http://127.0.0.1:8000/console/"})
     expect(browser.get("status") == "not_configured", "tool proxy browser policy", browser)
+    expect(browser.get("tool_trace", {}).get("action_type") == "browser_open", "tool proxy browser trace", browser)
 
     api = post_json("/tool-proxy/api/request", {"payload": {"method": "GET", "url": "http://127.0.0.1:8000/state"}})
     expect(api.get("status") == "not_configured", "tool proxy api policy", api)
+    expect(api.get("tool_trace", {}).get("action_type") == "api_request", "tool proxy api trace", api)
+
+    file_target = ROOT / "state" / "mvp_self_test_tool_file.txt"
+    file_target.write_text("file-before\n", encoding="utf-8")
+    file_write = post_json("/tool-proxy/file/write", {"path": str(file_target), "content": "file-after\n", "reason": "mvp_self_test"})
+    expect(file_write.get("status") == "ok", "tool proxy file write", file_write)
+    expect(file_write.get("snapshot", {}).get("checksum"), "tool proxy file snapshot checksum", file_write)
+    expect(file_write.get("tool_trace", {}).get("snapshot_id") == file_write.get("snapshot", {}).get("snapshot_id"), "tool proxy file trace snapshot", file_write)
 
     policy_logs = get_json("/logs/policy")
     expect(bool(policy_logs.get("items")), "policy trace log", policy_logs)
+    tool_logs = get_json("/logs/tools")
+    standard_tools = [item for item in tool_logs.get("items", []) if item.get("trace_id")]
+    expect(len(standard_tools) >= 5, "standard tool trace ids", standard_tools[-5:])
+    execution_logs = get_json("/logs/execution")
+    expect(bool(execution_logs.get("items")), "execution trace log", execution_logs)
 
     scratch = ROOT / "state" / "mvp_self_test.txt"
     scratch.write_text("before\n", encoding="utf-8")
@@ -127,9 +145,29 @@ def main() -> int:
     scratch.write_text("after\n", encoding="utf-8")
     diff = get_json(f"/rollback/{snapshot['snapshot_id']}/diff")
     expect(diff.get("changed") is True, "rollback diff", diff)
+    expect(diff.get("source_exists") is True and diff.get("snapshot_exists") is True, "rollback diff evidence", diff)
     restored = post_json(f"/rollback/{snapshot['snapshot_id']}/restore")
     expect(restored.get("status") == "restored", "rollback restore", restored)
+    expect(restored.get("source_checksum") == restored.get("snapshot_checksum"), "rollback restore checksum", restored)
     expect(scratch.read_text(encoding="utf-8") == "before\n", "rollback restored content")
+
+    verifier = Verifier()
+    verified_success = verifier.verify_execution_result(
+        ExecutionResult(task_id="v_success", executor="self-test", status="success", result="done", raw={"evidence": True})
+    )
+    expect(verified_success.get("status") == "verified_success", "verifier success evidence", verified_success)
+    submitted = verifier.verify_execution_result(
+        ExecutionResult(task_id="v_submitted", executor="self-test", status="submitted", result="queued")
+    )
+    expect(submitted.get("status") == "partially_success", "verifier submitted status", submitted)
+    unconfigured = verifier.verify_execution_result(
+        ExecutionResult(task_id="v_agent", executor="openclaw", status="adapter_unconfigured", result="")
+    )
+    expect(unconfigured.get("status") == "needs_more_probe", "verifier adapter unconfigured", unconfigured)
+    failed_with_changes = verifier.verify_execution_result(
+        ExecutionResult(task_id="v_failed", executor="self-test", status="failed", result="failed", changed_files=["state/mvp_self_test.txt"])
+    )
+    expect(failed_with_changes.get("status") == "needs_rollback", "verifier rollback needed", failed_with_changes)
 
     memory = post_json(
         "/memory/patch",

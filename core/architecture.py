@@ -53,7 +53,7 @@ ARCHITECTURE_BLOCKS: list[dict[str, Any]] = [
         "name": "Rollback / Audit",
         "role": "Record traces, snapshots, diffs, rollback actions, and replayable execution evidence.",
         "paths": ["rollback_audit/", "state/*.jsonl", "state/snapshots/"],
-        "status": "mvp_foundation",
+        "status": "p4_completed",
     },
     {
         "id": "web_control_ui",
@@ -77,7 +77,7 @@ CORE_MODULES: list[dict[str, str]] = [
     {"id": "decision_core", "path": "core/decision_core.py", "status": "mvp_foundation"},
     {"id": "foresight_engine", "path": "core/foresight_engine.py", "status": "mvp_foundation"},
     {"id": "guardian_execution_controller", "path": "core/guardian_controller.py", "status": "mvp_foundation"},
-    {"id": "verifier", "path": "core/verifier.py", "status": "mvp_foundation"},
+    {"id": "verifier", "path": "core/verifier.py", "status": "p4_completed"},
     {"id": "context_patch_builder", "path": "core/context_patch_builder.py", "status": "mvp_foundation"},
 ]
 
@@ -139,6 +139,13 @@ STATE_DEFINITIONS: list[dict[str, Any]] = [
         "purpose": "Selected Agent Runtime, connection status, and adapter capability status.",
         "freshness": "probe_backed",
     },
+    {
+        "id": "execution_trace",
+        "file": "state/execution_trace.jsonl",
+        "owner": "RollbackAudit.ExecutionTrace",
+        "purpose": "Execution evidence linking events, routes, executors, results, and verifier verdicts.",
+        "freshness": "append_only_audit",
+    },
 ]
 
 
@@ -147,7 +154,7 @@ IMPLEMENTATION_PHASES: list[dict[str, str]] = [
     {"phase": "P1", "name": "State and probe hardening", "status": "completed"},
     {"phase": "P2", "name": "Decision, Guardian, and Tool Proxy policy depth", "status": "completed"},
     {"phase": "P3", "name": "Agent adapter execution contracts", "status": "completed"},
-    {"phase": "P4", "name": "Rollback, audit, and verifier depth", "status": "pending"},
+    {"phase": "P4", "name": "Rollback, audit, and verifier depth", "status": "completed"},
     {"phase": "P5", "name": "Web Control Console completeness", "status": "pending"},
     {"phase": "P6", "name": "End-to-end runtime hardening", "status": "pending"},
     {"phase": "P7", "name": "Production operations and safety validation", "status": "pending"},

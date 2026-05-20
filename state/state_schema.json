@@ -56,6 +56,13 @@
       "owner": "AgentAdapter",
       "purpose": "Selected Agent Runtime, connection status, and adapter capability status.",
       "freshness": "probe_backed"
+    },
+    {
+      "id": "execution_trace",
+      "file": "state/execution_trace.jsonl",
+      "owner": "RollbackAudit.ExecutionTrace",
+      "purpose": "Execution evidence linking events, routes, executors, results, and verifier verdicts.",
+      "freshness": "append_only_audit"
     }
   ],
   "lifecycle_statuses": [

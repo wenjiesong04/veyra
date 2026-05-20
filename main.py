@@ -273,6 +273,11 @@ async def policy_logs(limit: int = 100):
     return {"items": state_store.read_jsonl("policy_trace.jsonl", limit=limit)}
 
 
+@app.get("/logs/execution")
+async def execution_logs(limit: int = 100):
+    return {"items": state_store.read_jsonl("execution_trace.jsonl", limit=limit)}
+
+
 @app.get("/logs/rollback")
 async def rollback_logs(limit: int = 100):
     return {"items": state_store.read_jsonl("rollback_log.jsonl", limit=limit)}
@@ -433,6 +438,9 @@ async def mvp_status():
             "approved_action_execution": True,
             "tool_proxy": True,
             "policy_trace": True,
+            "execution_trace": True,
+            "verifier_evidence_chain": True,
+            "rollback_audit_depth": True,
             "rollback_snapshot_restore": True,
             "memory_bridge_local": True,
             "proactive_read_only_checks": True,

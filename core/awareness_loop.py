@@ -17,6 +17,7 @@ from core.task_packet_builder import TaskPacketBuilder
 from core.verifier import Verifier
 from core.world_state import WorldStateStore
 from guardian.review_queue import ReviewQueue
+from interface.agent_adapter import ExecutionResult
 from interface.agent_registry import AgentRegistry
 from interface.event_schema import LoopResult, Route, VeyraEvent
 from memory_bridge.local_memory_bridge import LocalMemoryBridge
@@ -24,6 +25,7 @@ from probes.git_probe import GitProbe
 from probes.port_probe import PortProbe
 from probes.process_probe import ProcessProbe
 from probes.system_probe import SystemProbe
+from rollback_audit.execution_trace import ExecutionTrace
 from skills.skill_loader import SkillLoader
 from skills.skill_runtime import SkillRuntime
 
@@ -50,6 +52,7 @@ class AwarenessLoop:
         self.agent_adapter = self.agent_registry.selected()
         self.review_queue = ReviewQueue(state_store)
         self.memory_bridge = LocalMemoryBridge(state_store)
+        self.execution_trace = ExecutionTrace(state_store)
         self.skill_loader = SkillLoader()
         self.skill_runtime = SkillRuntime(state_store)
         self.probes = {
@@ -142,7 +145,7 @@ class AwarenessLoop:
             execution = self.agent_adapter.send_task(packet)
             verified = self.verifier.verify_execution_result(execution)
             memory_write = None
-            if verified["status"] in {"success", "submitted"}:
+            if verified.get("needs_memory_patch"):
                 memory_write = self.memory_bridge.write_patch(
                     {
                         "session_id": event.source.session_id,
@@ -152,13 +155,34 @@ class AwarenessLoop:
                         "result": execution.result,
                     }
                 )
+            artifacts = {
+                "task_packet": packet.to_dict(),
+                "execution_result": asdict(execution),
+                "verification": verified,
+                "memory_write": memory_write,
+                "decision": decision.to_dict(),
+                "guardian": guardian_decision,
+            }
+            artifacts["execution_trace"] = self.execution_trace.record(
+                {
+                    "event_id": event.event_id,
+                    "route": decision.route.value,
+                    "task_id": execution.task_id,
+                    "executor": execution.executor,
+                    "status": verified["status"],
+                    "decision": decision.to_dict(),
+                    "guardian": guardian_decision,
+                    "execution_result": asdict(execution),
+                    "verification": verified,
+                }
+            )
             result = LoopResult(
                 event_id=event.event_id,
                 route=decision.route,
                 status=verified["status"],
                 response=execution.result,
                 risk_level=decision.risk_level,
-                artifacts={"task_packet": packet.to_dict(), "execution_result": asdict(execution), "verification": verified, "memory_write": memory_write},
+                artifacts=artifacts,
             )
         else:
             result = LoopResult(
@@ -187,7 +211,7 @@ class AwarenessLoop:
                 guardian_decision={"decision": "ask_user", "risk_level": "R2", "reason": "Skill requires confirmation before write action."},
                 proposal={"agent": "skill", "action": {"type": "skill", "name": skill_name}, "risk_guess": "R2"},
             )
-            return LoopResult(
+            result = LoopResult(
                 event_id=event.event_id,
                 route=Route.HUMAN_REVIEW,
                 status="needs_confirmation",
@@ -195,13 +219,46 @@ class AwarenessLoop:
                 risk_level=RiskLevel.R2,
                 artifacts={"skill_result": raw, "review": review},
             )
+            result.artifacts["execution_trace"] = self.execution_trace.record(
+                {
+                    "event_id": event.event_id,
+                    "route": result.route.value,
+                    "task_id": event.event_id,
+                    "executor": f"skill:{skill_name}",
+                    "status": result.status,
+                    "execution_result": raw,
+                    "verification": {"status": "partially_success", "verdict": "skill_waiting_for_confirmation"},
+                }
+            )
+            return result
+        execution = ExecutionResult(
+            task_id=event.event_id,
+            executor=f"skill:{skill_name}",
+            status="success" if status == "success" else status,
+            result=response,
+            raw=raw,
+        )
+        verified = self.verifier.verify_execution_result(execution)
+        result_status = "success" if verified["status"] == "verified_success" else verified["status"]
+        artifacts = {"skill_result": raw, "verification": verified}
+        artifacts["execution_trace"] = self.execution_trace.record(
+            {
+                "event_id": event.event_id,
+                "route": Route.SKILL.value,
+                "task_id": event.event_id,
+                "executor": f"skill:{skill_name}",
+                "status": verified["status"],
+                "execution_result": asdict(execution),
+                "verification": verified,
+            }
+        )
         return LoopResult(
             event_id=event.event_id,
             route=Route.SKILL,
-            status="success" if status == "success" else status,
+            status=result_status,
             response=response,
             risk_level=risk,
-            artifacts={"skill_result": raw},
+            artifacts=artifacts,
         )
 
     def _run_probe(self, event: VeyraEvent, probe_name: str) -> LoopResult:
@@ -211,6 +268,17 @@ class AwarenessLoop:
         state_patch = self.perception.interpret_probe_result(raw)
         belief_state = self.belief.refresh()
         verified = self.verifier.verify_probe_result(raw)
+        trace = self.execution_trace.record(
+            {
+                "event_id": event.event_id,
+                "route": Route.PROBE.value,
+                "task_id": event.event_id,
+                "executor": f"probe:{probe_name}",
+                "status": verified["status"],
+                "execution_result": raw,
+                "verification": verified,
+            }
+        )
         return LoopResult(
             event_id=event.event_id,
             route=Route.PROBE,
@@ -221,6 +289,7 @@ class AwarenessLoop:
                 "probe_result": raw,
                 "state_patch": state_patch,
                 "verification": verified,
+                "execution_trace": trace,
                 "uncertainty": self.uncertainty.uncertainty_summary(belief_state.get("claims", [])),
             },
         )

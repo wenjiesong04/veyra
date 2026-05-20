@@ -15,7 +15,7 @@
 | Memory Bridge | `memory_bridge/` | MVP foundation | 加敏感信息过滤和过期 memory 标记 |
 | Skill | `skills/` | MVP foundation | 把内置 skill 输出统一成 ExecutionResult |
 | Tool Proxy | `tool_proxy/` | MVP foundation | 扩展真实 Browser/API 执行适配器 |
-| Rollback / Audit | `rollback_audit/` | MVP foundation | 扩展 Action Journal 和 policy trace |
+| Rollback / Audit | `rollback_audit/` | P4 completed | 扩展 replay 和长期审计留存策略 |
 | Web Control UI | `web/`, `ui/` | MVP foundation | 接入 `/architecture` 和 `/definitions` |
 
 ## Veyra Core 子模块
@@ -33,7 +33,7 @@
 | Decision Core | `core/decision_core.py`, `decision/` | MVP foundation |
 | Foresight Engine | `core/foresight_engine.py`, `foresight/` | MVP foundation |
 | Guardian / Execution Controller | `core/guardian_controller.py`, `execution/` | MVP foundation |
-| Verifier | `core/verifier.py` | MVP foundation |
+| Verifier | `core/verifier.py` | P4 completed |
 | Context / Patch Builder | `core/context_patch_builder.py`, `core/*_patch_builder.py` | MVP foundation |
 
 ## 生命周期状态
@@ -147,7 +147,7 @@ P2 已将 Tool Proxy 接入统一策略审查：
 | P1 | State and probe hardening | Completed |
 | P2 | Decision, Guardian, and Tool Proxy policy depth | Completed |
 | P3 | Agent adapter execution contracts | Completed |
-| P4 | Rollback, audit, and verifier depth | Pending |
+| P4 | Rollback, audit, and verifier depth | Completed |
 | P5 | Web Control Console completeness | Pending |
 | P6 | End-to-end runtime hardening | Pending |
 | P7 | Production operations and safety validation | Pending |
@@ -173,6 +173,16 @@ OpenClaw 这次“协议不匹配”属于运行中的 Gateway 与 Control UI �
 - Hermes / Custom 通过 `/capabilities` 暴露 `contract_version`、`features`、`tools`、`skills`，Veyra 将未知新版本标记为 `unverified` 并继续使用 rendered prompt fallback。
 - 只有传输协议、认证方式、任务包结构或必需方法发生破坏性变化时，才需要维护并发布新版 adapter。
 - 如果只是 Agent app/runtime 版本号更新，但 contract 与必需能力保持兼容，Veyra 不需要跟着每个版本改代码。
+
+## Rollback / Audit / Verifier
+
+P4 已补齐第一版可审计执行证据链：
+
+- `Verifier`: 输出 `verified_success`、`verified_failed`、`partially_success`、`needs_more_probe`、`needs_rollback`、`needs_memory_patch`。
+- `ExecutionTrace`: 将 event、route、task、executor、execution result、verification 写入 `execution_trace.jsonl`。
+- `ToolTrace`: Tool Proxy 返回标准 `trace_id`、`tool`、`action_type`、`target`、`status`、`risk_level`、`policy_decision`、`snapshot_id`。
+- `RollbackManager`: snapshot / diff / restore 记录 checksum、size、source_exists、snapshot_exists，restore 后可校验恢复结果。
+- `/logs/execution`: 暴露执行证据日志给后续 Web Control Console。
 
 ## P5 之后
 

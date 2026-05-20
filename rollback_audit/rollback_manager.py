@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 from pathlib import Path
 from shutil import copy2
 from typing import Any
@@ -20,7 +21,15 @@ class RollbackManager:
         source = Path(path)
         snapshot_id = f"snap_{uuid4().hex[:12]}"
         if not source.exists() or not source.is_file():
-            snapshot = {"snapshot_id": snapshot_id, "status": "missing", "source": str(source), "reason": reason, "created_at": utc_now_iso()}
+            snapshot = {
+                "snapshot_id": snapshot_id,
+                "status": "missing",
+                "source": str(source),
+                "reason": reason,
+                "created_at": utc_now_iso(),
+                "checksum": None,
+                "size_bytes": 0,
+            }
         else:
             target = self.snapshot_root / f"{snapshot_id}_{source.name}"
             copy2(source, target)
@@ -31,6 +40,8 @@ class RollbackManager:
                 "snapshot": str(target),
                 "reason": reason,
                 "created_at": utc_now_iso(),
+                "checksum": self._sha256(source),
+                "size_bytes": source.stat().st_size,
             }
         state = self.state_store.read_json("rollback_state.json") or {"snapshots": []}
         state.setdefault("snapshots", []).append(snapshot)
@@ -47,7 +58,16 @@ class RollbackManager:
             result = {"status": "not_restorable", "snapshot": snapshot}
         else:
             copy2(str(snapshot["snapshot"]), str(snapshot["source"]))
-            result = {"status": "restored", "snapshot_id": snapshot_id, "source": snapshot["source"], "restored_at": utc_now_iso()}
+            source = Path(str(snapshot["source"]))
+            snapshot_path = Path(str(snapshot["snapshot"]))
+            result = {
+                "status": "restored",
+                "snapshot_id": snapshot_id,
+                "source": snapshot["source"],
+                "restored_at": utc_now_iso(),
+                "source_checksum": self._sha256(source) if source.exists() else None,
+                "snapshot_checksum": self._sha256(snapshot_path) if snapshot_path.exists() else None,
+            }
         self.state_store.append_jsonl("rollback_log.jsonl", {"action": "restore", "result": result})
         return result
 
@@ -57,14 +77,33 @@ class RollbackManager:
         if not snapshot:
             raise KeyError(f"Snapshot not found: {snapshot_id}")
         if snapshot.get("status") != "created":
-            return {"status": "not_available", "reason": "snapshot is not restorable", "snapshot": snapshot}
+            return {
+                "status": "not_available",
+                "reason": "snapshot is not restorable",
+                "snapshot": snapshot,
+                "changed": False,
+                "source_exists": Path(str(snapshot.get("source", ""))).exists(),
+                "snapshot_exists": False,
+            }
 
         snapshot_path = Path(str(snapshot["snapshot"]))
         source_path = Path(str(snapshot["source"]))
         if not snapshot_path.exists():
-            return {"status": "missing_snapshot", "snapshot": snapshot}
+            return {
+                "status": "missing_snapshot",
+                "snapshot": snapshot,
+                "changed": False,
+                "source_exists": source_path.exists(),
+                "snapshot_exists": False,
+            }
         if not source_path.exists():
-            return {"status": "missing_source", "snapshot": snapshot}
+            return {
+                "status": "missing_source",
+                "snapshot": snapshot,
+                "changed": True,
+                "source_exists": False,
+                "snapshot_exists": snapshot_path.exists(),
+            }
 
         before = snapshot_path.read_text(encoding="utf-8", errors="replace").splitlines()
         after = source_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -82,5 +121,16 @@ class RollbackManager:
             "snapshot_id": snapshot_id,
             "source": str(source_path),
             "changed": bool(diff),
+            "source_exists": source_path.exists(),
+            "snapshot_exists": snapshot_path.exists(),
+            "source_checksum": self._sha256(source_path),
+            "snapshot_checksum": self._sha256(snapshot_path),
             "diff": diff or "No changes between snapshot and current file.",
         }
+
+    def _sha256(self, path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
