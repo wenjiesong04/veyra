@@ -60,7 +60,7 @@ ARCHITECTURE_BLOCKS: list[dict[str, Any]] = [
         "name": "Web Control UI",
         "role": "Expose awareness, runtime, action review, tool proxy, and rollback state to operators.",
         "paths": ["web/", "ui/"],
-        "status": "mvp_foundation",
+        "status": "p5_completed",
     },
 ]
 
@@ -155,7 +155,7 @@ IMPLEMENTATION_PHASES: list[dict[str, str]] = [
     {"phase": "P2", "name": "Decision, Guardian, and Tool Proxy policy depth", "status": "completed"},
     {"phase": "P3", "name": "Agent adapter execution contracts", "status": "completed"},
     {"phase": "P4", "name": "Rollback, audit, and verifier depth", "status": "completed"},
-    {"phase": "P5", "name": "Web Control Console completeness", "status": "pending"},
+    {"phase": "P5", "name": "Web Control Console completeness", "status": "completed"},
     {"phase": "P6", "name": "End-to-end runtime hardening", "status": "pending"},
     {"phase": "P7", "name": "Production operations and safety validation", "status": "pending"},
 ]

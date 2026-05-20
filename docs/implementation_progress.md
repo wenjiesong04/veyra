@@ -16,7 +16,7 @@
 | Skill | `skills/` | MVP foundation | 把内置 skill 输出统一成 ExecutionResult |
 | Tool Proxy | `tool_proxy/` | MVP foundation | 扩展真实 Browser/API 执行适配器 |
 | Rollback / Audit | `rollback_audit/` | P4 completed | 扩展 replay 和长期审计留存策略 |
-| Web Control UI | `web/`, `ui/` | MVP foundation | 接入 `/architecture` 和 `/definitions` |
+| Web Control UI | `web/`, `ui/` | P5 completed | 下一步接入更完整的生产监控与告警 |
 
 ## Veyra Core 子模块
 
@@ -148,7 +148,7 @@ P2 已将 Tool Proxy 接入统一策略审查：
 | P2 | Decision, Guardian, and Tool Proxy policy depth | Completed |
 | P3 | Agent adapter execution contracts | Completed |
 | P4 | Rollback, audit, and verifier depth | Completed |
-| P5 | Web Control Console completeness | Pending |
+| P5 | Web Control Console completeness | Completed |
 | P6 | End-to-end runtime hardening | Pending |
 | P7 | Production operations and safety validation | Pending |
 
@@ -183,6 +183,21 @@ P4 已补齐第一版可审计执行证据链：
 - `ToolTrace`: Tool Proxy 返回标准 `trace_id`、`tool`、`action_type`、`target`、`status`、`risk_level`、`policy_decision`、`snapshot_id`。
 - `RollbackManager`: snapshot / diff / restore 记录 checksum、size、source_exists、snapshot_exists，restore 后可校验恢复结果。
 - `/logs/execution`: 暴露执行证据日志给后续 Web Control Console。
+
+## Web Control Console
+
+P5 已将 `/console` 补为 Awareness & Agent Control Console：
+
+- Setup Wizard：展示选定 runtime、安全边界、主动等级、Rollback/Audit 状态。
+- Awareness Dashboard：展示生命周期、风险、Attention、Belief、当前任务和 Executor。
+- Agent Runtime Manager：展示并切换 OpenClaw / Hermes / Custom，保存当前选中 Agent URL，展示 contract。
+- Action Review：展示 pending review、foresight、副作用、安全替代方案，并支持 approve/reject。
+- Persona Manager：展示 Operational Modes 和当前 active modes。
+- State / Heartbeat / EventLog：展示 state definitions、heartbeat、event/action/rollback logs。
+- Tool Proxy Monitor：展示 SafeShell / SafeFile / SafeBrowser / SafeAPI 的 tool trace。
+- Rollback / Audit Viewer：展示 snapshot、diff、restore、policy trace、execution trace。
+
+当前控制台数据全部来自 Veyra 本地 API；开发过程中看到的事件和 snapshot 多数是自测产生的真实运行记录，不是前端 mock 数据。
 
 ## P5 之后
 

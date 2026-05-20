@@ -4,6 +4,8 @@ import {
   Activity,
   AlertTriangle,
   Bot,
+  Brain,
+  BookOpen,
   CheckCircle2,
   ClipboardList,
   Database,
@@ -12,10 +14,14 @@ import {
   FileText,
   Gauge,
   History,
+  Layers,
+  ListChecks,
   Play,
   RefreshCw,
   RotateCcw,
   Save,
+  ScrollText,
+  Settings,
   Shield,
   ThumbsDown,
   ThumbsUp,
@@ -65,6 +71,22 @@ type MessageResult = {
 
 type LogResponse = {
   items: Array<Record<string, JsonValue>>;
+};
+
+type ArchitectureSnapshot = {
+  blocks: Array<Record<string, JsonValue>>;
+  core_modules: Array<Record<string, JsonValue>>;
+  state_definitions: Array<Record<string, JsonValue>>;
+  implementation_phases: Array<Record<string, JsonValue>>;
+  risk_levels: Array<Record<string, JsonValue>>;
+  lifecycle_statuses: string[];
+  operational_modes: string[];
+};
+
+type Definitions = {
+  risk_levels: Array<Record<string, JsonValue>>;
+  lifecycle_statuses: string[];
+  operational_modes: string[];
 };
 
 const initialMessage = "帮我看 18789 端口有没有被占用";
@@ -130,6 +152,18 @@ function memoryPatch(item: Record<string, JsonValue>) {
   return asRecord(item.patch);
 }
 
+function traceTarget(item: Record<string, JsonValue>) {
+  return compactJson(item.target ?? item.task_id ?? item.event_id);
+}
+
+function statusCounts(items: Array<Record<string, JsonValue>>, key = "status") {
+  return items.reduce<Record<string, number>>((acc, item) => {
+    const value = String(item[key] ?? "unknown");
+    acc[value] = (acc[value] ?? 0) + 1;
+    return acc;
+  }, {});
+}
+
 function Metric({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div className="metric">
@@ -146,10 +180,16 @@ function App() {
   const [actions, setActions] = useState<LogResponse>({ items: [] });
   const [reviews, setReviews] = useState<LogResponse>({ items: [] });
   const [toolLogs, setToolLogs] = useState<LogResponse>({ items: [] });
+  const [policyLogs, setPolicyLogs] = useState<LogResponse>({ items: [] });
+  const [executionLogs, setExecutionLogs] = useState<LogResponse>({ items: [] });
   const [memoryLogs, setMemoryLogs] = useState<LogResponse>({ items: [] });
   const [agentStatus, setAgentStatus] = useState<Record<string, JsonValue> | null>(null);
   const [agentRegistry, setAgentRegistry] = useState<Record<string, JsonValue> | null>(null);
+  const [agentContract, setAgentContract] = useState<Record<string, JsonValue> | null>(null);
   const [mvpStatus, setMvpStatus] = useState<Record<string, JsonValue> | null>(null);
+  const [architecture, setArchitecture] = useState<ArchitectureSnapshot | null>(null);
+  const [definitions, setDefinitions] = useState<Definitions | null>(null);
+  const [heartbeat, setHeartbeat] = useState("");
   const [rollbackLogs, setRollbackLogs] = useState<LogResponse>({ items: [] });
   const [diffStatus, setDiffStatus] = useState<Record<string, JsonValue> | null>(null);
   const [rollbackDiff, setRollbackDiff] = useState<Record<string, JsonValue> | null>(null);
@@ -161,18 +201,43 @@ function App() {
   const [error, setError] = useState<string | null>(null);
 
   const refresh = async () => {
-    const [runtimeData, stateData, eventData, actionData, reviewData, toolData, memoryData, rollbackData, agentData, registryData, mvpData, diffData] = await Promise.all([
+    const [
+      runtimeData,
+      stateData,
+      eventData,
+      actionData,
+      reviewData,
+      toolData,
+      policyData,
+      executionData,
+      memoryData,
+      rollbackData,
+      agentData,
+      registryData,
+      contractData,
+      mvpData,
+      architectureData,
+      definitionsData,
+      heartbeatData,
+      diffData
+    ] = await Promise.all([
       fetchJson<RuntimeInfo>("/runtime"),
       fetchJson<VeyraState>("/state"),
       fetchJson<LogResponse>("/logs/events?limit=20"),
       fetchJson<LogResponse>("/logs/actions?limit=20"),
       fetchJson<LogResponse>("/reviews/actions?limit=20"),
       fetchJson<LogResponse>("/logs/tools?limit=20"),
+      fetchJson<LogResponse>("/logs/policy?limit=20"),
+      fetchJson<LogResponse>("/logs/execution?limit=20"),
       fetchJson<LogResponse>("/logs/memory?limit=20"),
       fetchJson<LogResponse>("/logs/rollback?limit=20"),
       fetchJson<Record<string, JsonValue>>("/agent/status"),
       fetchJson<Record<string, JsonValue>>("/agents"),
+      fetchJson<Record<string, JsonValue>>("/agent/contract"),
       fetchJson<Record<string, JsonValue>>("/mvp/status"),
+      fetchJson<ArchitectureSnapshot>("/architecture"),
+      fetchJson<Definitions>("/definitions"),
+      fetchJson<{ heartbeat: string }>("/heartbeat"),
       fetchJson<Record<string, JsonValue>>("/rollback/diff")
     ]);
     setRuntime(runtimeData);
@@ -181,11 +246,17 @@ function App() {
     setActions(actionData);
     setReviews(reviewData);
     setToolLogs(toolData);
+    setPolicyLogs(policyData);
+    setExecutionLogs(executionData);
     setMemoryLogs(memoryData);
     setRollbackLogs(rollbackData);
     setAgentStatus(agentData);
     setAgentRegistry(registryData);
+    setAgentContract(contractData);
     setMvpStatus(mvpData);
+    setArchitecture(architectureData);
+    setDefinitions(definitionsData);
+    setHeartbeat(heartbeatData.heartbeat);
     setDiffStatus(diffData);
   };
 
@@ -339,6 +410,15 @@ function App() {
   const memoryItems = Array.isArray(state?.agent_memory?.items) ? (state.agent_memory.items as Array<Record<string, JsonValue>>) : [];
   const agents = asRecord(agentRegistry?.agents);
   const selectedAgent = String(agentRegistry?.selected_agent ?? runtime?.identity.selected_agent ?? "openclaw");
+  const coreModules = architecture?.core_modules ?? [];
+  const architectureBlocks = architecture?.blocks ?? [];
+  const stateDefinitions = architecture?.state_definitions ?? [];
+  const phases = architecture?.implementation_phases ?? [];
+  const operationalModes = definitions?.operational_modes ?? architecture?.operational_modes ?? [];
+  const activeModes = runtime?.operational_mode ?? [];
+  const readiness = asRecord(mvpStatus?.core_loops);
+  const executionStatusCounts = statusCounts(executionLogs.items);
+  const policyDecisionCounts = statusCounts(policyLogs.items, "decision");
 
   return (
     <main className="appShell">
@@ -367,6 +447,44 @@ function App() {
         <Metric label="Lifecycle" value={<StatusPill value={runtime?.lifecycle.status ?? "loading"} />} />
         <Metric label="Risk" value={<StatusPill value={currentRisk} />} />
         <Metric label="Focus" value={focus.length ? focus.join(", ") : "none"} />
+      </section>
+
+      <section className="workspaceGrid">
+        <Section title="Setup Wizard" icon={<Settings size={18} />}>
+          <div className="setupGrid">
+            <div className="setupStep">
+              <span>Selected runtime</span>
+              <strong>{selectedAgent}</strong>
+              <small>{connected}</small>
+            </div>
+            <div className="setupStep">
+              <span>Safety boundary</span>
+              <strong>Guardian enforced</strong>
+              <small>{String(asRecord(mvpStatus?.agent_runtime).status ?? "unknown")}</small>
+            </div>
+            <div className="setupStep">
+              <span>Autonomy</span>
+              <strong>Read-only proactive checks</strong>
+              <small>{String(readiness.proactive_read_only_checks ?? false)}</small>
+            </div>
+            <div className="setupStep">
+              <span>Rollback / audit</span>
+              <strong>{String(readiness.rollback_audit_depth ?? false)}</strong>
+              <small>{snapshots.length} snapshots</small>
+            </div>
+          </div>
+        </Section>
+
+        <Section title="Architecture Coverage" icon={<Layers size={18} />}>
+          <div className="coverageGrid">
+            {architectureBlocks.map((block) => (
+              <div className="coverageItem" key={String(block.id)}>
+                <span>{String(block.name)}</span>
+                <StatusPill value={String(block.status ?? "unknown")} />
+              </div>
+            ))}
+          </div>
+        </Section>
       </section>
 
       <section className="workspaceGrid">
@@ -497,6 +615,30 @@ function App() {
       </section>
 
       <section className="workspaceGrid">
+        <Section title="Persona Manager" icon={<Brain size={18} />}>
+          <div className="personaGrid">
+            {operationalModes.map((mode) => (
+              <div className={`personaItem ${activeModes.includes(mode) ? "active" : ""}`} key={mode}>
+                <strong>{mode}</strong>
+                <StatusPill value={activeModes.includes(mode) ? "active" : "available"} />
+              </div>
+            ))}
+          </div>
+        </Section>
+
+        <Section title="Core Module Status" icon={<ListChecks size={18} />}>
+          <div className="moduleList">
+            {coreModules.map((module) => (
+              <div className="moduleItem" key={String(module.id)}>
+                <span>{String(module.id)}</span>
+                <StatusPill value={String(module.status ?? "unknown")} />
+              </div>
+            ))}
+          </div>
+        </Section>
+      </section>
+
+      <section className="workspaceGrid">
         <Section title="Rollback Viewer" icon={<RotateCcw size={18} />}>
           <div className="rollbackControls">
             <input value={snapshotPath} onChange={(event) => setSnapshotPath(event.target.value)} aria-label="Snapshot path" />
@@ -585,6 +727,67 @@ function App() {
       </section>
 
       <section className="logGrid operationsGrid">
+        <Section title="Execution Trace" icon={<ScrollText size={18} />}>
+          <div className="traceSummary">
+            {Object.entries(executionStatusCounts).map(([status, count]) => (
+              <Metric key={status} label={status} value={count} />
+            ))}
+          </div>
+          <div className="dataTable traceTable">
+            <div className="dataTableHead">
+              <span>Trace</span>
+              <span>Route</span>
+              <span>Status</span>
+              <span>Executor</span>
+              <span>Target</span>
+              <span>Verifier</span>
+            </div>
+            {executionLogs.items.slice(-6).reverse().map((item, index) => {
+              const verification = asRecord(item.verification);
+              return (
+                <div className="dataTableRow" key={String(item.trace_id ?? index)}>
+                  <code>{String(item.trace_id ?? "-")}</code>
+                  <span>{String(item.route ?? "-")}</span>
+                  <StatusPill value={String(item.status ?? "unknown")} />
+                  <span>{String(item.executor ?? "-")}</span>
+                  <code>{traceTarget(item)}</code>
+                  <span>{String(verification.verdict ?? "-")}</span>
+                </div>
+              );
+            })}
+            {!executionLogs.items.length ? <div className="emptyState"><ScrollText size={18} />No execution traces yet.</div> : null}
+          </div>
+        </Section>
+
+        <Section title="Policy Trace" icon={<Shield size={18} />}>
+          <div className="traceSummary">
+            {Object.entries(policyDecisionCounts).map(([decision, count]) => (
+              <Metric key={decision} label={decision} value={count} />
+            ))}
+          </div>
+          <div className="dataTable policyTable">
+            <div className="dataTableHead">
+              <span>Tool</span>
+              <span>Action</span>
+              <span>Decision</span>
+              <span>Risk</span>
+              <span>Target</span>
+              <span>Reason</span>
+            </div>
+            {policyLogs.items.slice(-6).reverse().map((item, index) => (
+              <div className="dataTableRow" key={index}>
+                <span>{String(item.tool ?? "-")}</span>
+                <span>{String(item.action_type ?? "-")}</span>
+                <StatusPill value={String(item.decision ?? "unknown")} />
+                <StatusPill value={String(item.risk_level ?? "R?")} />
+                <code>{traceTarget(item)}</code>
+                <span>{String(item.reason ?? "-")}</span>
+              </div>
+            ))}
+            {!policyLogs.items.length ? <div className="emptyState"><Shield size={18} />No policy traces yet.</div> : null}
+          </div>
+        </Section>
+
         <Section title="Tool Proxy Monitor" icon={<Shield size={18} />}>
           <div className="dataTable toolTable">
             <div className="dataTableHead">
@@ -599,12 +802,12 @@ function App() {
             {toolLogs.items.slice(-8).reverse().map((item, index) => (
               <div className="dataTableRow" key={index}>
                 <span>{String(item.tool ?? "-")}</span>
-                <span>{String(item.operation ?? (Array.isArray(item.command) ? "shell" : "policy"))}</span>
+                <span>{String(item.action_type ?? item.operation ?? (Array.isArray(item.command) ? "shell" : "policy"))}</span>
                 <StatusPill value={String(item.status ?? "unknown")} />
-                <code>{toolTarget(item)}</code>
+                <code>{String(item.target ?? toolTarget(item))}</code>
                 <span>{String(item.approved_by ?? "-")}</span>
-                <code>{compactJson(item.returncode ?? item.reason ?? item.stderr, "ok")}</code>
-                <small>{String(item.timestamp ?? "")}</small>
+                <code>{compactJson(item.result_summary ?? item.returncode ?? item.reason ?? item.stderr, "ok")}</code>
+                <small>{String(item.recorded_at ?? item.timestamp ?? "")}</small>
               </div>
             ))}
             {!toolLogs.items.length ? <div className="emptyState"><Shield size={18} />No tool calls yet.</div> : null}
@@ -652,6 +855,40 @@ function App() {
           <JsonBlock value={mvpStatus ?? { status: "not loaded" }} />
         </Section>
       </section>
+
+      <section className="workspaceGrid">
+        <Section title="State / Heartbeat" icon={<BookOpen size={18} />}>
+          <div className="stateDefinitionGrid">
+            {stateDefinitions.map((definition) => (
+              <div className="stateDefinitionItem" key={String(definition.id)}>
+                <strong>{String(definition.id)}</strong>
+                <span>{String(definition.owner ?? "-")}</span>
+                <small>{String(definition.freshness ?? "-")}</small>
+              </div>
+            ))}
+          </div>
+          <pre className="heartbeatBlock">{heartbeat || "heartbeat not loaded"}</pre>
+        </Section>
+
+        <Section title="Agent Contract" icon={<Bot size={18} />}>
+          <JsonBlock value={agentContract ?? { status: "not loaded" }} />
+        </Section>
+      </section>
+
+      <section className="logGrid single">
+        <Section title="Implementation Phases" icon={<ListChecks size={18} />}>
+          <div className="phaseGrid">
+            {phases.map((phase) => (
+              <div className="phaseItem" key={String(phase.phase)}>
+                <strong>{String(phase.phase)}</strong>
+                <span>{String(phase.name)}</span>
+                <StatusPill value={String(phase.status ?? "unknown")} />
+              </div>
+            ))}
+          </div>
+        </Section>
+      </section>
+
       <section className="logGrid">
         <Section title="Event Log" icon={<FileClock size={18} />}>
           <JsonBlock value={events.items.slice(-4).reverse()} />

@@ -116,6 +116,80 @@ h2 {
   font-size: 16px;
 }
 
+.setupGrid,
+.coverageGrid,
+.personaGrid,
+.moduleList,
+.stateDefinitionGrid,
+.phaseGrid,
+.traceSummary {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+}
+
+.setupGrid,
+.coverageGrid,
+.personaGrid,
+.stateDefinitionGrid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.traceSummary {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  padding-bottom: 10px;
+}
+
+.setupStep,
+.coverageItem,
+.personaItem,
+.moduleItem,
+.stateDefinitionItem,
+.phaseItem {
+  min-width: 0;
+  border: 1px solid #e3e7e3;
+  border-radius: 8px;
+  padding: 10px;
+  background: #fbfcfb;
+}
+
+.setupStep span,
+.stateDefinitionItem span,
+.phaseItem span {
+  display: block;
+  color: #65707d;
+  font-size: 12px;
+  font-weight: 800;
+  margin-bottom: 5px;
+}
+
+.setupStep small,
+.stateDefinitionItem small {
+  display: block;
+  color: #68727d;
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+}
+
+.coverageItem,
+.personaItem,
+.moduleItem,
+.phaseItem {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.personaItem.active {
+  border-color: #8fbab2;
+  background: #eef8f5;
+}
+
+.moduleList {
+  grid-template-columns: 1fr;
+}
+
 .workspaceGrid {
   display: grid;
   grid-template-columns: minmax(0, 1.25fr) minmax(320px, 0.75fr);
@@ -503,6 +577,20 @@ code {
     minmax(120px, 0.85fr);
 }
 
+.traceTable .dataTableHead,
+.traceTable .dataTableRow,
+.policyTable .dataTableHead,
+.policyTable .dataTableRow {
+  grid-template-columns:
+    minmax(120px, 0.75fr)
+    minmax(90px, 0.6fr)
+    minmax(110px, 0.7fr)
+    minmax(120px, 0.75fr)
+    minmax(150px, 1fr)
+    minmax(170px, 1.2fr);
+  min-width: 860px;
+}
+
 .memoryTable .dataTableHead,
 .memoryTable .dataTableRow {
   grid-template-columns:
@@ -605,6 +693,21 @@ code {
   overflow-wrap: anywhere;
 }
 
+.heartbeatBlock {
+  max-height: 180px;
+  overflow: auto;
+  margin: 0 14px 14px;
+  border: 1px solid #e3e7e3;
+  border-radius: 8px;
+  padding: 10px;
+  background: #fbfcfb;
+  color: #26323d;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .operationsGrid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
@@ -671,7 +774,12 @@ code {
 @media (max-width: 1100px) {
   .overviewGrid,
   .logGrid,
-  .operationsGrid {
+  .operationsGrid,
+  .setupGrid,
+  .coverageGrid,
+  .personaGrid,
+  .stateDefinitionGrid,
+  .traceSummary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -702,18 +810,32 @@ code {
   }
 
   .rollbackControls,
-  .dataTableHead,
-  .dataTableRow,
-  .toolTable .dataTableHead,
-  .toolTable .dataTableRow,
-  .memoryTable .dataTableHead,
-  .memoryTable .dataTableRow,
-  .writeLogItem {
+    .dataTableHead,
+    .dataTableRow,
+    .toolTable .dataTableHead,
+    .toolTable .dataTableRow,
+    .traceTable .dataTableHead,
+    .traceTable .dataTableRow,
+    .policyTable .dataTableHead,
+    .policyTable .dataTableRow,
+    .memoryTable .dataTableHead,
+    .memoryTable .dataTableRow,
+    .writeLogItem,
+    .setupGrid,
+    .coverageGrid,
+    .personaGrid,
+    .stateDefinitionGrid,
+    .traceSummary,
+    .phaseItem {
     grid-template-columns: 1fr;
   }
 
   .toolTable .dataTableHead,
   .toolTable .dataTableRow,
+  .traceTable .dataTableHead,
+  .traceTable .dataTableRow,
+  .policyTable .dataTableHead,
+  .policyTable .dataTableRow,
   .memoryTable .dataTableHead,
   .memoryTable .dataTableRow {
     min-width: 0;

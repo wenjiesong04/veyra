@@ -37,6 +37,12 @@ def get_json(path: str) -> dict[str, Any]:
     return response.json()
 
 
+def get_text(path: str) -> str:
+    response = client.get(path)
+    expect(response.status_code < 400, f"GET {path}", response.text)
+    return response.text
+
+
 def send_message(text: str) -> dict[str, Any]:
     return post_json(
         "/events/message",
@@ -54,6 +60,13 @@ def main() -> int:
 
     runtime = get_json("/runtime")
     expect(bool(runtime.get("identity", {}).get("name")), "runtime identity", runtime)
+
+    console = get_text("/console")
+    expect("Veyra Console" in console and "/console/assets/" in console, "web console shell", console[:200])
+
+    architecture = get_json("/architecture")
+    phases = {item.get("phase"): item.get("status") for item in architecture.get("implementation_phases", [])}
+    expect(phases.get("P5") == "completed", "P5 architecture status", phases)
 
     contract = get_json("/agent/contract")
     expect(contract.get("contract_version") == "veyra.agent_adapter.v1", "agent adapter contract", contract)
