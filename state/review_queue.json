@@ -516,6 +516,1762 @@
       "created_at": "2026-05-18T06:14:26.945928+00:00",
       "decided_at": "2026-05-18T06:14:26.950070+00:00",
       "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_724239937e46",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "ActionProposal requires human confirmation."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_724239937e46"
+      },
+      "created_at": "2026-05-18T06:51:10.904782+00:00",
+      "decided_at": "2026-05-18T06:51:10.906097+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_5d23c684b8a2",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "risk_policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "ActionProposal requires human confirmation."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_5d23c684b8a2"
+      },
+      "created_at": "2026-05-18T06:57:13.709798+00:00",
+      "decided_at": "2026-05-18T06:57:13.710752+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_47b3f96e19f6",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "risk_policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "ActionProposal requires human confirmation."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_47b3f96e19f6"
+      },
+      "created_at": "2026-05-18T06:58:26.800796+00:00",
+      "decided_at": "2026-05-18T06:58:26.801965+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_ec67963b6afc",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "risk_policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "ActionProposal requires human confirmation."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_ec67963b6afc"
+      },
+      "created_at": "2026-05-18T07:18:10.471806+00:00",
+      "decided_at": "2026-05-18T07:18:10.473036+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_042cf43c7a9c",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "risk_policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "foresight": {
+          "risk_level": "R4",
+          "risk_policy": {
+            "level": "R4",
+            "title": "high_impact",
+            "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+            "default_decision": "ask_user",
+            "requires_confirmation": true,
+            "requires_snapshot": true,
+            "examples": [
+              "restart service",
+              "deploy",
+              "sudo command",
+              "delete file"
+            ]
+          },
+          "reversible": "full",
+          "side_effects": [],
+          "safer_alternatives": []
+        },
+        "decision_trace": {
+          "route": "human_review",
+          "risk_level": "R4",
+          "reason": "self-test approved shell action",
+          "requires_confirmation": true,
+          "selected_probe": null,
+          "target_agent": null,
+          "intent": "action",
+          "complexity": "moderate",
+          "capability": "human_review",
+          "signals": [
+            "risk:R4",
+            "agent:self-test",
+            "action_proposal"
+          ],
+          "constraints": [
+            "explain impact",
+            "wait for explicit approval"
+          ]
+        },
+        "constraints": [
+          "explain impact",
+          "wait for explicit approval"
+        ],
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "Action needs confirmation because it may alter service, files, or data.",
+        "required_preconditions": [
+          "create snapshot if possible",
+          "explain downtime or data impact",
+          "ask user"
+        ],
+        "forbidden": [
+          "rm -rf",
+          "curl | bash",
+          "drop database",
+          "git push --force",
+          "externalize_secrets"
+        ],
+        "message_to_executor": "Pause and request user confirmation with impact and rollback notes."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_042cf43c7a9c"
+      },
+      "created_at": "2026-05-18T07:23:51.149398+00:00",
+      "decided_at": "2026-05-18T07:23:51.150408+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_77dcdd582012",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "risk_policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "foresight": {
+          "risk_level": "R4",
+          "risk_policy": {
+            "level": "R4",
+            "title": "high_impact",
+            "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+            "default_decision": "ask_user",
+            "requires_confirmation": true,
+            "requires_snapshot": true,
+            "examples": [
+              "restart service",
+              "deploy",
+              "sudo command",
+              "delete file"
+            ]
+          },
+          "reversible": "full",
+          "side_effects": [],
+          "safer_alternatives": []
+        },
+        "decision_trace": {
+          "route": "human_review",
+          "risk_level": "R4",
+          "reason": "self-test approved shell action",
+          "requires_confirmation": true,
+          "selected_probe": null,
+          "target_agent": null,
+          "intent": "action",
+          "complexity": "moderate",
+          "capability": "human_review",
+          "signals": [
+            "risk:R4",
+            "agent:self-test",
+            "action_proposal"
+          ],
+          "constraints": [
+            "explain impact",
+            "wait for explicit approval"
+          ]
+        },
+        "constraints": [
+          "explain impact",
+          "wait for explicit approval"
+        ],
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "Action needs confirmation because it may alter service, files, or data.",
+        "required_preconditions": [
+          "create snapshot if possible",
+          "explain downtime or data impact",
+          "ask user"
+        ],
+        "forbidden": [
+          "rm -rf",
+          "curl | bash",
+          "drop database",
+          "git push --force",
+          "externalize_secrets"
+        ],
+        "message_to_executor": "Pause and request user confirmation with impact and rollback notes."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_77dcdd582012"
+      },
+      "created_at": "2026-05-18T09:36:30.154657+00:00",
+      "decided_at": "2026-05-18T09:36:30.160361+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_2f539d19c485",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "risk_policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "foresight": {
+          "risk_level": "R4",
+          "risk_policy": {
+            "level": "R4",
+            "title": "high_impact",
+            "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+            "default_decision": "ask_user",
+            "requires_confirmation": true,
+            "requires_snapshot": true,
+            "examples": [
+              "restart service",
+              "deploy",
+              "sudo command",
+              "delete file"
+            ]
+          },
+          "reversible": "full",
+          "side_effects": [],
+          "safer_alternatives": []
+        },
+        "decision_trace": {
+          "route": "human_review",
+          "risk_level": "R4",
+          "reason": "self-test approved shell action",
+          "requires_confirmation": true,
+          "selected_probe": null,
+          "target_agent": null,
+          "intent": "action",
+          "complexity": "moderate",
+          "capability": "human_review",
+          "signals": [
+            "risk:R4",
+            "agent:self-test",
+            "action_proposal"
+          ],
+          "constraints": [
+            "explain impact",
+            "wait for explicit approval"
+          ]
+        },
+        "constraints": [
+          "explain impact",
+          "wait for explicit approval"
+        ],
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "Action needs confirmation because it may alter service, files, or data.",
+        "required_preconditions": [
+          "create snapshot if possible",
+          "explain downtime or data impact",
+          "ask user"
+        ],
+        "forbidden": [
+          "rm -rf",
+          "curl | bash",
+          "drop database",
+          "git push --force",
+          "externalize_secrets"
+        ],
+        "message_to_executor": "Pause and request user confirmation with impact and rollback notes."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_2f539d19c485"
+      },
+      "created_at": "2026-05-18T09:51:45.307537+00:00",
+      "decided_at": "2026-05-18T09:51:45.310481+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_0d35ff902eda",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "risk_policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "foresight": {
+          "risk_level": "R4",
+          "risk_policy": {
+            "level": "R4",
+            "title": "high_impact",
+            "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+            "default_decision": "ask_user",
+            "requires_confirmation": true,
+            "requires_snapshot": true,
+            "examples": [
+              "restart service",
+              "deploy",
+              "sudo command",
+              "delete file"
+            ]
+          },
+          "reversible": "full",
+          "side_effects": [],
+          "safer_alternatives": []
+        },
+        "decision_trace": {
+          "route": "human_review",
+          "risk_level": "R4",
+          "reason": "self-test approved shell action",
+          "requires_confirmation": true,
+          "selected_probe": null,
+          "target_agent": null,
+          "intent": "action",
+          "complexity": "moderate",
+          "capability": "human_review",
+          "signals": [
+            "risk:R4",
+            "agent:self-test",
+            "action_proposal"
+          ],
+          "constraints": [
+            "explain impact",
+            "wait for explicit approval"
+          ]
+        },
+        "constraints": [
+          "explain impact",
+          "wait for explicit approval"
+        ],
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "Action needs confirmation because it may alter service, files, or data.",
+        "required_preconditions": [
+          "create snapshot if possible",
+          "explain downtime or data impact",
+          "ask user"
+        ],
+        "forbidden": [
+          "rm -rf",
+          "curl | bash",
+          "drop database",
+          "git push --force",
+          "externalize_secrets"
+        ],
+        "message_to_executor": "Pause and request user confirmation with impact and rollback notes."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_0d35ff902eda"
+      },
+      "created_at": "2026-05-18T10:24:21.383217+00:00",
+      "decided_at": "2026-05-18T10:24:21.384817+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_ceb6e79fa03d",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "risk_policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "foresight": {
+          "risk_level": "R4",
+          "risk_policy": {
+            "level": "R4",
+            "title": "high_impact",
+            "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+            "default_decision": "ask_user",
+            "requires_confirmation": true,
+            "requires_snapshot": true,
+            "examples": [
+              "restart service",
+              "deploy",
+              "sudo command",
+              "delete file"
+            ]
+          },
+          "reversible": "full",
+          "side_effects": [],
+          "safer_alternatives": []
+        },
+        "decision_trace": {
+          "route": "human_review",
+          "risk_level": "R4",
+          "reason": "self-test approved shell action",
+          "requires_confirmation": true,
+          "selected_probe": null,
+          "target_agent": null,
+          "intent": "action",
+          "complexity": "moderate",
+          "capability": "human_review",
+          "signals": [
+            "risk:R4",
+            "agent:self-test",
+            "action_proposal"
+          ],
+          "constraints": [
+            "explain impact",
+            "wait for explicit approval"
+          ]
+        },
+        "constraints": [
+          "explain impact",
+          "wait for explicit approval"
+        ],
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "Action needs confirmation because it may alter service, files, or data.",
+        "required_preconditions": [
+          "create snapshot if possible",
+          "explain downtime or data impact",
+          "ask user"
+        ],
+        "forbidden": [
+          "rm -rf",
+          "curl | bash",
+          "drop database",
+          "git push --force",
+          "externalize_secrets"
+        ],
+        "message_to_executor": "Pause and request user confirmation with impact and rollback notes."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_ceb6e79fa03d"
+      },
+      "created_at": "2026-05-18T10:37:35.714653+00:00",
+      "decided_at": "2026-05-18T10:37:35.720239+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_3fa34151b3b2",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "risk_policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "foresight": {
+          "risk_level": "R4",
+          "risk_policy": {
+            "level": "R4",
+            "title": "high_impact",
+            "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+            "default_decision": "ask_user",
+            "requires_confirmation": true,
+            "requires_snapshot": true,
+            "examples": [
+              "restart service",
+              "deploy",
+              "sudo command",
+              "delete file"
+            ]
+          },
+          "reversible": "full",
+          "side_effects": [],
+          "safer_alternatives": []
+        },
+        "decision_trace": {
+          "route": "human_review",
+          "risk_level": "R4",
+          "reason": "self-test approved shell action",
+          "requires_confirmation": true,
+          "selected_probe": null,
+          "target_agent": null,
+          "intent": "action",
+          "complexity": "moderate",
+          "capability": "human_review",
+          "signals": [
+            "risk:R4",
+            "agent:self-test",
+            "action_proposal"
+          ],
+          "constraints": [
+            "explain impact",
+            "wait for explicit approval"
+          ]
+        },
+        "constraints": [
+          "explain impact",
+          "wait for explicit approval"
+        ],
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "Action needs confirmation because it may alter service, files, or data.",
+        "required_preconditions": [
+          "create snapshot if possible",
+          "explain downtime or data impact",
+          "ask user"
+        ],
+        "forbidden": [
+          "rm -rf",
+          "curl | bash",
+          "drop database",
+          "git push --force",
+          "externalize_secrets"
+        ],
+        "message_to_executor": "Pause and request user confirmation with impact and rollback notes."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_3fa34151b3b2"
+      },
+      "created_at": "2026-05-18T14:15:30.897695+00:00",
+      "decided_at": "2026-05-18T14:15:30.903238+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_ceec7d9822ed",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "risk_policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "foresight": {
+          "risk_level": "R4",
+          "risk_policy": {
+            "level": "R4",
+            "title": "high_impact",
+            "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+            "default_decision": "ask_user",
+            "requires_confirmation": true,
+            "requires_snapshot": true,
+            "examples": [
+              "restart service",
+              "deploy",
+              "sudo command",
+              "delete file"
+            ]
+          },
+          "reversible": "full",
+          "side_effects": [],
+          "safer_alternatives": []
+        },
+        "decision_trace": {
+          "route": "human_review",
+          "risk_level": "R4",
+          "reason": "self-test approved shell action",
+          "requires_confirmation": true,
+          "selected_probe": null,
+          "target_agent": null,
+          "intent": "action",
+          "complexity": "moderate",
+          "capability": "human_review",
+          "signals": [
+            "risk:R4",
+            "agent:self-test",
+            "action_proposal"
+          ],
+          "constraints": [
+            "explain impact",
+            "wait for explicit approval"
+          ]
+        },
+        "constraints": [
+          "explain impact",
+          "wait for explicit approval"
+        ],
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "Action needs confirmation because it may alter service, files, or data.",
+        "required_preconditions": [
+          "create snapshot if possible",
+          "explain downtime or data impact",
+          "ask user"
+        ],
+        "forbidden": [
+          "rm -rf",
+          "curl | bash",
+          "drop database",
+          "git push --force",
+          "externalize_secrets"
+        ],
+        "message_to_executor": "Pause and request user confirmation with impact and rollback notes."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_ceec7d9822ed"
+      },
+      "created_at": "2026-05-18T14:18:04.681653+00:00",
+      "decided_at": "2026-05-18T14:18:04.684185+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_b80a195cfae1",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "risk_policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "foresight": {
+          "risk_level": "R4",
+          "risk_policy": {
+            "level": "R4",
+            "title": "high_impact",
+            "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+            "default_decision": "ask_user",
+            "requires_confirmation": true,
+            "requires_snapshot": true,
+            "examples": [
+              "restart service",
+              "deploy",
+              "sudo command",
+              "delete file"
+            ]
+          },
+          "reversible": "full",
+          "side_effects": [],
+          "safer_alternatives": []
+        },
+        "decision_trace": {
+          "route": "human_review",
+          "risk_level": "R4",
+          "reason": "self-test approved shell action",
+          "requires_confirmation": true,
+          "selected_probe": null,
+          "target_agent": null,
+          "intent": "action",
+          "complexity": "moderate",
+          "capability": "human_review",
+          "signals": [
+            "risk:R4",
+            "agent:self-test",
+            "action_proposal"
+          ],
+          "constraints": [
+            "explain impact",
+            "wait for explicit approval"
+          ]
+        },
+        "constraints": [
+          "explain impact",
+          "wait for explicit approval"
+        ],
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "Action needs confirmation because it may alter service, files, or data.",
+        "required_preconditions": [
+          "create snapshot if possible",
+          "explain downtime or data impact",
+          "ask user"
+        ],
+        "forbidden": [
+          "rm -rf",
+          "curl | bash",
+          "drop database",
+          "git push --force",
+          "externalize_secrets"
+        ],
+        "message_to_executor": "Pause and request user confirmation with impact and rollback notes."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": null,
+      "created_at": "2026-05-20T06:05:18.667873+00:00",
+      "decided_at": "2026-05-20T06:05:18.674351+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_ae5fd019bcae",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "risk_policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "foresight": {
+          "risk_level": "R4",
+          "risk_policy": {
+            "level": "R4",
+            "title": "high_impact",
+            "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+            "default_decision": "ask_user",
+            "requires_confirmation": true,
+            "requires_snapshot": true,
+            "examples": [
+              "restart service",
+              "deploy",
+              "sudo command",
+              "delete file"
+            ]
+          },
+          "reversible": "full",
+          "side_effects": [],
+          "safer_alternatives": []
+        },
+        "decision_trace": {
+          "route": "human_review",
+          "risk_level": "R4",
+          "reason": "self-test approved shell action",
+          "requires_confirmation": true,
+          "selected_probe": null,
+          "target_agent": null,
+          "intent": "action",
+          "complexity": "moderate",
+          "capability": "human_review",
+          "signals": [
+            "risk:R4",
+            "agent:self-test",
+            "action_proposal"
+          ],
+          "constraints": [
+            "explain impact",
+            "wait for explicit approval"
+          ]
+        },
+        "constraints": [
+          "explain impact",
+          "wait for explicit approval"
+        ],
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "Action needs confirmation because it may alter service, files, or data.",
+        "required_preconditions": [
+          "create snapshot if possible",
+          "explain downtime or data impact",
+          "ask user"
+        ],
+        "forbidden": [
+          "rm -rf",
+          "curl | bash",
+          "drop database",
+          "git push --force",
+          "externalize_secrets"
+        ],
+        "message_to_executor": "Pause and request user confirmation with impact and rollback notes."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_ae5fd019bcae",
+        "tool_trace": {
+          "trace_id": "tool_0f0cf8394b82",
+          "tool": "safe_shell",
+          "action_type": "shell_command",
+          "target": [
+            "echo",
+            "veyra-approved"
+          ],
+          "status": "ok",
+          "risk_level": "R0",
+          "policy_decision": "allow",
+          "approved_by": "rev_ae5fd019bcae",
+          "snapshot_id": null,
+          "result_summary": "veyra-approved",
+          "recorded_at": "2026-05-20T06:05:43.595864+00:00",
+          "details": {
+            "status": "ok",
+            "stdout": "veyra-approved\n",
+            "stderr": "",
+            "returncode": 0,
+            "command": [
+              "echo",
+              "veyra-approved"
+            ],
+            "approved_by": "rev_ae5fd019bcae"
+          },
+          "timestamp": "2026-05-20T06:05:43.595905+00:00"
+        }
+      },
+      "created_at": "2026-05-20T06:05:43.579419+00:00",
+      "decided_at": "2026-05-20T06:05:43.585930+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_7e9e4fc1bc0a",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "risk_policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "foresight": {
+          "risk_level": "R4",
+          "risk_policy": {
+            "level": "R4",
+            "title": "high_impact",
+            "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+            "default_decision": "ask_user",
+            "requires_confirmation": true,
+            "requires_snapshot": true,
+            "examples": [
+              "restart service",
+              "deploy",
+              "sudo command",
+              "delete file"
+            ]
+          },
+          "reversible": "full",
+          "side_effects": [],
+          "safer_alternatives": []
+        },
+        "decision_trace": {
+          "route": "human_review",
+          "risk_level": "R4",
+          "reason": "self-test approved shell action",
+          "requires_confirmation": true,
+          "selected_probe": null,
+          "target_agent": null,
+          "intent": "action",
+          "complexity": "moderate",
+          "capability": "human_review",
+          "signals": [
+            "risk:R4",
+            "agent:self-test",
+            "action_proposal"
+          ],
+          "constraints": [
+            "explain impact",
+            "wait for explicit approval"
+          ]
+        },
+        "constraints": [
+          "explain impact",
+          "wait for explicit approval"
+        ],
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "Action needs confirmation because it may alter service, files, or data.",
+        "required_preconditions": [
+          "create snapshot if possible",
+          "explain downtime or data impact",
+          "ask user"
+        ],
+        "forbidden": [
+          "rm -rf",
+          "curl | bash",
+          "drop database",
+          "git push --force",
+          "externalize_secrets"
+        ],
+        "message_to_executor": "Pause and request user confirmation with impact and rollback notes."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_7e9e4fc1bc0a",
+        "tool_trace": {
+          "trace_id": "tool_51ed30f9e318",
+          "tool": "safe_shell",
+          "action_type": "shell_command",
+          "target": [
+            "echo",
+            "veyra-approved"
+          ],
+          "status": "ok",
+          "risk_level": "R0",
+          "policy_decision": "allow",
+          "approved_by": "rev_7e9e4fc1bc0a",
+          "snapshot_id": null,
+          "result_summary": "veyra-approved",
+          "recorded_at": "2026-05-20T06:15:38.381914+00:00",
+          "details": {
+            "status": "ok",
+            "stdout": "veyra-approved\n",
+            "stderr": "",
+            "returncode": 0,
+            "command": [
+              "echo",
+              "veyra-approved"
+            ],
+            "approved_by": "rev_7e9e4fc1bc0a"
+          },
+          "timestamp": "2026-05-20T06:15:38.381962+00:00"
+        }
+      },
+      "created_at": "2026-05-20T06:15:38.365405+00:00",
+      "decided_at": "2026-05-20T06:15:38.371994+00:00",
+      "decision_reason": "mvp_self_test"
+    },
+    {
+      "review_id": "rev_de6af14e08f7",
+      "event_id": "selftest_review_echo",
+      "task_text": "self-test approved shell action",
+      "risk_level": "R4",
+      "status": "approved",
+      "foresight": {
+        "risk_level": "R4",
+        "risk_policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "reversible": "full",
+        "side_effects": [],
+        "safer_alternatives": []
+      },
+      "guardian_decision": {
+        "policy": {
+          "level": "R4",
+          "title": "high_impact",
+          "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+          "default_decision": "ask_user",
+          "requires_confirmation": true,
+          "requires_snapshot": true,
+          "examples": [
+            "restart service",
+            "deploy",
+            "sudo command",
+            "delete file"
+          ]
+        },
+        "foresight": {
+          "risk_level": "R4",
+          "risk_policy": {
+            "level": "R4",
+            "title": "high_impact",
+            "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+            "default_decision": "ask_user",
+            "requires_confirmation": true,
+            "requires_snapshot": true,
+            "examples": [
+              "restart service",
+              "deploy",
+              "sudo command",
+              "delete file"
+            ]
+          },
+          "reversible": "full",
+          "side_effects": [],
+          "safer_alternatives": []
+        },
+        "decision_trace": {
+          "route": "human_review",
+          "risk_level": "R4",
+          "reason": "self-test approved shell action",
+          "requires_confirmation": true,
+          "selected_probe": null,
+          "target_agent": null,
+          "intent": "action",
+          "complexity": "moderate",
+          "capability": "human_review",
+          "signals": [
+            "risk:R4",
+            "agent:self-test",
+            "action_proposal"
+          ],
+          "constraints": [
+            "explain impact",
+            "wait for explicit approval"
+          ]
+        },
+        "constraints": [
+          "explain impact",
+          "wait for explicit approval"
+        ],
+        "decision": "ask_user",
+        "risk_level": "R4",
+        "reason": "Action needs confirmation because it may alter service, files, or data.",
+        "required_preconditions": [
+          "create snapshot if possible",
+          "explain downtime or data impact",
+          "ask user"
+        ],
+        "forbidden": [
+          "rm -rf",
+          "curl | bash",
+          "drop database",
+          "git push --force",
+          "externalize_secrets"
+        ],
+        "message_to_executor": "Pause and request user confirmation with impact and rollback notes."
+      },
+      "proposal": {
+        "proposal_id": "selftest_review_echo",
+        "task_id": null,
+        "agent": "self-test",
+        "action": {
+          "type": "shell_command",
+          "command": [
+            "echo",
+            "veyra-approved"
+          ]
+        },
+        "risk_guess": "R4",
+        "reversible": "yes",
+        "reason": "self-test approved shell action"
+      },
+      "execution_result": {
+        "status": "ok",
+        "stdout": "veyra-approved\n",
+        "stderr": "",
+        "returncode": 0,
+        "command": [
+          "echo",
+          "veyra-approved"
+        ],
+        "approved_by": "rev_de6af14e08f7",
+        "tool_trace": {
+          "trace_id": "tool_93b6b63abba0",
+          "tool": "safe_shell",
+          "action_type": "shell_command",
+          "target": [
+            "echo",
+            "veyra-approved"
+          ],
+          "status": "ok",
+          "risk_level": "R0",
+          "policy_decision": "allow",
+          "approved_by": "rev_de6af14e08f7",
+          "snapshot_id": null,
+          "result_summary": "veyra-approved",
+          "recorded_at": "2026-05-20T06:16:54.419932+00:00",
+          "details": {
+            "status": "ok",
+            "stdout": "veyra-approved\n",
+            "stderr": "",
+            "returncode": 0,
+            "command": [
+              "echo",
+              "veyra-approved"
+            ],
+            "approved_by": "rev_de6af14e08f7"
+          },
+          "timestamp": "2026-05-20T06:16:54.419952+00:00"
+        }
+      },
+      "created_at": "2026-05-20T06:16:54.411992+00:00",
+      "decided_at": "2026-05-20T06:16:54.414558+00:00",
+      "decision_reason": "mvp_self_test"
     }
   ],
   "updated_at": "2026-05-14T09:02:44.422096+00:00"

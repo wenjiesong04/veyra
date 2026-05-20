@@ -17,6 +17,7 @@ from core.task_packet_builder import TaskPacketBuilder
 from core.verifier import Verifier
 from core.world_state import WorldStateStore
 from guardian.review_queue import ReviewQueue
+from interface.agent_contract import NON_TERMINAL_STATUSES
 from interface.agent_adapter import ExecutionResult
 from interface.agent_registry import AgentRegistry
 from interface.event_schema import LoopResult, Route, VeyraEvent
@@ -51,7 +52,7 @@ class AwarenessLoop:
         self.runtime_entity.set_selected_agent(self.agent_registry.selected_name())
         self.agent_adapter = self.agent_registry.selected()
         self.review_queue = ReviewQueue(state_store)
-        self.memory_bridge = LocalMemoryBridge(state_store)
+        self.memory_bridge = LocalMemoryBridge(state_store, adapter_resolver=lambda: self.agent_registry.selected())
         self.execution_trace = ExecutionTrace(state_store)
         self.skill_loader = SkillLoader()
         self.skill_runtime = SkillRuntime(state_store)
@@ -129,7 +130,7 @@ class AwarenessLoop:
         elif decision.route == Route.AGENT:
             self.agent_adapter = self.agent_registry.selected()
             selected_agent = decision.target_agent or self.agent_registry.selected_name()
-            memory_summary = self.memory_bridge.read_summary(event.source.session_id)
+            memory_summary = self.memory_bridge.read_summary(event.source.session_id, attention_focus)
             context_patch = self.context_builder.build(text, attention_focus)
             context_patch["memory_summary"] = memory_summary
             agent_memory_summary = self.agent_adapter.fetch_memory_summary(event.source.session_id)
@@ -143,6 +144,7 @@ class AwarenessLoop:
                 context_patch=context_patch,
             )
             execution = self.agent_adapter.send_task(packet)
+            execution = self._poll_if_needed(execution)
             verified = self.verifier.verify_execution_result(execution)
             memory_write = None
             if verified.get("needs_memory_patch"):
@@ -306,6 +308,7 @@ class AwarenessLoop:
             "task_state.json",
             {"current_task": {"event_id": event.event_id, "route": result.route.value, "status": result.status}},
         )
+        self._append_task_history(event, result)
         self.state_store.append_jsonl(
             "action_record.jsonl",
             {"event_id": event.event_id, "route": result.route.value, "status": result.status, "artifacts": result.artifacts},
@@ -313,3 +316,33 @@ class AwarenessLoop:
         self.agent_adapter = self.agent_registry.selected()
         self.state_store.patch_json("executor_state.json", {"selected_agent": self.agent_registry.selected_name(), **self.agent_adapter.connection_status()})
         self.runtime_entity.set_idle()
+
+    def _poll_if_needed(self, execution: ExecutionResult) -> ExecutionResult:
+        if execution.status not in NON_TERMINAL_STATUSES:
+            return execution
+        try:
+            polled = self.agent_adapter.poll_task(execution.task_id, timeout_seconds=2.0, interval_seconds=0.5)
+        except Exception as exc:  # Adapter polling must not erase the submitted evidence.
+            execution.raw["poll_error"] = str(exc)
+            return execution
+        if polled.status == "adapter_unconfigured":
+            return execution
+        if polled.status in NON_TERMINAL_STATUSES and not polled.result:
+            polled.result = execution.result
+        if not polled.raw:
+            polled.raw = execution.raw
+        return polled
+
+    def _append_task_history(self, event: VeyraEvent, result: LoopResult) -> None:
+        state = self.state_store.read_json("task_state.json")
+        history = state.setdefault("history", [])
+        history.append(
+            {
+                "event_id": event.event_id,
+                "route": result.route.value,
+                "status": result.status,
+                "risk_level": result.risk_level.value,
+            }
+        )
+        state["history"] = history[-100:]
+        self.state_store.write_json("task_state.json", state)

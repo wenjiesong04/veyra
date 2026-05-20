@@ -149,7 +149,7 @@ P2 已将 Tool Proxy 接入统一策略审查：
 | P3 | Agent adapter execution contracts | Completed |
 | P4 | Rollback, audit, and verifier depth | Completed |
 | P5 | Web Control Console completeness | Completed |
-| P6 | End-to-end runtime hardening | Pending |
+| P6 | End-to-end runtime hardening | In progress |
 | P7 | Production operations and safety validation | Pending |
 
 ## Agent Adapter Contract
@@ -201,7 +201,16 @@ P5 已将 `/console` 补为 Awareness & Agent Control Console：
 
 ## P5 之后
 
-P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块：
+P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块。当前 P6 已补上第一批后端硬化：
+
+- AgentAdapter 增加任务状态 polling / stop API，Verifier 能区分 submitted / running / pending。
+- ActionProposal 会按真实动作文本提升风险等级，R0-R2 走 Tool Proxy，R3-R4 进 review，R5 阻断。
+- AgencyCore 写入 intention queue，proactive check 会对 state gap 做 Foresight + Guardian 审查。
+- network / web / hermes / mcp probe 改为真实只读探测，并由 PerceptionLayer 标记常见异常。
+- Memory Bridge 增加外部 adapter hook、敏感信息阻断和 freshness / trust 标记。
+- P7 增加非破坏性红队安全检查和日志保留策略摘要 API。
+
+后续仍需要：
 
 - P6：端到端真实运行硬化，包括 OpenClaw/Hermes/Custom Agent 真实连接测试、失败恢复、长任务停止、结果回传、状态过期刷新。
-- P7：生产运维和安全验证，包括高危动作红队测试、敏感信息泄露测试、日志留存策略、部署配置、监控告警和长期 heartbeat。
+- P7：继续补部署配置、监控告警、长期 heartbeat 和真实环境 soak test。

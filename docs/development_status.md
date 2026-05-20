@@ -26,8 +26,8 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | P3 Agent adapter execution contracts | Completed | `veyra.agent_adapter.v1`, OpenClaw WebSocket adapter, Hermes/Custom HTTP adapter, compatibility negotiation |
 | P4 Rollback / Audit / Verifier depth | Completed | Verifier verdicts, execution trace, tool trace, rollback checksum/diff/restore evidence |
 | P5 Web Control Console completeness | Completed | Console surfaces for setup, awareness, runtime, review, persona, state/logs, tool proxy, rollback/audit |
-| P6 End-to-end runtime hardening | Pending | Real multi-runtime soak tests, long-task polling, failure recovery |
-| P7 Production operations and safety validation | Pending | Red-team safety tests, deployment hardening, monitoring/retention policy |
+| P6 End-to-end runtime hardening | In progress | Task polling/stop API, ActionProposal hardening, Agency intentions, real probe envelopes, external-memory bridge slots |
+| P7 Production operations and safety validation | Started | Non-destructive red-team validation and retention summary API exist; deployment monitoring remains pending |
 
 ## Eight Architecture Blocks
 
@@ -88,8 +88,8 @@ The current codebase follows the original design direction:
 
 Remaining gaps before calling it a complete Veyra runtime:
 
-- Full Agency Core intention queue and long-running stewardship are not complete.
-- Real external Memory Bridge adapters are not complete.
-- Browser/API execution is policy-reviewed but not wired to real external executors by default.
+- Long-running stewardship and real multi-runtime soak tests are not complete.
+- External Memory Bridge hooks exist, but production OpenClaw/Hermes memory semantics still need runtime validation.
+- Browser/API execution has pluggable executors, but remains disabled by default.
 - Replayable Agent Runtime and time-travel debugging are not implemented.
-- P6/P7 production hardening, red-team safety tests, and deployment monitoring remain pending.
+- P7 deployment hardening, monitoring alerts, and long-running soak tests remain pending.

@@ -6,6 +6,7 @@ from typing import Any
 
 from interface.agent_contract import (
     AGENT_CONTRACT_VERSION,
+    TERMINAL_STATUSES,
     normalize_capabilities,
     normalize_execution_payload,
     render_prompt_payload,
@@ -56,6 +57,28 @@ class AgentAdapter(ABC):
 
     def write_memory_patch(self, memory_patch: dict[str, Any]) -> None:
         return None
+
+    def fetch_task_status(self, task_id: str) -> ExecutionResult:
+        return ExecutionResult(
+            task_id=task_id,
+            executor="unknown",
+            status="adapter_unconfigured",
+            result="Agent adapter does not expose task status polling.",
+            raw={"configured": False},
+        )
+
+    def poll_task(self, task_id: str, timeout_seconds: float = 0.0, interval_seconds: float = 1.0) -> ExecutionResult:
+        if timeout_seconds <= 0:
+            return self.fetch_task_status(task_id)
+
+        import time
+
+        deadline = time.monotonic() + timeout_seconds
+        last = self.fetch_task_status(task_id)
+        while last.status not in TERMINAL_STATUSES and time.monotonic() < deadline:
+            time.sleep(max(0.05, interval_seconds))
+            last = self.fetch_task_status(task_id)
+        return last
 
     def receive_result(self, raw_result: dict[str, Any]) -> ExecutionResult:
         payload = normalize_execution_payload(raw_result, default_task_id="unknown", default_executor="unknown", default_status="unknown")

@@ -55,10 +55,10 @@ class Verifier:
                 "needs_rollback": False,
                 "needs_memory_patch": False,
             }
-        if status == "submitted":
+        if status in {"submitted", "running", "pending"}:
             return {
                 "status": "partially_success",
-                "verdict": "execution_submitted_but_not_final",
+                "verdict": f"execution_{status}_but_not_final",
                 "confidence": 0.55,
                 "evidence": evidence,
                 "next_action": "poll_runtime_or_probe_result",

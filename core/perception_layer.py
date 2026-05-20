@@ -26,6 +26,12 @@ class PerceptionLayer:
             "ttl_seconds": ttl_seconds,
             "confidence": confidence,
         }
+        anomaly = self._detect_anomaly(enriched)
+        if anomaly:
+            enriched["anomaly"] = anomaly
+            details = dict(enriched.get("details") or {})
+            details["anomaly"] = anomaly
+            enriched["details"] = details
         local_world = self.state_store.read_json("local_world.json")
         probes = local_world.setdefault("probes", {})
         probes[probe_name] = enriched
@@ -104,3 +110,22 @@ class PerceptionLayer:
     def _compact_evidence(self, probe_result: dict[str, Any]) -> dict[str, Any]:
         skipped = {"claims", "details"}
         return {key: value for key, value in probe_result.items() if key not in skipped}
+
+    def _detect_anomaly(self, probe_result: dict[str, Any]) -> dict[str, str] | None:
+        text = " ".join(
+            [
+                str(probe_result.get("status", "")),
+                str(probe_result.get("summary", "")),
+                str(probe_result.get("details", "")),
+            ]
+        ).lower()
+        patterns = {
+            "connection_refused": ["connection refused", "errno 61", "connect call failed"],
+            "timeout": ["timed out", "timeout"],
+            "auth_required": ["auth", "unauthorized", "forbidden", "token", "password"],
+            "protocol_mismatch": ["protocol mismatch", "unsupported protocol", "incompatible_gateway"],
+        }
+        for kind, markers in patterns.items():
+            if any(marker in text for marker in markers):
+                return {"kind": kind, "next_action": "refresh_probe" if kind in {"timeout", "connection_refused"} else "request_configuration"}
+        return None

@@ -160,6 +160,54 @@ class OpenClawAdapter(AgentAdapter):
     def write_memory_patch(self, memory_patch: dict[str, Any]) -> None:
         return None
 
+    def fetch_task_status(self, task_id: str) -> ExecutionResult:
+        if not self.gateway_url:
+            return ExecutionResult(
+                task_id=task_id,
+                executor="openclaw",
+                status="adapter_unconfigured",
+                result="OpenClaw adapter is not connected. Configure OPENCLAW_GATEWAY_URL or OPENCLAW_BASE_URL before polling tasks.",
+                raw={"configured": False},
+            )
+        try:
+            status = self._gateway_request("status", {})
+        except OpenClawGatewayError as exc:
+            return ExecutionResult(
+                task_id=task_id,
+                executor="openclaw",
+                status=exc.status,
+                result=f"OpenClaw task status request failed: {exc.message}",
+                raw=self._redact_payload({"error": exc.details}),
+            )
+        tasks = status.get("tasks") if isinstance(status.get("tasks"), dict) else {}
+        active = tasks.get("active")
+        known_task = self._find_task(status, task_id)
+        if known_task:
+            state = str(known_task.get("state") or known_task.get("status") or "running")
+            normalized = "success" if state in {"final", "done", "completed"} else "error" if state in {"error", "failed"} else "running"
+            return ExecutionResult(
+                task_id=task_id,
+                executor="openclaw",
+                status=normalized,
+                result=str(known_task.get("result") or known_task.get("message") or f"OpenClaw task {task_id} is {normalized}."),
+                raw=self._redact_payload({"task": known_task, "status": status}),
+            )
+        if isinstance(active, int) and active > 0:
+            return ExecutionResult(
+                task_id=task_id,
+                executor="openclaw",
+                status="running",
+                result=f"OpenClaw has {active} active task(s); task {task_id} has not reached a final event yet.",
+                raw=self._redact_payload({"status": status}),
+            )
+        return ExecutionResult(
+            task_id=task_id,
+            executor="openclaw",
+            status="submitted",
+            result=f"OpenClaw task {task_id} is not present in the current status snapshot.",
+            raw=self._redact_payload({"status": status}),
+        )
+
     def stop_task(self, task_id: str) -> bool:
         if not self.gateway_url:
             return False
@@ -235,6 +283,7 @@ class OpenClawAdapter(AgentAdapter):
                 "rendered_prompt_fallback": True,
                 "memory_summary": True,
                 "memory_patch": True,
+                "task_status": True,
                 "stop_task": True,
                 "tool_proxy_enforced": True,
             },
@@ -630,6 +679,22 @@ class OpenClawAdapter(AgentAdapter):
         enabled = [item for item in items if isinstance(item, dict) and item.get("disabled") is not True]
         eligible = [item for item in items if isinstance(item, dict) and item.get("eligible") is True]
         return {"skill_count": len(items), "enabled_count": len(enabled), "eligible_count": len(eligible)}
+
+    def _find_task(self, payload: Any, task_id: str) -> dict[str, Any] | None:
+        if isinstance(payload, dict):
+            candidates = [payload.get("runId"), payload.get("run_id"), payload.get("task_id"), payload.get("id")]
+            if task_id in {str(item) for item in candidates if item is not None}:
+                return payload
+            for value in payload.values():
+                found = self._find_task(value, task_id)
+                if found:
+                    return found
+        if isinstance(payload, list):
+            for item in payload:
+                found = self._find_task(item, task_id)
+                if found:
+                    return found
+        return None
 
     def _redact_payload(self, value: Any) -> Any:
         # Treat gateway payloads as hostile-by-default: recurse through nested events

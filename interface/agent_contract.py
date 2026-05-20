@@ -76,6 +76,7 @@ def normalize_capabilities(
         "rendered_prompt_fallback": True,
         "memory_summary": True,
         "memory_patch": True,
+        "task_status": True,
         "stop_task": True,
         **(data.get("features") if isinstance(data.get("features"), dict) else {}),
     }

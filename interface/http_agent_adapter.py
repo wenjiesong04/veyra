@@ -23,6 +23,7 @@ class AgentHttpConfig:
     capabilities_path: str = "/capabilities"
     memory_summary_path: str = "/memory/summary"
     memory_patch_path: str = "/memory/patch"
+    status_path_template: str = "/tasks/{task_id}"
     stop_path_template: str = "/tasks/{task_id}/stop"
 
 
@@ -46,6 +47,7 @@ class HttpAgentAdapter(AgentAdapter):
             capabilities_path=str(overrides.get("capabilities_path") or os.getenv(f"{env_prefix}_CAPABILITIES_PATH", "/capabilities")),
             memory_summary_path=str(overrides.get("memory_summary_path") or os.getenv(f"{env_prefix}_MEMORY_SUMMARY_PATH", "/memory/summary")),
             memory_patch_path=str(overrides.get("memory_patch_path") or os.getenv(f"{env_prefix}_MEMORY_PATCH_PATH", "/memory/patch")),
+            status_path_template=str(overrides.get("status_path_template") or os.getenv(f"{env_prefix}_STATUS_PATH_TEMPLATE", "/tasks/{task_id}")),
             stop_path_template=str(overrides.get("stop_path_template") or os.getenv(f"{env_prefix}_STOP_PATH_TEMPLATE", "/tasks/{task_id}/stop")),
         )
         return cls(config)
@@ -106,6 +108,30 @@ class HttpAgentAdapter(AgentAdapter):
         if self.base_url:
             self._request("POST", self.config.memory_patch_path, memory_patch)
         return None
+
+    def fetch_task_status(self, task_id: str) -> ExecutionResult:
+        if not self.base_url:
+            return ExecutionResult(
+                task_id=task_id,
+                executor=self.config.name,
+                status="adapter_unconfigured",
+                result=f"{self.config.name} adapter is not connected. Configure its base_url before polling tasks.",
+                raw={"configured": False},
+            )
+        path = self.config.status_path_template.format(task_id=task_id)
+        try:
+            response = self._request("GET", path)
+        except RuntimeError as exc:
+            return ExecutionResult(
+                task_id=task_id,
+                executor=self.config.name,
+                status="error",
+                result=f"{self.config.name} task status request failed: {exc}",
+                raw={"error": str(exc)},
+            )
+        response.setdefault("task_id", task_id)
+        response.setdefault("executor", self.config.name)
+        return self.receive_result(response)
 
     def stop_task(self, task_id: str) -> bool:
         if not self.base_url:

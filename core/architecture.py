@@ -156,8 +156,8 @@ IMPLEMENTATION_PHASES: list[dict[str, str]] = [
     {"phase": "P3", "name": "Agent adapter execution contracts", "status": "completed"},
     {"phase": "P4", "name": "Rollback, audit, and verifier depth", "status": "completed"},
     {"phase": "P5", "name": "Web Control Console completeness", "status": "completed"},
-    {"phase": "P6", "name": "End-to-end runtime hardening", "status": "pending"},
-    {"phase": "P7", "name": "Production operations and safety validation", "status": "pending"},
+    {"phase": "P6", "name": "End-to-end runtime hardening", "status": "in_progress"},
+    {"phase": "P7", "name": "Production operations and safety validation", "status": "started"},
 ]
 
 

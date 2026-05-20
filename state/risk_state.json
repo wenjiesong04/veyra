@@ -1,5 +1,88 @@
 {
   "current_risk": "R4",
   "signals": [],
-  "updated_at": "2026-05-14T09:02:44.417129+00:00"
+  "updated_at": "2026-05-14T09:02:44.417129+00:00",
+  "levels": [
+    {
+      "level": "R0",
+      "title": "answer_only",
+      "description": "No tool execution and no side effect.",
+      "default_decision": "allow",
+      "requires_confirmation": false,
+      "requires_snapshot": false,
+      "examples": [
+        "direct explanation",
+        "cached state summary"
+      ]
+    },
+    {
+      "level": "R1",
+      "title": "read_only",
+      "description": "Read-only probes or state inspection with repeatable low cost.",
+      "default_decision": "allow",
+      "requires_confirmation": false,
+      "requires_snapshot": false,
+      "examples": [
+        "port check",
+        "git status",
+        "process list",
+        "log read"
+      ]
+    },
+    {
+      "level": "R2",
+      "title": "low_risk_write",
+      "description": "Small, scoped writes with clear rollback or reviewable diff.",
+      "default_decision": "allow_with_constraints",
+      "requires_confirmation": false,
+      "requires_snapshot": true,
+      "examples": [
+        "create a new file",
+        "small code edit",
+        "local git commit"
+      ]
+    },
+    {
+      "level": "R3",
+      "title": "medium_change",
+      "description": "Configuration, broad file, or stateful changes that need snapshot and review.",
+      "default_decision": "ask_user",
+      "requires_confirmation": true,
+      "requires_snapshot": true,
+      "examples": [
+        "modify config",
+        "overwrite files",
+        "database migration"
+      ]
+    },
+    {
+      "level": "R4",
+      "title": "high_impact",
+      "description": "Service, deployment, permission, external-cost, or hard-to-revert action.",
+      "default_decision": "ask_user",
+      "requires_confirmation": true,
+      "requires_snapshot": true,
+      "examples": [
+        "restart service",
+        "deploy",
+        "sudo command",
+        "delete file"
+      ]
+    },
+    {
+      "level": "R5",
+      "title": "forbidden_or_manual_takeover",
+      "description": "Destructive, secret-exfiltrating, or policy-bypassing action.",
+      "default_decision": "block",
+      "requires_confirmation": true,
+      "requires_snapshot": true,
+      "examples": [
+        "rm -rf",
+        "curl pipe bash",
+        "drop database",
+        "git push --force",
+        "externalize secrets"
+      ]
+    }
+  ]
 }

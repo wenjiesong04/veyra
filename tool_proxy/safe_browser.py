@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Callable
+
 from core.world_state import WorldStateStore
 from rollback_audit.policy_trace import PolicyTrace
 from rollback_audit.tool_trace import ToolTrace
@@ -7,9 +9,10 @@ from tool_proxy.tool_policy import ToolPolicy
 
 
 class SafeBrowser:
-    def __init__(self, state_store: WorldStateStore | None = None, policy: ToolPolicy | None = None) -> None:
+    def __init__(self, state_store: WorldStateStore | None = None, policy: ToolPolicy | None = None, executor: Callable[[str], dict] | None = None) -> None:
         self.state_store = state_store
         self.policy = policy or ToolPolicy()
+        self.executor = executor
         self.policy_trace = PolicyTrace(state_store)
         self.tool_trace = ToolTrace(state_store)
 
@@ -24,13 +27,19 @@ class SafeBrowser:
             result = {"status": "needs_confirmation", "url": url, "review": review}
             result["tool_trace"] = self._record("browser_open", url, result, review, approved_by)
             return result
-        result = {
-            "status": "not_configured",
-            "url": url,
-            "review": review,
-            "reason": "SafeBrowser policy passed, but browser execution is not configured in this runtime.",
-            "approved_by": approved_by,
-        }
+        if self.executor:
+            result = self.executor(url)
+            result.setdefault("url", url)
+            result.setdefault("review", review)
+            result.setdefault("approved_by", approved_by)
+        else:
+            result = {
+                "status": "not_configured",
+                "url": url,
+                "review": review,
+                "reason": "SafeBrowser policy passed, but browser execution is not configured in this runtime.",
+                "approved_by": approved_by,
+            }
         result["tool_trace"] = self._record("browser_open", url, result, review, approved_by)
         return result
 

@@ -7,8 +7,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from core.architecture import architecture_snapshot
+from core.agency_core import AgencyCore
 from core.awareness_loop import AwarenessLoop
-from core.definitions import RiskLevel, lifecycle_statuses, normalize_risk, operational_modes, risk_catalog
+from core.definitions import RiskLevel, classify_text_risk, lifecycle_statuses, normalize_risk, operational_modes, risk_catalog
 from core.foresight_engine import ForesightEngine
 from core.runtime_entity import RuntimeEntity
 from core.world_state import WorldStateStore
@@ -21,10 +22,12 @@ from pydantic import Field
 from rollback_audit.rollback_manager import RollbackManager
 from rollback_audit.diff_tracker import DiffTracker
 from runtime.proactive_checks import ProactiveChecks
+from runtime.retention_policy import RetentionPolicy
 from tool_proxy.safe_api import SafeAPI
 from tool_proxy.safe_browser import SafeBrowser
 from tool_proxy.safe_file import SafeFile
 from tool_proxy.safe_shell import SafeShell
+from runtime.safety_validation import SafetyValidation
 
 
 app = FastAPI(title="Veyra", version="0.1.0")
@@ -44,6 +47,9 @@ action_executor = ActionExecutor(state_store=state_store)
 foresight_engine = ForesightEngine()
 proactive_checks = ProactiveChecks(state_store)
 diff_tracker = DiffTracker()
+agency_core = AgencyCore(state_store)
+safety_validation = SafetyValidation()
+retention_policy = RetentionPolicy(state_store)
 
 
 class MessageRequest(BaseModel):
@@ -98,6 +104,7 @@ class AgentConfigRequest(BaseModel):
     capabilities_path: str | None = None
     memory_summary_path: str | None = None
     memory_patch_path: str | None = None
+    status_path_template: str | None = None
     stop_path_template: str | None = None
     protocol_min: int | None = None
     protocol_max: int | None = None
@@ -107,7 +114,7 @@ class ActionProposalRequest(BaseModel):
     proposal_id: str | None = None
     task_id: str | None = None
     agent: str = "external"
-    action: dict
+    action: dict[str, Any]
     risk_guess: str = "R2"
     reversible: str = "unknown"
     reason: str = ""
@@ -145,7 +152,9 @@ async def message(request: MessageRequest):
 
 @app.get("/state")
 async def state():
-    return state_store.read_all()
+    payload = state_store.read_all()
+    payload["agency"] = agency_core.state()
+    return payload
 
 
 @app.get("/architecture")
@@ -293,6 +302,21 @@ async def proactive_check():
     return proactive_checks.run_read_only()
 
 
+@app.get("/agency/intentions")
+async def agency_intentions():
+    return agency_core.state()
+
+
+@app.get("/ops/safety/red-team")
+async def ops_safety_red_team():
+    return safety_validation.run()
+
+
+@app.get("/ops/retention")
+async def ops_retention():
+    return retention_policy.summary()
+
+
 @app.get("/rollback/diff")
 async def rollback_diff(full: bool = False):
     return diff_tracker.git_diff_text() if full else diff_tracker.git_diff()
@@ -300,11 +324,17 @@ async def rollback_diff(full: bool = False):
 
 @app.post("/actions/proposals")
 async def action_proposal(request: ActionProposalRequest):
-    action_text = str(request.action.get("command") or request.action.get("path") or request.action)
+    validation_error = _validate_action_proposal(request)
+    if validation_error:
+        raise HTTPException(status_code=422, detail=validation_error)
+    action_text = _action_text(request.action)
     try:
-        risk_level = normalize_risk(request.risk_guess)
+        guessed_risk = normalize_risk(request.risk_guess)
     except ValueError:
-        risk_level = RiskLevel.R2
+        guessed_risk = RiskLevel.R2
+    detected_risk = classify_text_risk(action_text)
+    risk_order = list(RiskLevel)
+    risk_level = detected_risk if risk_order.index(detected_risk) > risk_order.index(guessed_risk) else guessed_risk
     risk = risk_level.value
     proposal_decision = _proposal_decision(risk_level, action_text, request)
     foresight = foresight_engine.predict_text_action(action_text, risk_level)
@@ -340,12 +370,79 @@ async def action_proposal(request: ActionProposalRequest):
             "proposal": request.model_dump(),
         }
     )
+    state_store.append_jsonl(
+        "action_record.jsonl",
+        {
+            "event_id": request.proposal_id or "direct_action",
+            "route": "native_tool",
+            "status": execution.get("status", "unknown"),
+            "artifacts": {"proposal": request.model_dump(), "guardian_decision": guardian_decision, "execution_result": execution},
+        },
+    )
     return {
         "status": execution.get("status", "unknown"),
         "decision": guardian_decision.get("decision", "allow"),
         "guardian_decision": guardian_decision,
         "execution_result": execution,
     }
+
+
+@app.get("/agent/tasks/{task_id}")
+async def agent_task_status(task_id: str):
+    awareness_loop.agent_adapter = awareness_loop.agent_registry.selected()
+    execution = awareness_loop.agent_adapter.fetch_task_status(task_id)
+    verified = awareness_loop.verifier.verify_execution_result(execution)
+    trace = awareness_loop.execution_trace.record(
+        {
+            "event_id": f"poll_{task_id}",
+            "route": "agent",
+            "task_id": execution.task_id,
+            "executor": execution.executor,
+            "status": verified["status"],
+            "execution_result": execution.to_dict(),
+            "verification": verified,
+        }
+    )
+    state_store.patch_json("task_state.json", {"current_task": {"task_id": task_id, "route": "agent", "status": verified["status"]}})
+    return {"execution_result": execution.to_dict(), "verification": verified, "execution_trace": trace}
+
+
+@app.post("/agent/tasks/{task_id}/stop")
+async def agent_task_stop(task_id: str):
+    awareness_loop.agent_adapter = awareness_loop.agent_registry.selected()
+    stopped = awareness_loop.agent_adapter.stop_task(task_id)
+    state_store.append_jsonl("action_record.jsonl", {"route": "agent_stop", "status": "stopped" if stopped else "not_stopped", "artifacts": {"task_id": task_id}})
+    return {"task_id": task_id, "stopped": stopped}
+
+
+def _validate_action_proposal(request: ActionProposalRequest) -> str | None:
+    action_type = request.action.get("type")
+    allowed = {"shell_command", "file_write", "file_read", "browser_open", "api_request"}
+    if action_type not in allowed:
+        return f"action.type must be one of {sorted(allowed)}"
+    if action_type == "shell_command" and not request.action.get("command"):
+        return "shell_command action requires command"
+    if action_type in {"file_write", "file_read"} and not request.action.get("path"):
+        return f"{action_type} action requires path"
+    if action_type == "browser_open" and not request.action.get("url"):
+        return "browser_open action requires url"
+    if action_type == "api_request" and not isinstance(request.action.get("payload"), dict):
+        return "api_request action requires payload object"
+    return None
+
+
+def _action_text(action: dict[str, Any]) -> str:
+    if action.get("type") == "shell_command":
+        command = action.get("command")
+        return " ".join(str(part) for part in command) if isinstance(command, list) else str(command)
+    if action.get("type") in {"file_write", "file_read"}:
+        return str(action.get("path") or action)
+    if action.get("type") == "browser_open":
+        return str(action.get("url") or action)
+    if action.get("type") == "api_request":
+        payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+        return f"{payload.get('method', 'GET')} {payload.get('url') or payload.get('endpoint') or ''}"
+    return str(action)
 
 
 def _proposal_decision(risk_level: RiskLevel, action_text: str, request: ActionProposalRequest) -> Decision:
@@ -446,6 +543,10 @@ async def mvp_status():
             "proactive_read_only_checks": True,
             "multi_agent_registry": True,
             "agent_adapter_contract": True,
+            "agent_task_polling": True,
+            "agency_intention_queue": True,
+            "real_probe_envelopes": True,
+            "external_memory_bridge_hooks": True,
             "web_console": console_dir.exists(),
         },
         "agent_runtime": {

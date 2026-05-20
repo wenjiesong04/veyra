@@ -117,6 +117,7 @@ class AgentRegistry:
             "capabilities_path": config.get("capabilities_path") or "/capabilities",
             "memory_summary_path": config.get("memory_summary_path") or "/memory/summary",
             "memory_patch_path": config.get("memory_patch_path") or "/memory/patch",
+            "status_path_template": config.get("status_path_template") or "/tasks/{task_id}",
             "stop_path_template": config.get("stop_path_template") or "/tasks/{task_id}/stop",
         }
         if kind == "openclaw":

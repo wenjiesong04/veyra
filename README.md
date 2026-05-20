@@ -49,8 +49,13 @@ Endpoints:
 - `POST /rollback/snapshot` create a file snapshot
 - `POST /rollback/{snapshot_id}/restore` restore a file snapshot
 - `GET /agent/status` inspect selected Agent adapter connection status
+- `GET /agent/tasks/{task_id}` poll selected Agent task status
+- `POST /agent/tasks/{task_id}/stop` request selected Agent task stop
 - `GET /agent/contract` inspect the AgentAdapter v1 contract
 - `GET /memory/summary` read local Memory Bridge summary
+- `GET /agency/intentions` read proactive Agency intention queue
+- `GET /ops/safety/red-team` run non-destructive safety validation cases
+- `GET /ops/retention` inspect append-only log retention status
 - `GET /console/` open the Veyra control console after the frontend is built
 
 Example:
