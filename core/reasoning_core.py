@@ -90,6 +90,42 @@ class CoreReasoning:
         self._trace("perception", result, {"probe": probe_result.get("probe"), "status": probe_result.get("status")})
         return result
 
+    def foresight_assist(
+        self,
+        *,
+        text: str,
+        risk_level: str,
+        rule_foresight: dict[str, Any],
+        decision: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        rule_context = {
+            "route": (decision or {}).get("route", ""),
+            "risk_level": risk_level,
+            "complexity": (decision or {}).get("complexity", ""),
+            "intent": (decision or {}).get("intent", ""),
+        }
+        if not self.should_assist("foresight", rule_context):
+            return {"status": "skipped"}
+        payload = {
+            "user_message": text,
+            "risk_level": risk_level,
+            "decision": redact_sensitive(decision or {}),
+            "rule_foresight": redact_sensitive(rule_foresight),
+            "task": "Predict operational impact, reversibility, assumptions, required preconditions, and safer alternatives.",
+        }
+        result = self.client.complete_json(
+            purpose="foresight",
+            system=(
+                "You are Veyra Core's foresight layer. Return strict JSON with optional "
+                "impact_summary, reversible, side_effects, required_preconditions, unsafe_assumptions, "
+                "safer_alternatives, and confidence. You may add caution but cannot approve execution "
+                "or lower risk."
+            ),
+            user=json.dumps(payload, ensure_ascii=False),
+        )
+        self._trace("foresight", result, {"risk_level": risk_level, "route": rule_context.get("route")})
+        return result
+
     def agency_assist(self, *, goals: dict[str, Any], world_state: dict[str, Any], rule_gaps: list[dict[str, Any]]) -> dict[str, Any]:
         if not self.should_assist("agency", {"route": "agent", "risk_level": "R1"}):
             return {"status": "skipped"}

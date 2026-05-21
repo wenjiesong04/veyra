@@ -52,7 +52,7 @@ class AwarenessLoop:
         self.belief = BeliefCore(state_store)
         self.uncertainty = UncertaintyCore()
         self.decision_core = DecisionCore(state_store=state_store, reasoning=self.core_reasoning)
-        self.foresight = ForesightEngine()
+        self.foresight = ForesightEngine(reasoning=self.core_reasoning)
         self.guardian = GuardianController()
         self.persona_engine = PersonaEngine()
         self.context_builder = ContextPatchBuilder(state_store)
@@ -91,7 +91,7 @@ class AwarenessLoop:
         belief_state = self.belief.refresh()
         decision = self.decision_core.decide(text=text, attention_focus=attention_focus)
         self.state_store.patch_json("risk_state.json", {"current_risk": decision.risk_level.value})
-        foresight = self.foresight.predict_text_action(text, decision.risk_level)
+        foresight = self.foresight.predict_text_action(text, decision.risk_level, decision=decision.to_dict())
         guardian_decision = self.guardian.review_text_action(text=text, decision=decision, foresight=foresight)
 
         if guardian_decision["decision"] == GuardianDecision.BLOCK.value:
@@ -149,7 +149,7 @@ class AwarenessLoop:
             self.agent_adapter = self.agent_registry.selected()
             selected_agent = decision.target_agent or self.agent_registry.selected_name()
             memory_summary = self.memory_bridge.read_summary(event.source.session_id, attention_focus)
-            context_patch = self.context_builder.build(text, attention_focus)
+            context_patch = self.context_builder.build(text, attention_focus, decision=decision.to_dict(), foresight=foresight)
             context_patch["memory_summary"] = memory_summary
             if decision.model_assist:
                 context_patch["core_reasoning"] = {

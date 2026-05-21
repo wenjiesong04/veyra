@@ -25,7 +25,7 @@ class ProactiveChecks:
         self.reasoning = reasoning or CoreReasoning(state_store)
         self.perception = PerceptionLayer(state_store, reasoning=self.reasoning)
         self.agency = AgencyCore(state_store, agency_root=agency_root, reasoning=self.reasoning)
-        self.foresight = ForesightEngine()
+        self.foresight = ForesightEngine(reasoning=self.reasoning)
         self.guardian = GuardianController()
 
     def run_read_only(self) -> dict:
@@ -73,7 +73,7 @@ class ProactiveChecks:
             signals=["agency:intention", f"risk:{risk.value}"],
             constraints=["read-only automatic execution" if risk == RiskLevel.R1 else "suggest only"],
         )
-        foresight = self.foresight.predict_text_action(text, risk)
+        foresight = self.foresight.predict_text_action(text, risk, decision=decision.to_dict())
         guardian = self.guardian.review_text_action(text=text, decision=decision, foresight=foresight)
         if risk == RiskLevel.R1 and guardian.get("decision") in {"allow", "allow_with_constraints"}:
             status = "executed_read_only"

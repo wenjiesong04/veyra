@@ -195,13 +195,13 @@ Core model flow:
 ```text
 User -> Veyra
   -> deterministic safety baseline + state snapshot
-  -> optional Core model reasoning for intent, route, perception, agency gaps, and solution outline
+  -> optional Core model reasoning for intent, route, foresight, perception, agency gaps, and solution outline
   -> deterministic risk clamp + Foresight + Guardian
   -> direct answer / probe / skill / selected AgentAdapter
   -> verifier + memory + perception state update
 ```
 
-The Core model is inside Veyra Core, not inside the selected Agent Runtime. It can improve understanding and planning, but it cannot lower a rule-detected risk level or bypass Guardian. Complex Agent tasks receive the Core model's solution outline and bounded context inside the `VeyraTaskPacket.context_patch`.
+The Core model is inside Veyra Core, not inside the selected Agent Runtime. It can improve understanding, planning, impact prediction, and precondition discovery, but it cannot lower a rule-detected risk level or bypass Guardian. Complex Agent tasks receive the Core model's solution outline, decision trace, foresight, executor state, and bounded context inside the `VeyraTaskPacket.context_patch`.
 
 The same capability can also be attached while configuring a selected runtime with `POST /agents/{name}/config` by setting `use_model_for_core`, `model_base_url`, `model_api_key_env`, and `model`. Top-level `/core/model/config` takes precedence when explicitly enabled.
 

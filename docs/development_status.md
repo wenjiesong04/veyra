@@ -51,12 +51,12 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | Attention Core | MVP implemented | Text-driven focus slice and context scoping |
 | Belief & Uncertainty Core | MVP implemented | Claim confidence, TTL, stale/conflict summaries |
 | WorldState | MVP implemented | Local JSON/JSONL state store and schema metadata |
-| Core Model / Reasoning | P6 implemented | OpenAI-compatible Core model config/status, redacted traces, model-assisted decision/perception/agency with rule fallback |
+| Core Model / Reasoning | P6 implemented | OpenAI-compatible Core model config/status, redacted traces, model-assisted decision/foresight/perception/agency with rule fallback |
 | Agency Core | P6 model-aware | Intention queue behavior exists; model can propose additional bounded state gaps, then Foresight/Guardian decides execute/suggest/review |
 | Perception Layer | P6 model-aware | Probe interpretation into state/belief patches; model can add grounded claims and anomaly interpretation |
 | Persona Engine | MVP implemented | Persona patch generation and operational mode display in console |
 | Decision Core | P6 model-aware | Deterministic safety baseline plus model-assisted intent, complexity, route, solution outline, signals, constraints; risk cannot be lowered by model |
-| Foresight Engine | MVP implemented | Risk impact, reversibility, safer alternatives for text/action review |
+| Foresight Engine | P6 model-aware | Risk impact, reversibility, safer alternatives, preconditions, and unsafe assumptions; model can add caution but cannot weaken rule impact |
 | Guardian / Execution Controller | MVP implemented | Risk policy, confirmation gate, block/allow decisions, tool proxy enforcement |
 | Verifier | P4 completed | Evidence-backed verdicts and rollback/probe/memory next actions |
 | Context / Patch Builder | MVP implemented | Context, policy, persona, task packet generation |
@@ -83,7 +83,7 @@ The current codebase follows the original design direction:
 - Veyra is not a replacement Agent Runtime; it governs a selected runtime.
 - Messages enter Veyra first; Veyra runs a deterministic safety baseline, optionally uses its Core model for understanding/planning, then applies Guardian before native execution or Agent delegation.
 - Simple tasks are handled directly or through probes/skills.
-- Complex Agent tasks receive state, background, policy, memory, and Core model solution outline through `VeyraTaskPacket.context_patch`.
+- Complex Agent tasks receive state, background, policy, memory, decision trace, foresight, and Core model solution outline through `VeyraTaskPacket.context_patch`.
 - High-risk actions go through Guardian, policy trace, review, and Tool Proxy.
 - Execution results now require verifier evidence instead of blind trust.
 - Rollback/Audit records snapshots, diffs, traces, and restores.

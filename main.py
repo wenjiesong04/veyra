@@ -48,7 +48,7 @@ safe_file = SafeFile(state_store=state_store)
 safe_browser = SafeBrowser(state_store=state_store)
 safe_api = SafeAPI(state_store=state_store)
 action_executor = ActionExecutor(state_store=state_store)
-foresight_engine = ForesightEngine()
+foresight_engine = ForesightEngine(reasoning=awareness_loop.core_reasoning)
 proactive_checks = ProactiveChecks(state_store, reasoning=awareness_loop.core_reasoning)
 diff_tracker = DiffTracker()
 agency_core = AgencyCore(state_store, reasoning=awareness_loop.core_reasoning)
@@ -419,7 +419,7 @@ async def action_proposal(request: ActionProposalRequest):
     risk_level = detected_risk if risk_order.index(detected_risk) > risk_order.index(guessed_risk) else guessed_risk
     risk = risk_level.value
     proposal_decision = _proposal_decision(risk_level, action_text, request)
-    foresight = foresight_engine.predict_text_action(action_text, risk_level)
+    foresight = foresight_engine.predict_text_action(action_text, risk_level, decision=proposal_decision.to_dict())
     guardian_decision = awareness_loop.guardian.review_text_action(
         text=action_text,
         decision=proposal_decision,

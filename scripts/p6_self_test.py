@@ -15,8 +15,11 @@ if str(ROOT) not in sys.path:
 
 import main as app_module  # noqa: E402
 from core.agency_core import AgencyCore  # noqa: E402
+from core.context_patch_builder import ContextPatchBuilder  # noqa: E402
 from core.awareness_loop import AwarenessLoop  # noqa: E402
 from core.decision_core import DecisionCore  # noqa: E402
+from core.definitions import RiskLevel  # noqa: E402
+from core.foresight_engine import ForesightEngine  # noqa: E402
 from core.model_client import CoreModelClient  # noqa: E402
 from core.perception_layer import PerceptionLayer  # noqa: E402
 from core.runtime_entity import RuntimeEntity  # noqa: E402
@@ -69,10 +72,17 @@ class FakePollingAdapter(AgentAdapter):
 
 
 class FakeCoreReasoning:
-    def __init__(self, decision: dict[str, Any] | None = None, perception: dict[str, Any] | None = None, agency: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        decision: dict[str, Any] | None = None,
+        perception: dict[str, Any] | None = None,
+        agency: dict[str, Any] | None = None,
+        foresight: dict[str, Any] | None = None,
+    ) -> None:
         self.decision = decision or {"status": "skipped"}
         self.perception = perception or {"status": "skipped"}
         self.agency = agency or {"status": "skipped"}
+        self.foresight = foresight or {"status": "skipped"}
 
     def status(self) -> dict[str, Any]:
         return {"enabled": True, "configured": True, "decision_mode": "always", "status": "configured"}
@@ -91,6 +101,9 @@ class FakeCoreReasoning:
 
     def agency_assist(self, *, goals: dict[str, Any], world_state: dict[str, Any], rule_gaps: list[dict[str, Any]]) -> dict[str, Any]:
         return self.agency
+
+    def foresight_assist(self, *, text: str, risk_level: str, rule_foresight: dict[str, Any], decision: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.foresight
 
 
 def reset_main_state(tmp: Path) -> TestClient:
@@ -114,6 +127,7 @@ def reset_main_state(tmp: Path) -> TestClient:
     app_module.safe_browser = SafeBrowser(state_store=state_store)
     app_module.safe_api = SafeAPI(state_store=state_store)
     app_module.action_executor = ActionExecutor(state_store=state_store)
+    app_module.foresight_engine = ForesightEngine(reasoning=loop.core_reasoning)
     app_module.proactive_checks = ProactiveChecks(state_store, agency_root=str(agency_root), reasoning=loop.core_reasoning)
     app_module.diff_tracker = DiffTracker()
     app_module.agency_core = AgencyCore(state_store, agency_root=agency_root, reasoning=loop.core_reasoning)
@@ -234,6 +248,31 @@ def main() -> int:
         )
         model_gaps = model_agency.detect_state_gap(goals={}, world_state=app_module.state_store.read_all())
         expect(any(gap.get("gap_id") == "model:missing_runtime_model" for gap in model_gaps), "core model can add agency state gap", model_gaps)
+
+        model_foresight = ForesightEngine(
+            reasoning=FakeCoreReasoning(
+                foresight={
+                    "status": "model_assisted",
+                    "reversible": "full",
+                    "impact_summary": "Restart can interrupt active sessions.",
+                    "side_effects": ["active session interruption"],
+                    "required_preconditions": ["confirm rollback command"],
+                    "safer_alternatives": ["probe logs before restart"],
+                    "unsafe_assumptions": ["service is stateless"],
+                    "confidence": 0.72,
+                }
+            )
+        ).predict_text_action("restart openclaw service", RiskLevel.R4, decision={"route": "human_review", "risk_level": "R4", "complexity": "moderate"})
+        expect(model_foresight["reversible"] == "partial", "model foresight cannot make rule impact less cautious", model_foresight)
+        expect("confirm rollback command" in model_foresight["required_preconditions"], "model foresight adds preconditions", model_foresight)
+
+        context_patch = ContextPatchBuilder(app_module.state_store).build(
+            "restart openclaw service",
+            ["openclaw"],
+            decision={"route": "human_review", "risk_level": "R4"},
+            foresight=model_foresight,
+        )
+        expect("decision_trace" in context_patch and "foresight" in context_patch and "executor_state" in context_patch, "context patch carries governance background", context_patch)
 
         agent_model_store = WorldStateStore(tmp / "agent-model-state")
         agent_model_config = agent_model_store.read_json("agent_config.json")
