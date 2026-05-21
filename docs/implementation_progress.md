@@ -204,11 +204,14 @@ P5 已将 `/console` 补为 Awareness & Agent Control Console：
 P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块。当前 P6 已补上第一批后端硬化：
 
 - AgentAdapter 增加任务状态 polling / stop API，Verifier 能区分 submitted / running / pending。
+- Agent pending task 会写入 `task_state.json`，支持批量刷新和 `/agent/results` 回调更新验证状态。
 - ActionProposal 会按真实动作文本提升风险等级，R0-R2 走 Tool Proxy，R3-R4 进 review，R5 阻断。
+- Core 增加 OpenAI-compatible 模型认知层：用户请求先进入 Veyra，规则给出安全基线，Core 模型增强意图/路由/状态理解/解决方案，再由 Foresight + Guardian 约束后原生处理或下发 Agent。
+- Agent 任务下发时会把 Core 模型生成的 solution outline 和 agent_context 放进 `VeyraTaskPacket.context_patch`；模型不能降低风险等级，也不能绕过 Tool Proxy / review。
 - AgencyCore 写入 intention queue，proactive check 会对 state gap 做 Foresight + Guardian 审查。
-- network / web / hermes / mcp probe 改为真实只读探测，并由 PerceptionLayer 标记常见异常。
+- network / web / hermes / mcp probe 改为真实只读探测，并由 PerceptionLayer 标记常见异常；stale belief 可通过只读 probe 刷新。
 - Memory Bridge 增加外部 adapter hook、敏感信息阻断和 freshness / trust 标记。
-- P7 增加非破坏性红队安全检查和日志保留策略摘要 API。
+- P7 增加非破坏性红队安全检查、日志保留策略摘要和 bounded soak API。
 
 后续仍需要：
 

@@ -6,6 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 from core.definitions import RiskLevel
+from core.reasoning_core import CoreReasoning, safe_model_risk
 from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
 
@@ -17,8 +18,9 @@ class AgencyCore:
     already run read-only probes, but R2+ intentions are suggestions or reviews.
     """
 
-    def __init__(self, state_store: WorldStateStore | None = None, agency_root: str | Path = "agency") -> None:
+    def __init__(self, state_store: WorldStateStore | None = None, agency_root: str | Path = "agency", reasoning: CoreReasoning | None = None) -> None:
         self.state_store = state_store
+        self.reasoning = reasoning or (CoreReasoning(state_store) if state_store else None)
         self.agency_root = Path(agency_root)
         self.intention_path = self.agency_root / "intention_queue.json"
         self.goals_path = self.agency_root / "goals.json"
@@ -83,7 +85,7 @@ class AgencyCore:
                 }
             )
 
-        return gaps
+        return self._merge_model_gaps(goals, world_state, gaps)
 
     def sync_intentions(self, world_state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         goals = self._read_json(self.goals_path, {})
@@ -156,3 +158,40 @@ class AgencyCore:
         if current:
             triggers.append(current)
         return triggers
+
+    def _merge_model_gaps(self, goals: dict[str, Any], world_state: dict[str, Any], gaps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not self.reasoning:
+            return gaps
+        assist = self.reasoning.agency_assist(goals=goals, world_state=world_state, rule_gaps=gaps)
+        if assist.get("status") != "model_assisted":
+            return gaps
+        raw_gaps = assist.get("state_gaps") or assist.get("gaps")
+        if not isinstance(raw_gaps, list):
+            return gaps
+        existing = {str(gap.get("gap_id")) for gap in gaps}
+        merged = list(gaps)
+        for index, raw_gap in enumerate(raw_gaps[:8]):
+            if not isinstance(raw_gap, dict):
+                continue
+            gap_id = str(raw_gap.get("gap_id") or f"model_gap_{index}").strip()
+            if not gap_id:
+                continue
+            if not gap_id.startswith("model:"):
+                gap_id = f"model:{gap_id}"
+            if gap_id in existing:
+                continue
+            existing.add(gap_id)
+            risk = safe_model_risk(raw_gap.get("risk_level"), RiskLevel.R2)
+            merged.append(
+                {
+                    "gap_id": gap_id,
+                    "target": str(raw_gap.get("target") or "world_state"),
+                    "observed_status": str(raw_gap.get("observed_status") or "needs_attention"),
+                    "risk_level": risk.value,
+                    "suggested_action": str(raw_gap.get("suggested_action") or "review_state_gap"),
+                    "action_text": str(raw_gap.get("action_text") or raw_gap.get("suggested_action") or "review model-detected state gap"),
+                    "confidence": raw_gap.get("confidence"),
+                    "source": "core_model",
+                }
+            )
+        return merged

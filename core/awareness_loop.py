@@ -12,6 +12,7 @@ from core.foresight_engine import ForesightEngine
 from core.guardian_controller import GuardianController
 from core.perception_layer import PerceptionLayer
 from core.persona_engine import PersonaEngine
+from core.reasoning_core import CoreReasoning
 from core.runtime_entity import RuntimeEntity
 from core.task_packet_builder import TaskPacketBuilder
 from core.verifier import Verifier
@@ -20,13 +21,21 @@ from guardian.review_queue import ReviewQueue
 from interface.agent_contract import NON_TERMINAL_STATUSES
 from interface.agent_adapter import ExecutionResult
 from interface.agent_registry import AgentRegistry
-from interface.event_schema import LoopResult, Route, VeyraEvent
+from interface.event_schema import Decision, LoopResult, Route, VeyraEvent
 from memory_bridge.local_memory_bridge import LocalMemoryBridge
 from probes.git_probe import GitProbe
+from probes.hermes_probe import HermesProbe
+from probes.file_probe import FileProbe
+from probes.log_probe import LogProbe
+from probes.mcp_probe import McpProbe
+from probes.network_probe import NetworkProbe
+from probes.openclaw_probe import OpenClawProbe
 from probes.port_probe import PortProbe
 from probes.process_probe import ProcessProbe
 from probes.system_probe import SystemProbe
+from probes.web_probe import WebProbe
 from rollback_audit.execution_trace import ExecutionTrace
+from runtime.agent_task_tracker import AgentTaskTracker
 from skills.skill_loader import SkillLoader
 from skills.skill_runtime import SkillRuntime
 
@@ -37,11 +46,12 @@ class AwarenessLoop:
     def __init__(self, state_store: WorldStateStore, runtime_entity: RuntimeEntity) -> None:
         self.state_store = state_store
         self.runtime_entity = runtime_entity
-        self.perception = PerceptionLayer(state_store)
+        self.core_reasoning = CoreReasoning(state_store)
+        self.perception = PerceptionLayer(state_store, reasoning=self.core_reasoning)
         self.attention = AttentionCore(state_store)
         self.belief = BeliefCore(state_store)
         self.uncertainty = UncertaintyCore()
-        self.decision_core = DecisionCore()
+        self.decision_core = DecisionCore(state_store=state_store, reasoning=self.core_reasoning)
         self.foresight = ForesightEngine()
         self.guardian = GuardianController()
         self.persona_engine = PersonaEngine()
@@ -54,6 +64,7 @@ class AwarenessLoop:
         self.review_queue = ReviewQueue(state_store)
         self.memory_bridge = LocalMemoryBridge(state_store, adapter_resolver=lambda: self.agent_registry.selected())
         self.execution_trace = ExecutionTrace(state_store)
+        self.task_tracker = AgentTaskTracker(state_store, self.execution_trace)
         self.skill_loader = SkillLoader()
         self.skill_runtime = SkillRuntime(state_store)
         self.probes = {
@@ -61,6 +72,13 @@ class AwarenessLoop:
             "git": GitProbe(),
             "port": PortProbe(),
             "process": ProcessProbe(),
+            "file": FileProbe(),
+            "log": LogProbe(),
+            "network": NetworkProbe(),
+            "web": WebProbe(),
+            "openclaw": OpenClawProbe(),
+            "hermes": HermesProbe(),
+            "mcp": McpProbe(),
         }
 
     def handle_event(self, event: VeyraEvent) -> LoopResult:
@@ -115,7 +133,7 @@ class AwarenessLoop:
                 event_id=event.event_id,
                 route=decision.route,
                 status="success",
-                response=self._direct_answer(text),
+                response=self._direct_answer(text, decision),
                 risk_level=decision.risk_level,
                 artifacts={
                     "attention": attention_focus,
@@ -133,6 +151,12 @@ class AwarenessLoop:
             memory_summary = self.memory_bridge.read_summary(event.source.session_id, attention_focus)
             context_patch = self.context_builder.build(text, attention_focus)
             context_patch["memory_summary"] = memory_summary
+            if decision.model_assist:
+                context_patch["core_reasoning"] = {
+                    "reason": decision.model_assist.get("reason"),
+                    "solution_outline": decision.model_assist.get("solution_outline", []),
+                    "agent_context": decision.model_assist.get("agent_context", {}),
+                }
             agent_memory_summary = self.agent_adapter.fetch_memory_summary(event.source.session_id)
             if agent_memory_summary.get("summary"):
                 context_patch["agent_memory_summary"] = agent_memory_summary
@@ -146,6 +170,12 @@ class AwarenessLoop:
             execution = self.agent_adapter.send_task(packet)
             execution = self._poll_if_needed(execution)
             verified = self.verifier.verify_execution_result(execution)
+            pending_task = self.task_tracker.register(
+                event_id=event.event_id,
+                route=decision.route.value,
+                execution=execution,
+                verification=verified,
+            )
             memory_write = None
             if verified.get("needs_memory_patch"):
                 memory_write = self.memory_bridge.write_patch(
@@ -162,6 +192,7 @@ class AwarenessLoop:
                 "execution_result": asdict(execution),
                 "verification": verified,
                 "memory_write": memory_write,
+                "pending_task": pending_task,
                 "decision": decision.to_dict(),
                 "guardian": guardian_decision,
             }
@@ -296,7 +327,10 @@ class AwarenessLoop:
             },
         )
 
-    def _direct_answer(self, text: str) -> str:
+    def _direct_answer(self, text: str, decision: Decision) -> str:
+        draft = decision.model_assist.get("draft_response") if decision.model_assist else ""
+        if draft:
+            return str(draft)
         if "veyra" in text.lower() or "是什么" in text:
             return "Veyra 是用于产出实时感知的虚拟实体：Awareness Entity + 高权限 Agent Core Middleware + Agent Governance Layer。"
         return "已由 Veyra 直接处理。当前请求不需要调用工具或 Agent。"

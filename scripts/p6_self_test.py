@@ -16,13 +16,16 @@ if str(ROOT) not in sys.path:
 import main as app_module  # noqa: E402
 from core.agency_core import AgencyCore  # noqa: E402
 from core.awareness_loop import AwarenessLoop  # noqa: E402
+from core.decision_core import DecisionCore  # noqa: E402
+from core.model_client import CoreModelClient  # noqa: E402
+from core.perception_layer import PerceptionLayer  # noqa: E402
 from core.runtime_entity import RuntimeEntity  # noqa: E402
 from core.verifier import Verifier  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
 from execution.action_executor import ActionExecutor  # noqa: E402
 from guardian.review_queue import ReviewQueue  # noqa: E402
 from interface.agent_adapter import AgentAdapter, ExecutionResult  # noqa: E402
-from interface.event_schema import VeyraTaskPacket  # noqa: E402
+from interface.event_schema import Route, VeyraTaskPacket  # noqa: E402
 from memory_bridge.local_memory_bridge import LocalMemoryBridge  # noqa: E402
 from probes.network_probe import NetworkProbe  # noqa: E402
 from probes.web_probe import WebProbe  # noqa: E402
@@ -31,6 +34,8 @@ from rollback_audit.rollback_manager import RollbackManager  # noqa: E402
 from runtime.proactive_checks import ProactiveChecks  # noqa: E402
 from runtime.retention_policy import RetentionPolicy  # noqa: E402
 from runtime.safety_validation import SafetyValidation  # noqa: E402
+from runtime.soak_runner import SoakRunner  # noqa: E402
+from runtime.state_refresh import StateRefresh  # noqa: E402
 from tool_proxy.safe_api import SafeAPI  # noqa: E402
 from tool_proxy.safe_browser import SafeBrowser  # noqa: E402
 from tool_proxy.safe_file import SafeFile  # noqa: E402
@@ -63,6 +68,31 @@ class FakePollingAdapter(AgentAdapter):
         return True
 
 
+class FakeCoreReasoning:
+    def __init__(self, decision: dict[str, Any] | None = None, perception: dict[str, Any] | None = None, agency: dict[str, Any] | None = None) -> None:
+        self.decision = decision or {"status": "skipped"}
+        self.perception = perception or {"status": "skipped"}
+        self.agency = agency or {"status": "skipped"}
+
+    def status(self) -> dict[str, Any]:
+        return {"enabled": True, "configured": True, "decision_mode": "always", "status": "configured"}
+
+    def is_enabled(self) -> bool:
+        return True
+
+    def should_assist(self, kind: str, rule_context: dict[str, Any]) -> bool:
+        return True
+
+    def decision_assist(self, *, text: str, attention_focus: list[str], rule_decision: dict[str, Any]) -> dict[str, Any]:
+        return self.decision
+
+    def perception_assist(self, probe_result: dict[str, Any]) -> dict[str, Any]:
+        return self.perception
+
+    def agency_assist(self, *, goals: dict[str, Any], world_state: dict[str, Any], rule_gaps: list[dict[str, Any]]) -> dict[str, Any]:
+        return self.agency
+
+
 def reset_main_state(tmp: Path) -> TestClient:
     state_store = WorldStateStore(tmp / "state")
     agency_root = tmp / "agency"
@@ -84,11 +114,21 @@ def reset_main_state(tmp: Path) -> TestClient:
     app_module.safe_browser = SafeBrowser(state_store=state_store)
     app_module.safe_api = SafeAPI(state_store=state_store)
     app_module.action_executor = ActionExecutor(state_store=state_store)
-    app_module.proactive_checks = ProactiveChecks(state_store, agency_root=str(agency_root))
+    app_module.proactive_checks = ProactiveChecks(state_store, agency_root=str(agency_root), reasoning=loop.core_reasoning)
     app_module.diff_tracker = DiffTracker()
-    app_module.agency_core = AgencyCore(state_store, agency_root=agency_root)
+    app_module.agency_core = AgencyCore(state_store, agency_root=agency_root, reasoning=loop.core_reasoning)
     app_module.safety_validation = SafetyValidation()
     app_module.retention_policy = RetentionPolicy(state_store)
+    app_module.state_refresh = StateRefresh(state_store, reasoning=loop.core_reasoning)
+    app_module.soak_runner = SoakRunner(
+        proactive_checks=app_module.proactive_checks,
+        task_tracker=loop.task_tracker,
+        state_refresh=app_module.state_refresh,
+        retention_policy=app_module.retention_policy,
+        safety_validation=app_module.safety_validation,
+        adapter_resolver=lambda: loop.agent_registry.selected(),
+        verifier=loop.verifier,
+    )
     return TestClient(app_module.app)
 
 
@@ -111,6 +151,108 @@ def main() -> int:
         )
         final = adapter.poll_task("fake_1", timeout_seconds=1, interval_seconds=0.01)
         expect(final.status == "success", "agent polling reaches terminal", final)
+        tracker = app_module.awareness_loop.task_tracker
+        pending_execution = ExecutionResult(task_id="retry_later", executor="fake", status="running", result="queued")
+        tracker.register(
+            event_id="evt_retry_later",
+            route="agent",
+            execution=pending_execution,
+            verification={"status": "partially_success", "next_action": "poll_runtime_or_probe_result"},
+        )
+        tracker.apply_result(
+            execution=ExecutionResult(task_id="retry_later", executor="fake", status="adapter_unconfigured", result="temporarily unavailable"),
+            verification={"status": "needs_more_probe", "next_action": "configure_or_refresh_agent_runtime"},
+        )
+        still_pending = app_module.state_store.read_json("task_state.json").get("pending_agent_tasks", [])
+        expect(any(item.get("task_id") == "retry_later" for item in still_pending), "transient adapter poll keeps pending task", still_pending)
+
+        model_decision = DecisionCore(
+            app_module.state_store,
+            reasoning=FakeCoreReasoning(
+                decision={
+                    "status": "model_assisted",
+                    "route": "agent",
+                    "risk_level": "R1",
+                    "intent": "implementation",
+                    "complexity": "complex",
+                    "reason": "needs selected agent runtime with context patch",
+                    "signals": ["model:implementation"],
+                    "solution_outline": ["read state", "delegate bounded implementation", "verify result"],
+                    "agent_context": {"handoff": "include state and proposed solution"},
+                }
+            ),
+        ).decide("完善 Veyra 的模型认知链路", [])
+        expect(model_decision.route == Route.AGENT, "core model can select agent route", model_decision.to_dict())
+        expect(bool(model_decision.model_assist.get("solution_outline")), "core model keeps solution outline", model_decision.to_dict())
+
+        blocked_decision = DecisionCore(
+            app_module.state_store,
+            reasoning=FakeCoreReasoning(decision={"status": "model_assisted", "route": "direct_answer", "risk_level": "R0", "reason": "safe"}),
+        ).decide("rm -rf /tmp/veyra-danger", [])
+        expect(blocked_decision.route == Route.BLOCK and blocked_decision.risk_level.value == "R5", "core model cannot lower R5 risk", blocked_decision.to_dict())
+
+        perception = PerceptionLayer(
+            app_module.state_store,
+            reasoning=FakeCoreReasoning(
+                perception={
+                    "status": "model_assisted",
+                    "summary": "OpenClaw appears unavailable because the port refused connections.",
+                    "claims": [{"key": "model:openclaw:unavailable", "claim": "OpenClaw needs runtime availability review", "confidence": 0.7}],
+                }
+            ),
+        )
+        perception_patch = perception.interpret_probe_result(
+            {
+                "probe": "openclaw_probe",
+                "status": "closed",
+                "summary": "OpenClaw runtime port 18789 is closed.",
+                "confidence": 0.8,
+                "ttl_seconds": 30,
+                "details": {"error": "connection refused"},
+            }
+        )
+        expect(any(str(claim.get("source", "")).startswith("core_model:") for claim in perception_patch["belief.claims"]), "core model perception creates grounded claim", perception_patch)
+
+        model_agency = AgencyCore(
+            app_module.state_store,
+            agency_root=tmp / "agency",
+            reasoning=FakeCoreReasoning(
+                agency={
+                    "status": "model_assisted",
+                    "state_gaps": [
+                        {
+                            "gap_id": "missing_runtime_model",
+                            "target": "core_model",
+                            "observed_status": "unconfigured",
+                            "risk_level": "R2",
+                            "suggested_action": "suggest_core_model_setup",
+                            "action_text": "suggest configuring a Core model for richer planning",
+                        }
+                    ],
+                }
+            ),
+        )
+        model_gaps = model_agency.detect_state_gap(goals={}, world_state=app_module.state_store.read_all())
+        expect(any(gap.get("gap_id") == "model:missing_runtime_model" for gap in model_gaps), "core model can add agency state gap", model_gaps)
+
+        agent_model_store = WorldStateStore(tmp / "agent-model-state")
+        agent_model_config = agent_model_store.read_json("agent_config.json")
+        agent_model_config["selected_agent"] = "openclaw"
+        agent_model_config["agents"]["openclaw"].update(
+            {
+                "use_model_for_core": True,
+                "model_base_url": "http://agent-model.local/v1",
+                "model_api_key_env": "AGENT_MODEL_KEY",
+                "model": "agent-runtime-model",
+            }
+        )
+        agent_model_store.write_json("agent_config.json", agent_model_config)
+        agent_model_status = CoreModelClient(agent_model_store).status()
+        expect(
+            agent_model_status["configured"] and agent_model_status["api_key_env"] == "AGENT_MODEL_KEY",
+            "selected agent model config can power Veyra Core",
+            agent_model_status,
+        )
 
         r2 = client.post(
             "/actions/proposals",
@@ -172,10 +314,55 @@ def main() -> int:
         stopped = client.post("/agent/tasks/task_unknown/stop")
         expect(stopped.status_code == 200, "agent task stop endpoint", stopped.text)
 
+        callback = client.post(
+            "/agent/results",
+            json={"task_id": "callback_1", "executor": "fake", "status": "success", "result": "callback done", "raw": {"session_id": "p6"}},
+        )
+        expect(callback.status_code == 200 and callback.json()["status"] == "verified_success", "agent result callback", callback.text)
+
+        app_module.state_store.write_json(
+            "belief_state.json",
+            {
+                "claims": [
+                    {
+                        "key": "local_system:platform",
+                        "claim": "stale platform",
+                        "source": "system_probe",
+                        "status": "stale",
+                        "next_action": "refresh_probe",
+                        "confidence": 0.5,
+                        "evidence": {},
+                    }
+                ]
+            },
+        )
+        stale_refresh = client.post("/state/refresh-stale")
+        expect(stale_refresh.status_code == 200 and stale_refresh.json()["refreshed"], "stale belief refresh endpoint", stale_refresh.text)
+
         red_team = client.get("/ops/safety/red-team").json()
         retention = client.get("/ops/retention").json()
         expect(red_team["status"] == "passed", "P7 red-team safety baseline", red_team)
         expect(retention["status"] == "ok" and retention["files"], "P7 retention policy summary", retention)
+
+        soak = client.post("/ops/soak", json={"iterations": 1})
+        expect(soak.status_code == 200 and soak.json()["status"] == "success", "ops soak endpoint", soak.text)
+
+        model_status = client.get("/core/model/status")
+        expect(model_status.status_code == 200 and model_status.json()["status"] == "unconfigured", "core model status endpoint", model_status.text)
+        configured_model = client.post(
+            "/core/model/config",
+            json={
+                "enabled": True,
+                "provider": "openai_compatible",
+                "base_url": "http://127.0.0.1:65535/v1",
+                "model": "veyra-self-test-model",
+                "api_key": "secret-self-test-key",
+                "decision_mode": "always",
+            },
+        )
+        expect(configured_model.status_code == 200 and configured_model.json()["configured"], "core model config endpoint", configured_model.text)
+        state_payload = client.get("/state").json()
+        expect(state_payload["agent_config"]["core_model"]["api_key"] == "<redacted>", "state endpoint redacts core model api key", state_payload["agent_config"]["core_model"])
 
     print("P6 self-test passed.")
     return 0

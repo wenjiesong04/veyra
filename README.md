@@ -50,12 +50,16 @@ Endpoints:
 - `POST /rollback/{snapshot_id}/restore` restore a file snapshot
 - `GET /agent/status` inspect selected Agent adapter connection status
 - `GET /agent/tasks/{task_id}` poll selected Agent task status
+- `POST /agent/tasks/refresh` refresh all pending selected Agent tasks
 - `POST /agent/tasks/{task_id}/stop` request selected Agent task stop
+- `POST /agent/results` receive an Agent result callback and update verification state
 - `GET /agent/contract` inspect the AgentAdapter v1 contract
 - `GET /memory/summary` read local Memory Bridge summary
 - `GET /agency/intentions` read proactive Agency intention queue
+- `POST /state/refresh-stale` refresh stale belief claims with read-only probes
 - `GET /ops/safety/red-team` run non-destructive safety validation cases
 - `GET /ops/retention` inspect append-only log retention status
+- `POST /ops/soak` run a bounded operational health loop
 - `GET /console/` open the Veyra control console after the frontend is built
 
 Example:
@@ -170,6 +174,10 @@ export OPENCLAW_GATEWAY_TOKEN=optional-token
 export OPENCLAW_SCOPES=operator.read,operator.write
 export HERMES_BASE_URL=http://127.0.0.1:18889
 export CUSTOM_AGENT_BASE_URL=http://127.0.0.1:18989
+export VEYRA_CORE_MODEL_ENABLED=1
+export VEYRA_CORE_MODEL_BASE_URL=http://127.0.0.1:11434/v1
+export VEYRA_CORE_MODEL=your-model
+export VEYRA_CORE_MODEL_API_KEY=optional-key
 ```
 
 Useful endpoints:
@@ -178,6 +186,24 @@ Useful endpoints:
 - `POST /agents/select`
 - `POST /agents/{name}/config`
 - `GET /agent/status`
+- `GET /core/model/status`
+- `POST /core/model/config`
+- `GET /logs/core-model`
+
+Core model flow:
+
+```text
+User -> Veyra
+  -> deterministic safety baseline + state snapshot
+  -> optional Core model reasoning for intent, route, perception, agency gaps, and solution outline
+  -> deterministic risk clamp + Foresight + Guardian
+  -> direct answer / probe / skill / selected AgentAdapter
+  -> verifier + memory + perception state update
+```
+
+The Core model is inside Veyra Core, not inside the selected Agent Runtime. It can improve understanding and planning, but it cannot lower a rule-detected risk level or bypass Guardian. Complex Agent tasks receive the Core model's solution outline and bounded context inside the `VeyraTaskPacket.context_patch`.
+
+The same capability can also be attached while configuring a selected runtime with `POST /agents/{name}/config` by setting `use_model_for_core`, `model_base_url`, `model_api_key_env`, and `model`. Top-level `/core/model/config` takes precedence when explicitly enabled.
 
 OpenClaw uses the same WebSocket Gateway protocol as the local OpenClaw Control UI. Veyra converts `http://127.0.0.1:18789` to `ws://127.0.0.1:18789`, sends `connect`, checks `health` / `status`, and submits Agent work with `chat.send`. If OpenClaw is reachable but requires device pairing or a gateway token, `/agent/status` reports that explicitly instead of treating the control UI HTML as a working Agent API.
 
@@ -198,7 +224,7 @@ Without a configured base URL, Veyra still builds the task packet but returns `a
 
 ## Implemented Architecture Slices
 
-- `core`: Runtime Entity, Awareness Loop, WorldState, Decision, Foresight, Guardian, Verifier, Patch/TaskPacket builders
+- `core`: Runtime Entity, Awareness Loop, WorldState, Core model reasoning, Decision, Foresight, Guardian, Verifier, Patch/TaskPacket builders
 - `awareness`: Attention, Belief, Uncertainty, Awareness summary/output
 - `interface`: Intake, event schema/normalizer, channel and Agent adapter interfaces
 - `probes`: system, git, port, process, file, OpenClaw/Hermes placeholders

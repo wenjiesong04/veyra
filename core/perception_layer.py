@@ -4,14 +4,16 @@ from typing import Any
 
 from awareness.belief_core import BeliefCore
 from awareness.claim_schema import make_claim
+from core.reasoning_core import CoreReasoning
 from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
 
 
 class PerceptionLayer:
-    def __init__(self, state_store: WorldStateStore) -> None:
+    def __init__(self, state_store: WorldStateStore, reasoning: CoreReasoning | None = None) -> None:
         self.state_store = state_store
         self.belief = BeliefCore(state_store)
+        self.reasoning = reasoning or CoreReasoning(state_store)
 
     def interpret_probe_result(self, probe_result: dict[str, Any]) -> dict[str, Any]:
         probe_name = probe_result.get("probe", "unknown")
@@ -32,13 +34,22 @@ class PerceptionLayer:
             details = dict(enriched.get("details") or {})
             details["anomaly"] = anomaly
             enriched["details"] = details
+        model_assist = self.reasoning.perception_assist(enriched)
+        if model_assist.get("status") == "model_assisted":
+            enriched["model_interpretation"] = self._compact_model_interpretation(model_assist)
+            model_anomaly = model_assist.get("anomaly") if isinstance(model_assist.get("anomaly"), dict) else {}
+            if model_anomaly and not enriched.get("anomaly"):
+                enriched["anomaly"] = {
+                    "kind": str(model_anomaly.get("kind") or "model_detected"),
+                    "next_action": str(model_anomaly.get("next_action") or "review"),
+                }
         local_world = self.state_store.read_json("local_world.json")
         probes = local_world.setdefault("probes", {})
         probes[probe_name] = enriched
         local_world["last_probe_at"] = observed_at
         self.state_store.write_json("local_world.json", local_world)
 
-        claims = self._claims_from_probe(enriched)
+        claims = self._claims_from_probe(enriched) + self._claims_from_model(enriched, model_assist)
         self.belief.upsert_claims(claims)
         return {
             "local_world.probes": {probe_name: enriched},
@@ -129,3 +140,40 @@ class PerceptionLayer:
             if any(marker in text for marker in markers):
                 return {"kind": kind, "next_action": "refresh_probe" if kind in {"timeout", "connection_refused"} else "request_configuration"}
         return None
+
+    def _claims_from_model(self, probe_result: dict[str, Any], model_assist: dict[str, Any]) -> list[dict[str, Any]]:
+        if model_assist.get("status") != "model_assisted":
+            return []
+        raw_claims = model_assist.get("claims")
+        if not isinstance(raw_claims, list):
+            return []
+        claims: list[dict[str, Any]] = []
+        probe_name = str(probe_result.get("probe") or "unknown")
+        observed_at = str(probe_result.get("observed_at") or probe_result.get("timestamp") or utc_now_iso())
+        probe_confidence = float(probe_result.get("confidence") or 0.75)
+        for index, raw_claim in enumerate(raw_claims[:5]):
+            if not isinstance(raw_claim, dict):
+                continue
+            claim_text = str(raw_claim.get("claim") or "").strip()
+            if not claim_text:
+                continue
+            confidence = min(float(raw_claim.get("confidence") or 0.65), probe_confidence, 0.8)
+            claims.append(
+                make_claim(
+                    key=str(raw_claim.get("key") or f"model:{probe_name}:{index}"),
+                    claim=claim_text,
+                    source=f"core_model:{probe_name}",
+                    confidence=confidence,
+                    ttl_seconds=int(raw_claim.get("ttl_seconds") or probe_result.get("ttl_seconds") or 60),
+                    observed_at=observed_at,
+                    evidence={"probe": probe_name, "model_assisted": True},
+                )
+            )
+        return claims
+
+    def _compact_model_interpretation(self, model_assist: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "summary": str(model_assist.get("summary") or "")[:800],
+            "anomaly": model_assist.get("anomaly") if isinstance(model_assist.get("anomaly"), dict) else None,
+            "confidence": model_assist.get("confidence"),
+        }

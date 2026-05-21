@@ -1,6 +1,6 @@
 # Veyra Development Status
 
-Updated after P5 Web Control Console completeness.
+Updated after P6 Core model-assisted reasoning hardening.
 
 ## Data Reality
 
@@ -26,14 +26,14 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | P3 Agent adapter execution contracts | Completed | `veyra.agent_adapter.v1`, OpenClaw WebSocket adapter, Hermes/Custom HTTP adapter, compatibility negotiation |
 | P4 Rollback / Audit / Verifier depth | Completed | Verifier verdicts, execution trace, tool trace, rollback checksum/diff/restore evidence |
 | P5 Web Control Console completeness | Completed | Console surfaces for setup, awareness, runtime, review, persona, state/logs, tool proxy, rollback/audit |
-| P6 End-to-end runtime hardening | In progress | Task polling/stop API, ActionProposal hardening, Agency intentions, real probe envelopes, external-memory bridge slots |
-| P7 Production operations and safety validation | Started | Non-destructive red-team validation and retention summary API exist; deployment monitoring remains pending |
+| P6 End-to-end runtime hardening | In progress | Task polling/stop/refresh, Agent result callback, ActionProposal hardening, Core model-assisted reasoning, Agency intentions, stale refresh, real probe envelopes, external-memory bridge slots |
+| P7 Production operations and safety validation | Started | Non-destructive red-team validation, retention summary, and bounded soak API exist; deployment monitoring remains pending |
 
 ## Eight Architecture Blocks
 
 | Block from original design | Current implementation |
 | --- | --- |
-| Veyra Core | Implemented MVP core loop: Sense, Understand, Focus, Evaluate, Decide, Act, Verify, Update. P4 adds evidence-backed verification. |
+| Veyra Core | Implemented MVP core loop plus model-assisted reasoning for intent/route, perception interpretation, and agency gaps. P4 adds evidence-backed verification. |
 | Interface Adapter / Agent Adapter | Implemented Intake/EventNormalizer plus AgentRegistry. OpenClaw, Hermes, and Custom adapters share the v1 task/result/capability contract. |
 | Probe Tools | Implemented system, git, port, process, file, network, web, log, MCP, OpenClaw, Hermes probe modules with standardized result envelopes where wired. |
 | Memory Bridge | Implemented local memory bridge for summary reads and filtered patch writes. Full external Agent Memory bridge remains future work. |
@@ -46,15 +46,16 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 
 | Core module | Status | Notes |
 | --- | --- | --- |
-| Runtime Entity | MVP implemented | Identity, lifecycle, selected agent, idle/thinking/acting/blocked states |
-| Awareness Loop | MVP implemented | Main event loop and route handling for direct answer, probe, skill, agent, review, block |
+| Runtime Entity | P6 model-aware | Identity, lifecycle, selected agent, idle/thinking/acting/blocked states, redacted Core model runtime summary |
+| Awareness Loop | P6 model-aware | Main event loop and route handling for direct answer, probe, skill, agent, review, block; injects Core reasoning outline into Agent task context |
 | Attention Core | MVP implemented | Text-driven focus slice and context scoping |
 | Belief & Uncertainty Core | MVP implemented | Claim confidence, TTL, stale/conflict summaries |
 | WorldState | MVP implemented | Local JSON/JSONL state store and schema metadata |
-| Agency Core | Placeholder/MVP | Proactive read-only check exists; full intention queue behavior remains future work |
-| Perception Layer | MVP implemented | Probe interpretation into state/belief patches |
+| Core Model / Reasoning | P6 implemented | OpenAI-compatible Core model config/status, redacted traces, model-assisted decision/perception/agency with rule fallback |
+| Agency Core | P6 model-aware | Intention queue behavior exists; model can propose additional bounded state gaps, then Foresight/Guardian decides execute/suggest/review |
+| Perception Layer | P6 model-aware | Probe interpretation into state/belief patches; model can add grounded claims and anomaly interpretation |
 | Persona Engine | MVP implemented | Persona patch generation and operational mode display in console |
-| Decision Core | MVP implemented | Intent, complexity, risk, capability, route, signals, constraints |
+| Decision Core | P6 model-aware | Deterministic safety baseline plus model-assisted intent, complexity, route, solution outline, signals, constraints; risk cannot be lowered by model |
 | Foresight Engine | MVP implemented | Risk impact, reversibility, safer alternatives for text/action review |
 | Guardian / Execution Controller | MVP implemented | Risk policy, confirmation gate, block/allow decisions, tool proxy enforcement |
 | Verifier | P4 completed | Evidence-backed verdicts and rollback/probe/memory next actions |
@@ -67,6 +68,7 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | `/runtime`, `/state`, `/heartbeat` | Runtime identity, state cache, heartbeat |
 | `/architecture`, `/definitions`, `/mvp/status` | Architecture metadata, risk/lifecycle/mode definitions, readiness flags |
 | `/events/message` | Standard user-message event entry |
+| `/core/model/status`, `/core/model/config`, `/logs/core-model` | Core model config/status and redacted model reasoning audit |
 | `/agent/contract`, `/agent/status`, `/agents`, `/agents/select`, `/agents/{name}/config` | Agent contract, status, selection, adapter configuration |
 | `/actions/proposals`, `/reviews/*` | Action review and human confirmation flow |
 | `/tool-proxy/*` | Safe shell/file/browser/API execution boundary |
@@ -79,8 +81,9 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 The current codebase follows the original design direction:
 
 - Veyra is not a replacement Agent Runtime; it governs a selected runtime.
-- Messages enter Veyra first; Agent execution is selected by Decision Core.
+- Messages enter Veyra first; Veyra runs a deterministic safety baseline, optionally uses its Core model for understanding/planning, then applies Guardian before native execution or Agent delegation.
 - Simple tasks are handled directly or through probes/skills.
+- Complex Agent tasks receive state, background, policy, memory, and Core model solution outline through `VeyraTaskPacket.context_patch`.
 - High-risk actions go through Guardian, policy trace, review, and Tool Proxy.
 - Execution results now require verifier evidence instead of blind trust.
 - Rollback/Audit records snapshots, diffs, traces, and restores.

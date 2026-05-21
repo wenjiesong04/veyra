@@ -11,11 +11,13 @@ from core.agency_core import AgencyCore
 from core.awareness_loop import AwarenessLoop
 from core.definitions import RiskLevel, classify_text_risk, lifecycle_statuses, normalize_risk, operational_modes, risk_catalog
 from core.foresight_engine import ForesightEngine
+from core.model_client import redact_sensitive
 from core.runtime_entity import RuntimeEntity
 from core.world_state import WorldStateStore
 from execution.action_executor import ActionExecutor
 from guardian.review_queue import ReviewQueue
 from interface.agent_contract import contract_summary
+from interface.agent_adapter import ExecutionResult
 from interface.event_normalizer import EventNormalizer
 from interface.event_schema import Decision, Route, utc_now_iso
 from pydantic import Field
@@ -23,6 +25,8 @@ from rollback_audit.rollback_manager import RollbackManager
 from rollback_audit.diff_tracker import DiffTracker
 from runtime.proactive_checks import ProactiveChecks
 from runtime.retention_policy import RetentionPolicy
+from runtime.soak_runner import SoakRunner
+from runtime.state_refresh import StateRefresh
 from tool_proxy.safe_api import SafeAPI
 from tool_proxy.safe_browser import SafeBrowser
 from tool_proxy.safe_file import SafeFile
@@ -45,11 +49,21 @@ safe_browser = SafeBrowser(state_store=state_store)
 safe_api = SafeAPI(state_store=state_store)
 action_executor = ActionExecutor(state_store=state_store)
 foresight_engine = ForesightEngine()
-proactive_checks = ProactiveChecks(state_store)
+proactive_checks = ProactiveChecks(state_store, reasoning=awareness_loop.core_reasoning)
 diff_tracker = DiffTracker()
-agency_core = AgencyCore(state_store)
+agency_core = AgencyCore(state_store, reasoning=awareness_loop.core_reasoning)
 safety_validation = SafetyValidation()
 retention_policy = RetentionPolicy(state_store)
+state_refresh = StateRefresh(state_store, reasoning=awareness_loop.core_reasoning)
+soak_runner = SoakRunner(
+    proactive_checks=proactive_checks,
+    task_tracker=awareness_loop.task_tracker,
+    state_refresh=state_refresh,
+    retention_policy=retention_policy,
+    safety_validation=safety_validation,
+    adapter_resolver=lambda: awareness_loop.agent_registry.selected(),
+    verifier=awareness_loop.verifier,
+)
 
 
 class MessageRequest(BaseModel):
@@ -108,6 +122,25 @@ class AgentConfigRequest(BaseModel):
     stop_path_template: str | None = None
     protocol_min: int | None = None
     protocol_max: int | None = None
+    use_model_for_core: bool | None = None
+    model_provider: str | None = None
+    model_base_url: str | None = None
+    model_api_key: str | None = None
+    model_api_key_env: str | None = None
+    model: str | None = None
+    model_timeout: float | None = None
+    model_decision_mode: str | None = None
+
+
+class CoreModelConfigRequest(BaseModel):
+    enabled: bool | None = None
+    provider: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    api_key_env: str | None = None
+    model: str | None = None
+    timeout: float | None = None
+    decision_mode: str | None = None
 
 
 class ActionProposalRequest(BaseModel):
@@ -118,6 +151,21 @@ class ActionProposalRequest(BaseModel):
     risk_guess: str = "R2"
     reversible: str = "unknown"
     reason: str = ""
+
+
+class AgentResultRequest(BaseModel):
+    task_id: str
+    executor: str = "external"
+    status: str
+    result: str = ""
+    logs: str = ""
+    changed_files: list[str] = Field(default_factory=list)
+    tool_calls: list[str] = Field(default_factory=list)
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class SoakRequest(BaseModel):
+    iterations: int = 1
 
 
 @app.get("/")
@@ -152,9 +200,28 @@ async def message(request: MessageRequest):
 
 @app.get("/state")
 async def state():
-    payload = state_store.read_all()
+    payload = _public_state(state_store.read_all())
     payload["agency"] = agency_core.state()
     return payload
+
+
+@app.get("/core/model/status")
+async def core_model_status():
+    return awareness_loop.core_reasoning.status()
+
+
+@app.post("/core/model/config")
+async def configure_core_model(request: CoreModelConfigRequest):
+    patch = request.model_dump(exclude_none=True)
+    if "decision_mode" in patch and patch["decision_mode"] not in {"auto", "always"}:
+        raise HTTPException(status_code=422, detail="decision_mode must be 'auto' or 'always'")
+    if "provider" in patch and patch["provider"] != "openai_compatible":
+        raise HTTPException(status_code=422, detail="only openai_compatible provider is supported")
+    config = state_store.read_json("agent_config.json")
+    core_model = config.setdefault("core_model", {})
+    core_model.update(patch)
+    state_store.write_json("agent_config.json", config)
+    return awareness_loop.core_reasoning.status()
 
 
 @app.get("/architecture")
@@ -297,9 +364,19 @@ async def memory_logs(limit: int = 100):
     return {"items": state_store.read_jsonl("memory_log.jsonl", limit=limit)}
 
 
+@app.get("/logs/core-model")
+async def core_model_logs(limit: int = 100):
+    return {"items": state_store.read_jsonl("core_model_trace.jsonl", limit=limit)}
+
+
 @app.post("/proactive/check")
 async def proactive_check():
     return proactive_checks.run_read_only()
+
+
+@app.post("/state/refresh-stale")
+async def refresh_stale_state():
+    return state_refresh.refresh_stale()
 
 
 @app.get("/agency/intentions")
@@ -315,6 +392,11 @@ async def ops_safety_red_team():
 @app.get("/ops/retention")
 async def ops_retention():
     return retention_policy.summary()
+
+
+@app.post("/ops/soak")
+async def ops_soak(request: SoakRequest):
+    return soak_runner.run(iterations=request.iterations)
 
 
 @app.get("/rollback/diff")
@@ -404,7 +486,60 @@ async def agent_task_status(task_id: str):
         }
     )
     state_store.patch_json("task_state.json", {"current_task": {"task_id": task_id, "route": "agent", "status": verified["status"]}})
+    awareness_loop.task_tracker.apply_result(execution=execution, verification=verified, event_id=f"poll_{task_id}")
     return {"execution_result": execution.to_dict(), "verification": verified, "execution_trace": trace}
+
+
+@app.post("/agent/tasks/refresh")
+async def agent_tasks_refresh():
+    awareness_loop.agent_adapter = awareness_loop.agent_registry.selected()
+    return awareness_loop.task_tracker.refresh_pending(awareness_loop.agent_adapter, awareness_loop.verifier)
+
+
+@app.post("/agent/results")
+async def agent_result_callback(request: AgentResultRequest):
+    execution = ExecutionResult(
+        task_id=request.task_id,
+        executor=request.executor,
+        status=request.status,
+        result=request.result,
+        logs=request.logs,
+        changed_files=request.changed_files,
+        tool_calls=request.tool_calls,
+        raw=request.raw,
+    )
+    verified = awareness_loop.verifier.verify_execution_result(execution)
+    trace = awareness_loop.execution_trace.record(
+        {
+            "event_id": f"callback_{execution.task_id}",
+            "route": "agent",
+            "task_id": execution.task_id,
+            "executor": execution.executor,
+            "status": verified["status"],
+            "execution_result": execution.to_dict(),
+            "verification": verified,
+        }
+    )
+    task_update = awareness_loop.task_tracker.apply_result(execution=execution, verification=verified, event_id=f"callback_{execution.task_id}")
+    memory_write = None
+    if verified.get("needs_memory_patch"):
+        memory_write = awareness_loop.memory_bridge.write_patch(
+            {
+                "session_id": str(request.raw.get("session_id") or "agent-callback"),
+                "task": str(request.raw.get("task") or request.task_id),
+                "executor": execution.executor,
+                "status": execution.status,
+                "result": execution.result,
+            }
+        )
+    return {
+        "status": verified["status"],
+        "execution_result": execution.to_dict(),
+        "verification": verified,
+        "execution_trace": trace,
+        "task_update": task_update,
+        "memory_write": memory_write,
+    }
 
 
 @app.post("/agent/tasks/{task_id}/stop")
@@ -471,6 +606,18 @@ def _proposal_decision(risk_level: RiskLevel, action_text: str, request: ActionP
     )
 
 
+def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
+    public = redact_sensitive(payload)
+    agent_config = public.get("agent_config") if isinstance(public.get("agent_config"), dict) else {}
+    if isinstance(agent_config, dict):
+        core_model = agent_config.get("core_model") if isinstance(agent_config.get("core_model"), dict) else {}
+        if isinstance(core_model, dict):
+            original = payload.get("agent_config", {}).get("core_model", {}) if isinstance(payload.get("agent_config"), dict) else {}
+            core_model["api_key_set"] = bool(original.get("api_key")) if isinstance(original, dict) else False
+            core_model["api_key"] = "<redacted>" if core_model.get("api_key") else ""
+    return public
+
+
 @app.get("/agent/status")
 async def agent_status():
     awareness_loop.agent_adapter = awareness_loop.agent_registry.selected()
@@ -504,7 +651,10 @@ async def select_agent(request: AgentSelectRequest):
 
 @app.post("/agents/{name}/config")
 async def configure_agent(name: str, request: AgentConfigRequest):
-    status = awareness_loop.agent_registry.upsert(name, request.model_dump())
+    payload = request.model_dump()
+    if payload.get("model_decision_mode") and payload["model_decision_mode"] not in {"auto", "always"}:
+        raise HTTPException(status_code=422, detail="model_decision_mode must be 'auto' or 'always'")
+    status = awareness_loop.agent_registry.upsert(name, payload)
     if status.get("selected_agent") == name:
         awareness_loop.agent_adapter = awareness_loop.agent_registry.selected()
     return status
@@ -544,11 +694,17 @@ async def mvp_status():
             "multi_agent_registry": True,
             "agent_adapter_contract": True,
             "agent_task_polling": True,
+            "agent_pending_task_refresh": True,
+            "agent_result_callback": True,
             "agency_intention_queue": True,
+            "stale_belief_refresh": True,
             "real_probe_envelopes": True,
             "external_memory_bridge_hooks": True,
+            "ops_soak_runner": True,
+            "core_model_reasoning_layer": True,
             "web_console": console_dir.exists(),
         },
+        "core_model": awareness_loop.core_reasoning.status(),
         "agent_runtime": {
             "selected_agent": awareness_loop.agent_registry.selected_name(),
             "real_agent_connected": bool(agent_status_data.get("connected")),
@@ -572,6 +728,10 @@ async def runtime():
             "last_heartbeat_at": runtime_entity.lifecycle.last_heartbeat_at,
         },
         "operational_mode": runtime_entity.operational_mode,
+        "core_model": {
+            "runtime_state": runtime_entity.core_model_runtime_state(),
+            "status": awareness_loop.core_reasoning.status(),
+        },
     }
 
 

@@ -6,6 +6,7 @@ from core.definitions import RiskLevel
 from core.foresight_engine import ForesightEngine
 from core.guardian_controller import GuardianController
 from core.perception_layer import PerceptionLayer
+from core.reasoning_core import CoreReasoning
 from core.world_state import WorldStateStore
 from probes.git_probe import GitProbe
 from probes.hermes_probe import HermesProbe
@@ -19,10 +20,11 @@ from probes.web_probe import WebProbe
 class ProactiveChecks:
     """A2/A3 MVP: run low-risk read-only checks and surface state gaps."""
 
-    def __init__(self, state_store: WorldStateStore, agency_root: str = "agency") -> None:
+    def __init__(self, state_store: WorldStateStore, agency_root: str = "agency", reasoning: CoreReasoning | None = None) -> None:
         self.state_store = state_store
-        self.perception = PerceptionLayer(state_store)
-        self.agency = AgencyCore(state_store, agency_root=agency_root)
+        self.reasoning = reasoning or CoreReasoning(state_store)
+        self.perception = PerceptionLayer(state_store, reasoning=self.reasoning)
+        self.agency = AgencyCore(state_store, agency_root=agency_root, reasoning=self.reasoning)
         self.foresight = ForesightEngine()
         self.guardian = GuardianController()
 

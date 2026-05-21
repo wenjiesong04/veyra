@@ -35,6 +35,15 @@ class WorldStateStore:
             "agent_memory.json": {"items": []},
             "agent_config.json": {
                 "selected_agent": "openclaw",
+                "core_model": {
+                    "enabled": False,
+                    "provider": "openai_compatible",
+                    "base_url": "",
+                    "api_key_env": "VEYRA_CORE_MODEL_API_KEY",
+                    "model": "",
+                    "timeout": 20,
+                    "decision_mode": "auto",
+                },
                 "agents": {
                     "openclaw": {"kind": "openclaw", "base_url": "", "api_key_env": "OPENCLAW_GATEWAY_TOKEN", "enabled": True},
                     "hermes": {"kind": "hermes", "base_url": "", "api_key_env": "HERMES_API_KEY", "enabled": True},
@@ -60,6 +69,7 @@ class WorldStateStore:
             "execution_trace.jsonl",
             "rollback_log.jsonl",
             "memory_log.jsonl",
+            "core_model_trace.jsonl",
         ]:
             path = self.root / name
             if not path.exists():

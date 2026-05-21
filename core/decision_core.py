@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+from typing import Any
+
 from core.definitions import RiskLevel, classify_text_risk
+from core.reasoning_core import CoreReasoning, safe_model_risk
+from core.world_state import WorldStateStore
 from interface.event_schema import Decision, Route
 
 
 class DecisionCore:
+    def __init__(self, state_store: WorldStateStore | None = None, reasoning: CoreReasoning | None = None) -> None:
+        self.reasoning = reasoning or (CoreReasoning(state_store) if state_store else None)
+
     def decide(self, text: str, attention_focus: list[str]) -> Decision:
+        base = self._rule_decide(text, attention_focus)
+        return self._apply_model_assist(text, attention_focus, base)
+
+    def _rule_decide(self, text: str, attention_focus: list[str]) -> Decision:
         lowered = text.lower()
         risk = self._risk_for_text(lowered)
         intent, intent_signals = self._intent_for_text(lowered)
@@ -72,15 +83,83 @@ class DecisionCore:
                 signals=signals + ["agent_required"],
                 constraints=["inject context patch", "enforce policy patch", "verify result"],
             )
+        if risk == RiskLevel.R2 and intent == "action":
+            return self._decision(
+                route=Route.AGENT,
+                risk=risk,
+                reason="low-risk write action requires governed execution",
+                intent=intent,
+                complexity=complexity,
+                capability="selected_agent_runtime",
+                signals=signals + ["agent_required", "write_action"],
+                constraints=["limit write scope", "record diff or snapshot", "verify result"],
+            )
         return self._decision(
             route=Route.DIRECT_ANSWER,
-            risk=RiskLevel.R0,
+            risk=RiskLevel.R0 if risk == RiskLevel.R0 else risk,
             reason="low complexity informational request",
             intent=intent,
             complexity=complexity,
             capability="native_answer",
             signals=signals,
             constraints=["no tool execution"],
+        )
+
+    def _apply_model_assist(self, text: str, attention_focus: list[str], base: Decision) -> Decision:
+        if not self.reasoning:
+            return base
+        assist = self.reasoning.decision_assist(text=text, attention_focus=attention_focus, rule_decision=base.to_dict())
+        if assist.get("status") != "model_assisted":
+            return base
+
+        model_risk = safe_model_risk(assist.get("risk_level"), base.risk_level)
+        risk = self._max_risk(base.risk_level, model_risk)
+        candidate_route = self._route_from_model(assist.get("route"), base.route)
+        if risk == RiskLevel.R5:
+            route = Route.BLOCK
+        elif risk in {RiskLevel.R3, RiskLevel.R4}:
+            route = Route.HUMAN_REVIEW
+        elif candidate_route == Route.BLOCK:
+            route = Route.HUMAN_REVIEW
+            risk = self._max_risk(risk, RiskLevel.R3)
+        elif candidate_route == Route.HUMAN_REVIEW:
+            route = Route.HUMAN_REVIEW
+            risk = self._max_risk(risk, RiskLevel.R3)
+        else:
+            route = candidate_route
+
+        selected_probe = base.selected_probe
+        if route == Route.PROBE:
+            selected_probe = self._selected_probe_from_model(assist, base.selected_probe)
+        elif route == Route.SKILL:
+            selected_probe = self._selected_skill_from_model(assist, base.selected_probe)
+
+        reason = str(assist.get("reason") or assist.get("rationale") or "model-assisted core reasoning")
+        signals = self._dedupe(base.signals + self._string_list(assist.get("signals")) + ["model:decision"])
+        constraints = self._dedupe(base.constraints + self._string_list(assist.get("constraints")) + ["guardian remains final execution boundary"])
+        model_assist = {
+            "status": "model_assisted",
+            "reason": reason,
+            "route": route.value,
+            "risk_level": risk.value,
+            "confidence": assist.get("confidence"),
+            "solution_outline": self._string_list(assist.get("solution_outline")),
+            "agent_context": assist.get("agent_context") if isinstance(assist.get("agent_context"), dict) else {},
+            "draft_response": str(assist.get("draft_response") or assist.get("response") or "")[:2000],
+        }
+        return self._decision(
+            route=route,
+            risk=risk,
+            reason=f"model-assisted: {reason}; rule baseline: {base.reason}",
+            intent=str(assist.get("intent") or base.intent),
+            complexity=str(assist.get("complexity") or base.complexity),
+            capability=self._capability_for_route(route, base.capability),
+            signals=signals,
+            requires_confirmation=base.requires_confirmation or risk in {RiskLevel.R3, RiskLevel.R4, RiskLevel.R5},
+            selected_probe=selected_probe,
+            target_agent=str(assist.get("target_agent") or base.target_agent or "") or None,
+            constraints=constraints,
+            model_assist=model_assist,
         )
 
     def _probe_for_text(self, lowered: str) -> str | None:
@@ -137,6 +216,58 @@ class DecisionCore:
     def _risk_signals(self, risk: RiskLevel) -> list[str]:
         return [f"risk:{risk.value}"]
 
+    def _route_from_model(self, value: Any, default: Route) -> Route:
+        if not value:
+            return default
+        try:
+            route = Route(str(value))
+        except ValueError:
+            return default
+        if route == Route.NATIVE_TOOL:
+            return Route.HUMAN_REVIEW
+        return route
+
+    def _selected_probe_from_model(self, assist: dict[str, Any], default: str | None) -> str:
+        allowed = {"system", "git", "port", "process", "file", "log", "network", "web", "openclaw", "hermes", "mcp"}
+        selected = str(assist.get("selected_probe") or assist.get("probe") or default or "system")
+        return selected if selected in allowed else "system"
+
+    def _selected_skill_from_model(self, assist: dict[str, Any], default: str | None) -> str:
+        allowed = {"diagnose_openclaw", "check_port", "summarize_logs", "safe_git_commit"}
+        selected = str(assist.get("selected_skill") or assist.get("skill") or default or "")
+        return selected if selected in allowed else (default or "")
+
+    def _capability_for_route(self, route: Route, default: str) -> str:
+        return {
+            Route.DIRECT_ANSWER: "native_answer",
+            Route.PROBE: "probe",
+            Route.SKILL: "skill",
+            Route.AGENT: "selected_agent_runtime",
+            Route.HUMAN_REVIEW: "human_review",
+            Route.BLOCK: "guardian",
+        }.get(route, default)
+
+    def _max_risk(self, left: RiskLevel, right: RiskLevel) -> RiskLevel:
+        order = list(RiskLevel)
+        return right if order.index(right) > order.index(left) else left
+
+    def _string_list(self, value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [str(item) for item in value[:12] if item is not None]
+        if isinstance(value, str) and value:
+            return [value]
+        return []
+
+    def _dedupe(self, values: list[str]) -> list[str]:
+        output: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            output.append(value)
+        return output
+
     def _decision(
         self,
         *,
@@ -151,6 +282,7 @@ class DecisionCore:
         selected_probe: str | None = None,
         target_agent: str | None = None,
         constraints: list[str] | None = None,
+        model_assist: dict[str, Any] | None = None,
     ) -> Decision:
         return Decision(
             route=route,
@@ -164,4 +296,5 @@ class DecisionCore:
             capability=capability,
             signals=signals,
             constraints=constraints or [],
+            model_assist=model_assist or {},
         )
