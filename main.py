@@ -23,6 +23,7 @@ from interface.event_schema import Decision, Route, utc_now_iso
 from pydantic import Field
 from rollback_audit.rollback_manager import RollbackManager
 from rollback_audit.diff_tracker import DiffTracker
+from runtime.external_world_refresh import ExternalWorldRefresh
 from runtime.proactive_checks import ProactiveChecks
 from runtime.retention_policy import RetentionPolicy
 from runtime.soak_runner import SoakRunner
@@ -55,6 +56,7 @@ agency_core = AgencyCore(state_store, reasoning=awareness_loop.core_reasoning)
 safety_validation = SafetyValidation()
 retention_policy = RetentionPolicy(state_store)
 state_refresh = StateRefresh(state_store, reasoning=awareness_loop.core_reasoning)
+external_world_refresh = ExternalWorldRefresh(state_store, reasoning=awareness_loop.core_reasoning)
 soak_runner = SoakRunner(
     proactive_checks=proactive_checks,
     task_tracker=awareness_loop.task_tracker,
@@ -101,6 +103,13 @@ class APIProxyRequest(BaseModel):
 
 class MemoryPatchRequest(BaseModel):
     patch: dict[str, Any]
+
+
+class ExternalWatchRequest(BaseModel):
+    target: str
+    kind: str | None = None
+    reason: str = ""
+    enabled: bool = True
 
 
 class AgentSelectRequest(BaseModel):
@@ -377,6 +386,28 @@ async def proactive_check():
 @app.post("/state/refresh-stale")
 async def refresh_stale_state():
     return state_refresh.refresh_stale()
+
+
+@app.post("/external/refresh")
+async def refresh_external_world(limit: int = 10):
+    return external_world_refresh.refresh_watchlist(limit=limit)
+
+
+@app.post("/external/watchlist")
+async def add_external_watch(request: ExternalWatchRequest):
+    external = state_store.read_json("external_world.json")
+    watchlist = external.setdefault("watchlist", [])
+    if not isinstance(watchlist, list):
+        watchlist = []
+        external["watchlist"] = watchlist
+    item = request.model_dump()
+    existing = [entry for entry in watchlist if isinstance(entry, dict) and entry.get("target") == request.target]
+    if existing:
+        existing[0].update(item)
+    else:
+        watchlist.append(item)
+    state_store.write_json("external_world.json", external)
+    return external
 
 
 @app.get("/agency/intentions")
@@ -702,6 +733,8 @@ async def mvp_status():
             "external_memory_bridge_hooks": True,
             "ops_soak_runner": True,
             "core_model_reasoning_layer": True,
+            "core_model_memory_relevance": True,
+            "external_world_watchlist_refresh": True,
             "web_console": console_dir.exists(),
         },
         "core_model": awareness_loop.core_reasoning.status(),

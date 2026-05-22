@@ -62,7 +62,7 @@ class AwarenessLoop:
         self.runtime_entity.set_selected_agent(self.agent_registry.selected_name())
         self.agent_adapter = self.agent_registry.selected()
         self.review_queue = ReviewQueue(state_store)
-        self.memory_bridge = LocalMemoryBridge(state_store, adapter_resolver=lambda: self.agent_registry.selected())
+        self.memory_bridge = LocalMemoryBridge(state_store, adapter_resolver=lambda: self.agent_registry.selected(), reasoning=self.core_reasoning)
         self.execution_trace = ExecutionTrace(state_store)
         self.task_tracker = AgentTaskTracker(state_store, self.execution_trace)
         self.skill_loader = SkillLoader()

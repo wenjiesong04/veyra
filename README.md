@@ -57,6 +57,8 @@ Endpoints:
 - `GET /memory/summary` read local Memory Bridge summary
 - `GET /agency/intentions` read proactive Agency intention queue
 - `POST /state/refresh-stale` refresh stale belief claims with read-only probes
+- `POST /external/watchlist` add or update an ExternalWorld watch target
+- `POST /external/refresh` refresh ExternalWorld watchlist targets with read-only probes
 - `GET /ops/safety/red-team` run non-destructive safety validation cases
 - `GET /ops/retention` inspect append-only log retention status
 - `POST /ops/soak` run a bounded operational health loop
@@ -198,10 +200,10 @@ User -> Veyra
   -> optional Core model reasoning for intent, route, foresight, perception, agency gaps, and solution outline
   -> deterministic risk clamp + Foresight + Guardian
   -> direct answer / probe / skill / selected AgentAdapter
-  -> verifier + memory + perception state update
+  -> verifier + model-ranked memory + perception / external world state update
 ```
 
-The Core model is inside Veyra Core, not inside the selected Agent Runtime. It can improve understanding, planning, impact prediction, and precondition discovery, but it cannot lower a rule-detected risk level or bypass Guardian. Complex Agent tasks receive the Core model's solution outline, decision trace, foresight, executor state, and bounded context inside the `VeyraTaskPacket.context_patch`.
+The Core model is inside Veyra Core, not inside the selected Agent Runtime. It can improve understanding, planning, impact prediction, memory relevance, ExternalWorld interpretation, and precondition discovery, but it cannot lower a rule-detected risk level or bypass Guardian. Complex Agent tasks receive the Core model's solution outline, decision trace, foresight, executor state, model-ranked memory, and bounded context inside the `VeyraTaskPacket.context_patch`.
 
 The same capability can also be attached while configuring a selected runtime with `POST /agents/{name}/config` by setting `use_model_for_core`, `model_base_url`, `model_api_key_env`, and `model`. Top-level `/core/model/config` takes precedence when explicitly enabled.
 

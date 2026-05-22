@@ -208,6 +208,8 @@ P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块。当�
 - ActionProposal 会按真实动作文本提升风险等级，R0-R2 走 Tool Proxy，R3-R4 进 review，R5 阻断。
 - Core 增加 OpenAI-compatible 模型认知层：用户请求先进入 Veyra，规则给出安全基线，Core 模型增强意图/路由/影响预测/状态理解/解决方案，再由 Foresight + Guardian 约束后原生处理或下发 Agent。
 - Agent 任务下发时会把 Core 模型生成的 solution outline、agent_context、decision trace、foresight、executor/task/background 放进 `VeyraTaskPacket.context_patch`；模型不能降低风险等级，也不能绕过 Tool Proxy / review。
+- MemoryBridge 会先按 focus 做规则过滤，再由 Core 模型在候选 memory 内排序选择相关条目；无模型或模型输出无效时回退最近相关 memory。
+- ExternalWorld 增加 watchlist refresh：对 URL/host 运行只读 web/network probe，再由 Core 模型解释外部状态与当前目标的相关性和 watch 建议。
 - AgencyCore 写入 intention queue，proactive check 会对 state gap 做 Foresight + Guardian 审查。
 - network / web / hermes / mcp probe 改为真实只读探测，并由 PerceptionLayer 标记常见异常；stale belief 可通过只读 probe 刷新。
 - Memory Bridge 增加外部 adapter hook、敏感信息阻断和 freshness / trust 标记。

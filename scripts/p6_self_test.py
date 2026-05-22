@@ -34,6 +34,7 @@ from probes.network_probe import NetworkProbe  # noqa: E402
 from probes.web_probe import WebProbe  # noqa: E402
 from rollback_audit.diff_tracker import DiffTracker  # noqa: E402
 from rollback_audit.rollback_manager import RollbackManager  # noqa: E402
+from runtime.external_world_refresh import ExternalWorldRefresh  # noqa: E402
 from runtime.proactive_checks import ProactiveChecks  # noqa: E402
 from runtime.retention_policy import RetentionPolicy  # noqa: E402
 from runtime.safety_validation import SafetyValidation  # noqa: E402
@@ -78,11 +79,15 @@ class FakeCoreReasoning:
         perception: dict[str, Any] | None = None,
         agency: dict[str, Any] | None = None,
         foresight: dict[str, Any] | None = None,
+        memory: dict[str, Any] | None = None,
+        external_world: dict[str, Any] | None = None,
     ) -> None:
         self.decision = decision or {"status": "skipped"}
         self.perception = perception or {"status": "skipped"}
         self.agency = agency or {"status": "skipped"}
         self.foresight = foresight or {"status": "skipped"}
+        self.memory = memory or {"status": "skipped"}
+        self.external_world = external_world or {"status": "skipped"}
 
     def status(self) -> dict[str, Any]:
         return {"enabled": True, "configured": True, "decision_mode": "always", "status": "configured"}
@@ -104,6 +109,12 @@ class FakeCoreReasoning:
 
     def foresight_assist(self, *, text: str, risk_level: str, rule_foresight: dict[str, Any], decision: dict[str, Any] | None = None) -> dict[str, Any]:
         return self.foresight
+
+    def memory_assist(self, *, session_id: str, focus: list[str], candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        return self.memory
+
+    def external_world_assist(self, *, target: str, probe_result: dict[str, Any], current_goal: str = "") -> dict[str, Any]:
+        return self.external_world
 
 
 def reset_main_state(tmp: Path) -> TestClient:
@@ -134,6 +145,7 @@ def reset_main_state(tmp: Path) -> TestClient:
     app_module.safety_validation = SafetyValidation()
     app_module.retention_policy = RetentionPolicy(state_store)
     app_module.state_refresh = StateRefresh(state_store, reasoning=loop.core_reasoning)
+    app_module.external_world_refresh = ExternalWorldRefresh(state_store, reasoning=loop.core_reasoning)
     app_module.soak_runner = SoakRunner(
         proactive_checks=app_module.proactive_checks,
         task_tracker=loop.task_tracker,
@@ -274,6 +286,38 @@ def main() -> int:
         )
         expect("decision_trace" in context_patch and "foresight" in context_patch and "executor_state" in context_patch, "context patch carries governance background", context_patch)
 
+        app_module.state_store.write_json(
+            "agent_memory.json",
+            {
+                "items": [
+                    {"patch": {"task": "unrelated", "result": "ignore"}, "freshness": "fresh", "trust": "observed"},
+                    {"patch": {"task": "openclaw restart", "result": "check gateway token first"}, "freshness": "fresh", "trust": "observed"},
+                    {"patch": {"task": "frontend css", "result": "not relevant"}, "freshness": "fresh", "trust": "observed"},
+                ]
+            },
+        )
+        model_memory = LocalMemoryBridge(
+            app_module.state_store,
+            adapter_resolver=lambda: adapter,
+            reasoning=FakeCoreReasoning(memory={"status": "model_assisted", "selected_indexes": [1], "relevance_notes": "OpenClaw memory is most relevant."}),
+        ).read_summary("p6", ["openclaw"])
+        expect(len(model_memory["summary"]) == 1 and "openclaw" in str(model_memory["summary"][0]).lower(), "core model ranks memory relevance", model_memory)
+
+        app_module.state_store.write_json("external_world.json", {"watchlist": [{"target": "localhost", "reason": "self-test"}], "summaries": []})
+        external = ExternalWorldRefresh(
+            app_module.state_store,
+            reasoning=FakeCoreReasoning(
+                external_world={
+                    "status": "model_assisted",
+                    "summary": "localhost remains relevant for local runtime diagnostics",
+                    "relevance": "runtime_probe",
+                    "watch_recommendation": "keep",
+                    "reasons": ["local runtime target"],
+                }
+            ),
+        ).refresh_watchlist(limit=1)
+        expect(external["refreshed"] and external["refreshed"][0]["model_assist"]["status"] == "model_assisted", "external world watchlist uses core model interpretation", external)
+
         agent_model_store = WorldStateStore(tmp / "agent-model-state")
         agent_model_config = agent_model_store.read_json("agent_config.json")
         agent_model_config["selected_agent"] = "openclaw"
@@ -377,6 +421,11 @@ def main() -> int:
         )
         stale_refresh = client.post("/state/refresh-stale")
         expect(stale_refresh.status_code == 200 and stale_refresh.json()["refreshed"], "stale belief refresh endpoint", stale_refresh.text)
+
+        watch = client.post("/external/watchlist", json={"target": "localhost", "reason": "p6_self_test"})
+        expect(watch.status_code == 200 and watch.json()["watchlist"], "external watchlist endpoint", watch.text)
+        external_refresh = client.post("/external/refresh?limit=1")
+        expect(external_refresh.status_code == 200 and external_refresh.json()["refreshed"], "external refresh endpoint", external_refresh.text)
 
         red_team = client.get("/ops/safety/red-team").json()
         retention = client.get("/ops/retention").json()

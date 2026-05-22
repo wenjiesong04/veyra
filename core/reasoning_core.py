@@ -31,7 +31,7 @@ class CoreReasoning:
             return False
         if status.get("decision_mode") == "always":
             return True
-        if kind in {"perception", "agency"}:
+        if kind in {"perception", "agency", "memory", "external_world"}:
             return True
         route = str(rule_context.get("route") or "")
         risk = str(rule_context.get("risk_level") or "R0")
@@ -124,6 +124,60 @@ class CoreReasoning:
             user=json.dumps(payload, ensure_ascii=False),
         )
         self._trace("foresight", result, {"risk_level": risk_level, "route": rule_context.get("route")})
+        return result
+
+    def memory_assist(
+        self,
+        *,
+        session_id: str,
+        focus: list[str],
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not self.should_assist("memory", {"route": "agent", "risk_level": "R1"}):
+            return {"status": "skipped"}
+        payload = {
+            "session_id": session_id,
+            "focus": focus,
+            "candidates": redact_sensitive(candidates, max_string=900),
+            "task": "Rank memory items by relevance to the current focus. Return only indexes from candidates.",
+        }
+        result = self.client.complete_json(
+            purpose="memory",
+            system=(
+                "You are Veyra Core's memory relevance selector. Return strict JSON with "
+                "selected_indexes [integer], relevance_notes, and optional summary. "
+                "Select only memories useful for the current task. Do not include secrets or local paths."
+            ),
+            user=json.dumps(payload, ensure_ascii=False),
+        )
+        self._trace("memory", result, {"candidate_count": len(candidates), "focus": focus[:8]})
+        return result
+
+    def external_world_assist(
+        self,
+        *,
+        target: str,
+        probe_result: dict[str, Any],
+        current_goal: str = "",
+    ) -> dict[str, Any]:
+        if not self.should_assist("external_world", {"route": "probe", "risk_level": "R1"}):
+            return {"status": "skipped"}
+        payload = {
+            "target": target,
+            "current_goal": current_goal,
+            "probe_result": redact_sensitive(probe_result, max_string=1800),
+            "task": "Summarize external world relevance and decide whether this target should keep being watched.",
+        }
+        result = self.client.complete_json(
+            purpose="external_world",
+            system=(
+                "You are Veyra Core's ExternalWorld interpreter. Return strict JSON with "
+                "summary, relevance, watch_recommendation keep|pause|remove, reasons, and optional claims. "
+                "Ground all claims in the probe result."
+            ),
+            user=json.dumps(payload, ensure_ascii=False),
+        )
+        self._trace("external_world", result, {"target": target, "status": probe_result.get("status")})
         return result
 
     def agency_assist(self, *, goals: dict[str, Any], world_state: dict[str, Any], rule_gaps: list[dict[str, Any]]) -> dict[str, Any]:
