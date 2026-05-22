@@ -72,6 +72,12 @@ class FakePollingAdapter(AgentAdapter):
     def stop_task(self, task_id: str) -> bool:
         return True
 
+    def fetch_memory_summary(self, session_id: str) -> dict[str, Any]:
+        return {"session_id": session_id, "summary": f"fake memory for {session_id}", "freshness": "fresh", "trust": "external"}
+
+    def write_memory_patch(self, memory_patch: dict[str, Any]) -> None:
+        return None
+
 
 class FakeCoreReasoning:
     def __init__(
@@ -322,9 +328,23 @@ def main() -> int:
         model_memory = LocalMemoryBridge(
             app_module.state_store,
             adapter_resolver=lambda: adapter,
+            adapter_getter=lambda provider: adapter,
+            provider_names=lambda: ["openclaw", "hermes", "custom"],
             reasoning=FakeCoreReasoning(memory={"status": "model_assisted", "selected_indexes": [1], "relevance_notes": "OpenClaw memory is most relevant."}),
         ).read_summary("p6", ["openclaw"])
         expect(len(model_memory["summary"]) == 1 and "openclaw" in str(model_memory["summary"][0]).lower(), "core model ranks memory relevance", model_memory)
+        routed_memory = LocalMemoryBridge(
+            app_module.state_store,
+            adapter_resolver=lambda: adapter,
+            adapter_getter=lambda provider: adapter,
+            provider_names=lambda: ["openclaw", "hermes", "custom"],
+        )
+        provider_status = routed_memory.provider_status()
+        all_summary = routed_memory.read_summary("p6", provider="all")
+        hermes_write = routed_memory.write_patch({"session_id": "p6", "task": "route memory", "result": "ok"}, provider="hermes")
+        expect("hermes" in provider_status["providers"] and "all" in provider_status["providers"], "memory providers are explicit", provider_status)
+        expect(all_summary["external_summary"]["provider"] == "all" and all_summary["external_summary"]["summary"], "memory summary can fan out across providers", all_summary)
+        expect(hermes_write["external_write"]["provider"] == "hermes" and hermes_write["external_write"]["status"] == "submitted", "memory patch can target provider", hermes_write)
 
         app_module.state_store.write_json("external_world.json", {"watchlist": [{"target": "localhost", "reason": "self-test"}], "summaries": []})
         external = ExternalWorldRefresh(
@@ -414,6 +434,13 @@ def main() -> int:
         expect(safe["status"] == "written", "memory safe write", safe)
         expect(blocked["status"] == "blocked", "memory sensitive write blocked", blocked)
         expect("summary" in summary and "external_summary" in summary, "memory summary includes external slot", summary)
+
+        providers_response = client.get("/memory/providers")
+        summary_response = client.get("/memory/summary?session_id=p6&provider=local")
+        patch_response = client.post("/memory/patch", json={"provider": "local", "patch": {"session_id": "p6", "task": "local provider", "result": "ok"}})
+        expect(providers_response.status_code == 200 and "selected" in providers_response.json()["providers"], "memory providers endpoint", providers_response.text)
+        expect(summary_response.status_code == 200 and summary_response.json()["provider"] == "local", "memory summary provider endpoint", summary_response.text)
+        expect(patch_response.status_code == 200 and patch_response.json()["external_write"]["status"] == "local_only", "memory patch provider endpoint", patch_response.text)
 
         polled = client.get("/agent/tasks/task_unknown")
         expect(polled.status_code == 200, "agent task polling endpoint", polled.text)

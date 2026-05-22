@@ -15,20 +15,25 @@ class LocalMemoryBridge:
         self,
         state_store: WorldStateStore,
         adapter_resolver: Callable[[], AgentAdapter] | None = None,
+        adapter_getter: Callable[[str], AgentAdapter] | None = None,
+        provider_names: Callable[[], list[str]] | None = None,
         reasoning: CoreReasoning | None = None,
     ) -> None:
         self.state_store = state_store
         self.filter = MemoryFilter()
         self.adapter_resolver = adapter_resolver
+        self.adapter_getter = adapter_getter
+        self.provider_names = provider_names
         self.reasoning = reasoning or CoreReasoning(state_store)
 
-    def read_summary(self, session_id: str, focus: list[str] | None = None) -> dict[str, Any]:
+    def read_summary(self, session_id: str, focus: list[str] | None = None, provider: str = "selected") -> dict[str, Any]:
         items = self.state_store.read_json("agent_memory.json").get("items", [])
         focused = self._relevant(items, focus)
         local, relevance = self._model_relevant(session_id, focus or [], focused)
-        external = self._external_summary(session_id)
+        external = self._external_summary(session_id, provider)
         return {
             "session_id": session_id,
+            "provider": provider,
             "summary": local,
             "external_summary": external,
             "freshness": self._freshness(local),
@@ -36,7 +41,7 @@ class LocalMemoryBridge:
             "relevance": relevance,
         }
 
-    def write_patch(self, patch: dict[str, Any]) -> dict[str, Any]:
+    def write_patch(self, patch: dict[str, Any], provider: str = "selected") -> dict[str, Any]:
         filtered = self.filter.filter(patch)
         if filtered is None:
             result = {"status": "blocked", "reason": "memory policy rejected sensitive patch"}
@@ -46,33 +51,64 @@ class LocalMemoryBridge:
                 "patch": filtered,
                 "freshness": filtered.get("freshness", "fresh"),
                 "trust": filtered.get("trust", "observed"),
+                "provider": provider,
                 "created_at": utc_now_iso(),
             }
             state.setdefault("items", []).append(item)
             self.state_store.write_json("agent_memory.json", state)
-            external = self._external_write(filtered)
+            external = self._external_write(filtered, provider)
             result = {"status": "written", "item": item, "external_write": external}
         self.state_store.append_jsonl("memory_log.jsonl", result)
         return result
 
-    def _external_summary(self, session_id: str) -> dict[str, Any]:
-        adapter = self.adapter_resolver() if self.adapter_resolver else None
-        if not adapter:
-            return {"status": "not_configured", "summary": ""}
-        try:
-            return adapter.fetch_memory_summary(session_id)
-        except Exception as exc:
-            return {"status": "error", "summary": "", "error": str(exc)}
+    def provider_status(self) -> dict[str, Any]:
+        names = self._provider_names()
+        return {
+            "providers": names,
+            "default": "selected",
+            "supports": ["summary", "patch"],
+            "notes": {
+                "local": "Veyra local JSON memory only",
+                "selected": "currently selected AgentAdapter memory API",
+                "all": "fan-out read/write across configured external adapters plus local",
+            },
+        }
 
-    def _external_write(self, patch: dict[str, Any]) -> dict[str, Any]:
-        adapter = self.adapter_resolver() if self.adapter_resolver else None
+    def _external_summary(self, session_id: str, provider: str) -> dict[str, Any]:
+        if provider == "local":
+            return {"provider": "local", "status": "local_only", "summary": "", "freshness": "fresh", "trust": "local"}
+        if provider == "all":
+            summaries = [self._external_summary(session_id, name) for name in self._provider_names() if name not in {"local", "all"}]
+            return {
+                "provider": "all",
+                "status": "success",
+                "summary": summaries,
+                "freshness": self._freshness_from_external(summaries),
+                "trust": "mixed",
+            }
+        adapter = self._adapter_for(provider)
         if not adapter:
-            return {"status": "not_configured"}
+            return {"provider": provider, "status": "not_configured", "summary": "", "freshness": "stale", "trust": "untrusted"}
+        try:
+            response = adapter.fetch_memory_summary(session_id)
+        except Exception as exc:
+            return {"provider": provider, "status": "error", "summary": "", "error": str(exc), "freshness": "stale", "trust": "untrusted"}
+        return self._normalize_external_summary(provider, response)
+
+    def _external_write(self, patch: dict[str, Any], provider: str) -> dict[str, Any]:
+        if provider == "local":
+            return {"provider": "local", "status": "local_only"}
+        if provider == "all":
+            results = [self._external_write(patch, name) for name in self._provider_names() if name not in {"local", "all"}]
+            return {"provider": "all", "status": "submitted" if any(item.get("status") == "submitted" for item in results) else "not_configured", "results": results}
+        adapter = self._adapter_for(provider)
+        if not adapter:
+            return {"provider": provider, "status": "not_configured"}
         try:
             adapter.write_memory_patch(patch)
         except Exception as exc:
-            return {"status": "error", "error": str(exc)}
-        return {"status": "submitted"}
+            return {"provider": provider, "status": "error", "error": str(exc)}
+        return {"provider": provider, "status": "submitted"}
 
     def _relevant(self, items: list[Any], focus: list[str] | None) -> list[Any]:
         if not focus:
@@ -88,6 +124,48 @@ class LocalMemoryBridge:
         if any(isinstance(item, dict) and item.get("freshness") == "conflict" for item in items):
             return "conflict"
         if any(isinstance(item, dict) and item.get("freshness") == "stale" for item in items):
+            return "stale"
+        return "fresh"
+
+    def _adapter_for(self, provider: str) -> AgentAdapter | None:
+        if provider == "selected":
+            return self.adapter_resolver() if self.adapter_resolver else None
+        if self.adapter_getter:
+            try:
+                return self.adapter_getter(provider)
+            except Exception:
+                return None
+        return None
+
+    def _provider_names(self) -> list[str]:
+        names = ["local", "selected"]
+        if self.provider_names:
+            for name in self.provider_names():
+                if name not in names:
+                    names.append(name)
+        names.append("all")
+        return names
+
+    def _normalize_external_summary(self, provider: str, response: dict[str, Any]) -> dict[str, Any]:
+        summary = response.get("summary", "")
+        freshness = str(response.get("freshness") or ("fresh" if summary else "stale"))
+        if freshness not in {"fresh", "stale", "conflict"}:
+            freshness = "fresh"
+        trust = str(response.get("trust") or ("external" if summary else "untrusted"))
+        status = str(response.get("status") or ("success" if summary else "empty"))
+        return {
+            "provider": provider,
+            "status": status,
+            "summary": summary,
+            "freshness": freshness,
+            "trust": trust,
+            "raw": redact_sensitive(response, max_string=1200),
+        }
+
+    def _freshness_from_external(self, summaries: list[dict[str, Any]]) -> str:
+        if any(item.get("freshness") == "conflict" for item in summaries):
+            return "conflict"
+        if any(item.get("freshness") == "stale" for item in summaries):
             return "stale"
         return "fresh"
 

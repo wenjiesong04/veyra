@@ -36,7 +36,7 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | Veyra Core | Implemented MVP core loop plus model-assisted reasoning for intent/route, foresight, memory relevance, ExternalWorld interpretation, perception, and agency gaps. P4 adds evidence-backed verification. |
 | Interface Adapter / Agent Adapter | Implemented Intake/EventNormalizer plus AgentRegistry. OpenClaw, Hermes, and Custom adapters share the v1 task/result/capability contract. |
 | Probe Tools | Implemented system, git, port, process, file, network, web, log, MCP, OpenClaw, Hermes probe modules with standardized result envelopes where wired. |
-| Memory Bridge | Implemented local memory bridge for summary reads, model-assisted relevance ranking, filtered patch writes, and external adapter hooks. Production external memory semantics still need runtime validation. |
+| Memory Bridge | Implemented local memory bridge for summary reads, model-assisted relevance ranking, filtered patch writes, provider routing (`local` / `selected` / runtime names / `all`), and external adapter hooks. Production external memory semantics still need runtime validation. |
 | Skill | Implemented registry/runtime and built-in skill definitions. Skills route through AwarenessLoop and now record execution trace. |
 | Tool Proxy | Implemented SafeShell, SafeFile, SafeBrowser, SafeAPI with Guardian-style policy review, policy trace, standard tool trace, and Agent result bypass verification. |
 | Rollback / Audit | Implemented snapshot, diff, restore, rollback log, policy trace, tool trace, execution trace. Replay/time-travel remains future work. |
@@ -69,6 +69,7 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | `/architecture`, `/definitions`, `/mvp/status` | Architecture metadata, risk/lifecycle/mode definitions, readiness flags |
 | `/events/message` | Standard user-message event entry |
 | `/core/model/status`, `/core/model/config`, `/logs/core-model` | Core model config/status and redacted model reasoning audit |
+| `/memory/providers`, `/memory/summary`, `/memory/patch` | Memory provider discovery, summary reads, and filtered writes across local/selected/explicit runtime providers |
 | `/external/watchlist`, `/external/refresh` | Add/update ExternalWorld watch targets and refresh them through read-only probes |
 | `/agent/contract`, `/agent/status`, `/agents`, `/agents/select`, `/agents/{name}/config` | Agent contract, Tool Proxy contract, status, selection, adapter configuration |
 | `/actions/proposals`, `/reviews/*` | Action review and human confirmation flow |

@@ -72,6 +72,11 @@ class AgentRegistry:
     def selected(self) -> AgentAdapter:
         return self.get(self.selected_name())
 
+    def names(self) -> list[str]:
+        if not self._adapters:
+            self.refresh()
+        return sorted(self._adapters)
+
     def get(self, name: str) -> AgentAdapter:
         if name not in self._adapters:
             self.refresh()

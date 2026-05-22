@@ -104,6 +104,7 @@ class APIProxyRequest(BaseModel):
 
 class MemoryPatchRequest(BaseModel):
     patch: dict[str, Any]
+    provider: str = "selected"
 
 
 class ExternalWatchRequest(BaseModel):
@@ -693,13 +694,18 @@ async def configure_agent(name: str, request: AgentConfigRequest):
 
 
 @app.get("/memory/summary")
-async def memory_summary(session_id: str = "console-session"):
-    return awareness_loop.memory_bridge.read_summary(session_id)
+async def memory_summary(session_id: str = "console-session", provider: str = "selected"):
+    return awareness_loop.memory_bridge.read_summary(session_id, provider=provider)
+
+
+@app.get("/memory/providers")
+async def memory_providers():
+    return awareness_loop.memory_bridge.provider_status()
 
 
 @app.post("/memory/patch")
 async def memory_patch(request: MemoryPatchRequest):
-    return awareness_loop.memory_bridge.write_patch(request.patch)
+    return awareness_loop.memory_bridge.write_patch(request.patch, provider=request.provider)
 
 
 @app.get("/mvp/status")
@@ -722,6 +728,7 @@ async def mvp_status():
             "rollback_audit_depth": True,
             "rollback_snapshot_restore": True,
             "memory_bridge_local": True,
+            "memory_bridge_provider_routing": True,
             "proactive_read_only_checks": True,
             "multi_agent_registry": True,
             "agent_adapter_contract": True,

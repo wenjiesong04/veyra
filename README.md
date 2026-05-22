@@ -55,6 +55,7 @@ Endpoints:
 - `POST /agent/results` receive an Agent result callback and update verification state
 - `GET /agent/contract` inspect the AgentAdapter v1 contract
 - `GET /memory/summary` read local Memory Bridge summary
+- `GET /memory/providers` list available MemoryBridge providers
 - `GET /agency/intentions` read proactive Agency intention queue
 - `POST /state/refresh-stale` refresh stale belief claims with read-only probes
 - `POST /external/watchlist` add or update an ExternalWorld watch target
@@ -208,6 +209,8 @@ The Core model is inside Veyra Core, not inside the selected Agent Runtime. It c
 The same capability can also be attached while configuring a selected runtime with `POST /agents/{name}/config` by setting `use_model_for_core`, `model_base_url`, `model_api_key_env`, and `model`. Top-level `/core/model/config` takes precedence when explicitly enabled.
 
 Agent tool governance is part of the task contract. Veyra adds `policy_patch.tool_proxy_contract` to every Agent task packet. R3-R4 tool actions must go through `/actions/proposals` and return approval evidence; R5 actions are blocked. The Verifier rejects or downgrades Agent success claims when high-risk `tool_calls` lack ActionProposal, review, policy, or Tool Proxy trace evidence.
+
+MemoryBridge supports `local`, `selected`, explicit runtime names such as `openclaw` / `hermes` / `custom`, and `all` provider fan-out. Writes still pass the sensitive-memory filter before local storage or external adapter submission.
 
 OpenClaw uses the same WebSocket Gateway protocol as the local OpenClaw Control UI. Veyra converts `http://127.0.0.1:18789` to `ws://127.0.0.1:18789`, sends `connect`, checks `health` / `status`, and submits Agent work with `chat.send`. If OpenClaw is reachable but requires device pairing or a gateway token, `/agent/status` reports that explicitly instead of treating the control UI HTML as a working Agent API.
 
