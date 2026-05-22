@@ -23,6 +23,13 @@ def contract_summary() -> dict[str, Any]:
         "execution_result": {
             "required": ["task_id", "executor", "status", "result"],
             "optional": ["logs", "changed_files", "tool_calls", "raw"],
+            "tool_proxy_evidence": [
+                "raw.action_proposals",
+                "raw.tool_proxy_traces",
+                "raw.policy_trace",
+                "raw.review_id",
+                "raw.approved_by",
+            ],
             "known_statuses": sorted(KNOWN_STATUSES),
         },
         "capabilities": {

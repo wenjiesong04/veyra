@@ -20,6 +20,7 @@ from core.awareness_loop import AwarenessLoop  # noqa: E402
 from core.decision_core import DecisionCore  # noqa: E402
 from core.definitions import RiskLevel  # noqa: E402
 from core.foresight_engine import ForesightEngine  # noqa: E402
+from core.guardian_controller import GuardianController  # noqa: E402
 from core.model_client import CoreModelClient  # noqa: E402
 from core.perception_layer import PerceptionLayer  # noqa: E402
 from core.runtime_entity import RuntimeEntity  # noqa: E402
@@ -164,10 +165,32 @@ def main() -> int:
         client = reset_main_state(tmp)
 
         verifier = Verifier()
+        policy_patch = GuardianController().policy_patch(RiskLevel.R2)
+        expect(policy_patch["tool_proxy_contract"]["proposal_endpoint"] == "/actions/proposals", "agent policy patch includes tool proxy contract", policy_patch)
         for status in ["submitted", "running", "pending"]:
             verdict = verifier.verify_execution_result(ExecutionResult(task_id=f"t_{status}", executor="fake", status=status, result="queued"))
             expect(verdict["status"] == "partially_success", f"verifier {status}", verdict)
             expect(verdict["next_action"] == "poll_runtime_or_probe_result", f"verifier {status} next action", verdict)
+
+        bypass = verifier.verify_execution_result(
+            ExecutionResult(task_id="tool_bypass", executor="fake", status="success", result="restarted", tool_calls=["sudo restart openclaw"])
+        )
+        expect(bypass["verdict"] == "tool_proxy_bypass_suspected", "verifier flags unproxied high-risk agent tool call", bypass)
+        proxied = verifier.verify_execution_result(
+            ExecutionResult(
+                task_id="tool_proxied",
+                executor="fake",
+                status="success",
+                result="restarted",
+                tool_calls=["sudo restart openclaw"],
+                raw={"action_proposals": [{"status": "approved", "review_id": "rev_1"}]},
+            )
+        )
+        expect(proxied["status"] == "verified_success", "verifier accepts approved high-risk agent tool call", proxied)
+        forbidden = verifier.verify_execution_result(
+            ExecutionResult(task_id="tool_forbidden", executor="fake", status="success", result="deleted", tool_calls=["rm -rf /tmp/veyra-danger"])
+        )
+        expect(forbidden["verdict"] == "forbidden_tool_call_reported", "verifier blocks forbidden agent tool call", forbidden)
 
         adapter = FakePollingAdapter(
             [

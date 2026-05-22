@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from core.definitions import GuardianDecision, RiskLevel, risk_catalog, risk_policy
 from interface.event_schema import Decision
+from tool_proxy.agent_tool_contract import agent_tool_proxy_contract
 
 
 class GuardianController:
@@ -54,7 +55,10 @@ class GuardianController:
                 "return evidence for execution claims",
                 "do not escalate risk without ActionProposal",
                 "refresh stale state before relying on it",
+                "route R3-R4 tool actions through /actions/proposals before execution",
+                "return tool_proxy_traces or action_proposals for R2+ tool calls",
             ],
+            "tool_proxy_contract": agent_tool_proxy_contract(),
         }
 
     def _review_base(self, decision: Decision, foresight: dict[str, object]) -> dict[str, object]:

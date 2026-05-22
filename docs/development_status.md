@@ -26,7 +26,7 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | P3 Agent adapter execution contracts | Completed | `veyra.agent_adapter.v1`, OpenClaw WebSocket adapter, Hermes/Custom HTTP adapter, compatibility negotiation |
 | P4 Rollback / Audit / Verifier depth | Completed | Verifier verdicts, execution trace, tool trace, rollback checksum/diff/restore evidence |
 | P5 Web Control Console completeness | Completed | Console surfaces for setup, awareness, runtime, review, persona, state/logs, tool proxy, rollback/audit |
-| P6 End-to-end runtime hardening | In progress | Task polling/stop/refresh, Agent result callback, ActionProposal hardening, Core model-assisted reasoning, model-ranked memory, ExternalWorld refresh, Agency intentions, stale refresh, real probe envelopes, external-memory bridge slots |
+| P6 End-to-end runtime hardening | In progress | Task polling/stop/refresh, Agent result callback, ActionProposal hardening, Agent Tool Proxy contract verification, Core model-assisted reasoning, model-ranked memory, ExternalWorld refresh, Agency intentions, stale refresh, real probe envelopes, external-memory bridge slots |
 | P7 Production operations and safety validation | Started | Non-destructive red-team validation, retention summary, and bounded soak API exist; deployment monitoring remains pending |
 
 ## Eight Architecture Blocks
@@ -38,7 +38,7 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | Probe Tools | Implemented system, git, port, process, file, network, web, log, MCP, OpenClaw, Hermes probe modules with standardized result envelopes where wired. |
 | Memory Bridge | Implemented local memory bridge for summary reads, model-assisted relevance ranking, filtered patch writes, and external adapter hooks. Production external memory semantics still need runtime validation. |
 | Skill | Implemented registry/runtime and built-in skill definitions. Skills route through AwarenessLoop and now record execution trace. |
-| Tool Proxy | Implemented SafeShell, SafeFile, SafeBrowser, SafeAPI with Guardian-style policy review, policy trace, and standard tool trace. |
+| Tool Proxy | Implemented SafeShell, SafeFile, SafeBrowser, SafeAPI with Guardian-style policy review, policy trace, standard tool trace, and Agent result bypass verification. |
 | Rollback / Audit | Implemented snapshot, diff, restore, rollback log, policy trace, tool trace, execution trace. Replay/time-travel remains future work. |
 | Web Control UI | Implemented React/Vite console served at `/console`, backed by live Veyra APIs and built into `ui/console`. |
 
@@ -70,7 +70,7 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | `/events/message` | Standard user-message event entry |
 | `/core/model/status`, `/core/model/config`, `/logs/core-model` | Core model config/status and redacted model reasoning audit |
 | `/external/watchlist`, `/external/refresh` | Add/update ExternalWorld watch targets and refresh them through read-only probes |
-| `/agent/contract`, `/agent/status`, `/agents`, `/agents/select`, `/agents/{name}/config` | Agent contract, status, selection, adapter configuration |
+| `/agent/contract`, `/agent/status`, `/agents`, `/agents/select`, `/agents/{name}/config` | Agent contract, Tool Proxy contract, status, selection, adapter configuration |
 | `/actions/proposals`, `/reviews/*` | Action review and human confirmation flow |
 | `/tool-proxy/*` | Safe shell/file/browser/API execution boundary |
 | `/rollback/*` | Snapshot, diff, restore, git diff |
@@ -85,6 +85,7 @@ The current codebase follows the original design direction:
 - Messages enter Veyra first; Veyra runs a deterministic safety baseline, optionally uses its Core model for understanding/planning, then applies Guardian before native execution or Agent delegation.
 - Simple tasks are handled directly or through probes/skills.
 - Complex Agent tasks receive state, background, policy, model-ranked memory, decision trace, foresight, and Core model solution outline through `VeyraTaskPacket.context_patch`.
+- Agent tasks include `policy_patch.tool_proxy_contract`; Verifier flags high-risk `tool_calls` that lack ActionProposal, review, policy, or Tool Proxy trace evidence.
 - High-risk actions go through Guardian, policy trace, review, and Tool Proxy.
 - Execution results now require verifier evidence instead of blind trust.
 - Rollback/Audit records snapshots, diffs, traces, and restores.

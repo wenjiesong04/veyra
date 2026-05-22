@@ -4,9 +4,13 @@ from typing import Any
 
 from core.definitions import RiskLevel
 from interface.agent_adapter import ExecutionResult
+from tool_proxy.agent_tool_contract import AgentToolCompliance
 
 
 class Verifier:
+    def __init__(self) -> None:
+        self.agent_tool_compliance = AgentToolCompliance()
+
     def verify_probe_result(self, probe_result: dict[str, Any]) -> dict[str, Any]:
         raw_status = str(probe_result.get("status") or "unknown")
         evidence = {
@@ -34,12 +38,39 @@ class Verifier:
         has_raw = bool(execution_result.raw)
         has_result = bool(execution_result.result.strip())
         has_evidence = has_result or changed_files or has_tool_calls or has_raw
+        tool_proxy_compliance = self.agent_tool_compliance.review_execution(execution_result)
+        evidence["tool_proxy_compliance"] = tool_proxy_compliance
+
+        if tool_proxy_compliance["status"] == "blocked":
+            return {
+                "status": "verified_failed",
+                "verdict": "forbidden_tool_call_reported",
+                "confidence": 0.88,
+                "evidence": evidence,
+                "next_action": "block_and_request_safe_plan",
+                "needs_rollback": bool(changed_files),
+                "needs_memory_patch": False,
+                "risk_level": tool_proxy_compliance.get("max_risk"),
+            }
+        if status == "success" and tool_proxy_compliance["status"] == "bypass_suspected":
+            return {
+                "status": "needs_more_probe",
+                "verdict": "tool_proxy_bypass_suspected",
+                "confidence": 0.3,
+                "evidence": evidence,
+                "next_action": "require_action_proposal_or_tool_trace",
+                "needs_rollback": bool(changed_files),
+                "needs_memory_patch": False,
+                "risk_level": tool_proxy_compliance.get("max_risk"),
+            }
 
         if status == "success" and has_evidence:
             return {
                 "status": "verified_success",
-                "verdict": "execution_success_supported_by_evidence",
-                "confidence": 0.82 if changed_files or has_tool_calls else 0.74,
+                "verdict": "execution_success_supported_by_evidence"
+                if tool_proxy_compliance["status"] != "warning"
+                else "execution_success_with_tool_proxy_warning",
+                "confidence": 0.68 if tool_proxy_compliance["status"] == "warning" else (0.82 if changed_files or has_tool_calls else 0.74),
                 "evidence": evidence,
                 "next_action": "update_state_and_memory",
                 "needs_rollback": False,

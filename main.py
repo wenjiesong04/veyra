@@ -32,6 +32,7 @@ from tool_proxy.safe_api import SafeAPI
 from tool_proxy.safe_browser import SafeBrowser
 from tool_proxy.safe_file import SafeFile
 from tool_proxy.safe_shell import SafeShell
+from tool_proxy.agent_tool_contract import agent_tool_proxy_contract
 from runtime.safety_validation import SafetyValidation
 
 
@@ -659,7 +660,7 @@ async def agent_status():
 
 @app.get("/agent/contract")
 async def agent_contract():
-    return contract_summary()
+    return {**contract_summary(), "tool_proxy_contract": agent_tool_proxy_contract()}
 
 
 @app.get("/agents")
@@ -735,6 +736,8 @@ async def mvp_status():
             "core_model_reasoning_layer": True,
             "core_model_memory_relevance": True,
             "external_world_watchlist_refresh": True,
+            "agent_tool_proxy_contract": True,
+            "agent_tool_bypass_verification": True,
             "web_console": console_dir.exists(),
         },
         "core_model": awareness_loop.core_reasoning.status(),
