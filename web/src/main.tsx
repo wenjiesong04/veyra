@@ -44,6 +44,7 @@ type RuntimeInfo = {
     last_heartbeat_at: string;
   };
   operational_mode: string[];
+  core_model?: Record<string, JsonValue>;
 };
 
 type VeyraState = {
@@ -183,9 +184,11 @@ function App() {
   const [policyLogs, setPolicyLogs] = useState<LogResponse>({ items: [] });
   const [executionLogs, setExecutionLogs] = useState<LogResponse>({ items: [] });
   const [memoryLogs, setMemoryLogs] = useState<LogResponse>({ items: [] });
+  const [coreModelLogs, setCoreModelLogs] = useState<LogResponse>({ items: [] });
   const [agentStatus, setAgentStatus] = useState<Record<string, JsonValue> | null>(null);
   const [agentRegistry, setAgentRegistry] = useState<Record<string, JsonValue> | null>(null);
   const [agentContract, setAgentContract] = useState<Record<string, JsonValue> | null>(null);
+  const [coreModelStatus, setCoreModelStatus] = useState<Record<string, JsonValue> | null>(null);
   const [mvpStatus, setMvpStatus] = useState<Record<string, JsonValue> | null>(null);
   const [architecture, setArchitecture] = useState<ArchitectureSnapshot | null>(null);
   const [definitions, setDefinitions] = useState<Definitions | null>(null);
@@ -196,6 +199,12 @@ function App() {
   const [message, setMessage] = useState(initialMessage);
   const [snapshotPath, setSnapshotPath] = useState("README.md");
   const [agentBaseUrl, setAgentBaseUrl] = useState("");
+  const [coreModelEnabled, setCoreModelEnabled] = useState(false);
+  const [coreModelBaseUrl, setCoreModelBaseUrl] = useState("");
+  const [coreModelName, setCoreModelName] = useState("");
+  const [coreModelKeyEnv, setCoreModelKeyEnv] = useState("VEYRA_CORE_MODEL_API_KEY");
+  const [coreModelDecisionMode, setCoreModelDecisionMode] = useState("auto");
+  const [watchTarget, setWatchTarget] = useState("localhost");
   const [result, setResult] = useState<MessageResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -211,10 +220,12 @@ function App() {
       policyData,
       executionData,
       memoryData,
+      coreModelLogData,
       rollbackData,
       agentData,
       registryData,
       contractData,
+      coreModelData,
       mvpData,
       architectureData,
       definitionsData,
@@ -230,10 +241,12 @@ function App() {
       fetchJson<LogResponse>("/logs/policy?limit=20"),
       fetchJson<LogResponse>("/logs/execution?limit=20"),
       fetchJson<LogResponse>("/logs/memory?limit=20"),
+      fetchJson<LogResponse>("/logs/core-model?limit=20"),
       fetchJson<LogResponse>("/logs/rollback?limit=20"),
       fetchJson<Record<string, JsonValue>>("/agent/status"),
       fetchJson<Record<string, JsonValue>>("/agents"),
       fetchJson<Record<string, JsonValue>>("/agent/contract"),
+      fetchJson<Record<string, JsonValue>>("/core/model/status"),
       fetchJson<Record<string, JsonValue>>("/mvp/status"),
       fetchJson<ArchitectureSnapshot>("/architecture"),
       fetchJson<Definitions>("/definitions"),
@@ -249,15 +262,22 @@ function App() {
     setPolicyLogs(policyData);
     setExecutionLogs(executionData);
     setMemoryLogs(memoryData);
+    setCoreModelLogs(coreModelLogData);
     setRollbackLogs(rollbackData);
     setAgentStatus(agentData);
     setAgentRegistry(registryData);
     setAgentContract(contractData);
+    setCoreModelStatus(coreModelData);
     setMvpStatus(mvpData);
     setArchitecture(architectureData);
     setDefinitions(definitionsData);
     setHeartbeat(heartbeatData.heartbeat);
     setDiffStatus(diffData);
+    setCoreModelEnabled(coreModelData.enabled === true);
+    setCoreModelBaseUrl(String(coreModelData.base_url ?? ""));
+    setCoreModelName(String(coreModelData.model ?? ""));
+    setCoreModelKeyEnv(String(coreModelData.api_key_env ?? "VEYRA_CORE_MODEL_API_KEY"));
+    setCoreModelDecisionMode(String(coreModelData.decision_mode ?? "auto"));
   };
 
   useEffect(() => {
@@ -402,6 +422,61 @@ function App() {
     }
   };
 
+  const saveCoreModelConfig = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      await fetchJson("/core/model/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          enabled: coreModelEnabled,
+          provider: "openai_compatible",
+          base_url: coreModelBaseUrl,
+          model: coreModelName,
+          api_key_env: coreModelKeyEnv,
+          decision_mode: coreModelDecisionMode
+        })
+      });
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const addWatchTarget = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      await fetchJson("/external/watchlist", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target: watchTarget, reason: "console_watch", enabled: true })
+      });
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const refreshExternalWorld = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetchJson<Record<string, JsonValue>>("/external/refresh?limit=5", { method: "POST" });
+      setResult(response as MessageResult);
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const latestClaims = useMemo(() => state?.belief_state.claims?.slice(-5).reverse() ?? [], [state]);
   const focus = state?.attention_state.focus ?? [];
   const currentRisk = String(state?.risk_state.current_risk ?? "R0");
@@ -419,6 +494,9 @@ function App() {
   const readiness = asRecord(mvpStatus?.core_loops);
   const executionStatusCounts = statusCounts(executionLogs.items);
   const policyDecisionCounts = statusCounts(policyLogs.items, "decision");
+  const externalWatchlist = Array.isArray(state?.external_world?.watchlist) ? (state.external_world.watchlist as Array<JsonValue>) : [];
+  const externalSummaries = Array.isArray(state?.external_world?.summaries) ? (state.external_world.summaries as Array<Record<string, JsonValue>>) : [];
+  const coreModelConfigured = coreModelStatus?.configured === true ? "configured" : String(coreModelStatus?.status ?? "unconfigured");
 
   return (
     <main className="appShell">
@@ -483,6 +561,68 @@ function App() {
                 <StatusPill value={String(block.status ?? "unknown")} />
               </div>
             ))}
+          </div>
+        </Section>
+      </section>
+
+      <section className="workspaceGrid">
+        <Section title="Core Model" icon={<Brain size={18} />}>
+          <div className="configPanel">
+            <div className="configSummary">
+              <Metric label="Status" value={<StatusPill value={coreModelConfigured} />} />
+              <Metric label="Mode" value={String(coreModelStatus?.decision_mode ?? "auto")} />
+            </div>
+            <label className="toggleRow">
+              <input type="checkbox" checked={coreModelEnabled} onChange={(event) => setCoreModelEnabled(event.target.checked)} />
+              <span>Use model inside Veyra Core</span>
+            </label>
+            <div className="configGrid">
+              <input value={coreModelBaseUrl} onChange={(event) => setCoreModelBaseUrl(event.target.value)} placeholder="http://127.0.0.1:11434/v1" aria-label="Core model base URL" />
+              <input value={coreModelName} onChange={(event) => setCoreModelName(event.target.value)} placeholder="model name" aria-label="Core model name" />
+              <input value={coreModelKeyEnv} onChange={(event) => setCoreModelKeyEnv(event.target.value)} placeholder="VEYRA_CORE_MODEL_API_KEY" aria-label="Core model API key environment variable" />
+              <select value={coreModelDecisionMode} onChange={(event) => setCoreModelDecisionMode(event.target.value)} aria-label="Core model decision mode">
+                <option value="auto">auto</option>
+                <option value="always">always</option>
+              </select>
+            </div>
+            <div className="buttonRow compact">
+              <button className="primaryButton compactButton" onClick={saveCoreModelConfig} disabled={loading || (coreModelEnabled && (!coreModelBaseUrl.trim() || !coreModelName.trim()))}>
+                <Save size={14} />
+                Save Core Model
+              </button>
+            </div>
+            <JsonBlock value={coreModelStatus ?? { status: "not loaded" }} />
+          </div>
+        </Section>
+
+        <Section title="External World" icon={<Eye size={18} />}>
+          <div className="configPanel">
+            <div className="agentUrlRow">
+              <input value={watchTarget} onChange={(event) => setWatchTarget(event.target.value)} placeholder="https://example.com or host" aria-label="External watch target" />
+              <button className="primaryButton compactButton" onClick={addWatchTarget} disabled={loading || !watchTarget.trim()}>
+                <Save size={14} />
+                Watch
+              </button>
+            </div>
+            <div className="buttonRow compact">
+              <button className="ghostButton" onClick={refreshExternalWorld} disabled={loading || !externalWatchlist.length}>
+                <RefreshCw size={15} />
+                Refresh Watchlist
+              </button>
+            </div>
+            <div className="watchList">
+              {externalWatchlist.slice(-5).reverse().map((item, index) => {
+                const record = typeof item === "object" && item !== null && !Array.isArray(item) ? (item as Record<string, JsonValue>) : { target: item };
+                return (
+                  <div className="watchItem" key={index}>
+                    <strong>{String(record.target ?? "-")}</strong>
+                    <small>{String(record.reason ?? record.kind ?? "watch target")}</small>
+                  </div>
+                );
+              })}
+              {!externalWatchlist.length ? <div className="emptyState"><Eye size={18} />No watch targets yet.</div> : null}
+            </div>
+            <JsonBlock value={externalSummaries.slice(-3).reverse()} />
           </div>
         </Section>
       </section>
@@ -895,6 +1035,9 @@ function App() {
         </Section>
         <Section title="Action Record" icon={<ClipboardList size={18} />}>
           <JsonBlock value={actions.items.slice(-4).reverse()} />
+        </Section>
+        <Section title="Core Model Trace" icon={<Brain size={18} />}>
+          <JsonBlock value={coreModelLogs.items.slice(-4).reverse()} />
         </Section>
         <Section title="Rollback Log" icon={<History size={18} />}>
           <JsonBlock value={rollbackLogs.items.slice(-4).reverse()} />

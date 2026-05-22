@@ -15,7 +15,14 @@ export default defineConfig({
       "/heartbeat": "http://127.0.0.1:8000",
       "/logs": "http://127.0.0.1:8000",
       "/reviews": "http://127.0.0.1:8000",
-      "/runtime": "http://127.0.0.1:8000"
+      "/runtime": "http://127.0.0.1:8000",
+      "/core": "http://127.0.0.1:8000",
+      "/external": "http://127.0.0.1:8000",
+      "/agent": "http://127.0.0.1:8000",
+      "/agents": "http://127.0.0.1:8000",
+      "/architecture": "http://127.0.0.1:8000",
+      "/definitions": "http://127.0.0.1:8000",
+      "/rollback": "http://127.0.0.1:8000"
     }
   }
 });

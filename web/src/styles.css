@@ -722,10 +722,75 @@ code {
   padding: 14px;
 }
 
-.agentRuntimePanel .jsonBlock {
+.agentRuntimePanel .jsonBlock,
+.configPanel .jsonBlock {
   min-height: 150px;
   max-height: 280px;
   border-radius: 8px;
+}
+
+.configPanel {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.configSummary,
+.configGrid {
+  display: grid;
+  gap: 8px;
+}
+
+.configSummary {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.configGrid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.configGrid input,
+.configGrid select {
+  min-width: 0;
+  min-height: 36px;
+  border: 1px solid #ccd4d2;
+  border-radius: 8px;
+  padding: 0 10px;
+  color: #1f2630;
+  background: #fbfcfb;
+}
+
+.toggleRow {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 34px;
+  font-weight: 800;
+  color: #26323d;
+}
+
+.toggleRow input {
+  width: 16px;
+  height: 16px;
+  accent-color: #245c56;
+}
+
+.watchList {
+  display: grid;
+  gap: 8px;
+}
+
+.watchItem {
+  display: grid;
+  gap: 4px;
+  border: 1px solid #e3e7e3;
+  border-radius: 8px;
+  padding: 9px 10px;
+  background: #fbfcfb;
+}
+
+.watchItem small {
+  color: #68727d;
 }
 
 .segmentedControl {
@@ -842,7 +907,9 @@ code {
   }
 
   .segmentedControl,
-  .agentUrlRow {
+  .agentUrlRow,
+  .configSummary,
+  .configGrid {
     grid-template-columns: 1fr;
   }
 }
