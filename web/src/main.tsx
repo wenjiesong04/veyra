@@ -189,6 +189,7 @@ function App() {
   const [toolProxyStatus, setToolProxyStatus] = useState<Record<string, JsonValue> | null>(null);
   const [executionLogs, setExecutionLogs] = useState<LogResponse>({ items: [] });
   const [memoryLogs, setMemoryLogs] = useState<LogResponse>({ items: [] });
+  const [memoryDiagnostics, setMemoryDiagnostics] = useState<Record<string, JsonValue> | null>(null);
   const [coreModelLogs, setCoreModelLogs] = useState<LogResponse>({ items: [] });
   const [alertLogs, setAlertLogs] = useState<LogResponse>({ items: [] });
   const [auditJournal, setAuditJournal] = useState<Record<string, JsonValue> | null>(null);
@@ -234,6 +235,7 @@ function App() {
       toolProxyData,
       executionData,
       memoryData,
+      memoryDiagnosticsData,
       coreModelLogData,
       alertLogData,
       auditJournalData,
@@ -264,6 +266,7 @@ function App() {
       fetchJson<Record<string, JsonValue>>("/tool-proxy/status"),
       fetchJson<LogResponse>("/logs/execution?limit=20"),
       fetchJson<LogResponse>("/logs/memory?limit=20"),
+      fetchJson<Record<string, JsonValue>>("/memory/providers/diagnostics?provider=all&session_id=console"),
       fetchJson<LogResponse>("/logs/core-model?limit=20"),
       fetchJson<LogResponse>("/logs/alerts?limit=20"),
       fetchJson<Record<string, JsonValue>>("/audit/journal?limit=40"),
@@ -294,6 +297,7 @@ function App() {
     setToolProxyStatus(toolProxyData);
     setExecutionLogs(executionData);
     setMemoryLogs(memoryData);
+    setMemoryDiagnostics(memoryDiagnosticsData);
     setCoreModelLogs(coreModelLogData);
     setAlertLogs(alertLogData);
     setAuditJournal(auditJournalData);
@@ -587,6 +591,24 @@ function App() {
         method: "POST",
         body: JSON.stringify({ api_executor_enabled: apiEnabled, browser_executor_enabled: browserEnabled })
       });
+      setResult(response as MessageResult);
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const probeMemoryProviders = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetchJson<Record<string, JsonValue>>("/memory/providers/diagnostics", {
+        method: "POST",
+        body: JSON.stringify({ provider: "all", session_id: "console", write_probe: false })
+      });
+      setMemoryDiagnostics(response);
       setResult(response as MessageResult);
       await refresh();
     } catch (caught) {
@@ -989,6 +1011,13 @@ function App() {
 
       <section className="workspaceGrid">
         <Section title="Memory Bridge" icon={<Database size={18} />}>
+          <div className="buttonRow compact">
+            <button className="ghostButton" onClick={probeMemoryProviders} disabled={loading}>
+              <Database size={15} />
+              Probe Providers
+            </button>
+          </div>
+          <JsonBlock value={memoryDiagnostics ?? { status: "not loaded" }} />
           <div className="dataTable memoryTable">
             <div className="dataTableHead">
               <span>Task</span>

@@ -61,6 +61,8 @@ Endpoints:
 - `GET /agent/contract` inspect the AgentAdapter v1 contract
 - `GET /memory/summary` read local Memory Bridge summary
 - `GET /memory/providers` list available MemoryBridge providers
+- `GET /memory/providers/diagnostics` run read-only MemoryBridge provider diagnostics
+- `POST /memory/providers/diagnostics` optionally run provider diagnostics with a write probe
 - `GET /agency/intentions` read proactive Agency intention queue
 - `POST /state/refresh-stale` refresh stale belief claims with read-only probes
 - `POST /external/watchlist` add or update an ExternalWorld watch target

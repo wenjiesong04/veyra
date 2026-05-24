@@ -67,12 +67,77 @@ class LocalMemoryBridge:
             "providers": names,
             "default": "selected",
             "supports": ["summary", "patch"],
+            "diagnostics_endpoint": "/memory/providers/diagnostics",
             "notes": {
                 "local": "Veyra local JSON memory only",
                 "selected": "currently selected AgentAdapter memory API",
                 "all": "fan-out read/write across configured external adapters plus local",
             },
         }
+
+    def provider_diagnostics(self, provider: str = "all", session_id: str = "memory-diagnostics", write_probe: bool = False) -> dict[str, Any]:
+        if provider == "all":
+            results = [
+                self.provider_diagnostics(name, session_id=session_id, write_probe=write_probe)
+                for name in self._provider_names()
+                if name != "all"
+            ]
+            status = "success" if all(item.get("status") == "success" for item in results) else "degraded"
+            output = {"status": status, "provider": "all", "session_id": session_id, "write_probe": write_probe, "results": results}
+            self.state_store.append_jsonl("memory_log.jsonl", {"status": status, "reason": "provider_diagnostics", "result": redact_sensitive(output, max_string=1800)})
+            return output
+        if provider == "local":
+            state = self.state_store.read_json("agent_memory.json")
+            items = state.get("items", []) if isinstance(state.get("items"), list) else []
+            output = {
+                "status": "success",
+                "provider": "local",
+                "mode": "local_json",
+                "session_id": session_id,
+                "summary": {"status": "success", "items": len(items), "freshness": self._freshness(items[-20:]), "trust": "local"},
+                "write_probe": {"status": "skipped", "reason": "local provider does not need external probe"},
+            }
+            return output
+        adapter = self._adapter_for(provider)
+        if not adapter:
+            return {
+                "status": "not_configured",
+                "provider": provider,
+                "mode": "external_adapter",
+                "session_id": session_id,
+                "connection": {"status": "adapter_unconfigured", "connected": False},
+                "summary": {"status": "not_configured", "freshness": "stale", "trust": "untrusted"},
+                "write_probe": {"status": "skipped"},
+            }
+        try:
+            connection = adapter.connection_status()
+        except Exception as exc:
+            connection = {"status": "error", "connected": False, "error": str(exc)}
+        summary = self._external_summary(session_id, provider)
+        probe_result = {"status": "skipped", "reason": "write_probe disabled"}
+        if write_probe:
+            probe_result = self._external_write(
+                {
+                    "session_id": session_id,
+                    "task": "veyra_memory_provider_diagnostics",
+                    "result": "probe_write",
+                    "freshness": "fresh",
+                    "trust": "veyra_probe",
+                },
+                provider,
+            )
+        status = self._diagnostic_status(connection, summary, probe_result, write_probe)
+        output = {
+            "status": status,
+            "provider": provider,
+            "mode": "external_adapter",
+            "session_id": session_id,
+            "connection": redact_sensitive(connection, max_string=1200),
+            "summary": summary,
+            "write_probe": probe_result,
+        }
+        self.state_store.append_jsonl("memory_log.jsonl", {"status": status, "reason": "provider_diagnostics", "result": redact_sensitive(output, max_string=1800)})
+        return output
 
     def _external_summary(self, session_id: str, provider: str) -> dict[str, Any]:
         if provider == "local":
@@ -168,6 +233,23 @@ class LocalMemoryBridge:
         if any(item.get("freshness") == "stale" for item in summaries):
             return "stale"
         return "fresh"
+
+    def _diagnostic_status(
+        self,
+        connection: dict[str, Any],
+        summary: dict[str, Any],
+        probe_result: dict[str, Any],
+        write_probe: bool,
+    ) -> str:
+        if str(connection.get("status")) in {"adapter_unconfigured", "unavailable", "error"}:
+            return "not_configured" if str(connection.get("status")) == "adapter_unconfigured" else "error"
+        if summary.get("status") == "error":
+            return "error"
+        if summary.get("status") in {"not_configured", "local_memory_bridge"}:
+            return "degraded"
+        if write_probe and probe_result.get("status") not in {"submitted", "local_only"}:
+            return "degraded"
+        return "success"
 
     def _model_relevant(self, session_id: str, focus: list[str], items: list[Any]) -> tuple[list[Any], dict[str, Any]]:
         fallback = items[-5:]

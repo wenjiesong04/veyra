@@ -210,6 +210,7 @@ P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块。当�
 - Agent 任务下发时会把 Core 模型生成的 solution outline、agent_context、decision trace、foresight、executor/task/background 放进 `VeyraTaskPacket.context_patch`；模型不能降低风险等级，也不能绕过 Tool Proxy / review。
 - MemoryBridge 会先按 focus 做规则过滤，再由 Core 模型在候选 memory 内排序选择相关条目；无模型或模型输出无效时回退最近相关 memory。
 - MemoryBridge 支持 `local`、`selected`、显式 runtime provider 和 `all` fan-out；写入仍先经过敏感信息过滤，再写本地或提交外部 adapter。
+- MemoryBridge 增加 provider diagnostics，可只读检查外部 summary 语义，也可显式执行 write probe。
 - ExternalWorld 增加 watchlist refresh：对 URL/host 运行只读 web/network probe，再由 Core 模型解释外部状态与当前目标的相关性和 watch 建议。
 - Web Console 增加 Core model 配置、Core model trace、ExternalWorld watchlist 和刷新入口。
 - Agent 任务包增加 `tool_proxy_contract`，Verifier 会检查 Agent 回传的高风险 `tool_calls` 是否有 ActionProposal / review / policy / Tool Proxy trace 证据；无证据的 R3-R4 不给 verified success，R5 直接标记 forbidden。

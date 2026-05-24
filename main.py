@@ -135,6 +135,12 @@ class MemoryPatchRequest(BaseModel):
     provider: str = "selected"
 
 
+class MemoryDiagnosticsRequest(BaseModel):
+    provider: str = "all"
+    session_id: str = "memory-diagnostics"
+    write_probe: bool = False
+
+
 class ExternalWatchRequest(BaseModel):
     target: str
     kind: str | None = None
@@ -864,6 +870,20 @@ async def memory_providers():
     return awareness_loop.memory_bridge.provider_status()
 
 
+@app.get("/memory/providers/diagnostics")
+async def memory_provider_diagnostics(provider: str = "all", session_id: str = "memory-diagnostics"):
+    return awareness_loop.memory_bridge.provider_diagnostics(provider=provider, session_id=session_id, write_probe=False)
+
+
+@app.post("/memory/providers/diagnostics")
+async def memory_provider_diagnostics_write(request: MemoryDiagnosticsRequest):
+    return awareness_loop.memory_bridge.provider_diagnostics(
+        provider=request.provider,
+        session_id=request.session_id,
+        write_probe=request.write_probe,
+    )
+
+
 @app.post("/memory/patch")
 async def memory_patch(request: MemoryPatchRequest):
     return awareness_loop.memory_bridge.write_patch(request.patch, provider=request.provider)
@@ -893,6 +913,7 @@ async def mvp_status():
             "time_travel_audit": True,
             "memory_bridge_local": True,
             "memory_bridge_provider_routing": True,
+            "memory_provider_diagnostics": True,
             "proactive_read_only_checks": True,
             "multi_agent_registry": True,
             "agent_adapter_contract": True,

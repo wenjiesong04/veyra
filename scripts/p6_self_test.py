@@ -364,9 +364,13 @@ def main() -> int:
         provider_status = routed_memory.provider_status()
         all_summary = routed_memory.read_summary("p6", provider="all")
         hermes_write = routed_memory.write_patch({"session_id": "p6", "task": "route memory", "result": "ok"}, provider="hermes")
+        hermes_diagnostics = routed_memory.provider_diagnostics(provider="hermes", session_id="p6", write_probe=True)
+        all_diagnostics = routed_memory.provider_diagnostics(provider="all", session_id="p6")
         expect("hermes" in provider_status["providers"] and "all" in provider_status["providers"], "memory providers are explicit", provider_status)
         expect(all_summary["external_summary"]["provider"] == "all" and all_summary["external_summary"]["summary"], "memory summary can fan out across providers", all_summary)
         expect(hermes_write["external_write"]["provider"] == "hermes" and hermes_write["external_write"]["status"] == "submitted", "memory patch can target provider", hermes_write)
+        expect(hermes_diagnostics["status"] == "success" and hermes_diagnostics["write_probe"]["status"] == "submitted", "memory provider diagnostics write probe", hermes_diagnostics)
+        expect(all_diagnostics["provider"] == "all" and all_diagnostics["results"], "memory provider diagnostics fan out", all_diagnostics)
 
         app_module.state_store.write_json("external_world.json", {"watchlist": [{"target": "localhost", "reason": "self-test"}], "summaries": []})
         external = ExternalWorldRefresh(
@@ -489,9 +493,11 @@ def main() -> int:
         expect("summary" in summary and "external_summary" in summary, "memory summary includes external slot", summary)
 
         providers_response = client.get("/memory/providers")
+        provider_diagnostics_response = client.get("/memory/providers/diagnostics?provider=local&session_id=p6")
         summary_response = client.get("/memory/summary?session_id=p6&provider=local")
         patch_response = client.post("/memory/patch", json={"provider": "local", "patch": {"session_id": "p6", "task": "local provider", "result": "ok"}})
         expect(providers_response.status_code == 200 and "selected" in providers_response.json()["providers"], "memory providers endpoint", providers_response.text)
+        expect(provider_diagnostics_response.status_code == 200 and provider_diagnostics_response.json()["status"] == "success", "memory provider diagnostics endpoint", provider_diagnostics_response.text)
         expect(summary_response.status_code == 200 and summary_response.json()["provider"] == "local", "memory summary provider endpoint", summary_response.text)
         expect(patch_response.status_code == 200 and patch_response.json()["external_write"]["status"] == "local_only", "memory patch provider endpoint", patch_response.text)
 
