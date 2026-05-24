@@ -51,6 +51,16 @@ class WorldStateStore:
                 },
             },
             "rollback_state.json": {"snapshots": []},
+            "ops_config.json": {
+                "alerting": {
+                    "enabled": True,
+                    "local_log": True,
+                    "webhook_enabled": False,
+                    "webhook_url": "",
+                    "webhook_url_env": "VEYRA_ALERT_WEBHOOK_URL",
+                    "min_severity": "warning",
+                }
+            },
         }
         for name, payload in defaults.items():
             path = self.root / name
@@ -70,6 +80,7 @@ class WorldStateStore:
             "rollback_log.jsonl",
             "memory_log.jsonl",
             "core_model_trace.jsonl",
+            "alert_log.jsonl",
         ]:
             path = self.root / name
             if not path.exists():
@@ -144,4 +155,5 @@ class WorldStateStore:
             "rollback_state": self.read_json("rollback_state.json"),
             "agent_memory": self.read_json("agent_memory.json"),
             "agent_config": self.read_json("agent_config.json"),
+            "ops_config": self.read_json("ops_config.json"),
         }

@@ -215,6 +215,7 @@ P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块。当�
 - Agent 任务包增加 `tool_proxy_contract`，Verifier 会检查 Agent 回传的高风险 `tool_calls` 是否有 ActionProposal / review / policy / Tool Proxy trace 证据；无证据的 R3-R4 不给 verified success，R5 直接标记 forbidden。
 - Rollback/Audit 增加 ActionJournal、time-travel summary 和非破坏性 replay plan；控制台展示 journal 来源统计和最近审计事件。
 - P7 OpsMonitor 增加 `/ops/health`、`/ops/alerts`、`/ops/deployment`，控制台展示健康状态、告警数和部署 readiness。
+- P7 AlertDispatcher 增加本地 `alert_log.jsonl` 和可选 webhook 投递；控制台可手动 dispatch alerts。
 - AgencyCore 写入 intention queue，proactive check 会对 state gap 做 Foresight + Guardian 审查。
 - network / web / hermes / mcp probe 改为真实只读探测，并由 PerceptionLayer 标记常见异常；stale belief 可通过只读 probe 刷新。
 - Memory Bridge 增加外部 adapter hook、敏感信息阻断和 freshness / trust 标记。

@@ -185,6 +185,7 @@ function App() {
   const [executionLogs, setExecutionLogs] = useState<LogResponse>({ items: [] });
   const [memoryLogs, setMemoryLogs] = useState<LogResponse>({ items: [] });
   const [coreModelLogs, setCoreModelLogs] = useState<LogResponse>({ items: [] });
+  const [alertLogs, setAlertLogs] = useState<LogResponse>({ items: [] });
   const [auditJournal, setAuditJournal] = useState<Record<string, JsonValue> | null>(null);
   const [timeTravel, setTimeTravel] = useState<Record<string, JsonValue> | null>(null);
   const [agentStatus, setAgentStatus] = useState<Record<string, JsonValue> | null>(null);
@@ -194,6 +195,7 @@ function App() {
   const [mvpStatus, setMvpStatus] = useState<Record<string, JsonValue> | null>(null);
   const [opsHealth, setOpsHealth] = useState<Record<string, JsonValue> | null>(null);
   const [deploymentReadiness, setDeploymentReadiness] = useState<Record<string, JsonValue> | null>(null);
+  const [alertingStatus, setAlertingStatus] = useState<Record<string, JsonValue> | null>(null);
   const [architecture, setArchitecture] = useState<ArchitectureSnapshot | null>(null);
   const [definitions, setDefinitions] = useState<Definitions | null>(null);
   const [heartbeat, setHeartbeat] = useState("");
@@ -225,6 +227,7 @@ function App() {
       executionData,
       memoryData,
       coreModelLogData,
+      alertLogData,
       auditJournalData,
       timeTravelData,
       rollbackData,
@@ -235,6 +238,7 @@ function App() {
       mvpData,
       opsHealthData,
       deploymentData,
+      alertingData,
       architectureData,
       definitionsData,
       heartbeatData,
@@ -250,6 +254,7 @@ function App() {
       fetchJson<LogResponse>("/logs/execution?limit=20"),
       fetchJson<LogResponse>("/logs/memory?limit=20"),
       fetchJson<LogResponse>("/logs/core-model?limit=20"),
+      fetchJson<LogResponse>("/logs/alerts?limit=20"),
       fetchJson<Record<string, JsonValue>>("/audit/journal?limit=40"),
       fetchJson<Record<string, JsonValue>>("/audit/time-travel?limit=40"),
       fetchJson<LogResponse>("/logs/rollback?limit=20"),
@@ -260,6 +265,7 @@ function App() {
       fetchJson<Record<string, JsonValue>>("/mvp/status"),
       fetchJson<Record<string, JsonValue>>("/ops/health"),
       fetchJson<Record<string, JsonValue>>("/ops/deployment"),
+      fetchJson<Record<string, JsonValue>>("/ops/alerting"),
       fetchJson<ArchitectureSnapshot>("/architecture"),
       fetchJson<Definitions>("/definitions"),
       fetchJson<{ heartbeat: string }>("/heartbeat"),
@@ -275,6 +281,7 @@ function App() {
     setExecutionLogs(executionData);
     setMemoryLogs(memoryData);
     setCoreModelLogs(coreModelLogData);
+    setAlertLogs(alertLogData);
     setAuditJournal(auditJournalData);
     setTimeTravel(timeTravelData);
     setRollbackLogs(rollbackData);
@@ -285,6 +292,7 @@ function App() {
     setMvpStatus(mvpData);
     setOpsHealth(opsHealthData);
     setDeploymentReadiness(deploymentData);
+    setAlertingStatus(alertingData);
     setArchitecture(architectureData);
     setDefinitions(definitionsData);
     setHeartbeat(heartbeatData.heartbeat);
@@ -484,6 +492,20 @@ function App() {
     setError(null);
     try {
       const response = await fetchJson<Record<string, JsonValue>>("/external/refresh?limit=5", { method: "POST" });
+      setResult(response as MessageResult);
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const dispatchAlerts = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetchJson<Record<string, JsonValue>>("/ops/alerts/dispatch?min_severity=info", { method: "POST" });
       setResult(response as MessageResult);
       await refresh();
     } catch (caught) {
@@ -1051,6 +1073,13 @@ function App() {
             <JsonBlock value={opsHealth ?? { status: "not loaded" }} />
             <JsonBlock value={deploymentReadiness ?? { status: "not loaded" }} />
           </div>
+          <div className="buttonRow compact">
+            <button className="ghostButton" onClick={dispatchAlerts} disabled={loading}>
+              <AlertTriangle size={15} />
+              Dispatch Alerts
+            </button>
+          </div>
+          <JsonBlock value={{ alerting: alertingStatus ?? { status: "not loaded" }, recent_alerts: alertLogs.items.slice(-5).reverse() }} />
         </Section>
       </section>
 

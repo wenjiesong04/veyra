@@ -14,6 +14,8 @@ class RetentionPolicy:
         "execution_trace.jsonl": 10000,
         "rollback_log.jsonl": 10000,
         "memory_log.jsonl": 10000,
+        "core_model_trace.jsonl": 10000,
+        "alert_log.jsonl": 10000,
     }
 
     def __init__(self, state_store: WorldStateStore, limits: dict[str, int] | None = None) -> None:

@@ -67,6 +67,9 @@ Endpoints:
 - `GET /ops/retention` inspect append-only log retention status
 - `GET /ops/health` inspect runtime health and alert summary
 - `GET /ops/alerts` list active operational alerts
+- `POST /ops/alerts/dispatch` write alerts to local alert log and optionally configured webhook
+- `GET /ops/alerting` inspect alert delivery configuration and recent dispatches
+- `POST /ops/alerting/config` configure local/webhook alert delivery
 - `GET /ops/deployment` inspect deployment readiness checks
 - `POST /ops/soak` run a bounded operational health loop
 - `GET /console/` open the Veyra control console after the frontend is built

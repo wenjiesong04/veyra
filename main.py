@@ -25,6 +25,7 @@ from rollback_audit.rollback_manager import RollbackManager
 from rollback_audit.diff_tracker import DiffTracker
 from rollback_audit.action_journal import ActionJournal
 from rollback_audit.replay import Replay
+from runtime.alert_dispatcher import AlertDispatcher
 from runtime.external_world_refresh import ExternalWorldRefresh
 from runtime.ops_monitor import OpsMonitor
 from runtime.proactive_checks import ProactiveChecks
@@ -69,6 +70,7 @@ ops_monitor = OpsMonitor(
     retention_policy=retention_policy,
     safety_validation=safety_validation,
 )
+alert_dispatcher = AlertDispatcher(state_store, ops_monitor)
 soak_runner = SoakRunner(
     proactive_checks=proactive_checks,
     task_tracker=awareness_loop.task_tracker,
@@ -188,6 +190,15 @@ class AgentResultRequest(BaseModel):
 
 class SoakRequest(BaseModel):
     iterations: int = 1
+
+
+class AlertingConfigRequest(BaseModel):
+    enabled: bool | None = None
+    local_log: bool | None = None
+    webhook_enabled: bool | None = None
+    webhook_url: str | None = None
+    webhook_url_env: str | None = None
+    min_severity: str | None = None
 
 
 @app.get("/")
@@ -391,6 +402,11 @@ async def core_model_logs(limit: int = 100):
     return {"items": state_store.read_jsonl("core_model_trace.jsonl", limit=limit)}
 
 
+@app.get("/logs/alerts")
+async def alert_logs(limit: int = 100):
+    return {"items": state_store.read_jsonl("alert_log.jsonl", limit=limit)}
+
+
 @app.get("/audit/journal")
 async def audit_journal(
     limit: int = 100,
@@ -471,6 +487,21 @@ async def ops_health():
 @app.get("/ops/alerts")
 async def ops_alerts():
     return ops_monitor.alerts()
+
+
+@app.get("/ops/alerting")
+async def ops_alerting_status():
+    return alert_dispatcher.status()
+
+
+@app.post("/ops/alerting/config")
+async def ops_alerting_config(request: AlertingConfigRequest):
+    return alert_dispatcher.configure(request.model_dump(exclude_none=True))
+
+
+@app.post("/ops/alerts/dispatch")
+async def ops_alerts_dispatch(min_severity: str | None = None):
+    return alert_dispatcher.dispatch(min_severity=min_severity)
 
 
 @app.get("/ops/deployment")
@@ -795,6 +826,7 @@ async def mvp_status():
             "external_memory_bridge_hooks": True,
             "ops_soak_runner": True,
             "ops_health_alerts": True,
+            "ops_alert_dispatch": True,
             "deployment_readiness": True,
             "core_model_reasoning_layer": True,
             "core_model_memory_relevance": True,
