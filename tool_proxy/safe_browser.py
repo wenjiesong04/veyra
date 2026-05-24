@@ -54,13 +54,22 @@ class SafeBrowser:
             return result
         if self.executor or self.executor_configured:
             if not self._host_allowed(url):
-                result = {"status": "blocked", "url": url, "review": review, "reason": "browser host is not in executor allowlist", "allowed_hosts": self.allowed_hosts}
+                result = {
+                    "status": "blocked",
+                    "url": url,
+                    "review": review,
+                    "reason": "browser host is not in executor allowlist",
+                    "allowed_hosts": self.allowed_hosts,
+                    "approved_by": approved_by,
+                    "validation": {"executor_configured": True, "host_allowed": False, "status": "blocked"},
+                }
                 result["tool_trace"] = self._record("browser_open", url, result, review, approved_by)
                 return result
             result = self.executor(url) if self.executor else self._execute_system_browser(url)
             result.setdefault("url", url)
             result.setdefault("review", review)
             result.setdefault("approved_by", approved_by)
+            result.setdefault("validation", {"executor_configured": True, "host_allowed": True, "status": "validated" if result.get("status") == "ok" else "validation_pending"})
         else:
             result = {
                 "status": "not_configured",
@@ -68,6 +77,7 @@ class SafeBrowser:
                 "review": review,
                 "reason": "SafeBrowser policy passed, but browser execution is not configured in this runtime.",
                 "approved_by": approved_by,
+                "validation": {"executor_configured": False, "host_allowed": None, "status": "not_configured"},
             }
         result["tool_trace"] = self._record("browser_open", url, result, review, approved_by)
         return result

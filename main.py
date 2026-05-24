@@ -886,7 +886,7 @@ async def agent_task_stop(task_id: str):
 
 def _validate_action_proposal(request: ActionProposalRequest) -> str | None:
     action_type = request.action.get("type")
-    allowed = {"shell_command", "file_write", "file_read", "browser_open", "api_request"}
+    allowed = {"shell_command", "file_write", "file_read", "browser_open", "api_request", "rollback_restore"}
     if action_type not in allowed:
         return f"action.type must be one of {sorted(allowed)}"
     if action_type == "shell_command" and not request.action.get("command"):
@@ -897,6 +897,8 @@ def _validate_action_proposal(request: ActionProposalRequest) -> str | None:
         return "browser_open action requires url"
     if action_type == "api_request" and not isinstance(request.action.get("payload"), dict):
         return "api_request action requires payload object"
+    if action_type == "rollback_restore" and not request.action.get("snapshot_id"):
+        return "rollback_restore action requires snapshot_id"
     return None
 
 
@@ -911,6 +913,8 @@ def _action_text(action: dict[str, Any]) -> str:
     if action.get("type") == "api_request":
         payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
         return f"{payload.get('method', 'GET')} {payload.get('url') or payload.get('endpoint') or ''}"
+    if action.get("type") == "rollback_restore":
+        return f"rollback restore {action.get('snapshot_id') or ''}"
     return str(action)
 
 

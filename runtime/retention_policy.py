@@ -97,9 +97,17 @@ class RetentionPolicy:
             "policy": "append_only_with_archive_before_truncate",
             "checked_at": utc_now_iso(),
             "files": files,
+            "validation": {
+                "archive_before_truncate": True,
+                "dry_run": dry_run,
+                "changed": changed,
+                "status": "previewed" if dry_run else "enforced",
+            },
         }
-        if not dry_run:
-            self.state_store.append_jsonl("action_record.jsonl", {"route": "ops_retention_enforce", "status": "success", "artifacts": result})
+        self.state_store.append_jsonl(
+            "action_record.jsonl",
+            {"route": "ops_retention_enforce", "status": "dry_run" if dry_run else "success", "artifacts": result},
+        )
         return result
 
     def _active_limits(self, limits: dict[str, int] | None = None) -> dict[str, int]:

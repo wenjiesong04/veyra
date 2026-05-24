@@ -64,6 +64,7 @@ class SafeAPI:
                     "reason": "API host is not in executor allowlist",
                     "allowed_hosts": self.allowed_hosts,
                     "approved_by": approved_by,
+                    "validation": {"executor_configured": True, "host_allowed": False, "status": "blocked"},
                 }
                 result["tool_trace"] = self._record("api_request", target, result, review, approved_by)
                 return result
@@ -71,6 +72,7 @@ class SafeAPI:
             result["payload"] = self._redact(payload)
             result["review"] = review
             result["approved_by"] = approved_by
+            result["validation"] = {"executor_configured": True, "host_allowed": True, "status": "validated" if result.get("status") == "ok" else "validation_pending"}
         else:
             result = {
                 "status": "not_configured",
@@ -78,6 +80,7 @@ class SafeAPI:
                 "review": review,
                 "reason": "SafeAPI policy passed, but outbound API execution is not configured in this runtime.",
                 "approved_by": approved_by,
+                "validation": {"executor_configured": False, "host_allowed": None, "status": "not_configured"},
             }
         result["tool_trace"] = self._record("api_request", target, result, review, approved_by)
         return result

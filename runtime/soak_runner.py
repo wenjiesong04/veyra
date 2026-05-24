@@ -53,7 +53,18 @@ class SoakRunner:
                 }
             )
         status = "success" if all(run["safety"]["status"] == "passed" for run in runs) else "failed"
-        return {"status": status, "iterations": iterations, "runs": runs}
+        result = {
+            "status": status,
+            "iterations": iterations,
+            "runs": runs,
+            "validation": {
+                "bounded": True,
+                "read_only": True,
+                "status": "validated" if status == "success" else "validation_pending",
+            },
+        }
+        self.retention_policy.state_store.append_jsonl("action_record.jsonl", {"route": "ops_soak", "status": status, "artifacts": {"iterations": iterations, "validation": result["validation"]}})
+        return result
 
     def start(self, *, iterations: int = 60, interval_seconds: float = 60.0) -> dict[str, Any]:
         iterations = max(1, min(int(iterations), 1440))

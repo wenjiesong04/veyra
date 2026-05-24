@@ -33,6 +33,10 @@ class AlertDispatcher:
             "webhook_configured": bool(webhook_url),
             "webhook_url_env": config.get("webhook_url_env", "VEYRA_ALERT_WEBHOOK_URL"),
             "min_severity": config.get("min_severity", "warning"),
+            "validation": {
+                "local_log": "validated" if bool(config.get("local_log", True)) else "disabled",
+                "webhook": "validated" if bool(config.get("webhook_enabled", False) and webhook_url) else "not_configured",
+            },
             "recent": self.state_store.read_jsonl("alert_log.jsonl", limit=20),
         }
 
@@ -70,7 +74,16 @@ class AlertDispatcher:
             self.state_store.append_jsonl("alert_log.jsonl", payload)
         external = self._send_webhook(config, payload) if alerts else {"status": "skipped", "reason": "no_alerts"}
         result_status = "success" if external.get("status") in {"sent", "not_configured", "disabled", "skipped"} else "partial"
-        result = {**payload, "status": result_status, "external": external}
+        result = {
+            **payload,
+            "status": result_status,
+            "external": external,
+            "validation": {
+                "local_audit_recorded": bool(config.get("local_log", True)),
+                "external_delivery": external.get("status"),
+                "status": "validated" if external.get("status") == "sent" else "not_configured" if external.get("status") in {"disabled", "not_configured", "skipped"} else "validation_pending",
+            },
+        }
         self.state_store.append_jsonl("action_record.jsonl", {"route": "ops_alert_dispatch", "status": result_status, "artifacts": result})
         return result
 
