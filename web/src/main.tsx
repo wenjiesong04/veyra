@@ -90,7 +90,18 @@ type Definitions = {
   operational_modes: string[];
 };
 
+type WorkbenchSection = "awareness" | "governance" | "runtime" | "ops" | "audit" | "logs";
+
 const initialMessage = "帮我看 18789 端口有没有被占用";
+
+const workbenchSections: Array<{ id: WorkbenchSection; label: string; icon: React.ReactNode }> = [
+  { id: "awareness", label: "Awareness", icon: <Gauge size={15} /> },
+  { id: "governance", label: "Governance", icon: <Shield size={15} /> },
+  { id: "runtime", label: "Runtime", icon: <Bot size={15} /> },
+  { id: "ops", label: "Ops", icon: <Activity size={15} /> },
+  { id: "audit", label: "Audit", icon: <History size={15} /> },
+  { id: "logs", label: "Logs", icon: <ScrollText size={15} /> }
+];
 
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
   const headers = new Headers(options?.headers);
@@ -223,6 +234,7 @@ function App() {
   const [result, setResult] = useState<MessageResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [activeSection, setActiveSection] = useState<WorkbenchSection>("awareness");
 
   const refresh = async () => {
     const [
@@ -705,7 +717,23 @@ function App() {
         <Metric label="Ops" value={<StatusPill value={opsStatus} />} />
       </section>
 
-      <section className="workspaceGrid">
+      <section className="workbenchShell">
+        <nav className="workbenchTabs" aria-label="Veyra console sections">
+          {workbenchSections.map((section) => (
+            <button
+              key={section.id}
+              className={`workbenchTab ${activeSection === section.id ? "active" : ""}`}
+              onClick={() => setActiveSection(section.id)}
+              type="button"
+            >
+              {section.icon}
+              <span>{section.label}</span>
+            </button>
+          ))}
+        </nav>
+        <div className="workbenchBody">
+
+      <section className={`workspaceGrid workbenchPane ${activeSection === "runtime" ? "active" : ""}`}>
         <Section title="Setup Wizard" icon={<Settings size={18} />}>
           <div className="setupGrid">
             <div className="setupStep">
@@ -748,7 +776,7 @@ function App() {
         </Section>
       </section>
 
-      <section className="workspaceGrid">
+      <section className={`workspaceGrid workbenchPane ${activeSection === "awareness" ? "active" : ""}`}>
         <Section title="Core Model" icon={<Brain size={18} />}>
           <div className="configPanel">
             <div className="configSummary">
@@ -810,7 +838,7 @@ function App() {
         </Section>
       </section>
 
-      <section className="workspaceGrid">
+      <section className={`workspaceGrid workbenchPane ${activeSection === "awareness" ? "active" : ""}`}>
         <Section title="Message Console" icon={<TerminalSquare size={18} />}>
           <textarea
             className="messageInput"
@@ -868,7 +896,7 @@ function App() {
         </Section>
       </section>
 
-      <section className="workspaceGrid">
+      <section className={`workspaceGrid workbenchPane ${activeSection === "governance" ? "active" : ""}`}>
         <Section title="Action Review" icon={<Shield size={18} />}>
           <div className="reviewList">
             {reviews.items.length ? (
@@ -937,7 +965,7 @@ function App() {
         </Section>
       </section>
 
-      <section className="workspaceGrid">
+      <section className={`workspaceGrid workbenchPane ${activeSection === "runtime" ? "active" : ""}`}>
         <Section title="Persona Manager" icon={<Brain size={18} />}>
           <div className="personaGrid">
             {operationalModes.map((mode) => (
@@ -961,7 +989,7 @@ function App() {
         </Section>
       </section>
 
-      <section className="workspaceGrid">
+      <section className={`workspaceGrid workbenchPane ${activeSection === "audit" ? "active" : ""}`}>
         <Section title="Rollback Viewer" icon={<RotateCcw size={18} />}>
           <div className="rollbackControls">
             <input value={snapshotPath} onChange={(event) => setSnapshotPath(event.target.value)} aria-label="Snapshot path" />
@@ -1050,7 +1078,7 @@ function App() {
         </Section>
       </section>
 
-      <section className="workspaceGrid">
+      <section className={`workspaceGrid workbenchPane ${activeSection === "runtime" ? "active" : ""}`}>
         <Section title="Memory Bridge" icon={<Database size={18} />}>
           <div className="buttonRow compact">
             <button className="ghostButton" onClick={probeMemoryProviders} disabled={loading}>
@@ -1093,7 +1121,7 @@ function App() {
         </Section>
       </section>
 
-      <section className="logGrid operationsGrid">
+      <section className={`logGrid operationsGrid workbenchPane ${activeSection === "governance" ? "active" : ""}`}>
         <Section title="Execution Trace" icon={<ScrollText size={18} />}>
           <div className="traceSummary">
             {Object.entries(executionStatusCounts).map(([status, count]) => (
@@ -1228,7 +1256,7 @@ function App() {
           <JsonBlock value={result ?? { status: "no message submitted in this console session" }} />
         </Section>
       </section>
-      <section className="logGrid single">
+      <section className={`logGrid single workbenchPane ${activeSection === "ops" ? "active" : ""}`}>
         <Section title="MVP Readiness" icon={<CheckCircle2 size={18} />}>
           <div className="readinessGrid">
             <JsonBlock value={mvpStatus ?? { status: "not loaded" }} />
@@ -1264,7 +1292,7 @@ function App() {
         </Section>
       </section>
 
-      <section className="workspaceGrid">
+      <section className={`workspaceGrid workbenchPane ${activeSection === "runtime" ? "active" : ""}`}>
         <Section title="State / Heartbeat" icon={<BookOpen size={18} />}>
           <div className="stateDefinitionGrid">
             {stateDefinitions.map((definition) => (
@@ -1283,7 +1311,7 @@ function App() {
         </Section>
       </section>
 
-      <section className="logGrid single">
+      <section className={`logGrid single workbenchPane ${activeSection === "ops" ? "active" : ""}`}>
         <Section title="Implementation Phases" icon={<ListChecks size={18} />}>
           <div className="phaseGrid">
             {phases.map((phase) => (
@@ -1297,7 +1325,7 @@ function App() {
         </Section>
       </section>
 
-      <section className="logGrid">
+      <section className={`logGrid workbenchPane ${activeSection === "logs" ? "active" : ""}`}>
         <Section title="Event Log" icon={<FileClock size={18} />}>
           <JsonBlock value={events.items.slice(-4).reverse()} />
         </Section>
@@ -1310,6 +1338,8 @@ function App() {
         <Section title="Rollback Log" icon={<History size={18} />}>
           <JsonBlock value={rollbackLogs.items.slice(-4).reverse()} />
         </Section>
+      </section>
+        </div>
       </section>
     </main>
   );
