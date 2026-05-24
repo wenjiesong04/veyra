@@ -39,7 +39,7 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | Memory Bridge | Implemented local memory bridge for summary reads, model-assisted relevance ranking, filtered patch writes, provider routing (`local` / `selected` / runtime names / `all`), and external adapter hooks. Production external memory semantics still need runtime validation. |
 | Skill | Implemented registry/runtime and built-in skill definitions. Skills route through AwarenessLoop and now record execution trace. |
 | Tool Proxy | Implemented SafeShell, SafeFile, SafeBrowser, SafeAPI with Guardian-style policy review, policy trace, standard tool trace, and Agent result bypass verification. |
-| Rollback / Audit | Implemented snapshot, diff, restore, rollback log, policy trace, tool trace, execution trace. Replay/time-travel remains future work. |
+| Rollback / Audit | Implemented snapshot, diff, restore, rollback log, policy trace, tool trace, execution trace, ActionJournal timeline, time-travel summary, and non-destructive replay plans. |
 | Web Control UI | Implemented React/Vite console served at `/console`, backed by live Veyra APIs and built into `ui/console`. |
 
 ## Veyra Core Submodules
@@ -74,7 +74,7 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | `/agent/contract`, `/agent/status`, `/agents`, `/agents/select`, `/agents/{name}/config` | Agent contract, Tool Proxy contract, status, selection, adapter configuration |
 | `/actions/proposals`, `/reviews/*` | Action review and human confirmation flow |
 | `/tool-proxy/*` | Safe shell/file/browser/API execution boundary |
-| `/rollback/*` | Snapshot, diff, restore, git diff |
+| `/rollback/*`, `/audit/journal`, `/audit/time-travel`, `/audit/replay/*` | Snapshot, diff, restore, git diff, correlated journal, time-travel summary, and replay plans |
 | `/logs/events`, `/logs/actions`, `/logs/tools`, `/logs/policy`, `/logs/execution`, `/logs/rollback`, `/logs/memory` | Audit and trace surfaces |
 | `/console` | Awareness & Agent Control Console |
 
@@ -97,5 +97,5 @@ Remaining gaps before calling it a complete Veyra runtime:
 - Long-running stewardship and real multi-runtime soak tests are not complete.
 - External Memory Bridge hooks exist, but production OpenClaw/Hermes memory semantics still need runtime validation.
 - Browser/API execution has pluggable executors, but remains disabled by default.
-- Replayable Agent Runtime and time-travel debugging are not implemented.
+- Replay planning and time-travel audit summaries exist; automatic side-effect replay remains intentionally gated behind guarded restore/resubmit flows.
 - P7 deployment hardening, monitoring alerts, and long-running soak tests remain pending.

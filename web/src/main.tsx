@@ -185,6 +185,8 @@ function App() {
   const [executionLogs, setExecutionLogs] = useState<LogResponse>({ items: [] });
   const [memoryLogs, setMemoryLogs] = useState<LogResponse>({ items: [] });
   const [coreModelLogs, setCoreModelLogs] = useState<LogResponse>({ items: [] });
+  const [auditJournal, setAuditJournal] = useState<Record<string, JsonValue> | null>(null);
+  const [timeTravel, setTimeTravel] = useState<Record<string, JsonValue> | null>(null);
   const [agentStatus, setAgentStatus] = useState<Record<string, JsonValue> | null>(null);
   const [agentRegistry, setAgentRegistry] = useState<Record<string, JsonValue> | null>(null);
   const [agentContract, setAgentContract] = useState<Record<string, JsonValue> | null>(null);
@@ -221,6 +223,8 @@ function App() {
       executionData,
       memoryData,
       coreModelLogData,
+      auditJournalData,
+      timeTravelData,
       rollbackData,
       agentData,
       registryData,
@@ -242,6 +246,8 @@ function App() {
       fetchJson<LogResponse>("/logs/execution?limit=20"),
       fetchJson<LogResponse>("/logs/memory?limit=20"),
       fetchJson<LogResponse>("/logs/core-model?limit=20"),
+      fetchJson<Record<string, JsonValue>>("/audit/journal?limit=40"),
+      fetchJson<Record<string, JsonValue>>("/audit/time-travel?limit=40"),
       fetchJson<LogResponse>("/logs/rollback?limit=20"),
       fetchJson<Record<string, JsonValue>>("/agent/status"),
       fetchJson<Record<string, JsonValue>>("/agents"),
@@ -263,6 +269,8 @@ function App() {
     setExecutionLogs(executionData);
     setMemoryLogs(memoryData);
     setCoreModelLogs(coreModelLogData);
+    setAuditJournal(auditJournalData);
+    setTimeTravel(timeTravelData);
     setRollbackLogs(rollbackData);
     setAgentStatus(agentData);
     setAgentRegistry(registryData);
@@ -494,6 +502,7 @@ function App() {
   const readiness = asRecord(mvpStatus?.core_loops);
   const executionStatusCounts = statusCounts(executionLogs.items);
   const policyDecisionCounts = statusCounts(policyLogs.items, "decision");
+  const auditItems = Array.isArray(auditJournal?.items) ? (auditJournal.items as Array<Record<string, JsonValue>>) : [];
   const externalWatchlist = Array.isArray(state?.external_world?.watchlist) ? (state.external_world.watchlist as Array<JsonValue>) : [];
   const externalSummaries = Array.isArray(state?.external_world?.summaries) ? (state.external_world.summaries as Array<Record<string, JsonValue>>) : [];
   const coreModelConfigured = coreModelStatus?.configured === true ? "configured" : String(coreModelStatus?.status ?? "unconfigured");
@@ -831,6 +840,36 @@ function App() {
           </div>
         </Section>
 
+        <Section title="Action Journal / Replay" icon={<History size={18} />}>
+          <div className="traceSummary">
+            {Object.entries(asRecord(asRecord(auditJournal?.summary).by_source)).map(([source, count]) => (
+              <Metric key={source} label={source} value={String(count)} />
+            ))}
+          </div>
+          <div className="dataTable auditTable">
+            <div className="dataTableHead">
+              <span>Source</span>
+              <span>Status</span>
+              <span>Route</span>
+              <span>Summary</span>
+              <span>Time</span>
+            </div>
+            {auditItems.slice(-6).reverse().map((item, index) => (
+              <div className="dataTableRow" key={String(item.journal_id ?? index)}>
+                <span>{String(item.source ?? "-")}</span>
+                <StatusPill value={String(item.status ?? "unknown")} />
+                <span>{String(item.route ?? "-")}</span>
+                <code>{String(item.summary ?? "-")}</code>
+                <small>{String(item.timestamp ?? "")}</small>
+              </div>
+            ))}
+            {!auditItems.length ? <div className="emptyState"><History size={18} />No journal entries yet.</div> : null}
+          </div>
+          <JsonBlock value={timeTravel ?? { status: "not loaded" }} />
+        </Section>
+      </section>
+
+      <section className="workspaceGrid">
         <Section title="Memory Bridge" icon={<Database size={18} />}>
           <div className="dataTable memoryTable">
             <div className="dataTableHead">

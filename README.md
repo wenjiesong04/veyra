@@ -48,6 +48,9 @@ Endpoints:
 - `POST /actions/proposals` submit an Agent or Tool action proposal through Guardian review
 - `POST /rollback/snapshot` create a file snapshot
 - `POST /rollback/{snapshot_id}/restore` restore a file snapshot
+- `GET /audit/journal` inspect correlated event/action/tool/policy/execution/memory/model timeline
+- `GET /audit/replay/{trace_id}` build a non-destructive replay plan
+- `GET /audit/time-travel` inspect last-known state from append-only audit logs
 - `GET /agent/status` inspect selected Agent adapter connection status
 - `GET /agent/tasks/{task_id}` poll selected Agent task status
 - `POST /agent/tasks/refresh` refresh all pending selected Agent tasks
@@ -236,7 +239,7 @@ Without a configured base URL, Veyra still builds the task packet but returns `a
 - `interface`: Intake, event schema/normalizer, channel and Agent adapter interfaces
 - `probes`: system, git, port, process, file, OpenClaw/Hermes placeholders
 - `tool_proxy`: SafeShell, SafeFile, SafeBrowser/SafeAPI placeholders
-- `rollback_audit`: snapshot, diff, journal, trace placeholders
+- `rollback_audit`: snapshot, diff, ActionJournal timeline, replay plan, compensation plan, traces
 - `memory_bridge`: memory read/write/filter placeholders
 - `skills`: built-in skill registry placeholders
 - `personas`: Minimalist, Operator, Engineer, Guardian, Steward

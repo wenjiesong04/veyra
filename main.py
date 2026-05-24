@@ -23,6 +23,8 @@ from interface.event_schema import Decision, Route, utc_now_iso
 from pydantic import Field
 from rollback_audit.rollback_manager import RollbackManager
 from rollback_audit.diff_tracker import DiffTracker
+from rollback_audit.action_journal import ActionJournal
+from rollback_audit.replay import Replay
 from runtime.external_world_refresh import ExternalWorldRefresh
 from runtime.proactive_checks import ProactiveChecks
 from runtime.retention_policy import RetentionPolicy
@@ -45,6 +47,8 @@ event_normalizer = EventNormalizer()
 console_dir = Path("ui/console")
 review_queue = ReviewQueue(state_store)
 rollback_manager = RollbackManager(state_store)
+action_journal = ActionJournal(state_store)
+replay_engine = Replay(state_store)
 safe_shell = SafeShell(state_store=state_store)
 safe_file = SafeFile(state_store=state_store)
 safe_browser = SafeBrowser(state_store=state_store)
@@ -378,6 +382,31 @@ async def memory_logs(limit: int = 100):
 @app.get("/logs/core-model")
 async def core_model_logs(limit: int = 100):
     return {"items": state_store.read_jsonl("core_model_trace.jsonl", limit=limit)}
+
+
+@app.get("/audit/journal")
+async def audit_journal(
+    limit: int = 100,
+    event_id: str | None = None,
+    task_id: str | None = None,
+    trace_id: str | None = None,
+):
+    return action_journal.timeline(limit=limit, event_id=event_id, task_id=task_id, trace_id=trace_id)
+
+
+@app.get("/audit/time-travel")
+async def audit_time_travel(until: str | None = None, limit: int = 200):
+    return action_journal.time_travel(until=until, limit=limit)
+
+
+@app.get("/audit/replay/{trace_id}")
+async def audit_replay(trace_id: str):
+    return replay_engine.replay(trace_id)
+
+
+@app.get("/audit/replay/event/{event_id}")
+async def audit_replay_event(event_id: str):
+    return replay_engine.plan(event_id=event_id)
 
 
 @app.post("/proactive/check")
@@ -727,6 +756,9 @@ async def mvp_status():
             "verifier_evidence_chain": True,
             "rollback_audit_depth": True,
             "rollback_snapshot_restore": True,
+            "action_journal_timeline": True,
+            "replay_plan": True,
+            "time_travel_audit": True,
             "memory_bridge_local": True,
             "memory_bridge_provider_routing": True,
             "proactive_read_only_checks": True,

@@ -34,6 +34,8 @@ from memory_bridge.local_memory_bridge import LocalMemoryBridge  # noqa: E402
 from probes.network_probe import NetworkProbe  # noqa: E402
 from probes.web_probe import WebProbe  # noqa: E402
 from rollback_audit.diff_tracker import DiffTracker  # noqa: E402
+from rollback_audit.action_journal import ActionJournal  # noqa: E402
+from rollback_audit.replay import Replay  # noqa: E402
 from rollback_audit.rollback_manager import RollbackManager  # noqa: E402
 from runtime.external_world_refresh import ExternalWorldRefresh  # noqa: E402
 from runtime.proactive_checks import ProactiveChecks  # noqa: E402
@@ -140,6 +142,8 @@ def reset_main_state(tmp: Path) -> TestClient:
     app_module.awareness_loop = loop
     app_module.review_queue = ReviewQueue(state_store)
     app_module.rollback_manager = RollbackManager(state_store, snapshot_root=str(tmp / "snapshots"))
+    app_module.action_journal = ActionJournal(state_store)
+    app_module.replay_engine = Replay(state_store)
     app_module.safe_shell = SafeShell(state_store=state_store)
     app_module.safe_file = SafeFile(state_store=state_store)
     app_module.safe_browser = SafeBrowser(state_store=state_store)
@@ -452,6 +456,14 @@ def main() -> int:
             json={"task_id": "callback_1", "executor": "fake", "status": "success", "result": "callback done", "raw": {"session_id": "p6"}},
         )
         expect(callback.status_code == 200 and callback.json()["status"] == "verified_success", "agent result callback", callback.text)
+
+        trace_id = callback.json()["execution_trace"]["trace_id"]
+        journal = client.get(f"/audit/journal?trace_id={trace_id}")
+        replay = client.get(f"/audit/replay/{trace_id}")
+        travel = client.get("/audit/time-travel?limit=20")
+        expect(journal.status_code == 200 and journal.json()["items"], "action journal trace lookup", journal.text)
+        expect(replay.status_code == 200 and replay.json()["status"] == "planned", "audit replay plan endpoint", replay.text)
+        expect(travel.status_code == 200 and travel.json()["last_known"], "audit time-travel endpoint", travel.text)
 
         app_module.state_store.write_json(
             "belief_state.json",

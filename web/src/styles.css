@@ -606,6 +606,17 @@ code {
   min-width: 760px;
 }
 
+.auditTable .dataTableHead,
+.auditTable .dataTableRow {
+  grid-template-columns:
+    minmax(90px, 0.6fr)
+    minmax(90px, 0.65fr)
+    minmax(90px, 0.6fr)
+    minmax(220px, 1.5fr)
+    minmax(140px, 0.85fr);
+  min-width: 760px;
+}
+
 .miniBlock {
   display: grid;
   gap: 8px;
@@ -885,6 +896,8 @@ code {
     .policyTable .dataTableRow,
     .memoryTable .dataTableHead,
     .memoryTable .dataTableRow,
+    .auditTable .dataTableHead,
+    .auditTable .dataTableRow,
     .writeLogItem,
     .setupGrid,
     .coverageGrid,
@@ -902,7 +915,9 @@ code {
   .policyTable .dataTableHead,
   .policyTable .dataTableRow,
   .memoryTable .dataTableHead,
-  .memoryTable .dataTableRow {
+  .memoryTable .dataTableRow,
+  .auditTable .dataTableHead,
+  .auditTable .dataTableRow {
     min-width: 0;
   }
 

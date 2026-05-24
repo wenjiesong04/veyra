@@ -22,7 +22,8 @@ export default defineConfig({
       "/agents": "http://127.0.0.1:8000",
       "/architecture": "http://127.0.0.1:8000",
       "/definitions": "http://127.0.0.1:8000",
-      "/rollback": "http://127.0.0.1:8000"
+      "/rollback": "http://127.0.0.1:8000",
+      "/audit": "http://127.0.0.1:8000"
     }
   }
 });
