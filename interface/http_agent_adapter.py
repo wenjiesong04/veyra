@@ -155,6 +155,7 @@ class HttpAgentAdapter(AgentAdapter):
         if not self.base_url:
             status = self.fetch_capabilities()
             status["name"] = self.config.name
+            status["validation"] = self._validation(False, False, str(status.get("status") or "adapter_unconfigured"))
             return status
         capabilities = self.fetch_capabilities()
         compatibility_status = (
@@ -170,6 +171,7 @@ class HttpAgentAdapter(AgentAdapter):
             "base_url": self.base_url,
             "capabilities": capabilities,
         }
+        status["validation"] = self._validation(True, bool(status["connected"]), str(status.get("status") or "unknown"))
         status["contract_version"] = AGENT_CONTRACT_VERSION
         return status
 
@@ -204,3 +206,13 @@ class HttpAgentAdapter(AgentAdapter):
             return json.loads(body)
         except json.JSONDecodeError:
             return {"status": "success", "result": body}
+
+    def _validation(self, configured: bool, connected: bool, runtime_status: str) -> dict[str, Any]:
+        return {
+            "implemented": True,
+            "configured": configured,
+            "connected": connected,
+            "validated": connected,
+            "status": "validated" if connected else "validation_pending" if configured else "not_configured",
+            "runtime_status": runtime_status,
+        }

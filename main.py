@@ -269,6 +269,9 @@ def _tool_proxy_status() -> dict[str, Any]:
 
 
 def _adapter_validation(name: str, status: dict[str, Any]) -> dict[str, Any]:
+    existing = status.get("validation") if isinstance(status.get("validation"), dict) else {}
+    if existing:
+        return {"name": name, **existing}
     raw_status = str(status.get("status") or "unknown")
     configured = bool(status.get("base_url")) or raw_status not in {"adapter_unconfigured", "unconfigured", "unknown"}
     connected = bool(status.get("connected"))

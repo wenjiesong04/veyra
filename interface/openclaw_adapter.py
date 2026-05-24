@@ -221,6 +221,7 @@ class OpenClawAdapter(AgentAdapter):
         capabilities = self.fetch_capabilities()
         status = str(capabilities.get("status", "unknown"))
         connected = status in {"available", "ok", "success"}
+        configured = bool(self.gateway_url)
         return {
             "name": "openclaw",
             "connected": connected,
@@ -228,6 +229,14 @@ class OpenClawAdapter(AgentAdapter):
             "base_url": self.gateway_url,
             "protocol": "openclaw_gateway_ws",
             "contract_version": AGENT_CONTRACT_VERSION,
+            "validation": {
+                "implemented": True,
+                "configured": configured,
+                "connected": connected,
+                "validated": connected,
+                "status": "validated" if connected else "validation_pending" if configured else "not_configured",
+                "runtime_status": status,
+            },
             "capabilities": capabilities,
         }
 

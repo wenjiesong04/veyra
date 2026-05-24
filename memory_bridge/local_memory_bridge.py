@@ -68,6 +68,7 @@ class LocalMemoryBridge:
             "default": "selected",
             "supports": ["summary", "patch"],
             "diagnostics_endpoint": "/memory/providers/diagnostics",
+            "validation": {name: self._provider_validation(name) for name in names},
             "notes": {
                 "local": "Veyra local JSON memory only",
                 "selected": "currently selected AgentAdapter memory API",
@@ -210,6 +211,30 @@ class LocalMemoryBridge:
                     names.append(name)
         names.append("all")
         return names
+
+    def _provider_validation(self, provider: str) -> dict[str, Any]:
+        if provider == "local":
+            return {"implemented": True, "configured": True, "validated": True, "status": "validated"}
+        if provider == "all":
+            return {"implemented": True, "configured": True, "validated": False, "status": "fan_out_runtime_dependent"}
+        adapter = self._adapter_for(provider)
+        if not adapter:
+            return {"implemented": True, "configured": False, "validated": False, "status": "not_configured"}
+        try:
+            connection = adapter.connection_status()
+        except Exception as exc:
+            return {"implemented": True, "configured": True, "validated": False, "status": "validation_pending", "error": str(exc)}
+        validation = connection.get("validation") if isinstance(connection.get("validation"), dict) else {}
+        if validation:
+            return redact_sensitive(validation, max_string=600)
+        connected = bool(connection.get("connected"))
+        configured = str(connection.get("status")) != "adapter_unconfigured"
+        return {
+            "implemented": True,
+            "configured": configured,
+            "validated": connected,
+            "status": "validated" if connected else "validation_pending" if configured else "not_configured",
+        }
 
     def _normalize_external_summary(self, provider: str, response: dict[str, Any]) -> dict[str, Any]:
         summary = response.get("summary", "")
