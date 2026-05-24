@@ -138,6 +138,8 @@ Run the core governance loop, review approval, Tool Proxy, rollback, Memory Brid
 python3 scripts/mvp_self_test.py
 ```
 
+Self-tests use temporary `VEYRA_STATE_ROOT` and `VEYRA_AGENCY_ROOT` directories so they do not pollute the local runtime state or tracked agency files.
+
 ## MVP Governance Workflow
 
 Implementation progress and the current architecture map are tracked in

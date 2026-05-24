@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,8 @@ from interface.event_schema import utc_now_iso
 
 class WorldStateStore:
     def __init__(self, root: str | Path = "state") -> None:
-        self.root = Path(root)
+        selected_root = os.getenv("VEYRA_STATE_ROOT", "state") if str(root) == "state" else root
+        self.root = Path(selected_root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._ensure_defaults()
 

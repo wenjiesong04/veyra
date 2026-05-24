@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -9,6 +11,13 @@ from fastapi.testclient import TestClient
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+_TEST_RUNTIME = TemporaryDirectory(prefix="veyra-mvp-")
+TEST_ROOT = Path(_TEST_RUNTIME.name)
+TEST_STATE_ROOT = TEST_ROOT / "state"
+TEST_AGENCY_ROOT = TEST_ROOT / "agency"
+os.environ.setdefault("VEYRA_STATE_ROOT", str(TEST_STATE_ROOT))
+os.environ.setdefault("VEYRA_AGENCY_ROOT", str(TEST_AGENCY_ROOT))
 
 from main import app  # noqa: E402
 from core.verifier import Verifier  # noqa: E402
@@ -136,7 +145,7 @@ def main() -> int:
     expect(api.get("status") == "not_configured", "tool proxy api policy", api)
     expect(api.get("tool_trace", {}).get("action_type") == "api_request", "tool proxy api trace", api)
 
-    file_target = ROOT / "state" / "mvp_self_test_tool_file.txt"
+    file_target = TEST_STATE_ROOT / "mvp_self_test_tool_file.txt"
     file_target.write_text("file-before\n", encoding="utf-8")
     file_write = post_json("/tool-proxy/file/write", {"path": str(file_target), "content": "file-after\n", "reason": "mvp_self_test"})
     expect(file_write.get("status") == "ok", "tool proxy file write", file_write)
@@ -151,7 +160,7 @@ def main() -> int:
     execution_logs = get_json("/logs/execution")
     expect(bool(execution_logs.get("items")), "execution trace log", execution_logs)
 
-    scratch = ROOT / "state" / "mvp_self_test.txt"
+    scratch = TEST_STATE_ROOT / "mvp_self_test.txt"
     scratch.write_text("before\n", encoding="utf-8")
     snapshot = post_json("/rollback/snapshot", {"path": str(scratch)})
     expect(snapshot.get("status") == "created", "rollback snapshot", snapshot)

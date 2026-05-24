@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from interface.event_schema import Decision, Route
 from core.agency_core import AgencyCore
 from core.definitions import RiskLevel
@@ -24,7 +26,8 @@ class ProactiveChecks:
         self.state_store = state_store
         self.reasoning = reasoning or CoreReasoning(state_store)
         self.perception = PerceptionLayer(state_store, reasoning=self.reasoning)
-        self.agency = AgencyCore(state_store, agency_root=agency_root, reasoning=self.reasoning)
+        selected_agency_root = os.getenv("VEYRA_AGENCY_ROOT", "agency") if str(agency_root) == "agency" else agency_root
+        self.agency = AgencyCore(state_store, agency_root=selected_agency_root, reasoning=self.reasoning)
         self.foresight = ForesightEngine(reasoning=self.reasoning)
         self.guardian = GuardianController()
 

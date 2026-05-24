@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -21,7 +22,8 @@ class AgencyCore:
     def __init__(self, state_store: WorldStateStore | None = None, agency_root: str | Path = "agency", reasoning: CoreReasoning | None = None) -> None:
         self.state_store = state_store
         self.reasoning = reasoning or (CoreReasoning(state_store) if state_store else None)
-        self.agency_root = Path(agency_root)
+        selected_root = os.getenv("VEYRA_AGENCY_ROOT", "agency") if str(agency_root) == "agency" else agency_root
+        self.agency_root = Path(selected_root)
         self.intention_path = self.agency_root / "intention_queue.json"
         self.goals_path = self.agency_root / "goals.json"
         self.triggers_path = self.agency_root / "triggers.yaml"

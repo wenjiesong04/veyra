@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -15,6 +16,11 @@ from fastapi.testclient import TestClient
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+_BOOTSTRAP_RUNTIME = TemporaryDirectory(prefix="veyra-p6-bootstrap-")
+_BOOTSTRAP_ROOT = Path(_BOOTSTRAP_RUNTIME.name)
+os.environ.setdefault("VEYRA_STATE_ROOT", str(_BOOTSTRAP_ROOT / "state"))
+os.environ.setdefault("VEYRA_AGENCY_ROOT", str(_BOOTSTRAP_ROOT / "agency"))
 
 import main as app_module  # noqa: E402
 from core.agency_core import AgencyCore  # noqa: E402
@@ -601,7 +607,14 @@ def main() -> int:
         expect((app_module.state_store.root / archive_path).exists(), "P7 retention archive written", archive_path)
         expect(health["status"] in {"healthy", "degraded", "critical"} and "components" in health, "P7 ops health endpoint", health)
         expect(alerts["status"] == "success" and "summary" in alerts, "P7 ops alerts endpoint", alerts)
-        expect(deployment["status"] in {"ready", "not_ready"} and deployment["checks"] and "configuration" in deployment, "P7 deployment readiness endpoint", deployment)
+        expect(
+            deployment["status"] in {"ready", "degraded", "not_ready", "not_configured", "validation_pending"}
+            and deployment["checks"]
+            and "configuration" in deployment
+            and "validation" in deployment,
+            "P7 deployment readiness endpoint",
+            deployment,
+        )
         expect(deployment_config["status"] in {"ready", "ready_with_warnings", "not_ready"} and deployment_config["checks"], "P7 deployment config validation endpoint", deployment_config)
         expect(runtime_matrix_before["status"] in {"not_run", "ready", "degraded", "not_configured"}, "P7 runtime matrix status endpoint", runtime_matrix_before)
         expect(runtime_matrix["status"] in {"ready", "degraded", "not_configured"} and runtime_matrix["runtimes"], "P7 runtime matrix run endpoint", runtime_matrix)

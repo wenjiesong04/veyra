@@ -6,7 +6,7 @@ Updated after P6 Core model-assisted reasoning hardening.
 
 The backend and console do not use hardcoded demo fixtures. The UI reads live local API responses from Veyra endpoints such as `/state`, `/runtime`, `/architecture`, `/logs/*`, `/agents`, `/agent/status`, and `/mvp/status`.
 
-Current local `state/` data may contain self-test records because `scripts/mvp_self_test.py` has been run repeatedly during development. Those records are real runtime outputs from tests, not static mock data. Runtime JSONL logs and snapshots are intentionally excluded from commits unless explicitly requested.
+Current local `state/` data may contain older self-test records from earlier development. Those records are real runtime outputs from tests, not static mock data. Runtime JSONL logs and snapshots are intentionally excluded from commits unless explicitly requested. Current self-test scripts redirect `VEYRA_STATE_ROOT` and `VEYRA_AGENCY_ROOT` to temporary directories before app import, so new test traffic does not write into the working runtime state or the tracked agency intention queue.
 
 | Data area | Source | Reality |
 | --- | --- | --- |
