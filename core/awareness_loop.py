@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict
 
 from awareness.attention_core import AttentionCore
@@ -115,20 +116,25 @@ class AwarenessLoop:
 
         if guardian_decision["decision"] == GuardianDecision.ASK_USER.value:
             self.runtime_entity.set_status(LifecycleStatus.WAITING_CONFIRMATION.value)
+            proposal = self._confirmation_proposal(text, decision)
             review = self.review_queue.create(
                 event_id=event.event_id,
                 task_text=text,
                 risk_level=decision.risk_level.value,
                 foresight=foresight,
                 guardian_decision=guardian_decision,
+                proposal=proposal,
             )
+            response = "该动作需要用户确认后才能执行。"
+            if decision.route == Route.ROLLBACK:
+                response = "该回滚动作需要用户确认；确认后将通过 RollbackManager 恢复指定 snapshot。"
             result = LoopResult(
                 event_id=event.event_id,
                 route=Route.HUMAN_REVIEW,
                 status="needs_confirmation",
-                response="该动作需要用户确认后才能执行。",
+                response=response,
                 risk_level=decision.risk_level,
-                artifacts={"guardian": guardian_decision, "foresight": foresight, "review": review},
+                artifacts={"guardian": guardian_decision, "foresight": foresight, "review": review, "proposal": proposal},
             )
             self._update(event, result)
             return result
@@ -223,17 +229,77 @@ class AwarenessLoop:
                 risk_level=decision.risk_level,
                 artifacts=artifacts,
             )
+        elif decision.route == Route.NATIVE_TOOL:
+            result = LoopResult(
+                event_id=event.event_id,
+                route=decision.route,
+                status="needs_action_proposal",
+                response="Native tool execution must be submitted as a structured ActionProposal or routed through Tool Proxy.",
+                risk_level=decision.risk_level,
+                artifacts={
+                    "decision": decision.to_dict(),
+                    "guardian": guardian_decision,
+                    "next_action": "submit /actions/proposals with action.type and target details",
+                },
+            )
+        elif decision.route == Route.ROLLBACK:
+            result = self._run_rollback_request(event, decision, guardian_decision, foresight)
         else:
             result = LoopResult(
                 event_id=event.event_id,
                 route=decision.route,
-                status="not_implemented",
-                response=f"Route {decision.route.value} is reserved but not implemented in v0.1.",
+                status="unsupported_route",
+                response=f"Route {decision.route.value} is not executable without a structured proposal.",
                 risk_level=decision.risk_level,
+                artifacts={"decision": decision.to_dict(), "next_action": "use a supported route or submit an ActionProposal"},
             )
 
         self._update(event, result)
         return result
+
+    def _confirmation_proposal(self, text: str, decision: Decision) -> dict[str, object] | None:
+        if decision.route != Route.ROLLBACK:
+            return None
+        snapshot_id = self._snapshot_id_from_text(text)
+        if not snapshot_id:
+            return None
+        return {
+            "agent": "veyra_core",
+            "action": {"type": "rollback_restore", "snapshot_id": snapshot_id},
+            "risk_guess": RiskLevel.R4.value,
+            "reversible": "yes",
+            "reason": "Restore an existing snapshot through guarded rollback flow.",
+        }
+
+    def _run_rollback_request(
+        self,
+        event: VeyraEvent,
+        decision: Decision,
+        guardian_decision: dict[str, object],
+        foresight: dict[str, object],
+    ) -> LoopResult:
+        snapshot_id = self._snapshot_id_from_text(str(event.payload.get("text", "")))
+        return LoopResult(
+            event_id=event.event_id,
+            route=Route.ROLLBACK,
+            status="needs_confirmation" if snapshot_id else "missing_snapshot_id",
+            response=(
+                "Rollback restore requires review approval before execution."
+                if snapshot_id
+                else "请提供要恢复的 snapshot_id，例如 snap_xxxxxxxxxxxx。"
+            ),
+            risk_level=decision.risk_level,
+            artifacts={
+                "decision": decision.to_dict(),
+                "guardian": guardian_decision,
+                "foresight": foresight,
+                "snapshot_id": snapshot_id,
+            },
+        )
+
+    def _snapshot_id_from_text(self, text: str) -> str | None:
+        match = re.search(r"\bsnap_[a-fA-F0-9]{6,32}\b", text)
+        return match.group(0) if match else None
 
     def _run_skill(self, event: VeyraEvent, skill_name: str) -> LoopResult:
         skill = self.skill_loader.load(skill_name)

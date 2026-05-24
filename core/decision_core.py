@@ -22,6 +22,18 @@ class DecisionCore:
         intent, intent_signals = self._intent_for_text(lowered)
         complexity, complexity_signals = self._complexity_for_text(lowered, attention_focus)
         signals = intent_signals + complexity_signals + self._risk_signals(risk)
+        if self._is_rollback_request(lowered):
+            return self._decision(
+                route=Route.ROLLBACK,
+                risk=RiskLevel.R4,
+                reason="snapshot rollback requires guarded confirmation",
+                intent="action",
+                complexity="moderate",
+                capability="rollback_audit",
+                signals=signals + ["route:rollback"],
+                requires_confirmation=True,
+                constraints=["restore only an existing snapshot", "record rollback trace", "verify restored checksum"],
+            )
         if risk == RiskLevel.R5:
             return self._decision(
                 route=Route.BLOCK,
@@ -125,6 +137,9 @@ class DecisionCore:
         elif candidate_route == Route.HUMAN_REVIEW:
             route = Route.HUMAN_REVIEW
             risk = self._max_risk(risk, RiskLevel.R3)
+        elif candidate_route == Route.ROLLBACK:
+            route = Route.ROLLBACK
+            risk = self._max_risk(risk, RiskLevel.R4)
         else:
             route = candidate_route
 
@@ -188,6 +203,10 @@ class DecisionCore:
         complex_markers = ["修改", "实现", "开发", "重构", "修复", "调试", "多文件", "代码", "agent", "openclaw", "hermes"]
         return complexity == "complex" or any(marker in lowered for marker in complex_markers) or len(attention_focus) >= 3
 
+    def _is_rollback_request(self, lowered: str) -> bool:
+        rollback_markers = ["rollback", "restore snapshot", "restore snap_", "回滚", "恢复快照"]
+        return any(marker in lowered for marker in rollback_markers)
+
     def _risk_for_text(self, lowered: str) -> RiskLevel:
         return classify_text_risk(lowered)
 
@@ -245,6 +264,7 @@ class DecisionCore:
             Route.AGENT: "selected_agent_runtime",
             Route.HUMAN_REVIEW: "human_review",
             Route.BLOCK: "guardian",
+            Route.ROLLBACK: "rollback_audit",
         }.get(route, default)
 
     def _max_risk(self, left: RiskLevel, right: RiskLevel) -> RiskLevel:
