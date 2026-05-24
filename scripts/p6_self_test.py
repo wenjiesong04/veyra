@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -528,6 +529,18 @@ def main() -> int:
 
         soak = client.post("/ops/soak", json={"iterations": 1})
         expect(soak.status_code == 200 and soak.json()["status"] == "success", "ops soak endpoint", soak.text)
+        soak_status = client.get("/ops/soak/status").json()
+        soak_start = client.post("/ops/soak/start", json={"iterations": 2, "interval_seconds": 0}).json()
+        for _ in range(20):
+            soak_session = client.get("/ops/soak/status").json()
+            if soak_session.get("status") in {"completed", "failed"}:
+                break
+            time.sleep(0.02)
+        soak_start_stop = client.post("/ops/soak/start", json={"iterations": 10, "interval_seconds": 1}).json()
+        soak_stop = client.post("/ops/soak/stop").json()
+        expect(soak_status["status"] in {"idle", "completed", "stale"}, "ops soak status endpoint", soak_status)
+        expect(soak_start.get("run_id") and soak_session["status"] in {"completed", "failed"}, "ops soak session start/status endpoint", soak_session)
+        expect(soak_start_stop.get("run_id") and soak_stop["status"] in {"stopping", "stopped", "completed", "stale"}, "ops soak session stop endpoint", soak_stop)
 
         model_status = client.get("/core/model/status")
         expect(model_status.status_code == 200 and model_status.json()["status"] == "unconfigured", "core model status endpoint", model_status.text)

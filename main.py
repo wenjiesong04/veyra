@@ -192,6 +192,11 @@ class SoakRequest(BaseModel):
     iterations: int = 1
 
 
+class SoakSessionRequest(BaseModel):
+    iterations: int = 60
+    interval_seconds: float = 60.0
+
+
 class AlertingConfigRequest(BaseModel):
     enabled: bool | None = None
     local_log: bool | None = None
@@ -525,6 +530,21 @@ async def ops_soak(request: SoakRequest):
     return soak_runner.run(iterations=request.iterations)
 
 
+@app.get("/ops/soak/status")
+async def ops_soak_status():
+    return soak_runner.status()
+
+
+@app.post("/ops/soak/start")
+async def ops_soak_start(request: SoakSessionRequest):
+    return soak_runner.start(iterations=request.iterations, interval_seconds=request.interval_seconds)
+
+
+@app.post("/ops/soak/stop")
+async def ops_soak_stop():
+    return soak_runner.stop()
+
+
 @app.get("/rollback/diff")
 async def rollback_diff(full: bool = False):
     return diff_tracker.git_diff_text() if full else diff_tracker.git_diff()
@@ -836,6 +856,7 @@ async def mvp_status():
             "real_probe_envelopes": True,
             "external_memory_bridge_hooks": True,
             "ops_soak_runner": True,
+            "ops_soak_session": True,
             "ops_health_alerts": True,
             "ops_alert_dispatch": True,
             "ops_retention_enforce": True,

@@ -73,6 +73,9 @@ Endpoints:
 - `POST /ops/alerting/config` configure local/webhook alert delivery
 - `GET /ops/deployment` inspect deployment readiness checks
 - `POST /ops/soak` run a bounded operational health loop
+- `GET /ops/soak/status` inspect the current soak session
+- `POST /ops/soak/start` start a controlled soak session
+- `POST /ops/soak/stop` request the active soak session to stop
 - `GET /console/` open the Veyra control console after the frontend is built
 
 Example:

@@ -217,12 +217,13 @@ P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块。当�
 - P7 OpsMonitor 增加 `/ops/health`、`/ops/alerts`、`/ops/deployment`，控制台展示健康状态、告警数和部署 readiness。
 - P7 AlertDispatcher 增加本地 `alert_log.jsonl` 和可选 webhook 投递；控制台可手动 dispatch alerts。
 - P7 RetentionPolicy 增加 `/ops/retention/enforce`，对超限 JSONL trace 先归档再截断，并写入审计记录。
+- P7 SoakRunner 增加 `/ops/soak/status`、`/ops/soak/start`、`/ops/soak/stop`，把长期健康巡检写入 `ops_soak_state.json` 并支持停止。
 - AgencyCore 写入 intention queue，proactive check 会对 state gap 做 Foresight + Guardian 审查。
 - network / web / hermes / mcp probe 改为真实只读探测，并由 PerceptionLayer 标记常见异常；stale belief 可通过只读 probe 刷新。
 - Memory Bridge 增加外部 adapter hook、敏感信息阻断和 freshness / trust 标记。
-- P7 增加非破坏性红队安全检查、日志保留策略执行和 bounded soak API。
+- P7 增加非破坏性红队安全检查、日志保留策略执行和 bounded/session soak API。
 
 后续仍需要：
 
 - P6：端到端真实运行硬化，包括 OpenClaw/Hermes/Custom Agent 真实连接测试、失败恢复、长任务停止、结果回传、状态过期刷新。
-- P7：继续补部署配置、监控告警、长期 heartbeat 和真实环境 soak test。
+- P7：继续补真实部署配置校验、告警通道实测和真实多 runtime soak test。

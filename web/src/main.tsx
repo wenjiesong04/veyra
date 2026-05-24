@@ -199,6 +199,7 @@ function App() {
   const [mvpStatus, setMvpStatus] = useState<Record<string, JsonValue> | null>(null);
   const [opsHealth, setOpsHealth] = useState<Record<string, JsonValue> | null>(null);
   const [retentionStatus, setRetentionStatus] = useState<Record<string, JsonValue> | null>(null);
+  const [soakStatus, setSoakStatus] = useState<Record<string, JsonValue> | null>(null);
   const [deploymentReadiness, setDeploymentReadiness] = useState<Record<string, JsonValue> | null>(null);
   const [alertingStatus, setAlertingStatus] = useState<Record<string, JsonValue> | null>(null);
   const [architecture, setArchitecture] = useState<ArchitectureSnapshot | null>(null);
@@ -243,6 +244,7 @@ function App() {
       mvpData,
       opsHealthData,
       retentionData,
+      soakData,
       deploymentData,
       alertingData,
       architectureData,
@@ -271,6 +273,7 @@ function App() {
       fetchJson<Record<string, JsonValue>>("/mvp/status"),
       fetchJson<Record<string, JsonValue>>("/ops/health"),
       fetchJson<Record<string, JsonValue>>("/ops/retention"),
+      fetchJson<Record<string, JsonValue>>("/ops/soak/status"),
       fetchJson<Record<string, JsonValue>>("/ops/deployment"),
       fetchJson<Record<string, JsonValue>>("/ops/alerting"),
       fetchJson<ArchitectureSnapshot>("/architecture"),
@@ -299,6 +302,7 @@ function App() {
     setMvpStatus(mvpData);
     setOpsHealth(opsHealthData);
     setRetentionStatus(retentionData);
+    setSoakStatus(soakData);
     setDeploymentReadiness(deploymentData);
     setAlertingStatus(alertingData);
     setArchitecture(architectureData);
@@ -531,6 +535,37 @@ function App() {
         method: "POST",
         body: JSON.stringify({ dry_run: false })
       });
+      setResult(response as MessageResult);
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const startSoakSession = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetchJson<Record<string, JsonValue>>("/ops/soak/start", {
+        method: "POST",
+        body: JSON.stringify({ iterations: 60, interval_seconds: 60 })
+      });
+      setResult(response as MessageResult);
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const stopSoakSession = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetchJson<Record<string, JsonValue>>("/ops/soak/stop", { method: "POST" });
       setResult(response as MessageResult);
       await refresh();
     } catch (caught) {
@@ -1097,9 +1132,18 @@ function App() {
             <JsonBlock value={mvpStatus ?? { status: "not loaded" }} />
             <JsonBlock value={opsHealth ?? { status: "not loaded" }} />
             <JsonBlock value={retentionStatus ?? { status: "not loaded" }} />
+            <JsonBlock value={soakStatus ?? { status: "not loaded" }} />
             <JsonBlock value={deploymentReadiness ?? { status: "not loaded" }} />
           </div>
           <div className="buttonRow compact">
+            <button className="ghostButton" onClick={startSoakSession} disabled={loading || soakStatus?.status === "running"}>
+              <Play size={15} />
+              Start Soak
+            </button>
+            <button className="ghostButton" onClick={stopSoakSession} disabled={loading || soakStatus?.status !== "running"}>
+              <XCircle size={15} />
+              Stop Soak
+            </button>
             <button className="ghostButton" onClick={enforceRetention} disabled={loading}>
               <FileClock size={15} />
               Enforce Retention
