@@ -221,6 +221,7 @@ P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块。当�
 - P7 RetentionPolicy 增加 `/ops/retention/enforce`，对超限 JSONL trace 先归档再截断，并写入审计记录。
 - P7 SoakRunner 增加 `/ops/soak/status`、`/ops/soak/start`、`/ops/soak/stop`，把长期健康巡检写入 `ops_soak_state.json` 并支持停止。
 - P7 DeploymentConfigValidator 增加 `/ops/deployment/config`，检查 Agent URL、Core model、Alerting、Tool Proxy executor 和 state root 配置。
+- P7 RuntimeMatrix 增加 `/ops/runtime-matrix` 和 `/ops/runtime-matrix/run`，逐个检查 OpenClaw/Hermes/Custom 的连接、capabilities、memory diagnostics 和 task status 降级。
 - AgencyCore 写入 intention queue，proactive check 会对 state gap 做 Foresight + Guardian 审查。
 - network / web / hermes / mcp probe 改为真实只读探测，并由 PerceptionLayer 标记常见异常；stale belief 可通过只读 probe 刷新。
 - Memory Bridge 增加外部 adapter hook、敏感信息阻断和 freshness / trust 标记。

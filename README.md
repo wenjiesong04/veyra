@@ -78,6 +78,8 @@ Endpoints:
 - `POST /ops/alerting/config` configure local/webhook alert delivery
 - `GET /ops/deployment` inspect deployment readiness checks
 - `GET /ops/deployment/config` inspect static deployment configuration validation
+- `GET /ops/runtime-matrix` inspect last multi-runtime matrix result
+- `POST /ops/runtime-matrix/run` check OpenClaw/Hermes/Custom connection, capability, memory, and task-status surfaces
 - `POST /ops/soak` run a bounded operational health loop
 - `GET /ops/soak/status` inspect the current soak session
 - `POST /ops/soak/start` start a controlled soak session

@@ -202,6 +202,7 @@ function App() {
   const [opsHealth, setOpsHealth] = useState<Record<string, JsonValue> | null>(null);
   const [retentionStatus, setRetentionStatus] = useState<Record<string, JsonValue> | null>(null);
   const [soakStatus, setSoakStatus] = useState<Record<string, JsonValue> | null>(null);
+  const [runtimeMatrix, setRuntimeMatrix] = useState<Record<string, JsonValue> | null>(null);
   const [deploymentReadiness, setDeploymentReadiness] = useState<Record<string, JsonValue> | null>(null);
   const [alertingStatus, setAlertingStatus] = useState<Record<string, JsonValue> | null>(null);
   const [architecture, setArchitecture] = useState<ArchitectureSnapshot | null>(null);
@@ -249,6 +250,7 @@ function App() {
       opsHealthData,
       retentionData,
       soakData,
+      runtimeMatrixData,
       deploymentData,
       alertingData,
       architectureData,
@@ -280,6 +282,7 @@ function App() {
       fetchJson<Record<string, JsonValue>>("/ops/health"),
       fetchJson<Record<string, JsonValue>>("/ops/retention"),
       fetchJson<Record<string, JsonValue>>("/ops/soak/status"),
+      fetchJson<Record<string, JsonValue>>("/ops/runtime-matrix"),
       fetchJson<Record<string, JsonValue>>("/ops/deployment"),
       fetchJson<Record<string, JsonValue>>("/ops/alerting"),
       fetchJson<ArchitectureSnapshot>("/architecture"),
@@ -311,6 +314,7 @@ function App() {
     setOpsHealth(opsHealthData);
     setRetentionStatus(retentionData);
     setSoakStatus(soakData);
+    setRuntimeMatrix(runtimeMatrixData);
     setDeploymentReadiness(deploymentData);
     setAlertingStatus(alertingData);
     setArchitecture(architectureData);
@@ -624,6 +628,21 @@ function App() {
     setError(null);
     try {
       const response = await fetchJson<Record<string, JsonValue>>(`/audit/replay/${encodeURIComponent(traceId)}/propose`, { method: "POST" });
+      setResult(response as MessageResult);
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const runRuntimeMatrix = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetchJson<Record<string, JsonValue>>("/ops/runtime-matrix/run", { method: "POST" });
+      setRuntimeMatrix(response);
       setResult(response as MessageResult);
       await refresh();
     } catch (caught) {
@@ -1216,9 +1235,14 @@ function App() {
             <JsonBlock value={opsHealth ?? { status: "not loaded" }} />
             <JsonBlock value={retentionStatus ?? { status: "not loaded" }} />
             <JsonBlock value={soakStatus ?? { status: "not loaded" }} />
+            <JsonBlock value={runtimeMatrix ?? { status: "not loaded" }} />
             <JsonBlock value={deploymentReadiness ?? { status: "not loaded" }} />
           </div>
           <div className="buttonRow compact">
+            <button className="ghostButton" onClick={runRuntimeMatrix} disabled={loading}>
+              <ListChecks size={15} />
+              Runtime Matrix
+            </button>
             <button className="ghostButton" onClick={startSoakSession} disabled={loading || soakStatus?.status === "running"}>
               <Play size={15} />
               Start Soak

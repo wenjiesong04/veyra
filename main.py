@@ -31,6 +31,7 @@ from runtime.external_world_refresh import ExternalWorldRefresh
 from runtime.ops_monitor import OpsMonitor
 from runtime.proactive_checks import ProactiveChecks
 from runtime.retention_policy import RetentionPolicy
+from runtime.runtime_matrix import RuntimeMatrix
 from runtime.soak_runner import SoakRunner
 from runtime.state_refresh import StateRefresh
 from tool_proxy.safe_api import SafeAPI
@@ -84,6 +85,7 @@ ops_monitor = OpsMonitor(
 )
 alert_dispatcher = AlertDispatcher(state_store, ops_monitor)
 deployment_validator = DeploymentConfigValidator(state_store)
+runtime_matrix = RuntimeMatrix(state_store, awareness_loop.agent_registry, awareness_loop.memory_bridge)
 soak_runner = SoakRunner(
     proactive_checks=proactive_checks,
     task_tracker=awareness_loop.task_tracker,
@@ -636,6 +638,16 @@ async def ops_deployment_config():
     return deployment_validator.validate()
 
 
+@app.get("/ops/runtime-matrix")
+async def ops_runtime_matrix_status():
+    return runtime_matrix.status()
+
+
+@app.post("/ops/runtime-matrix/run")
+async def ops_runtime_matrix_run(write_memory_probe: bool = False):
+    return runtime_matrix.run(write_memory_probe=write_memory_probe)
+
+
 @app.post("/ops/soak")
 async def ops_soak(request: SoakRequest):
     return soak_runner.run(iterations=request.iterations)
@@ -985,6 +997,7 @@ async def mvp_status():
             "tool_proxy_executor_config": True,
             "ops_soak_runner": True,
             "ops_soak_session": True,
+            "ops_runtime_matrix": True,
             "ops_health_alerts": True,
             "ops_alert_dispatch": True,
             "ops_retention_enforce": True,
