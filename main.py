@@ -201,6 +201,11 @@ class AlertingConfigRequest(BaseModel):
     min_severity: str | None = None
 
 
+class RetentionEnforceRequest(BaseModel):
+    dry_run: bool = False
+    limit_overrides: dict[str, int] | None = None
+
+
 @app.get("/")
 async def root():
     return {
@@ -477,6 +482,12 @@ async def ops_safety_red_team():
 @app.get("/ops/retention")
 async def ops_retention():
     return retention_policy.summary()
+
+
+@app.post("/ops/retention/enforce")
+async def ops_retention_enforce(request: RetentionEnforceRequest | None = None):
+    payload = request or RetentionEnforceRequest()
+    return retention_policy.enforce(dry_run=payload.dry_run, limits=payload.limit_overrides)
 
 
 @app.get("/ops/health")
@@ -827,6 +838,7 @@ async def mvp_status():
             "ops_soak_runner": True,
             "ops_health_alerts": True,
             "ops_alert_dispatch": True,
+            "ops_retention_enforce": True,
             "deployment_readiness": True,
             "core_model_reasoning_layer": True,
             "core_model_memory_relevance": True,

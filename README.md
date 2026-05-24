@@ -65,6 +65,7 @@ Endpoints:
 - `POST /external/refresh` refresh ExternalWorld watchlist targets with read-only probes
 - `GET /ops/safety/red-team` run non-destructive safety validation cases
 - `GET /ops/retention` inspect append-only log retention status
+- `POST /ops/retention/enforce` archive and truncate logs that exceed retention limits
 - `GET /ops/health` inspect runtime health and alert summary
 - `GET /ops/alerts` list active operational alerts
 - `POST /ops/alerts/dispatch` write alerts to local alert log and optionally configured webhook

@@ -500,6 +500,12 @@ def main() -> int:
 
         red_team = client.get("/ops/safety/red-team").json()
         retention = client.get("/ops/retention").json()
+        for idx in range(5):
+            app_module.state_store.append_jsonl("event_log.jsonl", {"idx": idx, "source": "retention_self_test"})
+        retention_preview = client.post("/ops/retention/enforce", json={"dry_run": True, "limit_overrides": {"event_log.jsonl": 2}}).json()
+        retention_enforce = client.post("/ops/retention/enforce", json={"limit_overrides": {"event_log.jsonl": 2}}).json()
+        retained_events = app_module.state_store.read_jsonl("event_log.jsonl", limit=10)
+        archive_path = next(item for item in retention_enforce["files"] if item["file"] == "event_log.jsonl")["archive_path"]
         health = client.get("/ops/health").json()
         alerts = client.get("/ops/alerts").json()
         deployment = client.get("/ops/deployment").json()
@@ -509,6 +515,9 @@ def main() -> int:
         alert_log = client.get("/logs/alerts").json()
         expect(red_team["status"] == "passed", "P7 red-team safety baseline", red_team)
         expect(retention["status"] == "ok" and retention["files"], "P7 retention policy summary", retention)
+        expect(retention_preview["dry_run"] is True and retention_preview["changed"] >= 1, "P7 retention enforce dry run", retention_preview)
+        expect(retention_enforce["changed"] >= 1 and retained_events[-1]["idx"] == 4 and len(retained_events) == 2, "P7 retention enforce truncates after archive", retention_enforce)
+        expect((app_module.state_store.root / archive_path).exists(), "P7 retention archive written", archive_path)
         expect(health["status"] in {"healthy", "degraded", "critical"} and "components" in health, "P7 ops health endpoint", health)
         expect(alerts["status"] == "success" and "summary" in alerts, "P7 ops alerts endpoint", alerts)
         expect(deployment["status"] in {"ready", "not_ready"} and deployment["checks"], "P7 deployment readiness endpoint", deployment)

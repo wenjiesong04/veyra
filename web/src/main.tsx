@@ -93,7 +93,11 @@ type Definitions = {
 const initialMessage = "帮我看 18789 端口有没有被占用";
 
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(url, options);
+  const headers = new Headers(options?.headers);
+  if (options?.body && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  const response = await fetch(url, options ? { ...options, headers } : undefined);
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText}`);
   }
@@ -194,6 +198,7 @@ function App() {
   const [coreModelStatus, setCoreModelStatus] = useState<Record<string, JsonValue> | null>(null);
   const [mvpStatus, setMvpStatus] = useState<Record<string, JsonValue> | null>(null);
   const [opsHealth, setOpsHealth] = useState<Record<string, JsonValue> | null>(null);
+  const [retentionStatus, setRetentionStatus] = useState<Record<string, JsonValue> | null>(null);
   const [deploymentReadiness, setDeploymentReadiness] = useState<Record<string, JsonValue> | null>(null);
   const [alertingStatus, setAlertingStatus] = useState<Record<string, JsonValue> | null>(null);
   const [architecture, setArchitecture] = useState<ArchitectureSnapshot | null>(null);
@@ -237,6 +242,7 @@ function App() {
       coreModelData,
       mvpData,
       opsHealthData,
+      retentionData,
       deploymentData,
       alertingData,
       architectureData,
@@ -264,6 +270,7 @@ function App() {
       fetchJson<Record<string, JsonValue>>("/core/model/status"),
       fetchJson<Record<string, JsonValue>>("/mvp/status"),
       fetchJson<Record<string, JsonValue>>("/ops/health"),
+      fetchJson<Record<string, JsonValue>>("/ops/retention"),
       fetchJson<Record<string, JsonValue>>("/ops/deployment"),
       fetchJson<Record<string, JsonValue>>("/ops/alerting"),
       fetchJson<ArchitectureSnapshot>("/architecture"),
@@ -291,6 +298,7 @@ function App() {
     setCoreModelStatus(coreModelData);
     setMvpStatus(mvpData);
     setOpsHealth(opsHealthData);
+    setRetentionStatus(retentionData);
     setDeploymentReadiness(deploymentData);
     setAlertingStatus(alertingData);
     setArchitecture(architectureData);
@@ -506,6 +514,23 @@ function App() {
     setError(null);
     try {
       const response = await fetchJson<Record<string, JsonValue>>("/ops/alerts/dispatch?min_severity=info", { method: "POST" });
+      setResult(response as MessageResult);
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const enforceRetention = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetchJson<Record<string, JsonValue>>("/ops/retention/enforce", {
+        method: "POST",
+        body: JSON.stringify({ dry_run: false })
+      });
       setResult(response as MessageResult);
       await refresh();
     } catch (caught) {
@@ -1071,9 +1096,14 @@ function App() {
           <div className="readinessGrid">
             <JsonBlock value={mvpStatus ?? { status: "not loaded" }} />
             <JsonBlock value={opsHealth ?? { status: "not loaded" }} />
+            <JsonBlock value={retentionStatus ?? { status: "not loaded" }} />
             <JsonBlock value={deploymentReadiness ?? { status: "not loaded" }} />
           </div>
           <div className="buttonRow compact">
+            <button className="ghostButton" onClick={enforceRetention} disabled={loading}>
+              <FileClock size={15} />
+              Enforce Retention
+            </button>
             <button className="ghostButton" onClick={dispatchAlerts} disabled={loading}>
               <AlertTriangle size={15} />
               Dispatch Alerts
