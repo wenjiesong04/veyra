@@ -58,8 +58,8 @@ safe_browser = SafeBrowser(state_store=state_store)
 safe_api = SafeAPI(state_store=state_store)
 _tool_proxy_config = state_store.read_json("ops_config.json").get("tool_proxy", {})
 if isinstance(_tool_proxy_config, dict):
-    safe_browser.configure_executor(bool(_tool_proxy_config.get("browser_executor_enabled", False)))
-    safe_api.configure_executor(bool(_tool_proxy_config.get("api_executor_enabled", False)))
+    safe_browser.configure_executor(bool(_tool_proxy_config.get("browser_executor_enabled", False)), _tool_proxy_config.get("browser_allowed_hosts"))
+    safe_api.configure_executor(bool(_tool_proxy_config.get("api_executor_enabled", False)), _tool_proxy_config.get("api_allowed_hosts"))
 action_executor = ActionExecutor(
     state_store=state_store,
     safe_shell=safe_shell,
@@ -130,6 +130,8 @@ class APIProxyRequest(BaseModel):
 class ToolProxyConfigRequest(BaseModel):
     browser_executor_enabled: bool | None = None
     api_executor_enabled: bool | None = None
+    browser_allowed_hosts: list[str] | None = None
+    api_allowed_hosts: list[str] | None = None
 
 
 class MemoryPatchRequest(BaseModel):
@@ -270,9 +272,13 @@ def _configure_tool_proxy(patch: dict[str, Any]) -> dict[str, Any]:
         tool_proxy["browser_executor_enabled"] = bool(patch["browser_executor_enabled"])
     if patch.get("api_executor_enabled") is not None:
         tool_proxy["api_executor_enabled"] = bool(patch["api_executor_enabled"])
+    if patch.get("browser_allowed_hosts") is not None:
+        tool_proxy["browser_allowed_hosts"] = [str(item).strip().lower() for item in patch["browser_allowed_hosts"] if str(item).strip()]
+    if patch.get("api_allowed_hosts") is not None:
+        tool_proxy["api_allowed_hosts"] = [str(item).strip().lower() for item in patch["api_allowed_hosts"] if str(item).strip()]
     state_store.write_json("ops_config.json", config)
-    safe_browser.configure_executor(bool(tool_proxy.get("browser_executor_enabled", False)))
-    safe_api.configure_executor(bool(tool_proxy.get("api_executor_enabled", False)))
+    safe_browser.configure_executor(bool(tool_proxy.get("browser_executor_enabled", False)), tool_proxy.get("browser_allowed_hosts"))
+    safe_api.configure_executor(bool(tool_proxy.get("api_executor_enabled", False)), tool_proxy.get("api_allowed_hosts"))
     return _tool_proxy_status()
 
 

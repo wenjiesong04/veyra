@@ -446,9 +446,12 @@ def main() -> int:
         expect(r5.json()["status"] == "blocked", "detected R5 overrides low risk guess", r5.json())
 
         tool_proxy_status = client.get("/tool-proxy/status").json()
-        tool_proxy_config = client.post("/tool-proxy/config", json={"api_executor_enabled": True, "browser_executor_enabled": False}).json()
+        tool_proxy_config = client.post(
+            "/tool-proxy/config",
+            json={"api_executor_enabled": True, "browser_executor_enabled": False, "api_allowed_hosts": ["127.0.0.1"]},
+        ).json()
         expect(tool_proxy_status["api"]["configured"] is False and tool_proxy_status["browser"]["configured"] is False, "tool proxy executor status defaults closed", tool_proxy_status)
-        expect(tool_proxy_config["api"]["configured"] is True and tool_proxy_config["browser"]["configured"] is False, "tool proxy executor config endpoint", tool_proxy_config)
+        expect(tool_proxy_config["api"]["configured"] is True and tool_proxy_config["api"]["allowed_hosts"] == ["127.0.0.1"], "tool proxy executor config endpoint", tool_proxy_config)
         client.post("/tool-proxy/config", json={"api_executor_enabled": False, "browser_executor_enabled": False})
 
         class APIHandler(BaseHTTPRequestHandler):
@@ -467,14 +470,25 @@ def main() -> int:
         try:
             api_executor = SafeAPI(state_store=app_module.state_store, executor_configured=True)
             api_result = api_executor.request({"method": "GET", "url": f"http://127.0.0.1:{server.server_port}/status"})
+            api_blocked = SafeAPI(state_store=app_module.state_store, executor_configured=True, allowed_hosts=["example.com"]).request(
+                {"method": "GET", "url": f"http://127.0.0.1:{server.server_port}/status"}
+            )
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=1)
         browser_executor = SafeBrowser(state_store=app_module.state_store, executor=lambda url: {"status": "ok", "opened": True, "url": url})
+        browser_blocked = SafeBrowser(
+            state_store=app_module.state_store,
+            executor=lambda url: {"status": "ok", "opened": True, "url": url},
+            allowed_hosts=["example.com"],
+        )
         browser_result = browser_executor.open("http://localhost:18789/")
+        browser_blocked_result = browser_blocked.open("http://localhost:18789/")
         expect(api_result["status"] == "ok" and api_result["status_code"] == 200, "safe api real executor hook", api_result)
+        expect(api_blocked["status"] == "blocked" and "allowlist" in api_blocked["reason"], "safe api executor allowlist blocks", api_blocked)
         expect(browser_result["status"] == "ok" and browser_result["opened"] is True, "safe browser executor hook", browser_result)
+        expect(browser_blocked_result["status"] == "blocked" and "allowlist" in browser_blocked_result["reason"], "safe browser executor allowlist blocks", browser_blocked_result)
 
         agency = client.post("/proactive/check")
         expect(agency.status_code == 200, "proactive check endpoint", agency.text)

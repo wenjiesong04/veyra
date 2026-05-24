@@ -114,19 +114,33 @@ class DeploymentConfigValidator:
         tool_proxy = config.get("tool_proxy") if isinstance(config.get("tool_proxy"), dict) else {}
         browser_enabled = bool(tool_proxy.get("browser_executor_enabled", False))
         api_enabled = bool(tool_proxy.get("api_executor_enabled", False))
+        browser_hosts = tool_proxy.get("browser_allowed_hosts") if isinstance(tool_proxy.get("browser_allowed_hosts"), list) else []
+        api_hosts = tool_proxy.get("api_allowed_hosts") if isinstance(tool_proxy.get("api_allowed_hosts"), list) else []
         checks = [
             self._check("tool_proxy_default_boundary", "pass", "SafeShell and SafeFile are always routed through Tool Proxy.", {}),
             self._check(
                 "browser_executor_explicit",
                 "warn" if browser_enabled else "pass",
                 "Browser executor is optional and should have deployment-specific allowlists before production use.",
-                {"enabled": browser_enabled},
+                {"enabled": browser_enabled, "allowed_hosts": browser_hosts},
+            ),
+            self._check(
+                "browser_executor_allowlist",
+                self._allowlist_status(browser_enabled, browser_hosts),
+                "Browser executor host allowlist checked.",
+                {"enabled": browser_enabled, "allowed_hosts": browser_hosts},
             ),
             self._check(
                 "api_executor_explicit",
                 "warn" if api_enabled else "pass",
                 "API executor is optional and should have deployment-specific allowlists before production use.",
-                {"enabled": api_enabled},
+                {"enabled": api_enabled, "allowed_hosts": api_hosts},
+            ),
+            self._check(
+                "api_executor_allowlist",
+                self._allowlist_status(api_enabled, api_hosts),
+                "API executor host allowlist checked.",
+                {"enabled": api_enabled, "allowed_hosts": api_hosts},
             ),
         ]
         return checks
@@ -150,3 +164,12 @@ class DeploymentConfigValidator:
             return True
         path = Path(value)
         return path.is_absolute()
+
+    def _allowlist_status(self, enabled: bool, hosts: list[Any]) -> str:
+        if not enabled:
+            return "pass"
+        if not hosts:
+            return "fail"
+        if "*" in {str(item).strip() for item in hosts}:
+            return "warn"
+        return "pass"

@@ -38,7 +38,7 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | Probe Tools | Implemented system, git, port, process, file, network, web, log, MCP, OpenClaw, Hermes probe modules with standardized result envelopes where wired. |
 | Memory Bridge | Implemented local memory bridge for summary reads, model-assisted relevance ranking, filtered patch writes, provider routing (`local` / `selected` / runtime names / `all`), external adapter hooks, and provider diagnostics. Production external memory semantics still need live runtime validation. |
 | Skill | Implemented registry/runtime and built-in skill definitions. Skills route through AwarenessLoop and now record execution trace. |
-| Tool Proxy | Implemented SafeShell, SafeFile, SafeBrowser, SafeAPI with Guardian-style policy review, runtime executor config, standard tool trace, and Agent result bypass verification. |
+| Tool Proxy | Implemented SafeShell, SafeFile, SafeBrowser, SafeAPI with Guardian-style policy review, runtime executor config, host allowlists, standard tool trace, and Agent result bypass verification. |
 | Rollback / Audit | Implemented snapshot, diff, restore, rollback log, policy trace, tool trace, execution trace, ActionJournal timeline, time-travel summary, and non-destructive replay plans. |
 | Web Control UI | Implemented React/Vite console served at `/console`, backed by live Veyra APIs and built into `ui/console`. |
 
@@ -73,7 +73,7 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | `/external/watchlist`, `/external/refresh` | Add/update ExternalWorld watch targets and refresh them through read-only probes |
 | `/agent/contract`, `/agent/status`, `/agents`, `/agents/select`, `/agents/{name}/config` | Agent contract, Tool Proxy contract, status, selection, adapter configuration |
 | `/actions/proposals`, `/reviews/*` | Action review and human confirmation flow |
-| `/tool-proxy/*`, `/tool-proxy/status`, `/tool-proxy/config` | Safe shell/file/browser/API execution boundary with optional Browser/API executor configuration |
+| `/tool-proxy/*`, `/tool-proxy/status`, `/tool-proxy/config` | Safe shell/file/browser/API execution boundary with optional Browser/API executor configuration and host allowlists |
 | `/rollback/*`, `/audit/journal`, `/audit/time-travel`, `/audit/replay/*` | Snapshot, diff, restore, git diff, correlated journal, time-travel summary, and replay plans |
 | `/ops/health`, `/ops/alerts`, `/ops/alerts/dispatch`, `/ops/alerting`, `/ops/deployment`, `/ops/deployment/config`, `/ops/soak`, `/ops/soak/status`, `/ops/soak/start`, `/ops/soak/stop`, `/ops/safety/red-team`, `/ops/retention`, `/ops/retention/enforce` | Operational health, alerts, local/webhook alert dispatch, deployment readiness/config validation, bounded/session soak, red-team safety, and retention checks/enforcement |
 | `/logs/events`, `/logs/actions`, `/logs/tools`, `/logs/policy`, `/logs/execution`, `/logs/rollback`, `/logs/memory` | Audit and trace surfaces |
@@ -97,6 +97,6 @@ Remaining gaps before calling it a complete Veyra runtime:
 
 - Real multi-runtime soak validation is not complete until OpenClaw/Hermes/Custom are exercised in a live deployment.
 - External Memory Bridge diagnostics exist, but production OpenClaw/Hermes memory semantics still need live runtime validation.
-- Browser/API execution has configurable executor hooks, but production browser/API side effects still need deployment-specific allowlists.
+- Browser/API execution has configurable executor hooks and host allowlists; live production allowlists still need environment-specific validation.
 - Replay planning and time-travel audit summaries exist; automatic side-effect replay remains intentionally gated behind guarded restore/resubmit flows.
 - Long-running soak now has controlled session APIs; alert delivery supports local audit log and optional configured webhook.

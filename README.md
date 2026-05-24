@@ -45,7 +45,7 @@ Endpoints:
 - `POST /tool-proxy/browser/open` review a browser-open request through SafeBrowser policy
 - `POST /tool-proxy/api/request` review an API request through SafeAPI policy
 - `GET /tool-proxy/status` inspect SafeShell/SafeFile/SafeBrowser/SafeAPI executor availability
-- `POST /tool-proxy/config` enable/disable optional SafeBrowser/SafeAPI executors
+- `POST /tool-proxy/config` enable/disable optional SafeBrowser/SafeAPI executors and host allowlists
 - `GET /logs/policy` read policy trace records
 - `POST /actions/proposals` submit an Agent or Tool action proposal through Guardian review
 - `POST /rollback/snapshot` create a file snapshot

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from core.world_state import WorldStateStore
@@ -18,11 +19,13 @@ class SafeAPI:
         policy: ToolPolicy | None = None,
         executor_configured: bool = False,
         executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        allowed_hosts: list[str] | None = None,
     ) -> None:
         self.state_store = state_store
         self.policy = policy or ToolPolicy()
         self.executor_configured = executor_configured
         self.executor = executor
+        self.allowed_hosts = allowed_hosts or ["localhost", "127.0.0.1", "::1"]
         self.policy_trace = PolicyTrace(state_store)
         self.tool_trace = ToolTrace(state_store)
 
@@ -32,10 +35,13 @@ class SafeAPI:
             "configured": bool(self.executor or self.executor_configured),
             "mode": "custom_executor" if self.executor else "http_urlopen",
             "default_enabled": False,
+            "allowed_hosts": self.allowed_hosts,
         }
 
-    def configure_executor(self, enabled: bool) -> None:
+    def configure_executor(self, enabled: bool, allowed_hosts: list[str] | None = None) -> None:
         self.executor_configured = enabled
+        if allowed_hosts is not None:
+            self.allowed_hosts = self._normalize_hosts(allowed_hosts)
 
     def request(self, payload: dict[str, Any], approved_by: str | None = None) -> dict[str, Any]:
         review = self.policy.review_api_request(payload)
@@ -50,6 +56,17 @@ class SafeAPI:
             result["tool_trace"] = self._record("api_request", target, result, review, approved_by)
             return result
         if self.executor or self.executor_configured:
+            if not self._host_allowed(target):
+                result = {
+                    "status": "blocked",
+                    "payload": self._redact(payload),
+                    "review": review,
+                    "reason": "API host is not in executor allowlist",
+                    "allowed_hosts": self.allowed_hosts,
+                    "approved_by": approved_by,
+                }
+                result["tool_trace"] = self._record("api_request", target, result, review, approved_by)
+                return result
             result = self._execute(payload)
             result["payload"] = self._redact(payload)
             result["review"] = review
@@ -85,6 +102,19 @@ class SafeAPI:
                 return {"status": "ok", "status_code": response.status, "body": content[:8000]}
         except (HTTPError, URLError, TimeoutError) as exc:
             return {"status": "error", "reason": str(exc)}
+
+    def _host_allowed(self, url: str) -> bool:
+        allowed = set(self.allowed_hosts)
+        if "*" in allowed:
+            return True
+        host = urlparse(url).hostname or ""
+        return host in allowed or any(host.endswith(item) for item in allowed if item.startswith("."))
+
+    def _normalize_hosts(self, hosts: list[str]) -> list[str]:
+        if not isinstance(hosts, list):
+            return ["localhost", "127.0.0.1", "::1"]
+        normalized = [str(item).strip().lower() for item in hosts if str(item).strip()]
+        return normalized or ["localhost", "127.0.0.1", "::1"]
 
     def _record(self, action_type: str, target: str, payload: dict[str, Any], review: dict, approved_by: str | None = None) -> dict[str, Any]:
         return self.tool_trace.record(

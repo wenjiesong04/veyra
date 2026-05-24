@@ -64,6 +64,8 @@ class WorldStateStore:
                 "tool_proxy": {
                     "browser_executor_enabled": False,
                     "api_executor_enabled": False,
+                    "browser_allowed_hosts": ["localhost", "127.0.0.1", "::1"],
+                    "api_allowed_hosts": ["localhost", "127.0.0.1", "::1"],
                 },
             },
         }
