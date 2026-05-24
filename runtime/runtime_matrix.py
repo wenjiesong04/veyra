@@ -18,7 +18,17 @@ class RuntimeMatrix:
         self.memory_bridge = memory_bridge
 
     def status(self) -> dict[str, Any]:
-        return self.state_store.read_json("ops_runtime_matrix.json") or {"status": "not_run", "runtimes": []}
+        current = self.state_store.read_json("ops_runtime_matrix.json") or {"status": "not_run", "runtimes": []}
+        current.setdefault(
+            "validation",
+            {
+                "codebase": "implemented",
+                "configured": 0,
+                "validated": 0,
+                "status": "not_run",
+            },
+        )
+        return current
 
     def run(self, *, write_memory_probe: bool = False) -> dict[str, Any]:
         self.registry.refresh()
@@ -36,6 +46,12 @@ class RuntimeMatrix:
             "checked_at": utc_now_iso(),
             "write_memory_probe": write_memory_probe,
             "summary": summary,
+            "validation": {
+                "codebase": "implemented",
+                "configured": summary["total"] - summary["not_configured"],
+                "validated": summary["ready"],
+                "status": "validated" if summary["ready"] else "validation_pending" if summary["degraded"] or summary["error"] else "not_configured",
+            },
             "runtimes": runtimes,
         }
         self.state_store.write_json("ops_runtime_matrix.json", result)
@@ -64,6 +80,12 @@ class RuntimeMatrix:
         return {
             "name": name,
             "status": row_status,
+            "validation": {
+                "implemented": True,
+                "configured": row_status != "not_configured",
+                "validated": row_status == "ready",
+                "status": "validated" if row_status == "ready" else "validation_pending" if row_status in {"degraded", "error"} else "not_configured",
+            },
             "connection": redact_sensitive(connection, max_string=1000),
             "capabilities": redact_sensitive(capabilities, max_string=1000),
             "memory": redact_sensitive(memory, max_string=1000),

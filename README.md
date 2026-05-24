@@ -254,11 +254,22 @@ Without a configured base URL, Veyra still builds the task packet but returns `a
 
 - `core`: Runtime Entity, Awareness Loop, WorldState, Core model reasoning, Decision, Foresight, Guardian, Verifier, Patch/TaskPacket builders
 - `awareness`: Attention, Belief, Uncertainty, Awareness summary/output
-- `interface`: Intake, event schema/normalizer, channel and Agent adapter interfaces
-- `probes`: system, git, port, process, file, OpenClaw/Hermes placeholders
-- `tool_proxy`: SafeShell, SafeFile, SafeBrowser/SafeAPI placeholders
+- `interface`: Intake, event schema/normalizer, channel adapters, OpenClaw WebSocket adapter, and Hermes/Custom HTTP Agent adapters
+- `probes`: system, git, port, process, file, log, network, web, MCP, OpenClaw, and Hermes read-only probe envelopes
+- `tool_proxy`: SafeShell, SafeFile, SafeBrowser, and SafeAPI policy gates with trace logging and optional executor hooks
 - `rollback_audit`: snapshot, diff, ActionJournal timeline, replay plan, compensation plan, traces
-- `memory_bridge`: memory read/write/filter placeholders
-- `skills`: built-in skill registry placeholders
+- `memory_bridge`: local/selected/runtime/all provider routing, sensitive-memory filtering, provider diagnostics, and external adapter hooks
+- `skills`: built-in skill registry/runtime for fixed low-risk workflows
 - `personas`: Minimalist, Operator, Engineer, Guardian, Steward
 - `state`: JSON/JSONL state cache and audit files
+
+## Validation Semantics
+
+Veyra reports implementation and validation separately. A module can be `implemented` while a live OpenClaw, Hermes, Custom Agent, memory provider, alert webhook, or production soak is still `not_configured` or `validation_pending`.
+
+- `implemented`: code path exists and is covered by local checks.
+- `configured`: an external runtime or executor has a concrete endpoint/configuration.
+- `validated`: Veyra connected to the real external surface and received a successful capability/status result.
+- `validation_pending`: code and configuration exist, but the real external service did not yet pass live validation.
+
+This keeps the API honest: Veyra does not fake a connected Agent runtime or production-ready deployment when the local environment has not provided one.

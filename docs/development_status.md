@@ -26,8 +26,8 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | P3 Agent adapter execution contracts | Completed | `veyra.agent_adapter.v1`, OpenClaw WebSocket adapter, Hermes/Custom HTTP adapter, compatibility negotiation |
 | P4 Rollback / Audit / Verifier depth | Completed | Verifier verdicts, execution trace, tool trace, rollback checksum/diff/restore evidence |
 | P5 Web Control Console completeness | Completed | Console surfaces for setup, awareness, runtime, review, persona, state/logs, tool proxy, rollback/audit |
-| P6 End-to-end runtime hardening | Implemented, live validation pending | Task polling/stop/refresh, Agent result callback, ActionProposal hardening, Agent Tool Proxy contract verification, Core model-assisted reasoning, model-ranked memory, ExternalWorld refresh, Agency intentions, stale refresh, real probe envelopes, external-memory bridge slots, and provider diagnostics |
-| P7 Production operations and safety validation | Implemented, live validation pending | Non-destructive red-team validation, retention summary/enforcement, runtime matrix, bounded/session soak APIs, Ops health, alerts, local/webhook alert dispatch, deployment config validation, and deployment readiness checks exist; live multi-runtime production soak still needs a configured environment |
+| P6 End-to-end runtime hardening | Implemented, live validation pending | Task polling/stop/refresh, Agent result callback, ActionProposal hardening, Agent Tool Proxy contract verification, Core model-assisted reasoning, model-ranked memory, ExternalWorld refresh, Agency intentions, stale refresh, real probe envelopes, external-memory bridge slots, and provider diagnostics. API validation fields now separate implemented/configured/validated state. |
+| P7 Production operations and safety validation | Implemented, live validation pending | Non-destructive red-team validation, retention summary/enforcement, runtime matrix, bounded/session soak APIs, Ops health, alerts, local/webhook alert dispatch, deployment config validation, and deployment readiness checks exist. `/ops/deployment` and `/ops/runtime-matrix` report not_configured or validation_pending instead of pretending live production readiness. |
 
 ## Eight Architecture Blocks
 
@@ -66,7 +66,7 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | Surface | Purpose |
 | --- | --- |
 | `/runtime`, `/state`, `/heartbeat` | Runtime identity, state cache, heartbeat |
-| `/architecture`, `/definitions`, `/mvp/status` | Architecture metadata, risk/lifecycle/mode definitions, readiness flags |
+| `/architecture`, `/definitions`, `/mvp/status` | Architecture metadata, risk/lifecycle/mode definitions, implementation flags, and validation status |
 | `/events/message` | Standard user-message event entry |
 | `/core/model/status`, `/core/model/config`, `/logs/core-model` | Core model config/status and redacted model reasoning audit |
 | `/memory/providers`, `/memory/providers/diagnostics`, `/memory/summary`, `/memory/patch` | Memory provider discovery, diagnostics, summary reads, and filtered writes across local/selected/explicit runtime providers |
@@ -75,7 +75,7 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | `/actions/proposals`, `/reviews/*` | Action review and human confirmation flow |
 | `/tool-proxy/*`, `/tool-proxy/status`, `/tool-proxy/config` | Safe shell/file/browser/API execution boundary with optional Browser/API executor configuration and host allowlists |
 | `/rollback/*`, `/audit/journal`, `/audit/time-travel`, `/audit/replay/*` | Snapshot, diff, restore, git diff, correlated journal, time-travel summary, replay plans, and guarded replay compensation proposals |
-| `/ops/health`, `/ops/alerts`, `/ops/alerts/dispatch`, `/ops/alerting`, `/ops/deployment`, `/ops/deployment/config`, `/ops/runtime-matrix`, `/ops/runtime-matrix/run`, `/ops/soak`, `/ops/soak/status`, `/ops/soak/start`, `/ops/soak/stop`, `/ops/safety/red-team`, `/ops/retention`, `/ops/retention/enforce` | Operational health, alerts, local/webhook alert dispatch, deployment readiness/config validation, runtime matrix, bounded/session soak, red-team safety, and retention checks/enforcement |
+| `/ops/health`, `/ops/alerts`, `/ops/alerts/dispatch`, `/ops/alerting`, `/ops/deployment`, `/ops/deployment/config`, `/ops/runtime-matrix`, `/ops/runtime-matrix/run`, `/ops/soak`, `/ops/soak/status`, `/ops/soak/start`, `/ops/soak/stop`, `/ops/safety/red-team`, `/ops/retention`, `/ops/retention/enforce` | Operational health, alerts, local/webhook alert dispatch, deployment readiness/config validation, runtime matrix with validation metadata, bounded/session soak, red-team safety, and retention checks/enforcement |
 | `/logs/events`, `/logs/actions`, `/logs/tools`, `/logs/policy`, `/logs/execution`, `/logs/rollback`, `/logs/memory` | Audit and trace surfaces |
 | `/console` | Awareness & Agent Control Console |
 

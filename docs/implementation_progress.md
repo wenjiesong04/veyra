@@ -149,8 +149,8 @@ P2 已将 Tool Proxy 接入统一策略审查：
 | P3 | Agent adapter execution contracts | Completed |
 | P4 | Rollback, audit, and verifier depth | Completed |
 | P5 | Web Control Console completeness | Completed |
-| P6 | End-to-end runtime hardening | In progress |
-| P7 | Production operations and safety validation | Pending |
+| P6 | End-to-end runtime hardening | Implemented, live runtime validation pending |
+| P7 | Production operations and safety validation | Implemented, production soak validation pending |
 
 ## Agent Adapter Contract
 
@@ -227,7 +227,7 @@ P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块。当�
 - Memory Bridge 增加外部 adapter hook、敏感信息阻断和 freshness / trust 标记。
 - P7 增加非破坏性红队安全检查、日志保留策略执行和 bounded/session soak API。
 
-后续仍需要的是真实环境验收，而不是本地功能补洞：
+后续仍需要的是真实环境验收，而不是本地功能补洞。接口现在明确区分 `implemented`、`configured`、`validated`、`validation_pending`，未配置或未连通的真实运行时不会被标成已连接：
 
 - P6：连接真实 OpenClaw/Hermes/Custom 后运行 runtime matrix、长任务停止、结果回传、memory diagnostics 和状态过期刷新验收。
 - P7：配置真实 alert webhook、生产 allowlist 和多 runtime soak session 后做长时间验收。

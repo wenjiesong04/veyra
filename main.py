@@ -268,6 +268,56 @@ def _tool_proxy_status() -> dict[str, Any]:
     }
 
 
+def _adapter_validation(name: str, status: dict[str, Any]) -> dict[str, Any]:
+    raw_status = str(status.get("status") or "unknown")
+    configured = bool(status.get("base_url")) or raw_status not in {"adapter_unconfigured", "unconfigured", "unknown"}
+    connected = bool(status.get("connected"))
+    validation_status = "validated" if connected else "validation_pending" if configured else "not_configured"
+    return {
+        "name": name,
+        "implemented": True,
+        "configured": configured,
+        "connected": connected,
+        "validated": connected,
+        "status": validation_status,
+        "runtime_status": raw_status,
+    }
+
+
+def _runtime_validation_summary(agent_status_data: dict[str, Any] | None = None) -> dict[str, Any]:
+    registry_status = awareness_loop.agent_registry.list_status()
+    selected_agent = str(registry_status.get("selected_agent") or awareness_loop.agent_registry.selected_name())
+    agents = registry_status.get("agents") if isinstance(registry_status.get("agents"), dict) else {}
+    validations = {
+        name: _adapter_validation(str(name), raw if isinstance(raw, dict) else {})
+        for name, raw in agents.items()
+    }
+    if agent_status_data is not None:
+        validations[selected_agent] = _adapter_validation(selected_agent, agent_status_data)
+    selected = validations.get(selected_agent, _adapter_validation(selected_agent, agent_status_data or {}))
+    configured_count = len([item for item in validations.values() if item["configured"]])
+    validated_count = len([item for item in validations.values() if item["validated"]])
+    if selected["validated"]:
+        status = "validated"
+    elif configured_count:
+        status = "validation_pending"
+    else:
+        status = "not_configured"
+    return {
+        "status": status,
+        "selected_agent": selected_agent,
+        "selected": selected,
+        "summary": {
+            "implemented": len(validations),
+            "configured": configured_count,
+            "validated": validated_count,
+            "validation_pending": len([item for item in validations.values() if item["status"] == "validation_pending"]),
+            "not_configured": len([item for item in validations.values() if item["status"] == "not_configured"]),
+        },
+        "agents": validations,
+    }
+
+
 def _configure_tool_proxy(patch: dict[str, Any]) -> dict[str, Any]:
     config = state_store.read_json("ops_config.json")
     tool_proxy = config.setdefault("tool_proxy", {})
@@ -288,12 +338,24 @@ def _configure_tool_proxy(patch: dict[str, Any]) -> dict[str, Any]:
 def _deployment_readiness() -> dict[str, Any]:
     readiness = ops_monitor.deployment_readiness()
     config = deployment_validator.validate()
+    runtime_validation = _runtime_validation_summary()
     config_passed = config["status"] in {"ready", "ready_with_warnings"}
     readiness["checks"].append({"name": "deployment_config", "passed": config_passed})
     readiness["configuration"] = config
+    readiness["validation"] = {
+        "codebase": "implemented",
+        "runtime_matrix": runtime_matrix.status().get("status", "not_run"),
+        "agent_runtime": runtime_validation,
+    }
     if not config_passed:
         readiness["status"] = "not_ready"
         readiness.setdefault("blocking_alerts", []).append({"component": "deployment_config", "severity": "critical", "details": config})
+    elif runtime_validation["status"] == "not_configured":
+        readiness["status"] = "not_configured"
+    elif runtime_validation["status"] == "validation_pending":
+        readiness["status"] = "validation_pending"
+    elif readiness.get("health_status") == "degraded":
+        readiness["status"] = "degraded"
     return readiness
 
 
@@ -961,54 +1023,63 @@ async def memory_patch(request: MemoryPatchRequest):
 @app.get("/mvp/status")
 async def mvp_status():
     agent_status_data = awareness_loop.agent_registry.selected().connection_status()
+    runtime_validation = _runtime_validation_summary(agent_status_data)
+    implemented_loops = {
+        "direct_answer": True,
+        "probe_route": True,
+        "skill_route": True,
+        "human_review_queue": True,
+        "approve_reject": True,
+        "approved_action_execution": True,
+        "tool_proxy": True,
+        "policy_trace": True,
+        "execution_trace": True,
+        "verifier_evidence_chain": True,
+        "rollback_audit_depth": True,
+        "rollback_snapshot_restore": True,
+        "action_journal_timeline": True,
+        "replay_plan": True,
+        "replay_compensation_review": True,
+        "time_travel_audit": True,
+        "memory_bridge_local": True,
+        "memory_bridge_provider_routing": True,
+        "memory_provider_diagnostics": True,
+        "proactive_read_only_checks": True,
+        "multi_agent_registry": True,
+        "agent_adapter_contract": True,
+        "agent_task_polling": True,
+        "agent_pending_task_refresh": True,
+        "agent_result_callback": True,
+        "agency_intention_queue": True,
+        "stale_belief_refresh": True,
+        "real_probe_envelopes": True,
+        "external_memory_bridge_hooks": True,
+        "tool_proxy_executor_config": True,
+        "ops_soak_runner": True,
+        "ops_soak_session": True,
+        "ops_runtime_matrix": True,
+        "ops_health_alerts": True,
+        "ops_alert_dispatch": True,
+        "ops_retention_enforce": True,
+        "deployment_readiness": True,
+        "deployment_config_validation": True,
+        "core_model_reasoning_layer": True,
+        "core_model_memory_relevance": True,
+        "external_world_watchlist_refresh": True,
+        "agent_tool_proxy_contract": True,
+        "agent_tool_bypass_verification": True,
+        "web_console": console_dir.exists(),
+    }
     return {
         "mvp": "core_governance",
-        "status": "ready",
-        "core_loops": {
-            "direct_answer": True,
-            "probe_route": True,
-            "skill_route": True,
-            "human_review_queue": True,
-            "approve_reject": True,
-            "approved_action_execution": True,
-            "tool_proxy": True,
-            "policy_trace": True,
-            "execution_trace": True,
-            "verifier_evidence_chain": True,
-            "rollback_audit_depth": True,
-            "rollback_snapshot_restore": True,
-            "action_journal_timeline": True,
-            "replay_plan": True,
-            "replay_compensation_review": True,
-            "time_travel_audit": True,
-            "memory_bridge_local": True,
-            "memory_bridge_provider_routing": True,
-            "memory_provider_diagnostics": True,
-            "proactive_read_only_checks": True,
-            "multi_agent_registry": True,
-            "agent_adapter_contract": True,
-            "agent_task_polling": True,
-            "agent_pending_task_refresh": True,
-            "agent_result_callback": True,
-            "agency_intention_queue": True,
-            "stale_belief_refresh": True,
-            "real_probe_envelopes": True,
-            "external_memory_bridge_hooks": True,
-            "tool_proxy_executor_config": True,
-            "ops_soak_runner": True,
-            "ops_soak_session": True,
-            "ops_runtime_matrix": True,
-            "ops_health_alerts": True,
-            "ops_alert_dispatch": True,
-            "ops_retention_enforce": True,
-            "deployment_readiness": True,
-            "deployment_config_validation": True,
-            "core_model_reasoning_layer": True,
-            "core_model_memory_relevance": True,
-            "external_world_watchlist_refresh": True,
-            "agent_tool_proxy_contract": True,
-            "agent_tool_bypass_verification": True,
-            "web_console": console_dir.exists(),
+        "status": "implemented",
+        "core_loops": implemented_loops,
+        "validation": {
+            "codebase": "implemented",
+            "local_self_tests": "available",
+            "runtime_validation": runtime_validation,
+            "production_validation": "pending_live_environment" if runtime_validation["status"] != "validated" else "ready_for_soak",
+            "data_reality": "live_local_api_no_mock_fixtures",
         },
         "core_model": awareness_loop.core_reasoning.status(),
         "agent_runtime": {
