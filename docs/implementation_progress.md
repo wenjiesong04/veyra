@@ -227,7 +227,7 @@ P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块。当�
 - Memory Bridge 增加外部 adapter hook、敏感信息阻断和 freshness / trust 标记。
 - P7 增加非破坏性红队安全检查、日志保留策略执行和 bounded/session soak API。
 
-后续仍需要：
+后续仍需要的是真实环境验收，而不是本地功能补洞：
 
-- P6：端到端真实运行硬化，包括 OpenClaw/Hermes/Custom Agent 真实连接测试、失败恢复、长任务停止、结果回传、状态过期刷新。
-- P7：继续补真实部署配置校验、告警通道实测和真实多 runtime soak test。
+- P6：连接真实 OpenClaw/Hermes/Custom 后运行 runtime matrix、长任务停止、结果回传、memory diagnostics 和状态过期刷新验收。
+- P7：配置真实 alert webhook、生产 allowlist 和多 runtime soak session 后做长时间验收。

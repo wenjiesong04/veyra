@@ -26,8 +26,8 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | P3 Agent adapter execution contracts | Completed | `veyra.agent_adapter.v1`, OpenClaw WebSocket adapter, Hermes/Custom HTTP adapter, compatibility negotiation |
 | P4 Rollback / Audit / Verifier depth | Completed | Verifier verdicts, execution trace, tool trace, rollback checksum/diff/restore evidence |
 | P5 Web Control Console completeness | Completed | Console surfaces for setup, awareness, runtime, review, persona, state/logs, tool proxy, rollback/audit |
-| P6 End-to-end runtime hardening | In progress | Task polling/stop/refresh, Agent result callback, ActionProposal hardening, Agent Tool Proxy contract verification, Core model-assisted reasoning, model-ranked memory, ExternalWorld refresh, Agency intentions, stale refresh, real probe envelopes, external-memory bridge slots |
-| P7 Production operations and safety validation | In progress | Non-destructive red-team validation, retention summary/enforcement, runtime matrix, bounded/session soak APIs, Ops health, alerts, local/webhook alert dispatch, deployment config validation, and deployment readiness checks exist; live multi-runtime production soak still needs a configured environment |
+| P6 End-to-end runtime hardening | Implemented, live validation pending | Task polling/stop/refresh, Agent result callback, ActionProposal hardening, Agent Tool Proxy contract verification, Core model-assisted reasoning, model-ranked memory, ExternalWorld refresh, Agency intentions, stale refresh, real probe envelopes, external-memory bridge slots, and provider diagnostics |
+| P7 Production operations and safety validation | Implemented, live validation pending | Non-destructive red-team validation, retention summary/enforcement, runtime matrix, bounded/session soak APIs, Ops health, alerts, local/webhook alert dispatch, deployment config validation, and deployment readiness checks exist; live multi-runtime production soak still needs a configured environment |
 
 ## Eight Architecture Blocks
 
@@ -93,10 +93,10 @@ The current codebase follows the original design direction:
 - Rollback/Audit records snapshots, diffs, traces, and restores.
 - The console is an Awareness & Agent Control Console rather than a plain chat box.
 
-Remaining gaps before calling it a complete Veyra runtime:
+Remaining live validation gates:
 
 - Runtime matrix exists for OpenClaw/Hermes/Custom; live multi-runtime soak validation still requires configured running runtimes.
 - External Memory Bridge diagnostics exist, but production OpenClaw/Hermes memory semantics still need live runtime validation.
 - Browser/API execution has configurable executor hooks and host allowlists; live production allowlists still need environment-specific validation.
-- Replay planning and time-travel audit summaries exist; side-effect replay is gated behind review-backed compensation proposals.
-- Long-running soak now has controlled session APIs; alert delivery supports local audit log and optional configured webhook.
+- Replay compensation is implemented as review-backed snapshot restore; live side-effect replay beyond snapshot restore remains intentionally gated.
+- Long-running soak now has controlled session APIs; alert delivery supports local audit log and optional configured webhook, with webhook delivery requiring a configured endpoint.
