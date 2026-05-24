@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -12,12 +12,30 @@ from tool_proxy.tool_policy import ToolPolicy
 
 
 class SafeAPI:
-    def __init__(self, state_store: WorldStateStore | None = None, policy: ToolPolicy | None = None, executor_configured: bool = False) -> None:
+    def __init__(
+        self,
+        state_store: WorldStateStore | None = None,
+        policy: ToolPolicy | None = None,
+        executor_configured: bool = False,
+        executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
         self.state_store = state_store
         self.policy = policy or ToolPolicy()
         self.executor_configured = executor_configured
+        self.executor = executor
         self.policy_trace = PolicyTrace(state_store)
         self.tool_trace = ToolTrace(state_store)
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "tool": "safe_api",
+            "configured": bool(self.executor or self.executor_configured),
+            "mode": "custom_executor" if self.executor else "http_urlopen",
+            "default_enabled": False,
+        }
+
+    def configure_executor(self, enabled: bool) -> None:
+        self.executor_configured = enabled
 
     def request(self, payload: dict[str, Any], approved_by: str | None = None) -> dict[str, Any]:
         review = self.policy.review_api_request(payload)
@@ -31,7 +49,7 @@ class SafeAPI:
             result = {"status": "needs_confirmation", "payload": self._redact(payload), "review": review}
             result["tool_trace"] = self._record("api_request", target, result, review, approved_by)
             return result
-        if self.executor_configured:
+        if self.executor or self.executor_configured:
             result = self._execute(payload)
             result["payload"] = self._redact(payload)
             result["review"] = review
@@ -48,6 +66,8 @@ class SafeAPI:
         return result
 
     def _execute(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.executor:
+            return self.executor(payload)
         method = str(payload.get("method", "GET")).upper()
         url = str(payload.get("url") or payload.get("endpoint") or "")
         if not url:

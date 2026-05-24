@@ -11,12 +11,20 @@ from tool_proxy.safe_shell import SafeShell
 
 
 class ActionExecutor:
-    def __init__(self, state_store: WorldStateStore) -> None:
+    def __init__(
+        self,
+        state_store: WorldStateStore,
+        *,
+        safe_shell: SafeShell | None = None,
+        safe_file: SafeFile | None = None,
+        safe_browser: SafeBrowser | None = None,
+        safe_api: SafeAPI | None = None,
+    ) -> None:
         self.state_store = state_store
-        self.safe_shell = SafeShell(state_store=state_store)
-        self.safe_file = SafeFile(state_store=state_store)
-        self.safe_browser = SafeBrowser(state_store=state_store)
-        self.safe_api = SafeAPI(state_store=state_store)
+        self.safe_shell = safe_shell or SafeShell(state_store=state_store)
+        self.safe_file = safe_file or SafeFile(state_store=state_store)
+        self.safe_browser = safe_browser or SafeBrowser(state_store=state_store)
+        self.safe_api = safe_api or SafeAPI(state_store=state_store)
 
     def execute_review(self, review: dict[str, Any]) -> dict[str, Any]:
         proposal = review.get("proposal")

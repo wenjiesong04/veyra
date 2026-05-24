@@ -60,7 +60,11 @@ class WorldStateStore:
                     "webhook_url": "",
                     "webhook_url_env": "VEYRA_ALERT_WEBHOOK_URL",
                     "min_severity": "warning",
-                }
+                },
+                "tool_proxy": {
+                    "browser_executor_enabled": False,
+                    "api_executor_enabled": False,
+                },
             },
         }
         for name, payload in defaults.items():

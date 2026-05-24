@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -151,7 +153,13 @@ def reset_main_state(tmp: Path) -> TestClient:
     app_module.safe_file = SafeFile(state_store=state_store)
     app_module.safe_browser = SafeBrowser(state_store=state_store)
     app_module.safe_api = SafeAPI(state_store=state_store)
-    app_module.action_executor = ActionExecutor(state_store=state_store)
+    app_module.action_executor = ActionExecutor(
+        state_store=state_store,
+        safe_shell=app_module.safe_shell,
+        safe_file=app_module.safe_file,
+        safe_browser=app_module.safe_browser,
+        safe_api=app_module.safe_api,
+    )
     app_module.foresight_engine = ForesightEngine(reasoning=loop.core_reasoning)
     app_module.proactive_checks = ProactiveChecks(state_store, agency_root=str(agency_root), reasoning=loop.core_reasoning)
     app_module.diff_tracker = DiffTracker()
@@ -430,6 +438,37 @@ def main() -> int:
             },
         )
         expect(r5.json()["status"] == "blocked", "detected R5 overrides low risk guess", r5.json())
+
+        tool_proxy_status = client.get("/tool-proxy/status").json()
+        tool_proxy_config = client.post("/tool-proxy/config", json={"api_executor_enabled": True, "browser_executor_enabled": False}).json()
+        expect(tool_proxy_status["api"]["configured"] is False and tool_proxy_status["browser"]["configured"] is False, "tool proxy executor status defaults closed", tool_proxy_status)
+        expect(tool_proxy_config["api"]["configured"] is True and tool_proxy_config["browser"]["configured"] is False, "tool proxy executor config endpoint", tool_proxy_config)
+        client.post("/tool-proxy/config", json={"api_executor_enabled": False, "browser_executor_enabled": False})
+
+        class APIHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"ok"}')
+
+            def log_message(self, format: str, *args: Any) -> None:
+                return None
+
+        server = HTTPServer(("127.0.0.1", 0), APIHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            api_executor = SafeAPI(state_store=app_module.state_store, executor_configured=True)
+            api_result = api_executor.request({"method": "GET", "url": f"http://127.0.0.1:{server.server_port}/status"})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+        browser_executor = SafeBrowser(state_store=app_module.state_store, executor=lambda url: {"status": "ok", "opened": True, "url": url})
+        browser_result = browser_executor.open("http://localhost:18789/")
+        expect(api_result["status"] == "ok" and api_result["status_code"] == 200, "safe api real executor hook", api_result)
+        expect(browser_result["status"] == "ok" and browser_result["opened"] is True, "safe browser executor hook", browser_result)
 
         agency = client.post("/proactive/check")
         expect(agency.status_code == 200, "proactive check endpoint", agency.text)

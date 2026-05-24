@@ -55,7 +55,17 @@ safe_shell = SafeShell(state_store=state_store)
 safe_file = SafeFile(state_store=state_store)
 safe_browser = SafeBrowser(state_store=state_store)
 safe_api = SafeAPI(state_store=state_store)
-action_executor = ActionExecutor(state_store=state_store)
+_tool_proxy_config = state_store.read_json("ops_config.json").get("tool_proxy", {})
+if isinstance(_tool_proxy_config, dict):
+    safe_browser.configure_executor(bool(_tool_proxy_config.get("browser_executor_enabled", False)))
+    safe_api.configure_executor(bool(_tool_proxy_config.get("api_executor_enabled", False)))
+action_executor = ActionExecutor(
+    state_store=state_store,
+    safe_shell=safe_shell,
+    safe_file=safe_file,
+    safe_browser=safe_browser,
+    safe_api=safe_api,
+)
 foresight_engine = ForesightEngine(reasoning=awareness_loop.core_reasoning)
 proactive_checks = ProactiveChecks(state_store, reasoning=awareness_loop.core_reasoning)
 diff_tracker = DiffTracker()
@@ -113,6 +123,11 @@ class BrowserOpenRequest(BaseModel):
 
 class APIProxyRequest(BaseModel):
     payload: dict[str, Any]
+
+
+class ToolProxyConfigRequest(BaseModel):
+    browser_executor_enabled: bool | None = None
+    api_executor_enabled: bool | None = None
 
 
 class MemoryPatchRequest(BaseModel):
@@ -230,6 +245,29 @@ async def console():
     }
 
 
+def _tool_proxy_status() -> dict[str, Any]:
+    return {
+        "status": "success",
+        "shell": {"tool": "safe_shell", "configured": True, "mode": "subprocess"},
+        "file": {"tool": "safe_file", "configured": True, "mode": "local_filesystem"},
+        "browser": safe_browser.status(),
+        "api": safe_api.status(),
+    }
+
+
+def _configure_tool_proxy(patch: dict[str, Any]) -> dict[str, Any]:
+    config = state_store.read_json("ops_config.json")
+    tool_proxy = config.setdefault("tool_proxy", {})
+    if patch.get("browser_executor_enabled") is not None:
+        tool_proxy["browser_executor_enabled"] = bool(patch["browser_executor_enabled"])
+    if patch.get("api_executor_enabled") is not None:
+        tool_proxy["api_executor_enabled"] = bool(patch["api_executor_enabled"])
+    state_store.write_json("ops_config.json", config)
+    safe_browser.configure_executor(bool(tool_proxy.get("browser_executor_enabled", False)))
+    safe_api.configure_executor(bool(tool_proxy.get("api_executor_enabled", False)))
+    return _tool_proxy_status()
+
+
 @app.post("/events/message")
 async def message(request: MessageRequest):
     event = event_normalizer.user_message(
@@ -317,6 +355,16 @@ async def reject_review(review_id: str, request: ReviewDecisionRequest):
         return review_queue.decide(review_id, "rejected", request.reason)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/tool-proxy/status")
+async def tool_proxy_status():
+    return _tool_proxy_status()
+
+
+@app.post("/tool-proxy/config")
+async def tool_proxy_config(request: ToolProxyConfigRequest):
+    return _configure_tool_proxy(request.model_dump(exclude_none=True))
 
 
 @app.post("/tool-proxy/shell")
@@ -855,6 +903,7 @@ async def mvp_status():
             "stale_belief_refresh": True,
             "real_probe_envelopes": True,
             "external_memory_bridge_hooks": True,
+            "tool_proxy_executor_config": True,
             "ops_soak_runner": True,
             "ops_soak_session": True,
             "ops_health_alerts": True,

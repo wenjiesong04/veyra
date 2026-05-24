@@ -186,6 +186,7 @@ function App() {
   const [reviews, setReviews] = useState<LogResponse>({ items: [] });
   const [toolLogs, setToolLogs] = useState<LogResponse>({ items: [] });
   const [policyLogs, setPolicyLogs] = useState<LogResponse>({ items: [] });
+  const [toolProxyStatus, setToolProxyStatus] = useState<Record<string, JsonValue> | null>(null);
   const [executionLogs, setExecutionLogs] = useState<LogResponse>({ items: [] });
   const [memoryLogs, setMemoryLogs] = useState<LogResponse>({ items: [] });
   const [coreModelLogs, setCoreModelLogs] = useState<LogResponse>({ items: [] });
@@ -230,6 +231,7 @@ function App() {
       reviewData,
       toolData,
       policyData,
+      toolProxyData,
       executionData,
       memoryData,
       coreModelLogData,
@@ -259,6 +261,7 @@ function App() {
       fetchJson<LogResponse>("/reviews/actions?limit=20"),
       fetchJson<LogResponse>("/logs/tools?limit=20"),
       fetchJson<LogResponse>("/logs/policy?limit=20"),
+      fetchJson<Record<string, JsonValue>>("/tool-proxy/status"),
       fetchJson<LogResponse>("/logs/execution?limit=20"),
       fetchJson<LogResponse>("/logs/memory?limit=20"),
       fetchJson<LogResponse>("/logs/core-model?limit=20"),
@@ -288,6 +291,7 @@ function App() {
     setReviews(reviewData);
     setToolLogs(toolData);
     setPolicyLogs(policyData);
+    setToolProxyStatus(toolProxyData);
     setExecutionLogs(executionData);
     setMemoryLogs(memoryData);
     setCoreModelLogs(coreModelLogData);
@@ -566,6 +570,23 @@ function App() {
     setError(null);
     try {
       const response = await fetchJson<Record<string, JsonValue>>("/ops/soak/stop", { method: "POST" });
+      setResult(response as MessageResult);
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const configureToolProxyExecutors = async (apiEnabled: boolean, browserEnabled: boolean) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetchJson<Record<string, JsonValue>>("/tool-proxy/config", {
+        method: "POST",
+        body: JSON.stringify({ api_executor_enabled: apiEnabled, browser_executor_enabled: browserEnabled })
+      });
       setResult(response as MessageResult);
       await refresh();
     } catch (caught) {
@@ -1065,6 +1086,17 @@ function App() {
         </Section>
 
         <Section title="Tool Proxy Monitor" icon={<Shield size={18} />}>
+          <div className="buttonRow compact">
+            <button className="ghostButton" onClick={() => configureToolProxyExecutors(true, false)} disabled={loading}>
+              <Settings size={15} />
+              Enable API
+            </button>
+            <button className="ghostButton" onClick={() => configureToolProxyExecutors(false, false)} disabled={loading}>
+              <XCircle size={15} />
+              Disable Executors
+            </button>
+          </div>
+          <JsonBlock value={toolProxyStatus ?? { status: "not loaded" }} />
           <div className="dataTable toolTable">
             <div className="dataTableHead">
               <span>Tool</span>
