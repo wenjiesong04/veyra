@@ -66,6 +66,7 @@ action_executor = ActionExecutor(
     safe_file=safe_file,
     safe_browser=safe_browser,
     safe_api=safe_api,
+    rollback_manager=rollback_manager,
 )
 foresight_engine = ForesightEngine(reasoning=awareness_loop.core_reasoning)
 proactive_checks = ProactiveChecks(state_store, reasoning=awareness_loop.core_reasoning)
@@ -511,9 +512,40 @@ async def audit_replay(trace_id: str):
     return replay_engine.replay(trace_id)
 
 
+def _create_replay_review(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("proposal_status") != "ready":
+        return payload
+    proposal = payload["proposal"]
+    snapshot_id = str(payload.get("snapshot_id") or proposal.get("action", {}).get("snapshot_id") or "")
+    task_text = f"Replay compensation: restore snapshot {snapshot_id}"
+    review = review_queue.create(
+        event_id=str(payload.get("plan", {}).get("event_id") or f"replay_{snapshot_id}"),
+        task_text=task_text,
+        risk_level="R4",
+        foresight=foresight_engine.predict_text_action(task_text, RiskLevel.R4),
+        guardian_decision={
+            "decision": "ask_user",
+            "risk_level": "R4",
+            "reason": "Replay compensation restores prior filesystem state and requires explicit approval.",
+        },
+        proposal=proposal,
+    )
+    return {"status": "needs_confirmation", "review": review, "proposal": proposal, "plan": payload.get("plan")}
+
+
+@app.post("/audit/replay/{trace_id}/propose")
+async def audit_replay_propose(trace_id: str):
+    return _create_replay_review(replay_engine.compensation_proposal(trace_id=trace_id))
+
+
 @app.get("/audit/replay/event/{event_id}")
 async def audit_replay_event(event_id: str):
     return replay_engine.plan(event_id=event_id)
+
+
+@app.post("/audit/replay/event/{event_id}/propose")
+async def audit_replay_event_propose(event_id: str):
+    return _create_replay_review(replay_engine.compensation_proposal(event_id=event_id))
 
 
 @app.post("/proactive/check")
@@ -935,6 +967,7 @@ async def mvp_status():
             "rollback_snapshot_restore": True,
             "action_journal_timeline": True,
             "replay_plan": True,
+            "replay_compensation_review": True,
             "time_travel_audit": True,
             "memory_bridge_local": True,
             "memory_bridge_provider_routing": True,

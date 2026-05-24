@@ -16,6 +16,35 @@ class Replay:
     def replay(self, trace_id: str) -> dict[str, Any]:
         return self.plan(trace_id=trace_id)
 
+    def compensation_proposal(self, trace_id: str | None = None, event_id: str | None = None) -> dict[str, Any]:
+        plan = self.plan(trace_id=trace_id, event_id=event_id)
+        if plan.get("status") != "planned":
+            return {**plan, "proposal_status": "not_available"}
+        rollback_step = next((step for step in plan.get("steps", []) if isinstance(step.get("rollback_option"), dict)), None)
+        if not rollback_step:
+            return {
+                "status": "plan_only",
+                "proposal_status": "not_available",
+                "reason": "No snapshot-backed rollback step is available for this replay plan.",
+                "plan": plan,
+            }
+        snapshot_id = str(rollback_step["rollback_option"]["snapshot_id"])
+        proposal = {
+            "agent": "veyra_replay",
+            "action": {"type": "rollback_restore", "snapshot_id": snapshot_id, "source_trace_id": trace_id, "source_event_id": event_id},
+            "risk_guess": "R4",
+            "reversible": "yes",
+            "reason": "Restore snapshot through guarded replay compensation.",
+        }
+        return {
+            "status": "proposal_ready",
+            "proposal_status": "ready",
+            "risk_level": "R4",
+            "snapshot_id": snapshot_id,
+            "proposal": proposal,
+            "plan": plan,
+        }
+
     def plan(self, trace_id: str | None = None, event_id: str | None = None) -> dict[str, Any]:
         items = self.journal.find_by_trace(trace_id) if trace_id else self.journal.find_by_event(str(event_id))
         if not items:
@@ -45,7 +74,7 @@ class Replay:
             elif source == "tool":
                 step = {"type": "inspect_tool_trace", "source": source, "trace_id": item.get("trace_id"), "status": item.get("status")}
                 if item.get("snapshot_id"):
-                    step["rollback_option"] = {"endpoint": f"/rollback/{item['snapshot_id']}/restore", "requires_confirmation": True}
+                    step["rollback_option"] = {"snapshot_id": item["snapshot_id"], "endpoint": f"/rollback/{item['snapshot_id']}/restore", "requires_confirmation": True}
                 steps.append(step)
             elif source == "execution":
                 steps.append(

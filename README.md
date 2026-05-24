@@ -52,6 +52,7 @@ Endpoints:
 - `POST /rollback/{snapshot_id}/restore` restore a file snapshot
 - `GET /audit/journal` inspect correlated event/action/tool/policy/execution/memory/model timeline
 - `GET /audit/replay/{trace_id}` build a non-destructive replay plan
+- `POST /audit/replay/{trace_id}/propose` turn a snapshot-backed replay plan into a guarded review item
 - `GET /audit/time-travel` inspect last-known state from append-only audit logs
 - `GET /agent/status` inspect selected Agent adapter connection status
 - `GET /agent/tasks/{task_id}` poll selected Agent task status

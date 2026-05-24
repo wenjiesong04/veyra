@@ -215,7 +215,7 @@ P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块。当�
 - Web Console 增加 Core model 配置、Core model trace、ExternalWorld watchlist 和刷新入口。
 - Agent 任务包增加 `tool_proxy_contract`，Verifier 会检查 Agent 回传的高风险 `tool_calls` 是否有 ActionProposal / review / policy / Tool Proxy trace 证据；无证据的 R3-R4 不给 verified success，R5 直接标记 forbidden。
 - Tool Proxy 增加 `/tool-proxy/status` 和 `/tool-proxy/config`，SafeBrowser/SafeAPI 可显式启用 executor hook，并在执行前校验 host allowlist；默认继续关闭。
-- Rollback/Audit 增加 ActionJournal、time-travel summary 和非破坏性 replay plan；控制台展示 journal 来源统计和最近审计事件。
+- Rollback/Audit 增加 ActionJournal、time-travel summary、非破坏性 replay plan 和受 ReviewQueue 保护的 replay compensation proposal；控制台展示 journal 来源统计和最近审计事件。
 - P7 OpsMonitor 增加 `/ops/health`、`/ops/alerts`、`/ops/deployment`，控制台展示健康状态、告警数和部署 readiness。
 - P7 AlertDispatcher 增加本地 `alert_log.jsonl` 和可选 webhook 投递；控制台可手动 dispatch alerts。
 - P7 RetentionPolicy 增加 `/ops/retention/enforce`，对超限 JSONL trace 先归档再截断，并写入审计记录。

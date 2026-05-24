@@ -618,6 +618,21 @@ function App() {
     }
   };
 
+  const proposeReplayCompensation = async (traceId: string) => {
+    if (!traceId) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetchJson<Record<string, JsonValue>>(`/audit/replay/${encodeURIComponent(traceId)}/propose`, { method: "POST" });
+      setResult(response as MessageResult);
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const latestClaims = useMemo(() => state?.belief_state.claims?.slice(-5).reverse() ?? [], [state]);
   const focus = state?.attention_state.focus ?? [];
   const currentRisk = String(state?.risk_state.current_risk ?? "R0");
@@ -993,16 +1008,23 @@ function App() {
               <span>Route</span>
               <span>Summary</span>
               <span>Time</span>
+              <span>Actions</span>
             </div>
-            {auditItems.slice(-6).reverse().map((item, index) => (
-              <div className="dataTableRow" key={String(item.journal_id ?? index)}>
-                <span>{String(item.source ?? "-")}</span>
-                <StatusPill value={String(item.status ?? "unknown")} />
-                <span>{String(item.route ?? "-")}</span>
-                <code>{String(item.summary ?? "-")}</code>
-                <small>{String(item.timestamp ?? "")}</small>
-              </div>
-            ))}
+            {auditItems.slice(-6).reverse().map((item, index) => {
+              const traceId = String(item.trace_id ?? "");
+              return (
+                <div className="dataTableRow" key={String(item.journal_id ?? index)}>
+                  <span>{String(item.source ?? "-")}</span>
+                  <StatusPill value={String(item.status ?? "unknown")} />
+                  <span>{String(item.route ?? "-")}</span>
+                  <code>{String(item.summary ?? "-")}</code>
+                  <small>{String(item.timestamp ?? "")}</small>
+                  <button className="iconButton smallIconButton" onClick={() => proposeReplayCompensation(traceId)} disabled={loading || !traceId} title="Propose replay compensation" aria-label="Propose replay compensation">
+                    <RotateCcw size={14} />
+                  </button>
+                </div>
+              );
+            })}
             {!auditItems.length ? <div className="emptyState"><History size={18} />No journal entries yet.</div> : null}
           </div>
           <JsonBlock value={timeTravel ?? { status: "not loaded" }} />

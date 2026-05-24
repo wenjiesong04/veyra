@@ -160,6 +160,7 @@ def reset_main_state(tmp: Path) -> TestClient:
         safe_file=app_module.safe_file,
         safe_browser=app_module.safe_browser,
         safe_api=app_module.safe_api,
+        rollback_manager=app_module.rollback_manager,
     )
     app_module.foresight_engine = ForesightEngine(reasoning=loop.core_reasoning)
     app_module.proactive_checks = ProactiveChecks(state_store, agency_root=str(agency_root), reasoning=loop.core_reasoning)
@@ -535,6 +536,19 @@ def main() -> int:
         expect(journal.status_code == 200 and journal.json()["items"], "action journal trace lookup", journal.text)
         expect(replay.status_code == 200 and replay.json()["status"] == "planned", "audit replay plan endpoint", replay.text)
         expect(travel.status_code == 200 and travel.json()["last_known"], "audit time-travel endpoint", travel.text)
+
+        restore_target = tmp / "restore_me.txt"
+        restore_target.write_text("before\n", encoding="utf-8")
+        write_for_restore = client.post(
+            "/tool-proxy/file/write",
+            json={"path": str(restore_target), "content": "after\n", "reason": "p6 replay compensation"},
+        ).json()
+        restore_trace_id = write_for_restore["tool_trace"]["trace_id"]
+        replay_proposal = client.post(f"/audit/replay/{restore_trace_id}/propose").json()
+        restore_review_id = replay_proposal["review"]["review_id"]
+        approved_restore = client.post(f"/reviews/{restore_review_id}/approve", json={"reason": "p6 replay restore"}).json()
+        expect(replay_proposal["status"] == "needs_confirmation", "audit replay compensation review endpoint", replay_proposal)
+        expect(approved_restore["execution_result"]["status"] == "restored" and restore_target.read_text(encoding="utf-8") == "before\n", "approved replay compensation restores snapshot", approved_restore)
 
         app_module.state_store.write_json(
             "belief_state.json",

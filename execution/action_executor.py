@@ -4,6 +4,7 @@ import shlex
 from typing import Any
 
 from core.world_state import WorldStateStore
+from rollback_audit.rollback_manager import RollbackManager
 from tool_proxy.safe_api import SafeAPI
 from tool_proxy.safe_browser import SafeBrowser
 from tool_proxy.safe_file import SafeFile
@@ -19,12 +20,14 @@ class ActionExecutor:
         safe_file: SafeFile | None = None,
         safe_browser: SafeBrowser | None = None,
         safe_api: SafeAPI | None = None,
+        rollback_manager: RollbackManager | None = None,
     ) -> None:
         self.state_store = state_store
         self.safe_shell = safe_shell or SafeShell(state_store=state_store)
         self.safe_file = safe_file or SafeFile(state_store=state_store)
         self.safe_browser = safe_browser or SafeBrowser(state_store=state_store)
         self.safe_api = safe_api or SafeAPI(state_store=state_store)
+        self.rollback_manager = rollback_manager or RollbackManager(state_store)
 
     def execute_review(self, review: dict[str, Any]) -> dict[str, Any]:
         proposal = review.get("proposal")
@@ -64,4 +67,10 @@ class ActionExecutor:
             if not isinstance(payload, dict):
                 return {"status": "error", "reason": "api_request action requires payload object"}
             return self.safe_api.request(payload, approved_by=approval_id)
+        if action_type == "rollback_restore":
+            snapshot_id = str(action.get("snapshot_id", ""))
+            if not snapshot_id:
+                return {"status": "error", "reason": "rollback_restore action requires snapshot_id"}
+            result = self.rollback_manager.restore(snapshot_id)
+            return {**result, "approved_by": approval_id, "operation": "rollback_restore"}
         return {"status": "not_supported", "reason": f"Unsupported action type: {action_type}", "proposal": proposal}
