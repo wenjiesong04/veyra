@@ -41,6 +41,7 @@ from rollback_audit.action_journal import ActionJournal  # noqa: E402
 from rollback_audit.replay import Replay  # noqa: E402
 from rollback_audit.rollback_manager import RollbackManager  # noqa: E402
 from runtime.alert_dispatcher import AlertDispatcher  # noqa: E402
+from runtime.deployment_config import DeploymentConfigValidator  # noqa: E402
 from runtime.external_world_refresh import ExternalWorldRefresh  # noqa: E402
 from runtime.ops_monitor import OpsMonitor  # noqa: E402
 from runtime.proactive_checks import ProactiveChecks  # noqa: E402
@@ -175,6 +176,7 @@ def reset_main_state(tmp: Path) -> TestClient:
         safety_validation=app_module.safety_validation,
     )
     app_module.alert_dispatcher = AlertDispatcher(state_store, app_module.ops_monitor)
+    app_module.deployment_validator = DeploymentConfigValidator(state_store)
     app_module.soak_runner = SoakRunner(
         proactive_checks=app_module.proactive_checks,
         task_tracker=loop.task_tracker,
@@ -555,6 +557,7 @@ def main() -> int:
         health = client.get("/ops/health").json()
         alerts = client.get("/ops/alerts").json()
         deployment = client.get("/ops/deployment").json()
+        deployment_config = client.get("/ops/deployment/config").json()
         alerting = client.get("/ops/alerting").json()
         alert_config = client.post("/ops/alerting/config", json={"webhook_enabled": False, "min_severity": "info"}).json()
         alert_dispatch = client.post("/ops/alerts/dispatch?min_severity=info").json()
@@ -566,7 +569,8 @@ def main() -> int:
         expect((app_module.state_store.root / archive_path).exists(), "P7 retention archive written", archive_path)
         expect(health["status"] in {"healthy", "degraded", "critical"} and "components" in health, "P7 ops health endpoint", health)
         expect(alerts["status"] == "success" and "summary" in alerts, "P7 ops alerts endpoint", alerts)
-        expect(deployment["status"] in {"ready", "not_ready"} and deployment["checks"], "P7 deployment readiness endpoint", deployment)
+        expect(deployment["status"] in {"ready", "not_ready"} and deployment["checks"] and "configuration" in deployment, "P7 deployment readiness endpoint", deployment)
+        expect(deployment_config["status"] in {"ready", "ready_with_warnings", "not_ready"} and deployment_config["checks"], "P7 deployment config validation endpoint", deployment_config)
         expect(alerting["local_log"] is True and "recent" in alerting, "P7 alerting status endpoint", alerting)
         expect(alert_config["min_severity"] == "info", "P7 alerting config endpoint", alert_config)
         expect(alert_dispatch["status"] == "success" and alert_dispatch["external"]["status"] in {"disabled", "skipped"}, "P7 alert dispatch endpoint", alert_dispatch)

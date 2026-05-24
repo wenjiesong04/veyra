@@ -26,6 +26,7 @@ from rollback_audit.diff_tracker import DiffTracker
 from rollback_audit.action_journal import ActionJournal
 from rollback_audit.replay import Replay
 from runtime.alert_dispatcher import AlertDispatcher
+from runtime.deployment_config import DeploymentConfigValidator
 from runtime.external_world_refresh import ExternalWorldRefresh
 from runtime.ops_monitor import OpsMonitor
 from runtime.proactive_checks import ProactiveChecks
@@ -81,6 +82,7 @@ ops_monitor = OpsMonitor(
     safety_validation=safety_validation,
 )
 alert_dispatcher = AlertDispatcher(state_store, ops_monitor)
+deployment_validator = DeploymentConfigValidator(state_store)
 soak_runner = SoakRunner(
     proactive_checks=proactive_checks,
     task_tracker=awareness_loop.task_tracker,
@@ -272,6 +274,18 @@ def _configure_tool_proxy(patch: dict[str, Any]) -> dict[str, Any]:
     safe_browser.configure_executor(bool(tool_proxy.get("browser_executor_enabled", False)))
     safe_api.configure_executor(bool(tool_proxy.get("api_executor_enabled", False)))
     return _tool_proxy_status()
+
+
+def _deployment_readiness() -> dict[str, Any]:
+    readiness = ops_monitor.deployment_readiness()
+    config = deployment_validator.validate()
+    config_passed = config["status"] in {"ready", "ready_with_warnings"}
+    readiness["checks"].append({"name": "deployment_config", "passed": config_passed})
+    readiness["configuration"] = config
+    if not config_passed:
+        readiness["status"] = "not_ready"
+        readiness.setdefault("blocking_alerts", []).append({"component": "deployment_config", "severity": "critical", "details": config})
+    return readiness
 
 
 @app.post("/events/message")
@@ -576,7 +590,12 @@ async def ops_alerts_dispatch(min_severity: str | None = None):
 
 @app.get("/ops/deployment")
 async def ops_deployment():
-    return ops_monitor.deployment_readiness()
+    return _deployment_readiness()
+
+
+@app.get("/ops/deployment/config")
+async def ops_deployment_config():
+    return deployment_validator.validate()
 
 
 @app.post("/ops/soak")
@@ -931,6 +950,7 @@ async def mvp_status():
             "ops_alert_dispatch": True,
             "ops_retention_enforce": True,
             "deployment_readiness": True,
+            "deployment_config_validation": True,
             "core_model_reasoning_layer": True,
             "core_model_memory_relevance": True,
             "external_world_watchlist_refresh": True,

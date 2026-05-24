@@ -76,6 +76,7 @@ Endpoints:
 - `GET /ops/alerting` inspect alert delivery configuration and recent dispatches
 - `POST /ops/alerting/config` configure local/webhook alert delivery
 - `GET /ops/deployment` inspect deployment readiness checks
+- `GET /ops/deployment/config` inspect static deployment configuration validation
 - `POST /ops/soak` run a bounded operational health loop
 - `GET /ops/soak/status` inspect the current soak session
 - `POST /ops/soak/start` start a controlled soak session
