@@ -27,7 +27,7 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | P4 Rollback / Audit / Verifier depth | Completed | Verifier verdicts, execution trace, tool trace, rollback checksum/diff/restore evidence |
 | P5 Web Control Console completeness | Completed | Console surfaces for setup, awareness, runtime, review, persona, state/logs, tool proxy, rollback/audit |
 | P6 End-to-end runtime hardening | In progress | Task polling/stop/refresh, Agent result callback, ActionProposal hardening, Agent Tool Proxy contract verification, Core model-assisted reasoning, model-ranked memory, ExternalWorld refresh, Agency intentions, stale refresh, real probe envelopes, external-memory bridge slots |
-| P7 Production operations and safety validation | Started | Non-destructive red-team validation, retention summary, and bounded soak API exist; deployment monitoring remains pending |
+| P7 Production operations and safety validation | In progress | Non-destructive red-team validation, retention summary, bounded soak API, Ops health, alerts, and deployment readiness checks exist; long-running production soak remains pending |
 
 ## Eight Architecture Blocks
 
@@ -75,6 +75,7 @@ Current local `state/` data may contain self-test records because `scripts/mvp_s
 | `/actions/proposals`, `/reviews/*` | Action review and human confirmation flow |
 | `/tool-proxy/*` | Safe shell/file/browser/API execution boundary |
 | `/rollback/*`, `/audit/journal`, `/audit/time-travel`, `/audit/replay/*` | Snapshot, diff, restore, git diff, correlated journal, time-travel summary, and replay plans |
+| `/ops/health`, `/ops/alerts`, `/ops/deployment`, `/ops/soak`, `/ops/safety/red-team`, `/ops/retention` | Operational health, alerts, deployment readiness, bounded soak, red-team safety, and retention checks |
 | `/logs/events`, `/logs/actions`, `/logs/tools`, `/logs/policy`, `/logs/execution`, `/logs/rollback`, `/logs/memory` | Audit and trace surfaces |
 | `/console` | Awareness & Agent Control Console |
 
@@ -98,4 +99,4 @@ Remaining gaps before calling it a complete Veyra runtime:
 - External Memory Bridge hooks exist, but production OpenClaw/Hermes memory semantics still need runtime validation.
 - Browser/API execution has pluggable executors, but remains disabled by default.
 - Replay planning and time-travel audit summaries exist; automatic side-effect replay remains intentionally gated behind guarded restore/resubmit flows.
-- P7 deployment hardening, monitoring alerts, and long-running soak tests remain pending.
+- Long-running production soak and external alert delivery channels remain pending.

@@ -26,6 +26,7 @@ from rollback_audit.diff_tracker import DiffTracker
 from rollback_audit.action_journal import ActionJournal
 from rollback_audit.replay import Replay
 from runtime.external_world_refresh import ExternalWorldRefresh
+from runtime.ops_monitor import OpsMonitor
 from runtime.proactive_checks import ProactiveChecks
 from runtime.retention_policy import RetentionPolicy
 from runtime.soak_runner import SoakRunner
@@ -62,6 +63,12 @@ safety_validation = SafetyValidation()
 retention_policy = RetentionPolicy(state_store)
 state_refresh = StateRefresh(state_store, reasoning=awareness_loop.core_reasoning)
 external_world_refresh = ExternalWorldRefresh(state_store, reasoning=awareness_loop.core_reasoning)
+ops_monitor = OpsMonitor(
+    state_store,
+    agent_status_resolver=lambda: awareness_loop.agent_registry.selected().connection_status(),
+    retention_policy=retention_policy,
+    safety_validation=safety_validation,
+)
 soak_runner = SoakRunner(
     proactive_checks=proactive_checks,
     task_tracker=awareness_loop.task_tracker,
@@ -456,6 +463,21 @@ async def ops_retention():
     return retention_policy.summary()
 
 
+@app.get("/ops/health")
+async def ops_health():
+    return ops_monitor.health()
+
+
+@app.get("/ops/alerts")
+async def ops_alerts():
+    return ops_monitor.alerts()
+
+
+@app.get("/ops/deployment")
+async def ops_deployment():
+    return ops_monitor.deployment_readiness()
+
+
 @app.post("/ops/soak")
 async def ops_soak(request: SoakRequest):
     return soak_runner.run(iterations=request.iterations)
@@ -772,6 +794,8 @@ async def mvp_status():
             "real_probe_envelopes": True,
             "external_memory_bridge_hooks": True,
             "ops_soak_runner": True,
+            "ops_health_alerts": True,
+            "deployment_readiness": True,
             "core_model_reasoning_layer": True,
             "core_model_memory_relevance": True,
             "external_world_watchlist_refresh": True,

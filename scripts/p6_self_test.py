@@ -38,6 +38,7 @@ from rollback_audit.action_journal import ActionJournal  # noqa: E402
 from rollback_audit.replay import Replay  # noqa: E402
 from rollback_audit.rollback_manager import RollbackManager  # noqa: E402
 from runtime.external_world_refresh import ExternalWorldRefresh  # noqa: E402
+from runtime.ops_monitor import OpsMonitor  # noqa: E402
 from runtime.proactive_checks import ProactiveChecks  # noqa: E402
 from runtime.retention_policy import RetentionPolicy  # noqa: E402
 from runtime.safety_validation import SafetyValidation  # noqa: E402
@@ -157,6 +158,12 @@ def reset_main_state(tmp: Path) -> TestClient:
     app_module.retention_policy = RetentionPolicy(state_store)
     app_module.state_refresh = StateRefresh(state_store, reasoning=loop.core_reasoning)
     app_module.external_world_refresh = ExternalWorldRefresh(state_store, reasoning=loop.core_reasoning)
+    app_module.ops_monitor = OpsMonitor(
+        state_store,
+        agent_status_resolver=lambda: loop.agent_registry.selected().connection_status(),
+        retention_policy=app_module.retention_policy,
+        safety_validation=app_module.safety_validation,
+    )
     app_module.soak_runner = SoakRunner(
         proactive_checks=app_module.proactive_checks,
         task_tracker=loop.task_tracker,
@@ -491,8 +498,14 @@ def main() -> int:
 
         red_team = client.get("/ops/safety/red-team").json()
         retention = client.get("/ops/retention").json()
+        health = client.get("/ops/health").json()
+        alerts = client.get("/ops/alerts").json()
+        deployment = client.get("/ops/deployment").json()
         expect(red_team["status"] == "passed", "P7 red-team safety baseline", red_team)
         expect(retention["status"] == "ok" and retention["files"], "P7 retention policy summary", retention)
+        expect(health["status"] in {"healthy", "degraded", "critical"} and "components" in health, "P7 ops health endpoint", health)
+        expect(alerts["status"] == "success" and "summary" in alerts, "P7 ops alerts endpoint", alerts)
+        expect(deployment["status"] in {"ready", "not_ready"} and deployment["checks"], "P7 deployment readiness endpoint", deployment)
 
         soak = client.post("/ops/soak", json={"iterations": 1})
         expect(soak.status_code == 200 and soak.json()["status"] == "success", "ops soak endpoint", soak.text)

@@ -65,6 +65,9 @@ Endpoints:
 - `POST /external/refresh` refresh ExternalWorld watchlist targets with read-only probes
 - `GET /ops/safety/red-team` run non-destructive safety validation cases
 - `GET /ops/retention` inspect append-only log retention status
+- `GET /ops/health` inspect runtime health and alert summary
+- `GET /ops/alerts` list active operational alerts
+- `GET /ops/deployment` inspect deployment readiness checks
 - `POST /ops/soak` run a bounded operational health loop
 - `GET /console/` open the Veyra control console after the frontend is built
 

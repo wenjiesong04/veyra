@@ -192,6 +192,8 @@ function App() {
   const [agentContract, setAgentContract] = useState<Record<string, JsonValue> | null>(null);
   const [coreModelStatus, setCoreModelStatus] = useState<Record<string, JsonValue> | null>(null);
   const [mvpStatus, setMvpStatus] = useState<Record<string, JsonValue> | null>(null);
+  const [opsHealth, setOpsHealth] = useState<Record<string, JsonValue> | null>(null);
+  const [deploymentReadiness, setDeploymentReadiness] = useState<Record<string, JsonValue> | null>(null);
   const [architecture, setArchitecture] = useState<ArchitectureSnapshot | null>(null);
   const [definitions, setDefinitions] = useState<Definitions | null>(null);
   const [heartbeat, setHeartbeat] = useState("");
@@ -231,6 +233,8 @@ function App() {
       contractData,
       coreModelData,
       mvpData,
+      opsHealthData,
+      deploymentData,
       architectureData,
       definitionsData,
       heartbeatData,
@@ -254,6 +258,8 @@ function App() {
       fetchJson<Record<string, JsonValue>>("/agent/contract"),
       fetchJson<Record<string, JsonValue>>("/core/model/status"),
       fetchJson<Record<string, JsonValue>>("/mvp/status"),
+      fetchJson<Record<string, JsonValue>>("/ops/health"),
+      fetchJson<Record<string, JsonValue>>("/ops/deployment"),
       fetchJson<ArchitectureSnapshot>("/architecture"),
       fetchJson<Definitions>("/definitions"),
       fetchJson<{ heartbeat: string }>("/heartbeat"),
@@ -277,6 +283,8 @@ function App() {
     setAgentContract(contractData);
     setCoreModelStatus(coreModelData);
     setMvpStatus(mvpData);
+    setOpsHealth(opsHealthData);
+    setDeploymentReadiness(deploymentData);
     setArchitecture(architectureData);
     setDefinitions(definitionsData);
     setHeartbeat(heartbeatData.heartbeat);
@@ -506,6 +514,8 @@ function App() {
   const externalWatchlist = Array.isArray(state?.external_world?.watchlist) ? (state.external_world.watchlist as Array<JsonValue>) : [];
   const externalSummaries = Array.isArray(state?.external_world?.summaries) ? (state.external_world.summaries as Array<Record<string, JsonValue>>) : [];
   const coreModelConfigured = coreModelStatus?.configured === true ? "configured" : String(coreModelStatus?.status ?? "unconfigured");
+  const opsStatus = String(opsHealth?.status ?? "unknown");
+  const deploymentStatus = String(deploymentReadiness?.status ?? "unknown");
 
   return (
     <main className="appShell">
@@ -533,7 +543,7 @@ function App() {
         <Metric label="Runtime" value={`${runtime?.identity.selected_agent ?? "unknown"} · ${connected}`} />
         <Metric label="Lifecycle" value={<StatusPill value={runtime?.lifecycle.status ?? "loading"} />} />
         <Metric label="Risk" value={<StatusPill value={currentRisk} />} />
-        <Metric label="Focus" value={focus.length ? focus.join(", ") : "none"} />
+        <Metric label="Ops" value={<StatusPill value={opsStatus} />} />
       </section>
 
       <section className="workspaceGrid">
@@ -558,6 +568,11 @@ function App() {
               <span>Rollback / audit</span>
               <strong>{String(readiness.rollback_audit_depth ?? false)}</strong>
               <small>{snapshots.length} snapshots</small>
+            </div>
+            <div className="setupStep">
+              <span>Deployment</span>
+              <strong>{deploymentStatus}</strong>
+              <small>{String(opsHealth?.alert_count ?? 0)} alerts</small>
             </div>
           </div>
         </Section>
@@ -1031,7 +1046,11 @@ function App() {
       </section>
       <section className="logGrid single">
         <Section title="MVP Readiness" icon={<CheckCircle2 size={18} />}>
-          <JsonBlock value={mvpStatus ?? { status: "not loaded" }} />
+          <div className="readinessGrid">
+            <JsonBlock value={mvpStatus ?? { status: "not loaded" }} />
+            <JsonBlock value={opsHealth ?? { status: "not loaded" }} />
+            <JsonBlock value={deploymentReadiness ?? { status: "not loaded" }} />
+          </div>
         </Section>
       </section>
 
