@@ -20,6 +20,7 @@ from interface.agent_contract import contract_summary
 from interface.agent_adapter import ExecutionResult
 from interface.event_normalizer import EventNormalizer
 from interface.event_schema import Decision, Route, utc_now_iso
+from interface.feishu_adapter import FeishuAdapter
 from interface.intake_gateway import IntakeGateway
 from pydantic import Field
 from rollback_audit.rollback_manager import RollbackManager
@@ -53,6 +54,7 @@ runtime_entity = RuntimeEntity(state_store=state_store)
 awareness_loop = AwarenessLoop(state_store=state_store, runtime_entity=runtime_entity)
 event_normalizer = EventNormalizer()
 intake_gateway = IntakeGateway(awareness_loop, event_normalizer, state_store=state_store)
+feishu_adapter = FeishuAdapter(intake_gateway, state_store=state_store)
 console_dir = Path("ui/console")
 review_queue = ReviewQueue(state_store)
 rollback_manager = RollbackManager(state_store)
@@ -282,6 +284,31 @@ class ReplayRuntimeRequest(BaseModel):
     auto_create_reviews: bool = True
 
 
+class ChannelConfigRequest(BaseModel):
+    enabled: bool | None = None
+    delivery: str | None = None
+    base_url: str | None = None
+    app_id: str | None = None
+    app_id_env: str | None = None
+    app_secret: str | None = None
+    app_secret_env: str | None = None
+    tenant_access_token: str | None = None
+    tenant_access_token_env: str | None = None
+    default_receive_id: str | None = None
+    default_receive_id_env: str | None = None
+    default_receive_id_type: str | None = None
+    verification_token: str | None = None
+    verification_token_env: str | None = None
+    reply_to_session: bool | None = None
+    timeout: float | None = None
+
+
+class ChannelSendRequest(BaseModel):
+    message: str
+    session_id: str = "manual"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class SoakSessionRequest(BaseModel):
     iterations: int = 60
     interval_seconds: float = 60.0
@@ -446,6 +473,21 @@ async def channels_status():
     return intake_gateway.channel_status()
 
 
+@app.get("/channels/{channel}/config")
+async def channel_config(channel: str):
+    return intake_gateway.channel_config(channel)
+
+
+@app.post("/channels/{channel}/config")
+async def configure_channel(channel: str, request: ChannelConfigRequest):
+    patch = request.model_dump(exclude_none=True)
+    if "delivery" in patch and patch["delivery"] not in {"local_outbox", "feishu"}:
+        raise HTTPException(status_code=422, detail="delivery must be local_outbox or feishu")
+    if "default_receive_id_type" in patch and patch["default_receive_id_type"] not in {"open_id", "user_id", "union_id", "email", "chat_id"}:
+        raise HTTPException(status_code=422, detail="unsupported Feishu receive_id_type")
+    return intake_gateway.configure_channel(channel, patch)
+
+
 @app.post("/channels/{channel}/messages")
 async def channel_message(channel: str, request: MessageRequest):
     return intake_gateway.receive_message(
@@ -458,6 +500,16 @@ async def channel_message(channel: str, request: MessageRequest):
     )
 
 
+@app.post("/channels/{channel}/send")
+async def channel_send(channel: str, request: ChannelSendRequest):
+    return intake_gateway.send_channel_message(
+        channel=channel,
+        session_id=request.session_id,
+        message=request.message,
+        metadata=request.metadata,
+    )
+
+
 @app.get("/channels/outbox")
 async def channels_outbox(limit: int = 100):
     return intake_gateway.outbox(limit=limit)
@@ -466,6 +518,11 @@ async def channels_outbox(limit: int = 100):
 @app.get("/channels/sessions")
 async def channels_sessions():
     return intake_gateway.sessions()
+
+
+@app.post("/integrations/feishu/events")
+async def feishu_events(payload: dict[str, Any]):
+    return feishu_adapter.handle_callback(payload)
 
 
 @app.get("/state")

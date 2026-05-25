@@ -2,6 +2,7 @@ from typing import Any
 from uuid import uuid4
 
 from core.awareness_loop import AwarenessLoop
+from core.model_client import redact_sensitive
 from core.world_state import WorldStateStore
 from interface.auth import AuthPolicy
 from interface.channel_adapter import ChannelAdapter
@@ -76,7 +77,13 @@ class IntakeGateway:
         outbox = adapter.send(
             mapped_session,
             result.response,
-            metadata={"event_id": event.event_id, "message_id": dedupe_id, "route": result.route.value, "status": result.status},
+            metadata={
+                "event_id": event.event_id,
+                "message_id": dedupe_id,
+                "route": result.route.value,
+                "status": result.status,
+                "inbound": metadata or {},
+            },
         )
         state = self._channel_state()
         seen = state.setdefault("seen_message_ids", {})
@@ -103,11 +110,32 @@ class IntakeGateway:
         outbox = state.get("outbox") if isinstance(state.get("outbox"), list) else []
         return {
             "status": "success",
-            "channels": state.get("channels", {}),
+            "channels": redact_sensitive(state.get("channels", {})),
             "session_count": len(state.get("sessions", {}) if isinstance(state.get("sessions"), dict) else {}),
             "inbox_count": len(inbox),
             "outbox_count": len(outbox),
         }
+
+    def channel_config(self, channel: str) -> dict[str, Any]:
+        channel_id = self.router.resolve(channel)
+        state = self._channel_state()
+        return {"status": "success", "channel": channel_id, "config": redact_sensitive(self._channel_config(state, channel_id))}
+
+    def configure_channel(self, channel: str, patch: dict[str, Any]) -> dict[str, Any]:
+        channel_id = self.router.resolve(channel)
+        state = self._channel_state()
+        config = self._channel_config(state, channel_id)
+        config.update({key: value for key, value in patch.items() if value is not None})
+        channels = state.setdefault("channels", {})
+        if isinstance(channels, dict):
+            channels[channel_id] = config
+        self._write_channel_state(state)
+        return {"status": "success", "channel": channel_id, "config": redact_sensitive(config)}
+
+    def send_channel_message(self, *, channel: str, session_id: str, message: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        channel_id = self.router.resolve(channel)
+        adapter = ChannelAdapter(self.state_store, channel=channel_id)
+        return {"status": "success", "delivery": adapter.send(session_id, message, metadata=metadata or {})}
 
     def outbox(self, limit: int = 100) -> dict[str, Any]:
         outbox = self._channel_state().get("outbox")
