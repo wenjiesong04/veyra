@@ -283,7 +283,7 @@ class DecisionCore:
         return classify_text_risk(lowered)
 
     def _intent_for_text(self, lowered: str) -> tuple[str, list[str]]:
-        action_markers = ["检查", "查看", "看", "修复", "执行", "修改", "部署", "重启", "创建", "写入", "诊断", "完善", "接入", "配置"]
+        action_markers = ["检查", "查看", "看", "搜索", "查找", "查询", "查一下", "修复", "执行", "修改", "部署", "重启", "创建", "写入", "诊断", "完善", "接入", "配置"]
         if any(marker in lowered for marker in action_markers):
             return "action", ["intent:action"]
         if any(marker in lowered for marker in ["为什么", "是什么", "解释", "说明", "总结", "怎么样", "怎么", "如何"]):

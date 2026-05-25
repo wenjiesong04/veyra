@@ -56,7 +56,13 @@ class SearchProbe:
             summary=summary,
             confidence=0.78 if results else 0.45,
             ttl_seconds=900,
-            details={"query": query, "provider": "duckduckgo_html", "results": results},
+            details={
+                "query": query,
+                "provider": "duckduckgo_html",
+                "results": results,
+                "perception_model_assist": False,
+                "answer_model_assist": True,
+            },
             claims=[
                 {
                     "key": f"search:{query}:results",

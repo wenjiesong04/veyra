@@ -82,7 +82,11 @@ class CoreReasoning:
 
     def perception_assist(self, probe_result: dict[str, Any]) -> dict[str, Any]:
         details = probe_result.get("details") if isinstance(probe_result.get("details"), dict) else {}
-        if probe_result.get("model_assist") is False or details.get("model_assist") is False:
+        if (
+            probe_result.get("model_assist") is False
+            or details.get("model_assist") is False
+            or details.get("perception_model_assist") is False
+        ):
             return {"status": "skipped", "reason": "probe_result_has_direct_summary"}
         if not self.should_assist("perception", {"route": "probe", "risk_level": "R1"}):
             return {"status": "skipped"}
@@ -109,7 +113,11 @@ class CoreReasoning:
         if not self.status().get("configured"):
             return {"status": "skipped"}
         details = probe_result.get("details") if isinstance(probe_result.get("details"), dict) else {}
-        if probe_result.get("model_assist") is False or details.get("model_assist") is False:
+        if (
+            probe_result.get("model_assist") is False
+            or details.get("model_assist") is False
+            or details.get("answer_model_assist") is False
+        ):
             return {"status": "skipped", "reason": "probe_result_has_direct_summary"}
         probe_name = str(probe_result.get("probe") or "")
         if probe_name not in {"search_probe", "web_probe"}:
