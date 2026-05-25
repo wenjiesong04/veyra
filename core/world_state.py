@@ -103,6 +103,20 @@ class WorldStateStore:
                 "interval_seconds": 300,
                 "ticks": [],
             },
+            "runtime_cron_state.json": {
+                "status": "configured",
+                "jobs": {
+                    "active_awareness_tick": {
+                        "job_id": "active_awareness_tick",
+                        "enabled": True,
+                        "interval_seconds": 300.0,
+                        "include_runtime_matrix": False,
+                        "last_run_at": None,
+                        "next_run_at": None,
+                        "run_count": 0,
+                    }
+                },
+            },
             "ops_runtime_matrix.json": {"status": "not_run", "runtimes": []},
             "ops_config.json": {
                 "alerting": {
@@ -219,5 +233,6 @@ class WorldStateStore:
             "ops_soak_state": self.read_json("ops_soak_state.json"),
             "ops_runtime_matrix": self.read_json("ops_runtime_matrix.json"),
             "active_loop_state": self.read_json("active_loop_state.json"),
+            "runtime_cron_state": self.read_json("runtime_cron_state.json"),
             "ops_config": self.read_json("ops_config.json"),
         }

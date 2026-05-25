@@ -31,6 +31,7 @@ from rollback_audit.replay_runtime import ReplayRuntime
 from runtime.active_loop import ActiveRuntimeLoop
 from runtime.agent_orchestrator import AgentOrchestrator
 from runtime.alert_dispatcher import AlertDispatcher
+from runtime.cron import Cron
 from runtime.deployment_config import DeploymentConfigValidator
 from runtime.external_world_refresh import ExternalWorldRefresh
 from runtime.ops_monitor import OpsMonitor
@@ -122,6 +123,7 @@ active_loop = ActiveRuntimeLoop(
     verifier=awareness_loop.verifier,
     replay_runtime=replay_runtime,
 )
+runtime_cron = Cron(state_store=state_store, active_loop=active_loop)
 agent_orchestrator = AgentOrchestrator(
     state_store=state_store,
     registry=awareness_loop.agent_registry,
@@ -277,6 +279,18 @@ class ActiveLoopTickRequest(BaseModel):
 class BeliefRefreshRequest(BaseModel):
     expire_after_seconds: int | None = 3600
     prune_expired_after_seconds: int | None = None
+
+
+class CronConfigRequest(BaseModel):
+    job_id: str = "active_awareness_tick"
+    enabled: bool | None = None
+    interval_seconds: float | None = None
+    include_runtime_matrix: bool | None = None
+
+
+class CronRunRequest(BaseModel):
+    job_id: str = "active_awareness_tick"
+    reason: str = "cron_manual"
 
 
 class ReplayRuntimeRequest(BaseModel):
@@ -920,6 +934,32 @@ async def runtime_active_loop_tick(request: ActiveLoopTickRequest | None = None)
     return active_loop.tick(reason=payload.reason, include_runtime_matrix=payload.include_runtime_matrix)
 
 
+@app.get("/runtime/cron")
+async def runtime_cron_status():
+    return runtime_cron.status()
+
+
+@app.post("/runtime/cron/config")
+async def runtime_cron_config(request: CronConfigRequest):
+    return runtime_cron.configure(
+        job_id=request.job_id,
+        enabled=request.enabled,
+        interval_seconds=request.interval_seconds,
+        include_runtime_matrix=request.include_runtime_matrix,
+    )
+
+
+@app.post("/runtime/cron/run")
+async def runtime_cron_run(request: CronRunRequest | None = None):
+    payload = request or CronRunRequest()
+    return runtime_cron.run_once(job_id=payload.job_id, reason=payload.reason)
+
+
+@app.post("/runtime/cron/run-due")
+async def runtime_cron_run_due():
+    return runtime_cron.run_due()
+
+
 @app.post("/ops/soak")
 async def ops_soak(request: SoakRequest):
     return soak_runner.run(iterations=request.iterations)
@@ -1314,6 +1354,8 @@ async def mvp_status():
         "external_world_watchlist_refresh": True,
         "active_runtime_loop": True,
         "active_loop_manual_tick": True,
+        "runtime_cron_scheduler": True,
+        "runtime_cron_placeholder_removed": True,
         "agent_tool_proxy_contract": True,
         "agent_tool_bypass_verification": True,
         "web_console": console_dir.exists(),
