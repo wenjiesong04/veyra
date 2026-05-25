@@ -26,6 +26,7 @@ from rollback_audit.rollback_manager import RollbackManager
 from rollback_audit.diff_tracker import DiffTracker
 from rollback_audit.action_journal import ActionJournal
 from rollback_audit.replay import Replay
+from rollback_audit.replay_runtime import ReplayRuntime
 from runtime.active_loop import ActiveRuntimeLoop
 from runtime.agent_orchestrator import AgentOrchestrator
 from runtime.alert_dispatcher import AlertDispatcher
@@ -110,6 +111,13 @@ active_loop = ActiveRuntimeLoop(
     task_tracker=awareness_loop.task_tracker,
     adapter_resolver=lambda: awareness_loop.agent_registry.selected(),
     verifier=awareness_loop.verifier,
+)
+replay_runtime = ReplayRuntime(
+    state_store=state_store,
+    replay=replay_engine,
+    journal=action_journal,
+    review_queue=review_queue,
+    foresight_engine=foresight_engine,
 )
 agent_orchestrator = AgentOrchestrator(
     state_store=state_store,
@@ -266,6 +274,11 @@ class ActiveLoopTickRequest(BaseModel):
 class BeliefRefreshRequest(BaseModel):
     expire_after_seconds: int | None = 3600
     prune_expired_after_seconds: int | None = None
+
+
+class ReplayRuntimeRequest(BaseModel):
+    limit: int = 200
+    auto_create_reviews: bool = True
 
 
 class SoakSessionRequest(BaseModel):
@@ -694,6 +707,25 @@ async def audit_replay_event(event_id: str):
 @app.post("/audit/replay/event/{event_id}/propose")
 async def audit_replay_event_propose(event_id: str):
     return _create_replay_review(replay_engine.compensation_proposal(event_id=event_id))
+
+
+@app.get("/audit/replay/runtime/status")
+async def audit_replay_runtime_status():
+    return replay_runtime.status()
+
+
+@app.post("/audit/replay/runtime/scan")
+async def audit_replay_runtime_scan(request: ReplayRuntimeRequest | None = None):
+    payload = request or ReplayRuntimeRequest()
+    return replay_runtime.scan(limit=payload.limit)
+
+
+@app.post("/audit/replay/runtime/run")
+async def audit_replay_runtime_run(request: ReplayRuntimeRequest | None = None):
+    payload = request or ReplayRuntimeRequest()
+    scan = replay_runtime.scan(limit=payload.limit)
+    run = replay_runtime.run_pending(auto_create_reviews=payload.auto_create_reviews, limit=min(payload.limit, 50))
+    return {"status": "success", "scan": scan, "run": run}
 
 
 @app.post("/proactive/check")
@@ -1189,6 +1221,8 @@ async def mvp_status():
         "action_journal_timeline": True,
         "replay_plan": True,
         "replay_compensation_review": True,
+        "replay_runtime_auto_scan": True,
+        "replay_runtime_review_creation": True,
         "time_travel_audit": True,
         "memory_bridge_local": True,
         "memory_bridge_provider_routing": True,

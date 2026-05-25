@@ -79,6 +79,7 @@ class WorldStateStore:
                 },
             },
             "rollback_state.json": {"snapshots": []},
+            "replay_runtime_state.json": {"status": "idle", "jobs": [], "last_scan_at": None},
             "ops_soak_state.json": {"status": "idle", "runs": []},
             "active_loop_state.json": {
                 "status": "stopped",
@@ -196,6 +197,7 @@ class WorldStateStore:
             "state_schema": self.read_json("state_schema.json"),
             "review_queue": self.read_json("review_queue.json"),
             "rollback_state": self.read_json("rollback_state.json"),
+            "replay_runtime_state": self.read_json("replay_runtime_state.json"),
             "agent_memory": self.read_json("agent_memory.json"),
             "agent_config": self.read_json("agent_config.json"),
             "ops_soak_state": self.read_json("ops_soak_state.json"),
