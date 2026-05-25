@@ -126,8 +126,8 @@ class DecisionCore:
             intent=intent,
             complexity=complexity,
             capability="native_answer",
-            signals=signals,
-            constraints=["no tool execution"],
+            signals=signals + ["model:answer_or_probe"],
+            constraints=["no write execution", "use a read-only probe when fresh local or external state is required"],
         )
 
     def _apply_model_assist(self, text: str, attention_focus: list[str], base: Decision) -> Decision:
@@ -142,6 +142,8 @@ class DecisionCore:
         model_risk = safe_model_risk(assist.get("risk_level"), base.risk_level)
         risk = self._max_risk(base.risk_level, model_risk)
         candidate_route = self._route_from_model(assist.get("route"), base.route)
+        if "model:answer_or_probe" in base.signals and candidate_route in {Route.AGENT, Route.SKILL, Route.NATIVE_TOOL}:
+            candidate_route = Route.DIRECT_ANSWER
         if risk == RiskLevel.R5:
             route = Route.BLOCK
         elif risk in {RiskLevel.R3, RiskLevel.R4}:
@@ -193,6 +195,10 @@ class DecisionCore:
         )
 
     def _probe_for_text(self, lowered: str) -> str | None:
+        if "天气" in lowered or "气温" in lowered or "温度" in lowered or "weather" in lowered:
+            return "weather"
+        if any(marker in lowered for marker in ["最新", "新闻", "搜索", "查找", "查资料", "外部世界", "search"]):
+            return "search"
         runtime_status_markers = ["状态", "连接", "可用", "能不能", "是否能", "status", "available", "connect", "configured"]
         if "openclaw" in lowered and any(marker in lowered for marker in runtime_status_markers):
             return "openclaw"
@@ -280,7 +286,7 @@ class DecisionCore:
         action_markers = ["检查", "查看", "看", "修复", "执行", "修改", "部署", "重启", "创建", "写入", "诊断", "完善", "接入", "配置"]
         if any(marker in lowered for marker in action_markers):
             return "action", ["intent:action"]
-        if any(marker in lowered for marker in ["为什么", "是什么", "解释", "说明", "总结"]):
+        if any(marker in lowered for marker in ["为什么", "是什么", "解释", "说明", "总结", "怎么样", "怎么", "如何"]):
             return "information", ["intent:information"]
         return "unknown", []
 
@@ -313,7 +319,7 @@ class DecisionCore:
         return route
 
     def _selected_probe_from_model(self, assist: dict[str, Any], default: str | None) -> str:
-        allowed = {"system", "git", "port", "process", "file", "log", "network", "web", "openclaw", "hermes", "mcp"}
+        allowed = {"system", "git", "port", "process", "file", "log", "network", "web", "weather", "search", "openclaw", "hermes", "mcp"}
         selected = str(assist.get("selected_probe") or assist.get("probe") or default or "system")
         return selected if selected in allowed else "system"
 

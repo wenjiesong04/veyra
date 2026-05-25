@@ -23,6 +23,7 @@ class CoreModelConfig:
     api_key_env: str = "VEYRA_CORE_MODEL_API_KEY"
     model: str = ""
     timeout: float = 20.0
+    max_tokens: int = 700
     decision_mode: str = "auto"
 
     def configured(self) -> bool:
@@ -124,6 +125,18 @@ class CoreModelClient:
             ),
             20.0,
         )
+        max_tokens = _int_or(
+            _pick_config_value(
+                core_model,
+                selected_agent,
+                core_key="max_tokens",
+                agent_key="model_max_tokens",
+                env_key="VEYRA_CORE_MODEL_MAX_TOKENS",
+                default=700,
+                prefer_agent=agent_enabled and not core_enabled,
+            ),
+            700,
+        )
         decision_mode = str(
             _pick_config_value(
                 core_model,
@@ -144,6 +157,7 @@ class CoreModelClient:
             api_key_env=api_key_env,
             model=model,
             timeout=timeout,
+            max_tokens=max(64, min(max_tokens, 4000)),
             decision_mode=decision_mode if decision_mode in {"auto", "always"} else "auto",
         )
 
@@ -164,6 +178,7 @@ class CoreModelClient:
             "model": config.model,
             "api_key_env": config.api_key_env,
             "api_key_set": bool(config.api_key),
+            "max_tokens": config.max_tokens,
             "decision_mode": config.decision_mode,
             "status": "configured" if config.configured() else "unconfigured",
             "missing": missing,
@@ -183,6 +198,7 @@ class CoreModelClient:
                 {"role": "user", "content": user},
             ],
             "temperature": 0,
+            "max_tokens": config.max_tokens,
             "response_format": {"type": "json_object"},
         }
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -273,6 +289,13 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
 def _float_or(value: Any, default: float) -> float:
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _int_or(value: Any, default: int) -> int:
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return default
 

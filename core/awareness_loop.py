@@ -33,8 +33,10 @@ from probes.network_probe import NetworkProbe
 from probes.openclaw_probe import OpenClawProbe
 from probes.port_probe import PortProbe
 from probes.process_probe import ProcessProbe
+from probes.search_probe import SearchProbe
 from probes.system_probe import SystemProbe
 from probes.web_probe import WebProbe
+from probes.weather_probe import WeatherProbe
 from rollback_audit.execution_trace import ExecutionTrace
 from runtime.agent_task_tracker import AgentTaskTracker
 from skills.skill_loader import SkillLoader
@@ -81,8 +83,10 @@ class AwarenessLoop:
             "process": ProcessProbe(),
             "file": FileProbe(),
             "log": LogProbe(),
+            "search": SearchProbe(),
             "network": NetworkProbe(),
             "web": WebProbe(),
+            "weather": WeatherProbe(),
             "openclaw": OpenClawProbe(),
             "hermes": HermesProbe(),
             "mcp": McpProbe(),
@@ -388,6 +392,7 @@ class AwarenessLoop:
         state_patch = self.perception.interpret_probe_result(raw)
         belief_state = self.belief.refresh()
         verified = self.verifier.verify_probe_result(raw)
+        answer_assist = self.core_reasoning.probe_answer_assist(text=text, probe_result=raw, decision={"route": Route.PROBE.value, "selected_probe": probe_name})
         trace = self.execution_trace.record(
             {
                 "event_id": event.event_id,
@@ -399,20 +404,41 @@ class AwarenessLoop:
                 "verification": verified,
             }
         )
+        response = self._probe_response(text=text, probe_name=probe_name, raw=raw, verified=verified, answer_assist=answer_assist)
         return LoopResult(
             event_id=event.event_id,
             route=Route.PROBE,
             status=verified["status"],
-            response=verified["message"],
+            response=response,
             risk_level=RiskLevel.R1,
             artifacts={
                 "probe_result": raw,
                 "state_patch": state_patch,
                 "verification": verified,
+                "answer_assist": answer_assist,
                 "execution_trace": trace,
                 "uncertainty": self.uncertainty.uncertainty_summary(belief_state.get("claims", [])),
             },
         )
+
+    def _probe_response(self, *, text: str, probe_name: str, raw: dict[str, object], verified: dict[str, object], answer_assist: dict[str, object]) -> str:
+        draft = str(answer_assist.get("draft_response") or answer_assist.get("response") or "").strip()
+        if answer_assist.get("status") == "model_assisted" and draft:
+            return draft
+        if probe_name == "search":
+            details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
+            results = details.get("results") if isinstance(details.get("results"), list) else []
+            if results:
+                lines = [str(raw.get("summary") or verified.get("message") or "Search completed.")]
+                for index, item in enumerate(results[:3], start=1):
+                    if not isinstance(item, dict):
+                        continue
+                    title = str(item.get("title") or "").strip()
+                    snippet = str(item.get("snippet") or "").strip()
+                    url = str(item.get("url") or "").strip()
+                    lines.append(f"{index}. {title} - {snippet} ({url})")
+                return "\n".join(lines)
+        return str(verified.get("message") or raw.get("summary") or "Probe completed.")
 
     def _direct_answer(self, text: str, decision: Decision) -> str:
         draft = decision.model_assist.get("draft_response") if decision.model_assist else ""

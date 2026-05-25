@@ -60,6 +60,7 @@ class RuntimeEntity:
             "base_url": public.get("base_url", ""),
             "model": public.get("model", ""),
             "decision_mode": public.get("decision_mode", "auto"),
+            "max_tokens": public.get("max_tokens", 700),
             "api_key_env": public.get("api_key_env", "VEYRA_CORE_MODEL_API_KEY"),
             "api_key_set": bool(core_model.get("api_key")),
         }
