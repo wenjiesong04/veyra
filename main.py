@@ -25,6 +25,7 @@ from rollback_audit.rollback_manager import RollbackManager
 from rollback_audit.diff_tracker import DiffTracker
 from rollback_audit.action_journal import ActionJournal
 from rollback_audit.replay import Replay
+from runtime.active_loop import ActiveRuntimeLoop
 from runtime.alert_dispatcher import AlertDispatcher
 from runtime.deployment_config import DeploymentConfigValidator
 from runtime.external_world_refresh import ExternalWorldRefresh
@@ -75,7 +76,7 @@ diff_tracker = DiffTracker()
 agency_core = AgencyCore(state_store, reasoning=awareness_loop.core_reasoning)
 safety_validation = SafetyValidation()
 retention_policy = RetentionPolicy(state_store)
-state_refresh = StateRefresh(state_store, reasoning=awareness_loop.core_reasoning)
+state_refresh = StateRefresh(state_store, reasoning=awareness_loop.core_reasoning, model_assist_enabled=False)
 external_world_refresh = ExternalWorldRefresh(state_store, reasoning=awareness_loop.core_reasoning)
 ops_monitor = OpsMonitor(
     state_store,
@@ -92,6 +93,18 @@ soak_runner = SoakRunner(
     state_refresh=state_refresh,
     retention_policy=retention_policy,
     safety_validation=safety_validation,
+    adapter_resolver=lambda: awareness_loop.agent_registry.selected(),
+    verifier=awareness_loop.verifier,
+)
+active_loop = ActiveRuntimeLoop(
+    state_store=state_store,
+    runtime_entity=runtime_entity,
+    proactive_checks=proactive_checks,
+    state_refresh=state_refresh,
+    external_world_refresh=external_world_refresh,
+    runtime_matrix=runtime_matrix,
+    retention_policy=retention_policy,
+    task_tracker=awareness_loop.task_tracker,
     adapter_resolver=lambda: awareness_loop.agent_registry.selected(),
     verifier=awareness_loop.verifier,
 )
@@ -218,6 +231,15 @@ class AgentResultRequest(BaseModel):
 
 class SoakRequest(BaseModel):
     iterations: int = 1
+
+
+class ActiveLoopRequest(BaseModel):
+    interval_seconds: float = 300.0
+
+
+class ActiveLoopTickRequest(BaseModel):
+    reason: str = "manual"
+    include_runtime_matrix: bool = False
 
 
 class SoakSessionRequest(BaseModel):
@@ -713,6 +735,27 @@ async def ops_runtime_matrix_run(write_memory_probe: bool = False):
     return runtime_matrix.run(write_memory_probe=write_memory_probe)
 
 
+@app.get("/runtime/active-loop")
+async def runtime_active_loop_status():
+    return active_loop.status()
+
+
+@app.post("/runtime/active-loop/start")
+async def runtime_active_loop_start(request: ActiveLoopRequest):
+    return active_loop.start(interval_seconds=request.interval_seconds)
+
+
+@app.post("/runtime/active-loop/stop")
+async def runtime_active_loop_stop():
+    return active_loop.stop()
+
+
+@app.post("/runtime/active-loop/tick")
+async def runtime_active_loop_tick(request: ActiveLoopTickRequest | None = None):
+    payload = request or ActiveLoopTickRequest()
+    return active_loop.tick(reason=payload.reason, include_runtime_matrix=payload.include_runtime_matrix)
+
+
 @app.post("/ops/soak")
 async def ops_soak(request: SoakRequest):
     return soak_runner.run(iterations=request.iterations)
@@ -1073,6 +1116,8 @@ async def mvp_status():
         "core_model_reasoning_layer": True,
         "core_model_memory_relevance": True,
         "external_world_watchlist_refresh": True,
+        "active_runtime_loop": True,
+        "active_loop_manual_tick": True,
         "agent_tool_proxy_contract": True,
         "agent_tool_bypass_verification": True,
         "web_console": console_dir.exists(),
@@ -1095,6 +1140,7 @@ async def mvp_status():
             "status": agent_status_data.get("status"),
             "note": "OpenClaw Gateway, Hermes HTTP, and Custom HTTP adapters share the AgentAdapter interface. OpenClaw remains the default selected runtime.",
         },
+        "active_loop": active_loop.status(),
     }
 
 
@@ -1116,6 +1162,7 @@ async def runtime():
             "runtime_state": runtime_entity.core_model_runtime_state(),
             "status": awareness_loop.core_reasoning.status(),
         },
+        "active_loop": active_loop.status(),
     }
 
 

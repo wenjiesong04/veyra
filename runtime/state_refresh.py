@@ -20,10 +20,10 @@ from probes.web_probe import WebProbe
 class StateRefresh:
     """Refreshes stale belief claims through known read-only probes."""
 
-    def __init__(self, state_store: WorldStateStore, reasoning: CoreReasoning | None = None) -> None:
+    def __init__(self, state_store: WorldStateStore, reasoning: CoreReasoning | None = None, *, model_assist_enabled: bool = True) -> None:
         self.state_store = state_store
         self.reasoning = reasoning or CoreReasoning(state_store)
-        self.perception = PerceptionLayer(state_store, reasoning=self.reasoning)
+        self.perception = PerceptionLayer(state_store, reasoning=self.reasoning, model_assist_enabled=model_assist_enabled)
         self.probes = {
             "git_probe": GitProbe(),
             "hermes_probe": HermesProbe(),

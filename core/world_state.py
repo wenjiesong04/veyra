@@ -54,6 +54,12 @@ class WorldStateStore:
             },
             "rollback_state.json": {"snapshots": []},
             "ops_soak_state.json": {"status": "idle", "runs": []},
+            "active_loop_state.json": {
+                "status": "stopped",
+                "enabled": False,
+                "interval_seconds": 300,
+                "ticks": [],
+            },
             "ops_runtime_matrix.json": {"status": "not_run", "runtimes": []},
             "ops_config.json": {
                 "alerting": {
@@ -167,5 +173,6 @@ class WorldStateStore:
             "agent_config": self.read_json("agent_config.json"),
             "ops_soak_state": self.read_json("ops_soak_state.json"),
             "ops_runtime_matrix": self.read_json("ops_runtime_matrix.json"),
+            "active_loop_state": self.read_json("active_loop_state.json"),
             "ops_config": self.read_json("ops_config.json"),
         }

@@ -1,0 +1,171 @@
+from __future__ import annotations
+
+import threading
+from time import perf_counter
+from typing import Any, Callable
+from uuid import uuid4
+
+from core.runtime_entity import RuntimeEntity
+from core.world_state import WorldStateStore
+from interface.event_schema import utc_now_iso
+
+
+class ActiveRuntimeLoop:
+    """Background read-only awareness loop for Veyra's continuous entity mode."""
+
+    def __init__(
+        self,
+        *,
+        state_store: WorldStateStore,
+        runtime_entity: RuntimeEntity,
+        proactive_checks: Any,
+        state_refresh: Any,
+        external_world_refresh: Any,
+        runtime_matrix: Any,
+        retention_policy: Any,
+        task_tracker: Any,
+        adapter_resolver: Callable[[], Any],
+        verifier: Any,
+    ) -> None:
+        self.state_store = state_store
+        self.runtime_entity = runtime_entity
+        self.proactive_checks = proactive_checks
+        self.state_refresh = state_refresh
+        self.external_world_refresh = external_world_refresh
+        self.runtime_matrix = runtime_matrix
+        self.retention_policy = retention_policy
+        self.task_tracker = task_tracker
+        self.adapter_resolver = adapter_resolver
+        self.verifier = verifier
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self, *, interval_seconds: float = 300.0) -> dict[str, Any]:
+        interval_seconds = max(5.0, min(float(interval_seconds), 3600.0))
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return {**self.status(), "status": "already_running"}
+            loop_id = f"active_{uuid4().hex[:12]}"
+            self._stop_event = threading.Event()
+            self._write_state(
+                {
+                    "status": "running",
+                    "enabled": True,
+                    "loop_id": loop_id,
+                    "started_at": utc_now_iso(),
+                    "updated_at": utc_now_iso(),
+                    "interval_seconds": interval_seconds,
+                    "ticks": [],
+                }
+            )
+            self._thread = threading.Thread(
+                target=self._run_forever,
+                args=(loop_id, interval_seconds, self._stop_event),
+                daemon=True,
+                name="veyra-active-loop",
+            )
+            self._thread.start()
+        self.state_store.append_jsonl("action_record.jsonl", {"route": "active_loop_start", "status": "running", "artifacts": {"loop_id": loop_id, "interval_seconds": interval_seconds}})
+        return self.status()
+
+    def stop(self) -> dict[str, Any]:
+        thread = self._thread
+        if thread and thread.is_alive():
+            self._stop_event.set()
+            self._patch_state({"status": "stopping", "enabled": False, "stop_requested_at": utc_now_iso()})
+            thread.join(timeout=2.0)
+        state = self._read_state()
+        if state.get("status") in {"running", "stopping", "stale"}:
+            self._patch_state({"status": "stopped", "enabled": False, "stopped_at": utc_now_iso()})
+        self.state_store.append_jsonl("action_record.jsonl", {"route": "active_loop_stop", "status": self.status().get("status"), "artifacts": self.status()})
+        return self.status()
+
+    def status(self) -> dict[str, Any]:
+        state = self._read_state()
+        alive = bool(self._thread and self._thread.is_alive())
+        status = str(state.get("status") or "stopped")
+        if status == "running" and not alive:
+            status = "stale"
+        return {**state, "status": status, "thread_alive": alive}
+
+    def tick(self, *, reason: str = "manual", include_runtime_matrix: bool = False) -> dict[str, Any]:
+        started = perf_counter()
+        tick_id = f"tick_{uuid4().hex[:12]}"
+        steps = [
+            self._step("heartbeat", lambda: self._heartbeat()),
+            self._step("pending_tasks", lambda: self.task_tracker.refresh_pending(self.adapter_resolver(), self.verifier, limit=20)),
+            self._step("stale_state", lambda: self.state_refresh.refresh_stale(limit=20)),
+            self._step("proactive", lambda: self.proactive_checks.run_read_only(timeout_seconds=12)),
+            self._step("external_world", lambda: self.external_world_refresh.refresh_watchlist(limit=5)),
+            self._step("retention", lambda: self.retention_policy.summary()),
+        ]
+        if include_runtime_matrix:
+            steps.append(self._step("runtime_matrix", lambda: self.runtime_matrix.run(write_memory_probe=False)))
+        status = "success" if all(step.get("status") not in {"error", "timeout"} for step in steps) else "degraded"
+        tick = {
+            "tick_id": tick_id,
+            "status": status,
+            "reason": reason,
+            "started_at": utc_now_iso(),
+            "duration_ms": int((perf_counter() - started) * 1000),
+            "steps": steps,
+        }
+        self._append_tick(tick)
+        self.state_store.append_jsonl("action_record.jsonl", {"route": "active_loop_tick", "status": status, "artifacts": tick})
+        return tick
+
+    def _run_forever(self, loop_id: str, interval_seconds: float, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
+            state = self._read_state()
+            if state.get("loop_id") != loop_id:
+                return
+            try:
+                self.tick(reason="scheduled", include_runtime_matrix=False)
+            except Exception as exc:
+                self._append_tick({"tick_id": f"tick_{uuid4().hex[:12]}", "status": "error", "reason": "scheduled", "error": str(exc), "error_type": type(exc).__name__, "started_at": utc_now_iso()})
+            if stop_event.wait(interval_seconds):
+                break
+        state = self._read_state()
+        if state.get("loop_id") == loop_id and state.get("status") in {"running", "stopping"}:
+            self._write_state({**state, "status": "stopped", "enabled": False, "updated_at": utc_now_iso(), "stopped_at": utc_now_iso()})
+
+    def _step(self, name: str, call: Callable[[], Any]) -> dict[str, Any]:
+        started = perf_counter()
+        try:
+            result = call()
+            result_status = str(result.get("status")) if isinstance(result, dict) and result.get("status") else "success"
+            return {
+                "name": name,
+                "status": "success" if result_status not in {"error", "timeout"} else result_status,
+                "result_status": result_status,
+                "duration_ms": int((perf_counter() - started) * 1000),
+                "result": self._compact_result(result),
+            }
+        except Exception as exc:
+            return {"name": name, "status": "error", "duration_ms": int((perf_counter() - started) * 1000), "error": str(exc), "error_type": type(exc).__name__}
+
+    def _heartbeat(self) -> dict[str, Any]:
+        self.runtime_entity.set_status(self.runtime_entity.lifecycle.status)
+        return {"status": "success", "heartbeat": self.runtime_entity.lifecycle.last_heartbeat_at}
+
+    def _compact_result(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: value.get(key) for key in ("status", "autonomy_level", "state_gaps", "summary", "validation", "refreshed", "skipped", "remaining_stale") if key in value}
+        return value
+
+    def _append_tick(self, tick: dict[str, Any]) -> None:
+        with self._lock:
+            state = self._read_state()
+            ticks = state.get("ticks") if isinstance(state.get("ticks"), list) else []
+            ticks.append(tick)
+            self._write_state({**state, "status": "running" if state.get("enabled") else state.get("status", "stopped"), "updated_at": utc_now_iso(), "last_tick": tick, "ticks": ticks[-100:]})
+
+    def _read_state(self) -> dict[str, Any]:
+        return self.state_store.read_json("active_loop_state.json") or {"status": "stopped", "enabled": False, "ticks": []}
+
+    def _write_state(self, payload: dict[str, Any]) -> None:
+        self.state_store.write_json("active_loop_state.json", payload)
+
+    def _patch_state(self, patch: dict[str, Any]) -> None:
+        self._write_state({**self._read_state(), **patch, "updated_at": utc_now_iso()})

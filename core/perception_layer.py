@@ -10,10 +10,11 @@ from interface.event_schema import utc_now_iso
 
 
 class PerceptionLayer:
-    def __init__(self, state_store: WorldStateStore, reasoning: CoreReasoning | None = None) -> None:
+    def __init__(self, state_store: WorldStateStore, reasoning: CoreReasoning | None = None, *, model_assist_enabled: bool = True) -> None:
         self.state_store = state_store
         self.belief = BeliefCore(state_store)
         self.reasoning = reasoning or CoreReasoning(state_store)
+        self.model_assist_enabled = model_assist_enabled
 
     def interpret_probe_result(self, probe_result: dict[str, Any]) -> dict[str, Any]:
         probe_name = probe_result.get("probe", "unknown")
@@ -34,7 +35,7 @@ class PerceptionLayer:
             details = dict(enriched.get("details") or {})
             details["anomaly"] = anomaly
             enriched["details"] = details
-        model_assist = self.reasoning.perception_assist(enriched)
+        model_assist = self.reasoning.perception_assist(enriched) if self.model_assist_enabled else {"status": "skipped"}
         if model_assist.get("status") == "model_assisted":
             enriched["model_interpretation"] = self._compact_model_interpretation(model_assist)
             model_anomaly = model_assist.get("anomaly") if isinstance(model_assist.get("anomaly"), dict) else {}

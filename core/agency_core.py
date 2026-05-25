@@ -19,9 +19,17 @@ class AgencyCore:
     already run read-only probes, but R2+ intentions are suggestions or reviews.
     """
 
-    def __init__(self, state_store: WorldStateStore | None = None, agency_root: str | Path = "agency", reasoning: CoreReasoning | None = None) -> None:
+    def __init__(
+        self,
+        state_store: WorldStateStore | None = None,
+        agency_root: str | Path = "agency",
+        reasoning: CoreReasoning | None = None,
+        *,
+        model_assist_enabled: bool = True,
+    ) -> None:
         self.state_store = state_store
         self.reasoning = reasoning or (CoreReasoning(state_store) if state_store else None)
+        self.model_assist_enabled = model_assist_enabled
         selected_root = os.getenv("VEYRA_AGENCY_ROOT", "agency") if str(agency_root) == "agency" else agency_root
         self.agency_root = Path(selected_root)
         self.intention_path = self.agency_root / "intention_queue.json"
@@ -162,7 +170,7 @@ class AgencyCore:
         return triggers
 
     def _merge_model_gaps(self, goals: dict[str, Any], world_state: dict[str, Any], gaps: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if not self.reasoning:
+        if not self.reasoning or not self.model_assist_enabled:
             return gaps
         assist = self.reasoning.agency_assist(goals=goals, world_state=world_state, rule_gaps=gaps)
         if assist.get("status") != "model_assisted":
