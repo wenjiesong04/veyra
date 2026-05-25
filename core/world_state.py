@@ -96,7 +96,12 @@ class WorldStateStore:
                 },
             },
             "rollback_state.json": {"snapshots": []},
-            "replay_runtime_state.json": {"status": "idle", "jobs": [], "last_scan_at": None},
+            "replay_runtime_state.json": {
+                "status": "idle",
+                "jobs": [],
+                "last_scan_at": None,
+                "config": {"auto_execute_enabled": False, "allow_r4_restore": False},
+            },
             "ops_soak_state.json": {"status": "idle", "runs": []},
             "active_loop_state.json": {
                 "status": "stopped",

@@ -109,6 +109,7 @@ replay_runtime = ReplayRuntime(
     journal=action_journal,
     review_queue=review_queue,
     foresight_engine=foresight_engine,
+    action_executor=action_executor,
 )
 active_loop = ActiveRuntimeLoop(
     state_store=state_store,
@@ -296,6 +297,13 @@ class CronRunRequest(BaseModel):
 class ReplayRuntimeRequest(BaseModel):
     limit: int = 200
     auto_create_reviews: bool = True
+    auto_execute: bool = False
+    allow_r4_restore: bool = False
+
+
+class ReplayRuntimeConfigRequest(BaseModel):
+    auto_execute_enabled: bool | None = None
+    allow_r4_restore: bool | None = None
 
 
 class ChannelConfigRequest(BaseModel):
@@ -796,7 +804,34 @@ async def audit_replay_runtime_scan(request: ReplayRuntimeRequest | None = None)
 async def audit_replay_runtime_run(request: ReplayRuntimeRequest | None = None):
     payload = request or ReplayRuntimeRequest()
     scan = replay_runtime.scan(limit=payload.limit)
-    run = replay_runtime.run_pending(auto_create_reviews=payload.auto_create_reviews, limit=min(payload.limit, 50))
+    run = replay_runtime.run_pending(
+        auto_create_reviews=payload.auto_create_reviews,
+        auto_execute=payload.auto_execute,
+        allow_r4_restore=payload.allow_r4_restore,
+        limit=min(payload.limit, 50),
+    )
+    return {"status": "success", "scan": scan, "run": run}
+
+
+@app.post("/audit/replay/runtime/config")
+async def audit_replay_runtime_config(request: ReplayRuntimeConfigRequest):
+    return replay_runtime.configure(
+        auto_execute_enabled=request.auto_execute_enabled,
+        allow_r4_restore=request.allow_r4_restore,
+    )
+
+
+@app.post("/audit/replay/runtime/execute")
+async def audit_replay_runtime_execute(request: ReplayRuntimeRequest | None = None):
+    payload = request or ReplayRuntimeRequest(auto_execute=True, allow_r4_restore=True)
+    replay_runtime.configure(auto_execute_enabled=True, allow_r4_restore=payload.allow_r4_restore)
+    scan = replay_runtime.scan(limit=payload.limit)
+    run = replay_runtime.run_pending(
+        auto_create_reviews=True,
+        auto_execute=True,
+        allow_r4_restore=payload.allow_r4_restore,
+        limit=min(payload.limit, 50),
+    )
     return {"status": "success", "scan": scan, "run": run}
 
 
@@ -1327,6 +1362,7 @@ async def mvp_status():
         "replay_compensation_review": True,
         "replay_runtime_auto_scan": True,
         "replay_runtime_review_creation": True,
+        "replay_runtime_auto_execute_guarded": True,
         "time_travel_audit": True,
         "memory_bridge_local": True,
         "memory_bridge_provider_routing": True,
