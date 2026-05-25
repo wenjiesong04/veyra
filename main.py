@@ -26,6 +26,7 @@ from rollback_audit.diff_tracker import DiffTracker
 from rollback_audit.action_journal import ActionJournal
 from rollback_audit.replay import Replay
 from runtime.active_loop import ActiveRuntimeLoop
+from runtime.agent_orchestrator import AgentOrchestrator
 from runtime.alert_dispatcher import AlertDispatcher
 from runtime.deployment_config import DeploymentConfigValidator
 from runtime.external_world_refresh import ExternalWorldRefresh
@@ -106,6 +107,13 @@ active_loop = ActiveRuntimeLoop(
     retention_policy=retention_policy,
     task_tracker=awareness_loop.task_tracker,
     adapter_resolver=lambda: awareness_loop.agent_registry.selected(),
+    verifier=awareness_loop.verifier,
+)
+agent_orchestrator = AgentOrchestrator(
+    state_store=state_store,
+    registry=awareness_loop.agent_registry,
+    task_tracker=awareness_loop.task_tracker,
+    execution_trace=awareness_loop.execution_trace,
     verifier=awareness_loop.verifier,
 )
 
@@ -195,6 +203,15 @@ class AgentConfigRequest(BaseModel):
     model: str | None = None
     model_timeout: float | None = None
     model_decision_mode: str | None = None
+
+
+class AgentInvokeRequest(BaseModel):
+    text: str
+    agents: list[str] = Field(default_factory=list)
+    mode: str = "fanout"
+    channel: str = "api"
+    user_id: str = "local-user"
+    session_id: str = "multi-agent"
 
 
 class CoreModelConfigRequest(BaseModel):
@@ -1019,6 +1036,28 @@ async def agents():
     return status
 
 
+@app.get("/agents/certification")
+async def agents_certification_status():
+    return runtime_matrix.status()
+
+
+@app.post("/agents/certification/run")
+async def agents_certification_run(write_memory_probe: bool = False):
+    return runtime_matrix.run(write_memory_probe=write_memory_probe)
+
+
+@app.post("/agents/invoke")
+async def agents_invoke(request: AgentInvokeRequest):
+    return agent_orchestrator.invoke(
+        text=request.text,
+        agents=request.agents,
+        mode=request.mode,
+        channel=request.channel,
+        user_id=request.user_id,
+        session_id=request.session_id,
+    )
+
+
 @app.post("/agents/select")
 async def select_agent(request: AgentSelectRequest):
     try:
@@ -1096,6 +1135,8 @@ async def mvp_status():
         "memory_provider_diagnostics": True,
         "proactive_read_only_checks": True,
         "multi_agent_registry": True,
+        "multi_agent_explicit_invocation": True,
+        "agent_certification_runtime_matrix": True,
         "agent_adapter_contract": True,
         "agent_task_polling": True,
         "agent_pending_task_refresh": True,

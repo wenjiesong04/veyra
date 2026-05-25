@@ -94,10 +94,16 @@ class RuntimeMatrix:
 
     def _row_status(self, connection: dict[str, Any], capabilities: dict[str, Any], memory: dict[str, Any], task_status: dict[str, Any]) -> str:
         statuses = {str(connection.get("status")), str(capabilities.get("status")), str(memory.get("status")), str(task_status.get("status"))}
-        if "error" in statuses or "unavailable" in statuses:
-            return "error"
         if "adapter_unconfigured" in statuses or "not_configured" in statuses:
             return "not_configured"
-        if bool(connection.get("connected")) and memory.get("status") == "success":
+        if "error" in statuses or "unavailable" in statuses:
+            return "error"
+        compatibility = capabilities.get("compatibility") if isinstance(capabilities.get("compatibility"), dict) else {}
+        connection_validation = connection.get("validation") if isinstance(connection.get("validation"), dict) else {}
+        connection_ready = bool(connection.get("connected") or connection_validation.get("validated"))
+        capabilities_ready = str(capabilities.get("status")) in {"available", "ok", "success"}
+        task_poll_ready = str(task_status.get("status")) in {"success", "submitted", "running", "pending"}
+        memory_acceptable = str(memory.get("status")) in {"success", "degraded"} and str(memory.get("summary", {}).get("status") if isinstance(memory.get("summary"), dict) else "") != "error"
+        if connection_ready and capabilities_ready and task_poll_ready and memory_acceptable and str(compatibility.get("status", "compatible")) != "incompatible":
             return "ready"
         return "degraded"
