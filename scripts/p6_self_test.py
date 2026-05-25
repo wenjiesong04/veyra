@@ -273,6 +273,13 @@ def main() -> int:
         expect(model_decision.route == Route.AGENT, "core model can select agent route", model_decision.to_dict())
         expect(bool(model_decision.model_assist.get("solution_outline")), "core model keeps solution outline", model_decision.to_dict())
 
+        identity_decision = DecisionCore(
+            app_module.state_store,
+            reasoning=FakeCoreReasoning(decision={"status": "model_assisted", "route": "agent", "risk_level": "R1", "reason": "delegate"}),
+        ).decide("我是说你现在接收消息的是Veyra中的Kimi模型还是openclaw的", [], source_channel="feishu")
+        expect(identity_decision.route == Route.DIRECT_ANSWER, "chat identity question stays inside Veyra", identity_decision.to_dict())
+        expect("model:skip" in identity_decision.signals and not identity_decision.model_assist, "chat identity fast path skips model assist", identity_decision.to_dict())
+
         blocked_decision = DecisionCore(
             app_module.state_store,
             reasoning=FakeCoreReasoning(decision={"status": "model_assisted", "route": "direct_answer", "risk_level": "R0", "reason": "safe"}),

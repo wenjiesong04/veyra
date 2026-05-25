@@ -39,6 +39,8 @@ class CoreReasoning:
         intent = str(rule_context.get("intent") or "unknown")
         if risk == RiskLevel.R5.value:
             return False
+        if route == "direct_answer" and risk in {RiskLevel.R0.value, RiskLevel.R1.value} and complexity == "simple":
+            return False
         return route in {"agent", "human_review"} or risk in {"R2", "R3", "R4"} or complexity != "simple" or intent == "unknown"
 
     def decision_assist(self, *, text: str, attention_focus: list[str], rule_decision: dict[str, Any]) -> dict[str, Any]:

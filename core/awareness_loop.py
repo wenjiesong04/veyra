@@ -96,7 +96,7 @@ class AwarenessLoop:
         attention_focus = self.attention.focus_for_text(text)
         self.belief.update_from_event(event)
         belief_state = self.belief.refresh()
-        decision = self.decision_core.decide(text=text, attention_focus=attention_focus)
+        decision = self.decision_core.decide(text=text, attention_focus=attention_focus, source_channel=event.source.channel)
         self.state_store.patch_json("risk_state.json", {"current_risk": decision.risk_level.value})
         persona_patch = self.persona_engine.patch_for(
             text,
@@ -418,6 +418,18 @@ class AwarenessLoop:
         draft = decision.model_assist.get("draft_response") if decision.model_assist else ""
         if draft:
             return str(draft)
+        if "veyra_route_identity" in decision.signals:
+            model_status = self.core_reasoning.status()
+            selected_agent = self.agent_registry.selected_name()
+            if model_status.get("configured"):
+                model_note = "Core 模型已配置，但这类通道/身份问题走本地快速路径，不调用模型。"
+            else:
+                model_note = "Core 模型辅助当前未启用，所以不会为这类聊天消耗模型 token。"
+            return (
+                "现在消息先进入 Veyra。Veyra 负责接收、判断风险、决定是否需要工具或 Agent；"
+                f"{selected_agent} 只是 Veyra 选中的 Agent Runtime，不会直接自动处理这条消息。"
+                f"{model_note}"
+            )
         if "veyra" in text.lower() or "是什么" in text:
             return "Veyra 是用于产出实时感知的虚拟实体：Awareness Entity + 高权限 Agent Core Middleware + Agent Governance Layer。"
         return "已由 Veyra 直接处理。当前请求不需要调用工具或 Agent。"
