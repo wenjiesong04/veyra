@@ -29,24 +29,15 @@ class CoreReasoning:
         status = self.status()
         if not status.get("configured"):
             return False
-        route = str(rule_context.get("route") or "")
-        risk = str(rule_context.get("risk_level") or "R0")
-        complexity = str(rule_context.get("complexity") or "simple")
-        intent = str(rule_context.get("intent") or "unknown")
-        signals = rule_context.get("signals") if isinstance(rule_context.get("signals"), list) else []
-        if risk == RiskLevel.R5.value:
-            return False
-        if "model:skip" in signals:
-            return False
-        if kind == "foresight" and route == "direct_answer":
-            return False
         if status.get("decision_mode") == "always":
             return True
         if kind in {"perception", "agency", "memory", "external_world"}:
             return True
-        if route == "direct_answer" and ("model:answer_or_probe" in signals or "model:answer_only" in signals):
-            return True
-        if route == "direct_answer" and risk in {RiskLevel.R0.value, RiskLevel.R1.value} and complexity == "simple":
+        route = str(rule_context.get("route") or "")
+        risk = str(rule_context.get("risk_level") or "R0")
+        complexity = str(rule_context.get("complexity") or "simple")
+        intent = str(rule_context.get("intent") or "unknown")
+        if risk == RiskLevel.R5.value:
             return False
         return route in {"agent", "human_review"} or risk in {"R2", "R3", "R4"} or complexity != "simple" or intent == "unknown"
 
@@ -59,8 +50,8 @@ class CoreReasoning:
             "attention_focus": attention_focus,
             "rule_decision": redact_sensitive(rule_decision),
             "state_snapshot": state,
-            "allowed_routes": self._allowed_routes(rule_decision),
-            "known_probes": ["system", "git", "port", "process", "file", "log", "network", "web", "weather", "search", "openclaw", "hermes", "mcp"],
+            "allowed_routes": ["direct_answer", "probe", "skill", "agent", "human_review", "block"],
+            "known_probes": ["system", "git", "port", "process", "file", "log", "network", "web", "openclaw", "hermes", "mcp"],
             "known_skills": ["diagnose_openclaw", "check_port", "summarize_logs", "safe_git_commit"],
         }
         result = self.client.complete_json(
@@ -69,11 +60,8 @@ class CoreReasoning:
                 "You are Veyra Core's internal reasoning layer. Return strict JSON only. "
                 "You may improve intent, complexity, route, selected_probe, selected_skill, "
                 "solution_outline, and agent_context. You cannot approve execution, lower risk, "
-                "or bypass Guardian. For ordinary chat, decide whether Veyra can answer directly "
-                "or must run a read-only probe for fresh local/external state. Use route=probe and "
-                "selected_probe when current facts are required. Use route=agent only when it is in "
-                "allowed_routes and the task requires implementation, multi-step execution, or selected "
-                "Agent Runtime capabilities. Put concise natural-language replies in draft_response."
+                "or bypass Guardian. Prefer delegating complex implementation to the selected agent "
+                "with concise context and a proposed solution outline."
             ),
             user=json.dumps(payload, ensure_ascii=False),
         )
@@ -81,13 +69,6 @@ class CoreReasoning:
         return result
 
     def perception_assist(self, probe_result: dict[str, Any]) -> dict[str, Any]:
-        details = probe_result.get("details") if isinstance(probe_result.get("details"), dict) else {}
-        if (
-            probe_result.get("model_assist") is False
-            or details.get("model_assist") is False
-            or details.get("perception_model_assist") is False
-        ):
-            return {"status": "skipped", "reason": "probe_result_has_direct_summary"}
         if not self.should_assist("perception", {"route": "probe", "risk_level": "R1"}):
             return {"status": "skipped"}
         payload = {
@@ -107,37 +88,6 @@ class CoreReasoning:
             user=json.dumps(payload, ensure_ascii=False),
         )
         self._trace("perception", result, {"probe": probe_result.get("probe"), "status": probe_result.get("status")})
-        return result
-
-    def probe_answer_assist(self, *, text: str, probe_result: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
-        if not self.status().get("configured"):
-            return {"status": "skipped"}
-        details = probe_result.get("details") if isinstance(probe_result.get("details"), dict) else {}
-        if (
-            probe_result.get("model_assist") is False
-            or details.get("model_assist") is False
-            or details.get("answer_model_assist") is False
-        ):
-            return {"status": "skipped", "reason": "probe_result_has_direct_summary"}
-        probe_name = str(probe_result.get("probe") or "")
-        if probe_name not in {"search_probe", "web_probe"}:
-            return {"status": "skipped", "reason": "probe_answer_not_needed"}
-        payload = {
-            "user_message": text,
-            "decision": redact_sensitive(decision),
-            "probe_result": redact_sensitive(probe_result, max_string=2600, max_list=5),
-            "task": "Answer the user using only the probe evidence. Mention uncertainty when evidence is thin.",
-        }
-        result = self.client.complete_json(
-            purpose="probe_answer",
-            system=(
-                "You are Veyra Core's evidence-grounded answer layer. Return strict JSON with "
-                "draft_response, confidence, and used_sources. Use only the supplied probe evidence; "
-                "do not invent facts. If evidence is insufficient, say what is missing."
-            ),
-            user=json.dumps(payload, ensure_ascii=False),
-        )
-        self._trace("probe_answer", result, {"probe": probe_name, "status": probe_result.get("status")})
         return result
 
     def foresight_assist(
@@ -276,12 +226,6 @@ class CoreReasoning:
                 "agent_config": self._public_agent_config(state.get("agent_config", {})),
             }
         )
-
-    def _allowed_routes(self, rule_decision: dict[str, Any]) -> list[str]:
-        signals = rule_decision.get("signals") if isinstance(rule_decision.get("signals"), list) else []
-        if "model:answer_or_probe" in signals or "model:answer_only" in signals:
-            return ["direct_answer", "probe", "human_review", "block"]
-        return ["direct_answer", "probe", "skill", "agent", "human_review", "block"]
 
     def _agency_state_snapshot(self, world_state: dict[str, Any]) -> dict[str, Any]:
         belief = world_state.get("belief_state", {}) if isinstance(world_state.get("belief_state"), dict) else {}

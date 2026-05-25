@@ -12,18 +12,16 @@ class DecisionCore:
     def __init__(self, state_store: WorldStateStore | None = None, reasoning: CoreReasoning | None = None) -> None:
         self.reasoning = reasoning or (CoreReasoning(state_store) if state_store else None)
 
-    def decide(self, text: str, attention_focus: list[str], source_channel: str = "") -> Decision:
-        base = self._rule_decide(text, attention_focus, source_channel=source_channel)
+    def decide(self, text: str, attention_focus: list[str]) -> Decision:
+        base = self._rule_decide(text, attention_focus)
         return self._apply_model_assist(text, attention_focus, base)
 
-    def _rule_decide(self, text: str, attention_focus: list[str], source_channel: str = "") -> Decision:
+    def _rule_decide(self, text: str, attention_focus: list[str]) -> Decision:
         lowered = text.lower()
         risk = self._risk_for_text(lowered)
         intent, intent_signals = self._intent_for_text(lowered)
         complexity, complexity_signals = self._complexity_for_text(lowered, attention_focus)
         signals = intent_signals + complexity_signals + self._risk_signals(risk)
-        if source_channel:
-            signals.append(f"channel:{source_channel}")
         if self._is_rollback_request(lowered):
             return self._decision(
                 route=Route.ROLLBACK,
@@ -59,17 +57,6 @@ class DecisionCore:
                 requires_confirmation=True,
                 constraints=["explain impact", "check rollback path", "wait for explicit approval"],
             )
-        if self._is_identity_or_route_question(lowered):
-            return self._decision(
-                route=Route.DIRECT_ANSWER,
-                risk=RiskLevel.R0,
-                reason="Veyra routing or identity question answered locally",
-                intent="information",
-                complexity="simple",
-                capability="native_answer",
-                signals=signals + ["chat_fast_path", "veyra_route_identity", "model:skip"],
-                constraints=["no tool execution", "do not delegate routing or identity questions to an agent runtime"],
-            )
         skill = self._skill_for_text(lowered)
         if skill:
             skill_risk = RiskLevel.R1 if skill != "safe_git_commit" else RiskLevel.R2
@@ -97,7 +84,7 @@ class DecisionCore:
                 selected_probe=probe,
                 constraints=["read-only", "refresh state cache"],
             )
-        if self._needs_agent(lowered, attention_focus, complexity, intent):
+        if self._needs_agent(lowered, attention_focus, complexity):
             return self._decision(
                 route=Route.AGENT,
                 risk=risk,
@@ -126,14 +113,12 @@ class DecisionCore:
             intent=intent,
             complexity=complexity,
             capability="native_answer",
-            signals=signals + ["model:answer_or_probe"],
-            constraints=["no write execution", "use a read-only probe when fresh local or external state is required"],
+            signals=signals,
+            constraints=["no tool execution"],
         )
 
     def _apply_model_assist(self, text: str, attention_focus: list[str], base: Decision) -> Decision:
         if not self.reasoning:
-            return base
-        if "model:skip" in base.signals:
             return base
         assist = self.reasoning.decision_assist(text=text, attention_focus=attention_focus, rule_decision=base.to_dict())
         if assist.get("status") != "model_assisted":
@@ -142,8 +127,6 @@ class DecisionCore:
         model_risk = safe_model_risk(assist.get("risk_level"), base.risk_level)
         risk = self._max_risk(base.risk_level, model_risk)
         candidate_route = self._route_from_model(assist.get("route"), base.route)
-        if "model:answer_or_probe" in base.signals and candidate_route in {Route.AGENT, Route.SKILL, Route.NATIVE_TOOL}:
-            candidate_route = Route.DIRECT_ANSWER
         if risk == RiskLevel.R5:
             route = Route.BLOCK
         elif risk in {RiskLevel.R3, RiskLevel.R4}:
@@ -195,17 +178,6 @@ class DecisionCore:
         )
 
     def _probe_for_text(self, lowered: str) -> str | None:
-        if "天气" in lowered or "气温" in lowered or "温度" in lowered or "weather" in lowered:
-            return "weather"
-        if any(marker in lowered for marker in ["最新", "新闻", "搜索", "查找", "查资料", "外部世界", "search"]):
-            return "search"
-        runtime_status_markers = ["状态", "连接", "可用", "能不能", "是否能", "status", "available", "connect", "configured"]
-        if "openclaw" in lowered and any(marker in lowered for marker in runtime_status_markers):
-            return "openclaw"
-        if "hermes" in lowered and any(marker in lowered for marker in runtime_status_markers):
-            return "hermes"
-        if "mcp" in lowered and any(marker in lowered for marker in runtime_status_markers):
-            return "mcp"
         if "端口" in lowered or "port" in lowered:
             return "port"
         if "git" in lowered or "未提交" in lowered or "工作区" in lowered:
@@ -227,66 +199,22 @@ class DecisionCore:
             return "safe_git_commit"
         return None
 
-    def _needs_agent(self, lowered: str, attention_focus: list[str], complexity: str, intent: str) -> bool:
-        complex_markers = ["修改", "实现", "开发", "重构", "修复", "调试", "完善", "接入", "多文件", "代码"]
-        runtime_markers = ["agent", "openclaw", "hermes"]
-        return (
-            complexity == "complex"
-            or any(marker in lowered for marker in complex_markers)
-            or (intent == "action" and any(marker in lowered for marker in runtime_markers))
-            or len(attention_focus) >= 3
-        )
+    def _needs_agent(self, lowered: str, attention_focus: list[str], complexity: str) -> bool:
+        complex_markers = ["修改", "实现", "开发", "重构", "修复", "调试", "多文件", "代码", "agent", "openclaw", "hermes"]
+        return complexity == "complex" or any(marker in lowered for marker in complex_markers) or len(attention_focus) >= 3
 
     def _is_rollback_request(self, lowered: str) -> bool:
         rollback_markers = ["rollback", "restore snapshot", "restore snap_", "回滚", "恢复快照"]
         return any(marker in lowered for marker in rollback_markers)
 
-    def _is_identity_or_route_question(self, lowered: str) -> bool:
-        subject_markers = [
-            "veyra",
-            "openclaw",
-            "kimi",
-            "agent",
-            "bot",
-            "飞书",
-            "feishu",
-            "模型",
-        ]
-        route_markers = [
-            "你现在是",
-            "现在是",
-            "谁在回复",
-            "谁回复",
-            "谁接收",
-            "接收消息",
-            "收到消息",
-            "优先收到",
-            "先收到",
-            "先接收",
-            "先处理",
-            "先进",
-            "通道",
-            "route",
-            "routing",
-            "channel",
-            "are you",
-            "who is answering",
-        ]
-        question_markers = ["吗", "么", "？", "?", "谁", "是否", "是不是", "还是", "现在", "当前", "which"]
-        return (
-            any(marker in lowered for marker in subject_markers)
-            and any(marker in lowered for marker in route_markers)
-            and any(marker in lowered for marker in question_markers)
-        )
-
     def _risk_for_text(self, lowered: str) -> RiskLevel:
         return classify_text_risk(lowered)
 
     def _intent_for_text(self, lowered: str) -> tuple[str, list[str]]:
-        action_markers = ["检查", "查看", "看", "搜索", "查找", "查询", "查一下", "修复", "执行", "修改", "部署", "重启", "创建", "写入", "诊断", "完善", "接入", "配置"]
+        action_markers = ["检查", "查看", "看", "修复", "执行", "修改", "部署", "重启", "创建", "写入", "诊断"]
         if any(marker in lowered for marker in action_markers):
             return "action", ["intent:action"]
-        if any(marker in lowered for marker in ["为什么", "是什么", "解释", "说明", "总结", "怎么样", "怎么", "如何"]):
+        if any(marker in lowered for marker in ["为什么", "是什么", "解释", "说明", "总结"]):
             return "information", ["intent:information"]
         return "unknown", []
 
@@ -319,7 +247,7 @@ class DecisionCore:
         return route
 
     def _selected_probe_from_model(self, assist: dict[str, Any], default: str | None) -> str:
-        allowed = {"system", "git", "port", "process", "file", "log", "network", "web", "weather", "search", "openclaw", "hermes", "mcp"}
+        allowed = {"system", "git", "port", "process", "file", "log", "network", "web", "openclaw", "hermes", "mcp"}
         selected = str(assist.get("selected_probe") or assist.get("probe") or default or "system")
         return selected if selected in allowed else "system"
 

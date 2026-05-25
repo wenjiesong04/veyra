@@ -90,7 +90,6 @@ class WorldStateStore:
                     "api_key_env": "VEYRA_CORE_MODEL_API_KEY",
                     "model": "",
                     "timeout": 20,
-                    "max_tokens": 700,
                     "decision_mode": "auto",
                 },
                 "agents": {
