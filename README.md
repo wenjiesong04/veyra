@@ -37,6 +37,9 @@ Endpoints:
 - `GET /channels/outbox` inspect local outbox delivery records
 - `GET /channels/sessions` inspect channel session mappings
 - `POST /integrations/feishu/events` receive Feishu URL verification and message callbacks
+- `POST /integrations/feishu/import-openclaw` import Feishu app credentials from local OpenClaw config
+- `GET /integrations/feishu/ws/status` inspect Feishu long-connection runner state
+- `POST /integrations/feishu/ws/start` start Feishu WebSocket long-connection intake for local Veyra-first operation
 - `GET /state` read current Veyra state cache
 - `GET /architecture` read architecture blocks, core module progress, state definitions, and implementation phases
 - `GET /definitions` read lifecycle statuses, operational modes, and risk-level catalog
@@ -251,6 +254,22 @@ curl -X POST http://127.0.0.1:8000/channels/feishu/config \
 ```
 
 Set the Feishu event callback URL to `/integrations/feishu/events`. Veyra handles URL verification and `im.message.receive_v1` text events. If the app enables encrypted callbacks, decrypt at the edge first; Veyra currently rejects encrypted callback payloads instead of guessing.
+
+For local development without a deployed server, use Feishu WebSocket long-connection mode instead of HTTP callbacks. Veyra can import an existing local OpenClaw Feishu app config:
+
+```bash
+curl -X POST http://127.0.0.1:8000/integrations/feishu/import-openclaw \
+  -H 'Content-Type: application/json' \
+  -d '{"enable":true}'
+```
+
+Then disable OpenClaw's direct Feishu handling and start Veyra's long connection:
+
+```bash
+curl -X POST http://127.0.0.1:8000/integrations/feishu/ws/start
+```
+
+Do not run OpenClaw and Veyra as independent Feishu message consumers for the same app unless OpenClaw is only forwarding to Veyra; otherwise messages can bypass Veyra governance or be processed twice.
 
 Agent runtimes are selected through `state/agent_config.json` or the console Agent Runtime panel. The MVP ships a native OpenClaw Gateway adapter plus compatible HTTP adapters for Hermes and a Custom Agent endpoint. OpenClaw remains the default:
 

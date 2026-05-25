@@ -241,7 +241,7 @@ P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块。当�
 - P8 Interface 增加本地多通道 state：`/channels`、`/channels/{channel}/messages`、`/channels/outbox`、`/channels/sessions`，记录 session、dedupe 和 outbox，不伪造外部 IM 平台投递成功。
 - P8 BeliefCore 增加 TTL remaining、source trust、refresh_count、history、expired/stale/conflict 汇总，并开放 `/belief/status` 和 `/belief/refresh`。
 - P8 ReplayRuntime 增加 `/audit/replay/runtime/status|scan|run`，从 ActionJournal 自动扫描失败/需回滚候选，生成受 Guardian review 保护的 R4 compensation proposal，不自动执行 restore。
-- P9 Feishu channel 增加 `/channels/feishu/config`、`/channels/feishu/send`、`/integrations/feishu/events`：支持 app credential 获取 tenant token、发送文本消息、URL verification、`im.message.receive_v1` 文本回调和同会话回复。
+- P9 Feishu channel 增加 `/channels/feishu/config`、`/channels/feishu/send`、`/integrations/feishu/events`、`/integrations/feishu/import-openclaw`、`/integrations/feishu/ws/*`：支持 app credential 获取 tenant token、发送文本消息、URL verification、`im.message.receive_v1` 文本回调、从 OpenClaw 本地配置导入、WebSocket 长连接和同会话回复。
 - P9 Runtime Cron 将 `runtime/cron.py` 从占位替换为持久化 bounded scheduler，可触发 active awareness tick，不执行任意外部命令。
 - P9 PersonaEngine 绑定 channel/risk/route/Agent policy，写入 `persona_state.json`，并进入 Agent task packet、execution trace 和 runtime API。
 - P9 ReplayRuntime 增加 `/audit/replay/runtime/config` 和 `/audit/replay/runtime/execute`：只有显式配置和请求同时允许 R4 snapshot restore 时，才会自动 approve review 并通过 ActionExecutor 执行 restore。

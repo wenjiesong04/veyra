@@ -32,6 +32,10 @@ class FeishuAdapter:
             return {"status": "ignored", "event_type": event_type or "unknown"}
 
         event = payload.get("event") if isinstance(payload.get("event"), dict) else {}
+        return self.handle_message_event(event, header=header, source="callback")
+
+    def handle_message_event(self, event: dict[str, Any], *, header: dict[str, Any] | None = None, source: str = "callback") -> dict[str, Any]:
+        header = header or {}
         message = event.get("message") if isinstance(event.get("message"), dict) else {}
         sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
         text = self._message_text(message)
@@ -56,7 +60,7 @@ class FeishuAdapter:
                 }
             },
         )
-        return {"status": "received", "event_type": event_type, "message_id": message_id, "receipt": receipt}
+        return {"status": "received", "event_type": str(header.get("event_type") or "im.message.receive_v1"), "source": source, "message_id": message_id, "receipt": receipt}
 
     def _message_text(self, message: dict[str, Any]) -> str:
         message_type = str(message.get("message_type") or "")

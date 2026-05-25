@@ -60,8 +60,11 @@ class WorldStateStore:
                         "default_receive_id": "",
                         "default_receive_id_env": "FEISHU_DEFAULT_RECEIVE_ID",
                         "default_receive_id_type": "chat_id",
+                        "connection_mode": "callback",
                         "verification_token": "",
                         "verification_token_env": "FEISHU_VERIFICATION_TOKEN",
+                        "encrypt_key": "",
+                        "encrypt_key_env": "FEISHU_ENCRYPT_KEY",
                         "reply_to_session": True,
                     },
                 },
@@ -123,6 +126,7 @@ class WorldStateStore:
                     }
                 },
             },
+            "feishu_ws_state.json": {"status": "stopped", "last_event_at": None},
             "ops_runtime_matrix.json": {"status": "not_run", "runtimes": []},
             "ops_config.json": {
                 "alerting": {
@@ -241,5 +245,6 @@ class WorldStateStore:
             "ops_runtime_matrix": self.read_json("ops_runtime_matrix.json"),
             "active_loop_state": self.read_json("active_loop_state.json"),
             "runtime_cron_state": self.read_json("runtime_cron_state.json"),
+            "feishu_ws_state": self.read_json("feishu_ws_state.json"),
             "ops_config": self.read_json("ops_config.json"),
         }

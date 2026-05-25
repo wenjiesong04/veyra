@@ -21,6 +21,7 @@ from interface.agent_adapter import ExecutionResult
 from interface.event_normalizer import EventNormalizer
 from interface.event_schema import Decision, Route, utc_now_iso
 from interface.feishu_adapter import FeishuAdapter
+from interface.feishu_ws_runner import FeishuWsRunner
 from interface.intake_gateway import IntakeGateway
 from pydantic import Field
 from rollback_audit.rollback_manager import RollbackManager
@@ -56,6 +57,7 @@ awareness_loop = AwarenessLoop(state_store=state_store, runtime_entity=runtime_e
 event_normalizer = EventNormalizer()
 intake_gateway = IntakeGateway(awareness_loop, event_normalizer, state_store=state_store)
 feishu_adapter = FeishuAdapter(intake_gateway, state_store=state_store)
+feishu_ws_runner = FeishuWsRunner(state_store=state_store, adapter=feishu_adapter)
 console_dir = Path("ui/console")
 review_queue = ReviewQueue(state_store)
 rollback_manager = RollbackManager(state_store)
@@ -319,10 +321,18 @@ class ChannelConfigRequest(BaseModel):
     default_receive_id: str | None = None
     default_receive_id_env: str | None = None
     default_receive_id_type: str | None = None
+    connection_mode: str | None = None
     verification_token: str | None = None
     verification_token_env: str | None = None
+    encrypt_key: str | None = None
+    encrypt_key_env: str | None = None
     reply_to_session: bool | None = None
     timeout: float | None = None
+
+
+class FeishuImportRequest(BaseModel):
+    path: str | None = None
+    enable: bool = True
 
 
 class ChannelSendRequest(BaseModel):
@@ -507,6 +517,8 @@ async def configure_channel(channel: str, request: ChannelConfigRequest):
         raise HTTPException(status_code=422, detail="delivery must be local_outbox or feishu")
     if "default_receive_id_type" in patch and patch["default_receive_id_type"] not in {"open_id", "user_id", "union_id", "email", "chat_id"}:
         raise HTTPException(status_code=422, detail="unsupported Feishu receive_id_type")
+    if "connection_mode" in patch and patch["connection_mode"] not in {"callback", "websocket"}:
+        raise HTTPException(status_code=422, detail="connection_mode must be callback or websocket")
     return intake_gateway.configure_channel(channel, patch)
 
 
@@ -545,6 +557,22 @@ async def channels_sessions():
 @app.post("/integrations/feishu/events")
 async def feishu_events(payload: dict[str, Any]):
     return feishu_adapter.handle_callback(payload)
+
+
+@app.get("/integrations/feishu/ws/status")
+async def feishu_ws_status():
+    return feishu_ws_runner.status()
+
+
+@app.post("/integrations/feishu/import-openclaw")
+async def feishu_import_openclaw(request: FeishuImportRequest | None = None):
+    payload = request or FeishuImportRequest()
+    return feishu_ws_runner.import_openclaw_config(path=payload.path, enable=payload.enable)
+
+
+@app.post("/integrations/feishu/ws/start")
+async def feishu_ws_start():
+    return feishu_ws_runner.start()
 
 
 @app.get("/state")
@@ -1343,6 +1371,9 @@ async def mvp_status():
     implemented_loops = {
         "direct_answer": True,
         "multi_channel_intake": True,
+        "feishu_callback_intake": True,
+        "feishu_websocket_intake": True,
+        "feishu_openclaw_config_import": True,
         "channel_outbox": True,
         "channel_session_mapping": True,
         "channel_dedupe": True,
