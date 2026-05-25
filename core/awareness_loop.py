@@ -55,7 +55,7 @@ class AwarenessLoop:
         self.decision_core = DecisionCore(state_store=state_store, reasoning=self.core_reasoning)
         self.foresight = ForesightEngine(reasoning=self.core_reasoning)
         self.guardian = GuardianController()
-        self.persona_engine = PersonaEngine()
+        self.persona_engine = PersonaEngine(state_store)
         self.context_builder = ContextPatchBuilder(state_store)
         self.task_packet_builder = TaskPacketBuilder(state_store)
         self.verifier = Verifier()
@@ -98,6 +98,16 @@ class AwarenessLoop:
         belief_state = self.belief.refresh()
         decision = self.decision_core.decide(text=text, attention_focus=attention_focus)
         self.state_store.patch_json("risk_state.json", {"current_risk": decision.risk_level.value})
+        persona_patch = self.persona_engine.patch_for(
+            text,
+            decision.risk_level,
+            channel=event.source.channel,
+            route=decision.route.value,
+            target_agent=decision.target_agent or self.agent_registry.selected_name(),
+            decision=decision.to_dict(),
+        )
+        self.persona_engine.record_binding(event, persona_patch)
+        self.runtime_entity.operational_mode = list(persona_patch.get("mode", []))
         foresight = self.foresight.predict_text_action(text, decision.risk_level, decision=decision.to_dict())
         guardian_decision = self.guardian.review_text_action(text=text, decision=decision, foresight=foresight)
 
@@ -109,7 +119,7 @@ class AwarenessLoop:
                 status="blocked",
                 response=guardian_decision["reason"],
                 risk_level=decision.risk_level,
-                artifacts={"guardian": guardian_decision, "foresight": foresight},
+                artifacts={"guardian": guardian_decision, "foresight": foresight, "persona": persona_patch},
             )
             self._update(event, result)
             return result
@@ -134,7 +144,7 @@ class AwarenessLoop:
                 status="needs_confirmation",
                 response=response,
                 risk_level=decision.risk_level,
-                artifacts={"guardian": guardian_decision, "foresight": foresight, "review": review, "proposal": proposal},
+                artifacts={"guardian": guardian_decision, "foresight": foresight, "review": review, "proposal": proposal, "persona": persona_patch},
             )
             self._update(event, result)
             return result
@@ -150,6 +160,7 @@ class AwarenessLoop:
                 artifacts={
                     "attention": attention_focus,
                     "decision": decision.to_dict(),
+                    "persona": persona_patch,
                     "uncertainty": self.uncertainty.uncertainty_summary(belief_state.get("claims", [])),
                 },
             )
@@ -175,7 +186,7 @@ class AwarenessLoop:
             packet = self.task_packet_builder.build(
                 event=event,
                 target_agent=selected_agent,
-                persona_patch=self.persona_engine.patch_for(text, decision.risk_level),
+                persona_patch=persona_patch,
                 policy_patch=self.guardian.policy_patch(decision.risk_level),
                 context_patch=context_patch,
             )
@@ -207,6 +218,7 @@ class AwarenessLoop:
                 "pending_task": pending_task,
                 "decision": decision.to_dict(),
                 "guardian": guardian_decision,
+                "persona": persona_patch,
             }
             artifacts["execution_trace"] = self.execution_trace.record(
                 {
@@ -217,6 +229,7 @@ class AwarenessLoop:
                     "status": verified["status"],
                     "decision": decision.to_dict(),
                     "guardian": guardian_decision,
+                    "persona": persona_patch,
                     "execution_result": asdict(execution),
                     "verification": verified,
                 }
@@ -239,6 +252,7 @@ class AwarenessLoop:
                 artifacts={
                     "decision": decision.to_dict(),
                     "guardian": guardian_decision,
+                    "persona": persona_patch,
                     "next_action": "submit /actions/proposals with action.type and target details",
                 },
             )
@@ -254,6 +268,7 @@ class AwarenessLoop:
                 artifacts={"decision": decision.to_dict(), "next_action": "use a supported route or submit an ActionProposal"},
             )
 
+        result.artifacts.setdefault("persona", persona_patch)
         self._update(event, result)
         return result
 

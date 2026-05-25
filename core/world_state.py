@@ -40,6 +40,7 @@ class WorldStateStore:
             },
             "task_state.json": {"current_task": None, "history": []},
             "attention_state.json": {"focus": [], "ignored_noise": []},
+            "persona_state.json": {"active_modes": ["Minimalist"], "last_binding": None, "history": [], "updated_at": None},
             "channel_state.json": {
                 "channels": {
                     "api": {"enabled": True, "delivery": "local_outbox"},
@@ -223,6 +224,7 @@ class WorldStateStore:
             "belief_state": self.read_json("belief_state.json"),
             "task_state": self.read_json("task_state.json"),
             "attention_state": self.read_json("attention_state.json"),
+            "persona_state": self.read_json("persona_state.json"),
             "channel_state": self.read_json("channel_state.json"),
             "state_schema": self.read_json("state_schema.json"),
             "review_queue": self.read_json("review_queue.json"),

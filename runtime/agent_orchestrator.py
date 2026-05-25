@@ -36,7 +36,7 @@ class AgentOrchestrator:
         self.verifier = verifier
         self.normalizer = EventNormalizer()
         self.task_packet_builder = TaskPacketBuilder(state_store)
-        self.persona_engine = PersonaEngine()
+        self.persona_engine = PersonaEngine(state_store)
         self.guardian = GuardianController()
 
     def invoke(
@@ -102,6 +102,14 @@ class AgentOrchestrator:
                 target_agent=name,
             )
             guardian = self.guardian.review_text_action(text, decision, {"risk_level": risk.value, "reversible": "full", "side_effects": [], "required_preconditions": []})
+            persona_patch = self.persona_engine.patch_for(
+                text,
+                risk,
+                channel=channel,
+                route=Route.AGENT.value,
+                target_agent=name,
+                decision=decision.to_dict(),
+            )
             packet = self.task_packet_builder.build(
                 event=event,
                 target_agent=name,
@@ -111,7 +119,7 @@ class AgentOrchestrator:
                     "requested_agents": requested,
                     "connection": redact_sensitive(connection, max_string=1000),
                 },
-                persona_patch=self.persona_engine.patch_for(text, risk),
+                persona_patch=persona_patch,
                 policy_patch=self.guardian.policy_patch(risk),
             )
             execution = adapter.send_task(packet)
@@ -127,6 +135,7 @@ class AgentOrchestrator:
                     "status": verification["status"],
                     "decision": decision.to_dict(),
                     "guardian": guardian,
+                    "persona": persona_patch,
                     "execution_result": execution.to_dict(),
                     "verification": verification,
                     "artifacts": {"multi_agent_invocation": True, "target_agent": name},

@@ -837,6 +837,11 @@ async def agency_intentions():
     return agency_core.state()
 
 
+@app.get("/personas/status")
+async def personas_status():
+    return {"status": "success", **state_store.read_json("persona_state.json")}
+
+
 @app.get("/belief/status")
 async def belief_status(limit: int = 50):
     return awareness_loop.belief.ttl_report(limit=limit)
@@ -1338,6 +1343,9 @@ async def mvp_status():
         "stale_belief_refresh": True,
         "belief_ttl_status": True,
         "belief_source_trust": True,
+        "persona_deep_binding": True,
+        "persona_channel_binding": True,
+        "persona_agent_policy_binding": True,
         "real_probe_envelopes": True,
         "external_memory_bridge_hooks": True,
         "tool_proxy_executor_config": True,
@@ -1379,6 +1387,7 @@ async def mvp_status():
             "note": "OpenClaw Gateway, Hermes HTTP, and Custom HTTP adapters share the AgentAdapter interface. OpenClaw remains the default selected runtime.",
         },
         "active_loop": active_loop.status(),
+        "persona": state_store.read_json("persona_state.json"),
     }
 
 
@@ -1396,6 +1405,7 @@ async def runtime():
             "last_heartbeat_at": runtime_entity.lifecycle.last_heartbeat_at,
         },
         "operational_mode": runtime_entity.operational_mode,
+        "persona": state_store.read_json("persona_state.json"),
         "core_model": {
             "runtime_state": runtime_entity.core_model_runtime_state(),
             "status": awareness_loop.core_reasoning.status(),

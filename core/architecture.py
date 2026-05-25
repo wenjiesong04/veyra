@@ -153,6 +153,13 @@ STATE_DEFINITIONS: list[dict[str, Any]] = [
         "freshness": "probe_backed",
     },
     {
+        "id": "persona_state",
+        "file": "state/persona_state.json",
+        "owner": "PersonaEngine",
+        "purpose": "Active persona modes and channel/risk/Agent binding decisions for recent events.",
+        "freshness": "event_scoped",
+    },
+    {
         "id": "channel_state",
         "file": "state/channel_state.json",
         "owner": "Interface.ChannelRouter",
