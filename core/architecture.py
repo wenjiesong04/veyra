@@ -17,7 +17,7 @@ ARCHITECTURE_BLOCKS: list[dict[str, Any]] = [
     {
         "id": "interface_adapter",
         "name": "Interface Adapter / Agent Adapter",
-        "role": "Normalize multi-channel inbound events and connect one or more validated Agent runtimes.",
+        "role": "Normalize multi-channel inbound events, connect real chat apps such as Feishu, and connect one or more validated Agent runtimes.",
         "paths": ["interface/"],
         "status": "implemented",
         "validation_state": "external_runtime_validation_pending",
@@ -77,6 +77,7 @@ CORE_MODULES: list[dict[str, str]] = [
     {"id": "runtime_entity", "path": "core/runtime_entity.py", "status": "p8_continuous_entity"},
     {"id": "awareness_loop", "path": "core/awareness_loop.py", "status": "p8_continuous_entity"},
     {"id": "active_runtime_loop", "path": "runtime/active_loop.py", "status": "p8_continuous_entity"},
+    {"id": "runtime_cron", "path": "runtime/cron.py", "status": "p9_runtime_scheduler"},
     {"id": "attention_core", "path": "awareness/attention_core.py", "status": "mvp_foundation"},
     {"id": "belief_uncertainty_core", "path": "awareness/belief_core.py", "status": "p8_deep_ttl"},
     {"id": "world_state", "path": "core/world_state.py", "status": "mvp_foundation"},
@@ -91,7 +92,7 @@ CORE_MODULES: list[dict[str, str]] = [
     {"id": "verifier", "path": "core/verifier.py", "status": "p4_completed"},
     {"id": "context_patch_builder", "path": "core/context_patch_builder.py", "status": "mvp_foundation"},
     {"id": "agent_orchestrator", "path": "runtime/agent_orchestrator.py", "status": "p8_validated_multi_agent"},
-    {"id": "replay_runtime", "path": "rollback_audit/replay_runtime.py", "status": "p8_auto_replay"},
+    {"id": "replay_runtime", "path": "rollback_audit/replay_runtime.py", "status": "p9_guarded_auto_execute"},
 ]
 
 
@@ -174,6 +175,13 @@ STATE_DEFINITIONS: list[dict[str, Any]] = [
         "freshness": "scheduled_runtime",
     },
     {
+        "id": "runtime_cron_state",
+        "file": "state/runtime_cron_state.json",
+        "owner": "Runtime.Cron",
+        "purpose": "Persistent bounded scheduler state for active awareness jobs.",
+        "freshness": "scheduled_runtime",
+    },
+    {
         "id": "replay_runtime_state",
         "file": "state/replay_runtime_state.json",
         "owner": "RollbackAudit.ReplayRuntime",
@@ -207,6 +215,7 @@ IMPLEMENTATION_PHASES: list[dict[str, str]] = [
     {"phase": "P6", "name": "End-to-end runtime hardening", "status": "implemented", "validation_state": "live_runtime_validation_pending"},
     {"phase": "P7", "name": "Production operations and safety validation", "status": "implemented", "validation_state": "production_soak_validation_pending"},
     {"phase": "P8", "name": "Continuous awareness entity runtime", "status": "implemented", "validation_state": "bounded_local_self_tested"},
+    {"phase": "P9", "name": "Chat app integration and guarded automation", "status": "implemented", "validation_state": "feishu_local_openapi_self_tested"},
 ]
 
 

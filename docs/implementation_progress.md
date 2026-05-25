@@ -10,12 +10,12 @@
 | Block | 代码位置 | 当前状态 | 下一步 |
 | --- | --- | --- | --- |
 | Veyra Core | `core/`, `awareness/`, `decision/`, `foresight/`, `guardian/`, `runtime/active_loop.py` | P8 continuous entity | 生产 supervisor 下的长期运行验收 |
-| Interface Adapter / Agent Adapter | `interface/`, `runtime/agent_orchestrator.py` | P8 multi-channel / multi-Agent | 连接真实 Hermes/Custom 后做多 runtime soak |
+| Interface Adapter / Agent Adapter | `interface/`, `runtime/agent_orchestrator.py` | P9 Feishu channel / multi-Agent | 连接真实 Feishu、Hermes、Custom 后做多 runtime soak |
 | Probe Tools | `probes/` | P7 implemented | 按真实部署扩展更多环境专属 probe |
 | Memory Bridge | `memory_bridge/` | P8 deep TTL metadata | 外部 memory provider 的生产语义验收 |
 | Skill | `skills/` | P6 implemented | 增加更多低风险内置 skill 时保持 ExecutionResult 统一 |
 | Tool Proxy | `tool_proxy/` | P7 implemented | 按生产 allowlist 开启 Browser/API executor |
-| Rollback / Audit | `rollback_audit/` | P8 auto replay | 真实副作用 replay 继续保持人工确认边界 |
+| Rollback / Audit | `rollback_audit/` | P9 guarded auto replay | 非 snapshot 副作用 replay 继续保持人工确认边界 |
 | Web Control UI | `web/`, `ui/` | P7 fixed workbench | 后续只接入新增生产指标，不引入 mock 数据 |
 
 ## Veyra Core 子模块
@@ -29,14 +29,15 @@
 | WorldState | `core/world_state.py`, `state/*.json` | MVP foundation |
 | Agency Core | `core/agency_core.py`, `agency/` | P8 proactive runtime |
 | Perception Layer | `core/perception_layer.py` | MVP foundation |
-| Persona Engine | `core/persona_engine.py`, `personas/` | MVP foundation |
+| Persona Engine | `core/persona_engine.py`, `personas/` | P9 channel/Agent binding |
 | Decision Core | `core/decision_core.py`, `decision/` | MVP foundation |
 | Foresight Engine | `core/foresight_engine.py`, `foresight/` | MVP foundation |
 | Guardian / Execution Controller | `core/guardian_controller.py`, `execution/` | MVP foundation |
 | Verifier | `core/verifier.py` | P4 completed |
 | Context / Patch Builder | `core/context_patch_builder.py`, `core/*_patch_builder.py` | MVP foundation |
 | Agent Orchestrator | `runtime/agent_orchestrator.py` | P8 validated multi-Agent |
-| Replay Runtime | `rollback_audit/replay_runtime.py` | P8 automatic replay |
+| Runtime Cron | `runtime/cron.py` | P9 bounded scheduler |
+| Replay Runtime | `rollback_audit/replay_runtime.py` | P9 guarded auto-execute |
 
 ## 生命周期状态
 
@@ -83,7 +84,9 @@
 | AttentionState | `state/attention_state.json` | AttentionCore | 当前关注切片、忽略噪声、上下文范围 |
 | ExecutorState | `state/executor_state.json` | AgentAdapter | 选定执行体、连接状态、能力状态 |
 | ChannelState | `state/channel_state.json` | Interface.ChannelRouter | 多通道 session、dedupe、outbox |
+| PersonaState | `state/persona_state.json` | PersonaEngine | 当前 persona mode、通道、风险、Agent 绑定 |
 | ActiveLoopState | `state/active_loop_state.json` | Runtime.ActiveRuntimeLoop | 定时主动循环状态、tick、步骤结果 |
+| RuntimeCronState | `state/runtime_cron_state.json` | Runtime.Cron | bounded scheduler job 状态 |
 | ReplayRuntimeState | `state/replay_runtime_state.json` | RollbackAudit.ReplayRuntime | 自动 replay 候选、job、scan 时间 |
 
 ## Probe 与 Belief 规则
@@ -157,6 +160,7 @@ P2 已将 Tool Proxy 接入统一策略审查：
 | P6 | End-to-end runtime hardening | Implemented, live runtime validation pending |
 | P7 | Production operations and safety validation | Implemented, production soak validation pending |
 | P8 | Continuous awareness entity runtime | Implemented, bounded local self-tested |
+| P9 | Chat app integration and guarded automation | Implemented, Feishu local OpenAPI self-tested |
 
 ## Agent Adapter Contract
 
@@ -237,8 +241,12 @@ P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块。当�
 - P8 Interface 增加本地多通道 state：`/channels`、`/channels/{channel}/messages`、`/channels/outbox`、`/channels/sessions`，记录 session、dedupe 和 outbox，不伪造外部 IM 平台投递成功。
 - P8 BeliefCore 增加 TTL remaining、source trust、refresh_count、history、expired/stale/conflict 汇总，并开放 `/belief/status` 和 `/belief/refresh`。
 - P8 ReplayRuntime 增加 `/audit/replay/runtime/status|scan|run`，从 ActionJournal 自动扫描失败/需回滚候选，生成受 Guardian review 保护的 R4 compensation proposal，不自动执行 restore。
+- P9 Feishu channel 增加 `/channels/feishu/config`、`/channels/feishu/send`、`/integrations/feishu/events`：支持 app credential 获取 tenant token、发送文本消息、URL verification、`im.message.receive_v1` 文本回调和同会话回复。
+- P9 Runtime Cron 将 `runtime/cron.py` 从占位替换为持久化 bounded scheduler，可触发 active awareness tick，不执行任意外部命令。
+- P9 PersonaEngine 绑定 channel/risk/route/Agent policy，写入 `persona_state.json`，并进入 Agent task packet、execution trace 和 runtime API。
+- P9 ReplayRuntime 增加 `/audit/replay/runtime/config` 和 `/audit/replay/runtime/execute`：只有显式配置和请求同时允许 R4 snapshot restore 时，才会自动 approve review 并通过 ActionExecutor 执行 restore。
 
 后续仍需要的是真实环境验收，而不是本地功能补洞。接口现在明确区分 `implemented`、`configured`、`validated`、`validation_pending`，未配置或未连通的真实运行时不会被标成已连接：
 
-- P6/P8：连接真实 OpenClaw/Hermes/Custom 后运行 certification、multi-Agent invoke、runtime matrix、长任务停止、结果回传、memory diagnostics 和状态过期刷新验收。
-- P7/P8：配置真实 alert webhook、生产 allowlist、API supervisor 和多 runtime soak session 后做长时间验收。
+- P6/P8/P9：连接真实 OpenClaw/Hermes/Custom 和 Feishu 后运行 certification、multi-Agent invoke、runtime matrix、长任务停止、结果回传、memory diagnostics、Feishu callback/send 和状态过期刷新验收。
+- P7/P8/P9：配置真实 alert webhook、生产 allowlist、API supervisor 和多 runtime/chat soak session 后做长时间验收。

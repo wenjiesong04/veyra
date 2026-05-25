@@ -30,9 +30,13 @@ Endpoints:
 - `GET /` runtime identity and status
 - `POST /events/message` normalize a message and run the Awareness Loop
 - `GET /channels` inspect local multi-channel intake state
+- `GET /channels/{channel}/config` inspect a redacted channel configuration
+- `POST /channels/{channel}/config` configure local or Feishu delivery
 - `POST /channels/{channel}/messages` deliver a channel-scoped message with session/dedupe tracking
+- `POST /channels/{channel}/send` send an outbound channel message directly
 - `GET /channels/outbox` inspect local outbox delivery records
 - `GET /channels/sessions` inspect channel session mappings
+- `POST /integrations/feishu/events` receive Feishu URL verification and message callbacks
 - `GET /state` read current Veyra state cache
 - `GET /architecture` read architecture blocks, core module progress, state definitions, and implementation phases
 - `GET /definitions` read lifecycle statuses, operational modes, and risk-level catalog
@@ -42,6 +46,10 @@ Endpoints:
 - `POST /runtime/active-loop/start` start bounded scheduled awareness ticks
 - `POST /runtime/active-loop/stop` stop scheduled awareness ticks
 - `POST /runtime/active-loop/tick` run one awareness tick immediately
+- `GET /runtime/cron` inspect bounded runtime scheduler state
+- `POST /runtime/cron/config` configure the active awareness scheduler job
+- `POST /runtime/cron/run` run a scheduler job immediately
+- `POST /runtime/cron/run-due` run due scheduler jobs
 - `GET /logs/events` read event log entries
 - `GET /logs/actions` read action records
 - `GET /reviews/actions` read blocked or review-needed actions
@@ -64,6 +72,8 @@ Endpoints:
 - `GET /audit/replay/runtime/status` inspect automatic replay/compensation jobs
 - `POST /audit/replay/runtime/scan` scan audit logs for replay candidates
 - `POST /audit/replay/runtime/run` create guarded compensation review jobs for pending candidates
+- `POST /audit/replay/runtime/config` configure guarded replay auto-execution gates
+- `POST /audit/replay/runtime/execute` explicitly auto-approve and execute allowed snapshot restore jobs
 - `GET /audit/time-travel` inspect last-known state from append-only audit logs
 - `GET /agent/status` inspect selected Agent adapter connection status
 - `GET /agents/certification` inspect multi-runtime certification matrix
@@ -81,6 +91,7 @@ Endpoints:
 - `GET /belief/status` inspect claim TTL, freshness, conflicts, and source trust
 - `POST /belief/refresh` refresh and optionally prune stale/expired claims
 - `GET /agency/intentions` read proactive Agency intention queue
+- `GET /personas/status` inspect current persona/channel/Agent binding state
 - `POST /state/refresh-stale` refresh stale belief claims with read-only probes
 - `POST /external/watchlist` add or update an ExternalWorld watch target
 - `POST /external/refresh` refresh ExternalWorld watchlist targets with read-only probes
@@ -222,6 +233,25 @@ Scheduled tick / manual tick
   -> active_loop_state + audit record
 ```
 
+Feishu channel setup:
+
+```bash
+export FEISHU_APP_ID=cli_xxx
+export FEISHU_APP_SECRET=xxx
+export FEISHU_DEFAULT_RECEIVE_ID=oc_xxx
+export FEISHU_VERIFICATION_TOKEN=optional-callback-token
+```
+
+Then enable the channel:
+
+```bash
+curl -X POST http://127.0.0.1:8000/channels/feishu/config \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled":true,"delivery":"feishu","default_receive_id_type":"chat_id"}'
+```
+
+Set the Feishu event callback URL to `/integrations/feishu/events`. Veyra handles URL verification and `im.message.receive_v1` text events. If the app enables encrypted callbacks, decrypt at the edge first; Veyra currently rejects encrypted callback payloads instead of guessing.
+
 Agent runtimes are selected through `state/agent_config.json` or the console Agent Runtime panel. The MVP ships a native OpenClaw Gateway adapter plus compatible HTTP adapters for Hermes and a Custom Agent endpoint. OpenClaw remains the default:
 
 ```bash
@@ -289,10 +319,10 @@ Without a configured base URL, Veyra still builds the task packet but returns `a
 
 - `core`: Runtime Entity, Awareness Loop, active runtime loop, WorldState, Core model reasoning, Decision, Foresight, Guardian, Verifier, Patch/TaskPacket builders
 - `awareness`: Attention, Belief TTL/source-trust lifecycle, Uncertainty, Awareness summary/output
-- `interface`: Intake, event schema/normalizer, local multi-channel routing/dedupe/outbox, channel adapters, OpenClaw WebSocket adapter, and Hermes/Custom HTTP Agent adapters
+- `interface`: Intake, event schema/normalizer, local multi-channel routing/dedupe/outbox, Feishu OpenAPI delivery/callback adapter, channel adapters, OpenClaw WebSocket adapter, and Hermes/Custom HTTP Agent adapters
 - `probes`: system, git, port, process, file, log, network, web, MCP, OpenClaw, and Hermes read-only probe envelopes
 - `tool_proxy`: SafeShell, SafeFile, SafeBrowser, and SafeAPI policy gates with trace logging and optional executor hooks
-- `rollback_audit`: snapshot, diff, ActionJournal timeline, replay plan, automatic replay runtime, compensation review jobs, traces
+- `rollback_audit`: snapshot, diff, ActionJournal timeline, replay plan, automatic replay runtime, compensation review jobs, guarded auto-execute, traces
 - `memory_bridge`: local/selected/runtime/all provider routing, sensitive-memory filtering, provider diagnostics, and external adapter hooks
 - `skills`: built-in skill registry/runtime for fixed low-risk workflows
 - `personas`: Minimalist, Operator, Engineer, Guardian, Steward
