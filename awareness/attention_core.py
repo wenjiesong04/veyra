@@ -21,6 +21,13 @@ class AttentionCore:
             "log": "logs",
             "部署": "deployment",
             "代码": "codebase",
+            "时间": "current_time",
+            "几点": "current_time",
+            "日期": "current_time",
+            "今天": "current_time",
+            "图片": "attachment_context",
+            "截图": "attachment_context",
+            "图上": "attachment_context",
         }
         for marker, item in mapping.items():
             if marker in lowered and item not in focus:
@@ -48,4 +55,6 @@ class AttentionCore:
             probe_priority.append("hermes_probe")
         if "logs" in focus:
             probe_priority.append("log_probe")
+        if "current_time" in focus:
+            probe_priority.append("time_probe")
         return {"probe_priority": list(dict.fromkeys(probe_priority))}

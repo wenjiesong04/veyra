@@ -34,6 +34,7 @@ from probes.openclaw_probe import OpenClawProbe
 from probes.port_probe import PortProbe
 from probes.process_probe import ProcessProbe
 from probes.system_probe import SystemProbe
+from probes.time_probe import TimeProbe
 from probes.web_probe import WebProbe
 from rollback_audit.execution_trace import ExecutionTrace
 from runtime.agent_task_tracker import AgentTaskTracker
@@ -75,6 +76,7 @@ class AwarenessLoop:
         self.skill_loader = SkillLoader()
         self.skill_runtime = SkillRuntime(state_store)
         self.probes = {
+            "time": TimeProbe(),
             "system": SystemProbe(),
             "git": GitProbe(),
             "port": PortProbe(),
@@ -96,7 +98,7 @@ class AwarenessLoop:
         attention_focus = self.attention.focus_for_text(text)
         self.belief.update_from_event(event)
         belief_state = self.belief.refresh()
-        decision = self.decision_core.decide(text=text, attention_focus=attention_focus)
+        decision = self.decision_core.decide(text=text, attention_focus=attention_focus, event=event)
         self.state_store.patch_json("risk_state.json", {"current_risk": decision.risk_level.value})
         persona_patch = self.persona_engine.patch_for(
             text,
@@ -155,7 +157,7 @@ class AwarenessLoop:
                 event_id=event.event_id,
                 route=decision.route,
                 status="success",
-                response=self._direct_answer(text, decision),
+                    response=self._direct_answer(event, decision, attention_focus),
                 risk_level=decision.risk_level,
                 artifacts={
                     "attention": attention_focus,
@@ -165,7 +167,7 @@ class AwarenessLoop:
                 },
             )
         elif decision.route == Route.PROBE:
-            result = self._run_probe(event, decision.selected_probe or "system")
+            result = self._run_probe(event, decision, attention_focus)
         elif decision.route == Route.SKILL:
             result = self._run_skill(event, decision.selected_probe or "")
         elif decision.route == Route.AGENT:
@@ -381,13 +383,25 @@ class AwarenessLoop:
             artifacts=artifacts,
         )
 
-    def _run_probe(self, event: VeyraEvent, probe_name: str) -> LoopResult:
+    def _run_probe(self, event: VeyraEvent, decision: Decision, attention_focus: list[str]) -> LoopResult:
         text = event.payload.get("text", "")
+        probe_name = decision.selected_probe or "system"
         probe = self.probes.get(probe_name, self.probes["system"])
         raw = probe.run(text)
         state_patch = self.perception.interpret_probe_result(raw)
         belief_state = self.belief.refresh()
         verified = self.verifier.verify_probe_result(raw)
+        answer_assist = (
+            self.core_reasoning.probe_answer_assist(
+                text=text,
+                attention_focus=attention_focus,
+                probe_result=raw,
+                decision=decision.to_dict(),
+                event=event,
+            )
+            if self._probe_needs_answer_model(probe_name, raw)
+            else {"status": "skipped", "reason": "deterministic_probe_response"}
+        )
         trace = self.execution_trace.record(
             {
                 "event_id": event.event_id,
@@ -397,30 +411,61 @@ class AwarenessLoop:
                 "status": verified["status"],
                 "execution_result": raw,
                 "verification": verified,
+                "decision": decision.to_dict(),
             }
         )
         return LoopResult(
             event_id=event.event_id,
             route=Route.PROBE,
             status=verified["status"],
-            response=verified["message"],
+            response=self._probe_response(probe_name=probe_name, raw=raw, verified=verified, answer_assist=answer_assist),
             risk_level=RiskLevel.R1,
             artifacts={
                 "probe_result": raw,
                 "state_patch": state_patch,
                 "verification": verified,
+                "decision": decision.to_dict(),
+                "answer_assist": answer_assist,
                 "execution_trace": trace,
                 "uncertainty": self.uncertainty.uncertainty_summary(belief_state.get("claims", [])),
             },
         )
 
-    def _direct_answer(self, text: str, decision: Decision) -> str:
+    def _probe_response(self, *, probe_name: str, raw: dict[str, object], verified: dict[str, object], answer_assist: dict[str, object]) -> str:
+        draft = str(answer_assist.get("draft_response") or answer_assist.get("response") or "").strip()
+        if answer_assist.get("status") == "model_assisted" and draft:
+            return draft
+        if probe_name == "time":
+            details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
+            timezone_name = str(details.get("timezone") or raw.get("target") or "local")
+            date_text = str(details.get("date") or "")
+            time_text = str(details.get("time") or "")
+            offset = str(details.get("utc_offset") or "")
+            if date_text and time_text:
+                return f"{timezone_name} 当前时间是 {date_text} {time_text}（{offset}）。"
+        return str(raw.get("summary") or verified.get("message") or "Probe completed.")
+
+    def _probe_needs_answer_model(self, probe_name: str, raw: dict[str, object]) -> bool:
+        if probe_name in {"time", "port", "process", "git", "system", "openclaw", "hermes", "mcp", "network"}:
+            return False
+        details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
+        return bool(details.get("sample") or details.get("results") or probe_name in {"web", "log", "file"})
+
+    def _direct_answer(self, event: VeyraEvent, decision: Decision, attention_focus: list[str]) -> str:
+        text = str(event.payload.get("text", ""))
         draft = decision.model_assist.get("draft_response") if decision.model_assist else ""
         if draft:
             return str(draft)
+        answer_assist = self.core_reasoning.answer_assist(text=text, attention_focus=attention_focus, decision=decision.to_dict(), event=event)
+        draft = str(answer_assist.get("draft_response") or answer_assist.get("response") or "").strip()
+        if answer_assist.get("status") == "model_assisted" and draft:
+            decision.model_assist = {**decision.model_assist, "answer_assist": answer_assist}
+            return draft
+        if "[feishu image message" in text or "attachment_context" in attention_focus:
+            return "我现在只收到图片/附件事件占位，通道还没有把可读的图片内容传给 Veyra Core。请补充文字描述，或接入 OCR/视觉解析后我再判断图里的问题。"
         if "veyra" in text.lower() or "是什么" in text:
             return "Veyra 是用于产出实时感知的虚拟实体：Awareness Entity + 高权限 Agent Core Middleware + Agent Governance Layer。"
-        return "已由 Veyra 直接处理。当前请求不需要调用工具或 Agent。"
+        return "我需要更多上下文或 Core 模型生成能力，才能给出可靠回答。"
 
     def _update(self, event: VeyraEvent, result: LoopResult) -> None:
         risk_level = result.risk_level.value if hasattr(result.risk_level, "value") else str(result.risk_level)

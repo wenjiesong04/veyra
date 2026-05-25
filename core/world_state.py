@@ -91,6 +91,7 @@ class WorldStateStore:
                     "model": "",
                     "timeout": 20,
                     "decision_mode": "auto",
+                    "max_tokens": 700,
                 },
                 "agents": {
                     "openclaw": {"kind": "openclaw", "base_url": "", "api_key_env": "OPENCLAW_GATEWAY_TOKEN", "enabled": True},

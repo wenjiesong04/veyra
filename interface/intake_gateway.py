@@ -60,7 +60,7 @@ class IntakeGateway:
         if isinstance(seen, dict) and dedupe_id in seen:
             return {"status": "duplicate", "message_id": dedupe_id, "channel": channel_id, "session_id": mapped_session, "previous": seen[dedupe_id]}
 
-        event = self.normalizer.user_message(text=text, channel=channel_id, user_id=user_id, session_id=mapped_session)
+        event = self.normalizer.user_message(text=text, channel=channel_id, user_id=user_id, session_id=mapped_session, metadata=metadata or {})
         inbox_item = {
             "message_id": dedupe_id,
             "event_id": event.event_id,

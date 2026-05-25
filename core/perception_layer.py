@@ -35,7 +35,7 @@ class PerceptionLayer:
             details = dict(enriched.get("details") or {})
             details["anomaly"] = anomaly
             enriched["details"] = details
-        model_assist = self.reasoning.perception_assist(enriched) if self.model_assist_enabled else {"status": "skipped"}
+        model_assist = self.reasoning.perception_assist(enriched) if self._should_model_interpret(enriched) else {"status": "skipped", "reason": "deterministic_perception"}
         if model_assist.get("status") == "model_assisted":
             enriched["model_interpretation"] = self._compact_model_interpretation(model_assist)
             model_anomaly = model_assist.get("anomaly") if isinstance(model_assist.get("anomaly"), dict) else {}
@@ -141,6 +141,17 @@ class PerceptionLayer:
             if any(marker in text for marker in markers):
                 return {"kind": kind, "next_action": "refresh_probe" if kind in {"timeout", "connection_refused"} else "request_configuration"}
         return None
+
+    def _should_model_interpret(self, probe_result: dict[str, Any]) -> bool:
+        if not self.model_assist_enabled:
+            return False
+        details = probe_result.get("details") if isinstance(probe_result.get("details"), dict) else {}
+        if probe_result.get("model_assist") is False or details.get("model_assist") is False or details.get("perception_model_assist") is False:
+            return False
+        probe_name = str(probe_result.get("probe") or "")
+        if probe_name in {"time_probe", "system_probe", "port_probe", "git_probe", "process_probe", "network_probe"} and not probe_result.get("anomaly"):
+            return False
+        return probe_name in {"web_probe", "log_probe", "file_probe", "openclaw_probe", "hermes_probe", "mcp_probe"} or bool(probe_result.get("anomaly"))
 
     def _claims_from_model(self, probe_result: dict[str, Any], model_assist: dict[str, Any]) -> list[dict[str, Any]]:
         if model_assist.get("status") != "model_assisted":

@@ -56,6 +56,8 @@ class FeishuAdapter:
                     "chat_id": chat_id,
                     "chat_type": message.get("chat_type"),
                     "message_type": message.get("message_type"),
+                    "content_text": self._content_text(message),
+                    "attachment_id": self._attachment_id(message),
                     "sender_id": redact_sensitive(sender_id),
                 }
             },
@@ -76,7 +78,41 @@ class FeishuAdapter:
             parsed = {}
         if message_type == "text" or "text" in parsed:
             return str(parsed.get("text") or "").strip() or "[empty feishu text message]"
+        if message_type == "image":
+            return "[feishu image message: image content not available to Veyra Core]"
         return f"[feishu {message_type or 'unknown'} message]"
+
+    def _content_text(self, message: dict[str, Any]) -> str:
+        content = message.get("content")
+        if isinstance(content, str):
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                return content[:500]
+        elif isinstance(content, dict):
+            parsed = content
+        else:
+            parsed = {}
+        for key in ("text", "title", "file_name"):
+            if parsed.get(key):
+                return str(parsed.get(key))[:500]
+        return ""
+
+    def _attachment_id(self, message: dict[str, Any]) -> str:
+        content = message.get("content")
+        if isinstance(content, str):
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                return ""
+        elif isinstance(content, dict):
+            parsed = content
+        else:
+            parsed = {}
+        for key in ("image_key", "file_key", "media_key"):
+            if parsed.get(key):
+                return str(parsed.get(key))[:500]
+        return ""
 
     def _verify_token(self, received: Any) -> bool:
         expected = self._configured_token()

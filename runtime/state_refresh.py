@@ -14,6 +14,7 @@ from probes.openclaw_probe import OpenClawProbe
 from probes.port_probe import PortProbe
 from probes.process_probe import ProcessProbe
 from probes.system_probe import SystemProbe
+from probes.time_probe import TimeProbe
 from probes.web_probe import WebProbe
 
 
@@ -33,6 +34,7 @@ class StateRefresh:
             "port_probe": PortProbe(),
             "process_probe": ProcessProbe(),
             "system_probe": SystemProbe(),
+            "time_probe": TimeProbe(),
             "web_probe": WebProbe(),
         }
 

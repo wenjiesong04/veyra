@@ -5,16 +5,16 @@ from typing import Any
 from core.definitions import RiskLevel, classify_text_risk
 from core.reasoning_core import CoreReasoning, safe_model_risk
 from core.world_state import WorldStateStore
-from interface.event_schema import Decision, Route
+from interface.event_schema import Decision, Route, VeyraEvent
 
 
 class DecisionCore:
     def __init__(self, state_store: WorldStateStore | None = None, reasoning: CoreReasoning | None = None) -> None:
         self.reasoning = reasoning or (CoreReasoning(state_store) if state_store else None)
 
-    def decide(self, text: str, attention_focus: list[str]) -> Decision:
+    def decide(self, text: str, attention_focus: list[str], event: VeyraEvent | None = None) -> Decision:
         base = self._rule_decide(text, attention_focus)
-        return self._apply_model_assist(text, attention_focus, base)
+        return self._apply_model_assist(text, attention_focus, base, event=event)
 
     def _rule_decide(self, text: str, attention_focus: list[str]) -> Decision:
         lowered = text.lower()
@@ -117,16 +117,23 @@ class DecisionCore:
             constraints=["no tool execution"],
         )
 
-    def _apply_model_assist(self, text: str, attention_focus: list[str], base: Decision) -> Decision:
+    def _apply_model_assist(self, text: str, attention_focus: list[str], base: Decision, event: VeyraEvent | None = None) -> Decision:
         if not self.reasoning:
             return base
-        assist = self.reasoning.decision_assist(text=text, attention_focus=attention_focus, rule_decision=base.to_dict())
+        assist = self.reasoning.decision_assist(text=text, attention_focus=attention_focus, rule_decision=base.to_dict(), event=event)
         if assist.get("status") != "model_assisted":
             return base
 
         model_risk = safe_model_risk(assist.get("risk_level"), base.risk_level)
         risk = self._max_risk(base.risk_level, model_risk)
         candidate_route = self._route_from_model(assist.get("route"), base.route)
+        policy_signals: list[str] = []
+        if base.route == Route.PROBE and candidate_route == Route.DIRECT_ANSWER and base.selected_probe:
+            candidate_route = Route.PROBE
+            policy_signals.append("policy:required_probe_preserved")
+        if candidate_route == Route.AGENT and not self._agent_allowed_by_policy(text, base, assist):
+            candidate_route = Route.DIRECT_ANSWER
+            policy_signals.append("policy:agent_route_rejected")
         if risk == RiskLevel.R5:
             route = Route.BLOCK
         elif risk in {RiskLevel.R3, RiskLevel.R4}:
@@ -150,7 +157,7 @@ class DecisionCore:
             selected_probe = self._selected_skill_from_model(assist, base.selected_probe)
 
         reason = str(assist.get("reason") or assist.get("rationale") or "model-assisted core reasoning")
-        signals = self._dedupe(base.signals + self._string_list(assist.get("signals")) + ["model:decision"])
+        signals = self._dedupe(base.signals + self._string_list(assist.get("signals")) + policy_signals + ["model:decision"])
         constraints = self._dedupe(base.constraints + self._string_list(assist.get("constraints")) + ["guardian remains final execution boundary"])
         model_assist = {
             "status": "model_assisted",
@@ -160,6 +167,9 @@ class DecisionCore:
             "confidence": assist.get("confidence"),
             "solution_outline": self._string_list(assist.get("solution_outline")),
             "agent_context": assist.get("agent_context") if isinstance(assist.get("agent_context"), dict) else {},
+            "memory_policy": assist.get("memory_policy") if isinstance(assist.get("memory_policy"), dict) else {},
+            "context_gaps": self._string_list(assist.get("context_gaps")),
+            "needs_observation": bool(assist.get("needs_observation")),
             "draft_response": str(assist.get("draft_response") or assist.get("response") or "")[:2000],
         }
         return self._decision(
@@ -178,6 +188,8 @@ class DecisionCore:
         )
 
     def _probe_for_text(self, lowered: str) -> str | None:
+        if self._asks_current_time(lowered):
+            return "time"
         if "端口" in lowered or "port" in lowered:
             return "port"
         if "git" in lowered or "未提交" in lowered or "工作区" in lowered:
@@ -187,6 +199,13 @@ class DecisionCore:
         if "系统" in lowered or "环境" in lowered:
             return "system"
         return None
+
+    def _asks_current_time(self, lowered: str) -> bool:
+        temporal_markers = ["现在", "当前", "今天", "日期", "几点", "时间", "星期", "today", "date", "time", "now"]
+        if not any(marker in lowered for marker in temporal_markers):
+            return False
+        false_friends = ["耗时", "时间复杂度", "运行时间", "timeout", "timestamp"]
+        return not any(marker in lowered for marker in false_friends)
 
     def _skill_for_text(self, lowered: str) -> str | None:
         if "诊断" in lowered and "openclaw" in lowered:
@@ -211,7 +230,7 @@ class DecisionCore:
         return classify_text_risk(lowered)
 
     def _intent_for_text(self, lowered: str) -> tuple[str, list[str]]:
-        action_markers = ["检查", "查看", "看", "修复", "执行", "修改", "部署", "重启", "创建", "写入", "诊断"]
+        action_markers = ["检查", "查看", "修复", "执行", "修改", "部署", "重启", "创建", "写入", "诊断"]
         if any(marker in lowered for marker in action_markers):
             return "action", ["intent:action"]
         if any(marker in lowered for marker in ["为什么", "是什么", "解释", "说明", "总结"]):
@@ -247,9 +266,20 @@ class DecisionCore:
         return route
 
     def _selected_probe_from_model(self, assist: dict[str, Any], default: str | None) -> str:
-        allowed = {"system", "git", "port", "process", "file", "log", "network", "web", "openclaw", "hermes", "mcp"}
+        allowed = {"time", "system", "git", "port", "process", "file", "log", "network", "web", "openclaw", "hermes", "mcp"}
         selected = str(assist.get("selected_probe") or assist.get("probe") or default or "system")
         return selected if selected in allowed else "system"
+
+    def _agent_allowed_by_policy(self, text: str, base: Decision, assist: dict[str, Any]) -> bool:
+        lowered = text.lower()
+        route_markers = ["修改", "实现", "开发", "重构", "修复", "调试", "多文件", "代码", "部署", "接入", "agent", "openclaw", "hermes"]
+        assist_intent = str(assist.get("intent") or "").lower()
+        assist_complexity = str(assist.get("complexity") or base.complexity).lower()
+        if base.route == Route.AGENT or "agent_required" in base.signals:
+            return True
+        if any(marker in lowered for marker in route_markers):
+            return True
+        return assist_intent in {"action", "implementation", "execution"} and assist_complexity in {"moderate", "complex"}
 
     def _selected_skill_from_model(self, assist: dict[str, Any], default: str | None) -> str:
         allowed = {"diagnose_openclaw", "check_port", "summarize_logs", "safe_git_commit"}

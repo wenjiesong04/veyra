@@ -5,7 +5,33 @@ from typing import Any
 
 from core.definitions import RiskLevel, normalize_risk
 from core.model_client import CoreModelClient, redact_sensitive
+from core.turn_context_builder import TurnContextBuilder
 from core.world_state import WorldStateStore
+from interface.event_schema import VeyraEvent
+
+
+CORE_DECISION_SYSTEM = (
+    "You are Veyra Core's internal cognition layer, not an external agent runtime. "
+    "Return strict JSON only. Veyra is an Awareness Entity: it uses current state, "
+    "belief freshness, attention focus, risk policy, probes, skills, and selected Agent Runtime "
+    "to decide how to answer or solve the user's message. "
+    "Do not answer from stale claims. If fresh local, external, time, status, or attachment evidence "
+    "is required, choose route=probe or ask a focused clarification in draft_response. "
+    "Use route=agent only for implementation, multi-step execution, complex debugging, or capabilities "
+    "that genuinely need the selected Agent Runtime. Ordinary chat and explanations should stay "
+    "route=direct_answer with a natural draft_response. Probe tools collect evidence; do not expose "
+    "raw internal probe summaries as the final conversational style. "
+    "You cannot approve execution, lower risk, bypass Guardian, or ignore allowed_routes."
+)
+
+CORE_ANSWER_SYSTEM = (
+    "You are Veyra Core's answer composer. Reply naturally in the user's language, using the supplied "
+    "turn context. Do not recite architecture slogans unless the user asks about architecture. "
+    "If the user asks about current time/date/status/latest facts and no evidence is supplied, say what "
+    "fresh observation is needed instead of guessing. If an image/attachment is referenced but only an "
+    "attachment placeholder is available, say that Veyra has not received readable image content and ask "
+    "for OCR/description or enabled vision intake. Return strict JSON only."
+)
 
 
 class CoreReasoning:
@@ -18,6 +44,7 @@ class CoreReasoning:
     def __init__(self, state_store: WorldStateStore, client: CoreModelClient | None = None) -> None:
         self.state_store = state_store
         self.client = client or CoreModelClient(state_store)
+        self.turn_context = TurnContextBuilder(state_store)
 
     def status(self) -> dict[str, Any]:
         return self.client.status()
@@ -33,42 +60,138 @@ class CoreReasoning:
             return True
         if kind in {"perception", "agency", "memory", "external_world"}:
             return True
+        if kind in {"answer", "probe_answer"}:
+            return True
         route = str(rule_context.get("route") or "")
         risk = str(rule_context.get("risk_level") or "R0")
         complexity = str(rule_context.get("complexity") or "simple")
         intent = str(rule_context.get("intent") or "unknown")
+        selected_probe = str(rule_context.get("selected_probe") or "")
         if risk == RiskLevel.R5.value:
             return False
+        if kind == "foresight" and route in {"direct_answer", "probe"} and risk in {"R0", "R1"} and complexity == "simple":
+            return False
+        if kind == "decision" and route == "probe" and selected_probe in {"time", "port", "process", "git", "system", "openclaw", "hermes", "mcp", "network"}:
+            return False
+        if route == "direct_answer" and intent in {"information", "unknown"}:
+            return True
         return route in {"agent", "human_review"} or risk in {"R2", "R3", "R4"} or complexity != "simple" or intent == "unknown"
 
-    def decision_assist(self, *, text: str, attention_focus: list[str], rule_decision: dict[str, Any]) -> dict[str, Any]:
+    def decision_assist(
+        self,
+        *,
+        text: str,
+        attention_focus: list[str],
+        rule_decision: dict[str, Any],
+        event: VeyraEvent | None = None,
+    ) -> dict[str, Any]:
         if not self.should_assist("decision", rule_decision):
             return {"status": "skipped"}
-        state = self._decision_state_snapshot(attention_focus)
+        turn_context = self.turn_context.build(user_message=text, attention_focus=attention_focus, event=event, rule_decision=rule_decision)
         payload = {
             "user_message": text,
             "attention_focus": attention_focus,
             "rule_decision": redact_sensitive(rule_decision),
-            "state_snapshot": state,
+            "turn_context": turn_context,
             "allowed_routes": ["direct_answer", "probe", "skill", "agent", "human_review", "block"],
-            "known_probes": ["system", "git", "port", "process", "file", "log", "network", "web", "openclaw", "hermes", "mcp"],
+            "known_probes": ["time", "system", "git", "port", "process", "file", "log", "network", "web", "openclaw", "hermes", "mcp"],
             "known_skills": ["diagnose_openclaw", "check_port", "summarize_logs", "safe_git_commit"],
+            "required_json_fields": {
+                "route": "direct_answer|probe|skill|agent|human_review|block",
+                "risk_level": "R0-R5",
+                "intent": "information|action|implementation|conversation|unknown",
+                "complexity": "simple|moderate|complex",
+                "reason": "short rationale",
+                "selected_probe": "only when route=probe",
+                "draft_response": "natural reply when route=direct_answer or clarification is needed",
+                "needs_observation": "boolean",
+                "context_gaps": "list of missing context/evidence",
+                "memory_policy": {"mode": "ignore|session|long_term", "reason": "why"},
+                "solution_outline": "list for agent/skill plans",
+                "agent_context": "object for agent handoff",
+            },
         }
         result = self.client.complete_json(
             purpose="decision",
-            system=(
-                "You are Veyra Core's internal reasoning layer. Return strict JSON only. "
-                "You may improve intent, complexity, route, selected_probe, selected_skill, "
-                "solution_outline, and agent_context. You cannot approve execution, lower risk, "
-                "or bypass Guardian. Prefer delegating complex implementation to the selected agent "
-                "with concise context and a proposed solution outline."
-            ),
+            system=CORE_DECISION_SYSTEM,
             user=json.dumps(payload, ensure_ascii=False),
         )
         self._trace("decision", result, {"route": rule_decision.get("route"), "risk_level": rule_decision.get("risk_level")})
         return result
 
+    def answer_assist(
+        self,
+        *,
+        text: str,
+        attention_focus: list[str],
+        decision: dict[str, Any],
+        event: VeyraEvent | None = None,
+    ) -> dict[str, Any]:
+        if not self.should_assist("answer", decision):
+            return {"status": "skipped"}
+        payload = {
+            "user_message": text,
+            "decision": redact_sensitive(decision),
+            "turn_context": self.turn_context.build(user_message=text, attention_focus=attention_focus, event=event, rule_decision=decision),
+            "required_json_fields": {
+                "draft_response": "final user-facing reply",
+                "confidence": "0.0-1.0",
+                "memory_policy": {"mode": "ignore|session|long_term", "reason": "why"},
+                "needs_observation": "boolean",
+                "context_gaps": "list",
+            },
+        }
+        result = self.client.complete_json(
+            purpose="answer",
+            system=CORE_ANSWER_SYSTEM,
+            user=json.dumps(payload, ensure_ascii=False),
+        )
+        self._trace("answer", result, {"route": decision.get("route"), "risk_level": decision.get("risk_level")})
+        return result
+
+    def probe_answer_assist(
+        self,
+        *,
+        text: str,
+        attention_focus: list[str],
+        probe_result: dict[str, Any],
+        decision: dict[str, Any],
+        event: VeyraEvent | None = None,
+    ) -> dict[str, Any]:
+        if not self.should_assist("probe_answer", {"route": "probe", "risk_level": "R1", "intent": decision.get("intent", "")}):
+            return {"status": "skipped"}
+        payload = {
+            "user_message": text,
+            "decision": redact_sensitive(decision),
+            "turn_context": self.turn_context.build(user_message=text, attention_focus=attention_focus, event=event, rule_decision=decision),
+            "probe_result": redact_sensitive(probe_result, max_string=2400, max_list=8),
+            "task": "Answer the user using the probe evidence and the turn context. Keep raw internals out of the final style.",
+            "required_json_fields": {
+                "draft_response": "final user-facing reply grounded in probe_result",
+                "confidence": "0.0-1.0",
+                "used_evidence": "list",
+                "memory_policy": {"mode": "ignore|session|long_term", "reason": "why"},
+            },
+        }
+        result = self.client.complete_json(
+            purpose="probe_answer",
+            system=(
+                CORE_ANSWER_SYSTEM
+                + " Use only supplied probe evidence for volatile facts. Mention uncertainty when evidence is missing or stale."
+            ),
+            user=json.dumps(payload, ensure_ascii=False),
+        )
+        self._trace("probe_answer", result, {"probe": probe_result.get("probe"), "status": probe_result.get("status")})
+        return result
+
     def perception_assist(self, probe_result: dict[str, Any]) -> dict[str, Any]:
+        details = probe_result.get("details") if isinstance(probe_result.get("details"), dict) else {}
+        if (
+            probe_result.get("model_assist") is False
+            or details.get("model_assist") is False
+            or details.get("perception_model_assist") is False
+        ):
+            return {"status": "skipped", "reason": "probe_result_has_direct_summary"}
         if not self.should_assist("perception", {"route": "probe", "risk_level": "R1"}):
             return {"status": "skipped"}
         payload = {
@@ -224,6 +347,7 @@ class CoreReasoning:
                 "recent_claims": recent_claims,
                 "attention_focus": attention_focus,
                 "agent_config": self._public_agent_config(state.get("agent_config", {})),
+                "current_time": TurnContextBuilder(self.state_store).build(user_message="", attention_focus=attention_focus).get("current_time", {}),
             }
         )
 

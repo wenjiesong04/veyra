@@ -243,6 +243,7 @@ class CoreModelConfigRequest(BaseModel):
     model: str | None = None
     timeout: float | None = None
     decision_mode: str | None = None
+    max_tokens: int | None = None
 
 
 class ActionProposalRequest(BaseModel):
@@ -594,6 +595,8 @@ async def configure_core_model(request: CoreModelConfigRequest):
         raise HTTPException(status_code=422, detail="decision_mode must be 'auto' or 'always'")
     if "provider" in patch and patch["provider"] != "openai_compatible":
         raise HTTPException(status_code=422, detail="only openai_compatible provider is supported")
+    if "max_tokens" in patch and not 128 <= int(patch["max_tokens"]) <= 2000:
+        raise HTTPException(status_code=422, detail="max_tokens must be between 128 and 2000")
     config = state_store.read_json("agent_config.json")
     core_model = config.setdefault("core_model", {})
     core_model.update(patch)

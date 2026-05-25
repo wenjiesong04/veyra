@@ -41,6 +41,7 @@ from interface.agent_adapter import AgentAdapter, ExecutionResult  # noqa: E402
 from interface.event_schema import Route, VeyraTaskPacket  # noqa: E402
 from memory_bridge.local_memory_bridge import LocalMemoryBridge  # noqa: E402
 from probes.network_probe import NetworkProbe  # noqa: E402
+from probes.time_probe import TimeProbe  # noqa: E402
 from probes.web_probe import WebProbe  # noqa: E402
 from rollback_audit.diff_tracker import DiffTracker  # noqa: E402
 from rollback_audit.action_journal import ActionJournal  # noqa: E402
@@ -103,6 +104,8 @@ class FakeCoreReasoning:
         foresight: dict[str, Any] | None = None,
         memory: dict[str, Any] | None = None,
         external_world: dict[str, Any] | None = None,
+        answer: dict[str, Any] | None = None,
+        probe_answer: dict[str, Any] | None = None,
     ) -> None:
         self.decision = decision or {"status": "skipped"}
         self.perception = perception or {"status": "skipped"}
@@ -110,6 +113,8 @@ class FakeCoreReasoning:
         self.foresight = foresight or {"status": "skipped"}
         self.memory = memory or {"status": "skipped"}
         self.external_world = external_world or {"status": "skipped"}
+        self.answer = answer or {"status": "skipped"}
+        self.probe_answer = probe_answer or {"status": "skipped"}
 
     def status(self) -> dict[str, Any]:
         return {"enabled": True, "configured": True, "decision_mode": "always", "status": "configured"}
@@ -120,8 +125,22 @@ class FakeCoreReasoning:
     def should_assist(self, kind: str, rule_context: dict[str, Any]) -> bool:
         return True
 
-    def decision_assist(self, *, text: str, attention_focus: list[str], rule_decision: dict[str, Any]) -> dict[str, Any]:
+    def decision_assist(self, *, text: str, attention_focus: list[str], rule_decision: dict[str, Any], event: Any = None) -> dict[str, Any]:
         return self.decision
+
+    def answer_assist(self, *, text: str, attention_focus: list[str], decision: dict[str, Any], event: Any = None) -> dict[str, Any]:
+        return self.answer
+
+    def probe_answer_assist(
+        self,
+        *,
+        text: str,
+        attention_focus: list[str],
+        probe_result: dict[str, Any],
+        decision: dict[str, Any],
+        event: Any = None,
+    ) -> dict[str, Any]:
+        return self.probe_answer
 
     def perception_assist(self, probe_result: dict[str, Any]) -> dict[str, Any]:
         return self.perception
@@ -278,6 +297,32 @@ def main() -> int:
             reasoning=FakeCoreReasoning(decision={"status": "model_assisted", "route": "direct_answer", "risk_level": "R0", "reason": "safe"}),
         ).decide("rm -rf /tmp/veyra-danger", [])
         expect(blocked_decision.route == Route.BLOCK and blocked_decision.risk_level.value == "R5", "core model cannot lower R5 risk", blocked_decision.to_dict())
+
+        time_decision = DecisionCore(app_module.state_store, reasoning=FakeCoreReasoning()).decide("现在东京时间是几点", [])
+        expect(time_decision.route == Route.PROBE and time_decision.selected_probe == "time", "volatile time question routes to time probe", time_decision.to_dict())
+        time_probe = TimeProbe().run("现在东京时间是几点")
+        expect(time_probe["probe"] == "time_probe" and time_probe["details"]["timezone"] == "Asia/Tokyo", "time probe returns Tokyo evidence", time_probe)
+        time_preserved = DecisionCore(
+            app_module.state_store,
+            reasoning=FakeCoreReasoning(decision={"status": "model_assisted", "route": "direct_answer", "risk_level": "R0", "reason": "guessed", "draft_response": "猜一个时间"}),
+        ).decide("现在东京时间是几点", [])
+        expect(time_preserved.route == Route.PROBE and "policy:required_probe_preserved" in time_preserved.signals, "model cannot replace required fresh probe with guess", time_preserved.to_dict())
+
+        agent_rejected = DecisionCore(
+            app_module.state_store,
+            reasoning=FakeCoreReasoning(
+                decision={
+                    "status": "model_assisted",
+                    "route": "agent",
+                    "risk_level": "R0",
+                    "intent": "conversation",
+                    "complexity": "simple",
+                    "reason": "mistaken delegation",
+                    "draft_response": "这是普通对话，不需要 Agent。",
+                }
+            ),
+        ).decide("你现在是谁在接收消息", [])
+        expect(agent_rejected.route == Route.DIRECT_ANSWER and "policy:agent_route_rejected" in agent_rejected.signals, "simple chat cannot be escalated to agent by model alone", agent_rejected.to_dict())
 
         perception = PerceptionLayer(
             app_module.state_store,
