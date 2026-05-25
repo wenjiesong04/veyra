@@ -9,7 +9,7 @@ ARCHITECTURE_BLOCKS: list[dict[str, Any]] = [
     {
         "id": "core",
         "name": "Veyra Core",
-        "role": "Awareness, state, attention, model-assisted reasoning, decision, risk governance, verification, and patch generation.",
+        "role": "Awareness, active runtime loop, state, attention, model-assisted reasoning, decision, risk governance, verification, and patch generation.",
         "paths": ["core/", "awareness/", "decision/", "foresight/", "guardian/"],
         "status": "implemented",
         "validation_state": "local_self_tested",
@@ -17,7 +17,7 @@ ARCHITECTURE_BLOCKS: list[dict[str, Any]] = [
     {
         "id": "interface_adapter",
         "name": "Interface Adapter / Agent Adapter",
-        "role": "Normalize inbound events and connect the selected Agent Runtime.",
+        "role": "Normalize multi-channel inbound events and connect one or more validated Agent runtimes.",
         "paths": ["interface/"],
         "status": "implemented",
         "validation_state": "external_runtime_validation_pending",
@@ -57,7 +57,7 @@ ARCHITECTURE_BLOCKS: list[dict[str, Any]] = [
     {
         "id": "rollback_audit",
         "name": "Rollback / Audit",
-        "role": "Record traces, snapshots, diffs, rollback actions, and replayable execution evidence.",
+        "role": "Record traces, snapshots, diffs, rollback actions, replayable execution evidence, and automatic compensation review jobs.",
         "paths": ["rollback_audit/", "state/*.jsonl", "state/snapshots/"],
         "status": "implemented",
         "validation_state": "local_self_tested",
@@ -74,14 +74,15 @@ ARCHITECTURE_BLOCKS: list[dict[str, Any]] = [
 
 
 CORE_MODULES: list[dict[str, str]] = [
-    {"id": "runtime_entity", "path": "core/runtime_entity.py", "status": "mvp_foundation"},
-    {"id": "awareness_loop", "path": "core/awareness_loop.py", "status": "mvp_foundation"},
+    {"id": "runtime_entity", "path": "core/runtime_entity.py", "status": "p8_continuous_entity"},
+    {"id": "awareness_loop", "path": "core/awareness_loop.py", "status": "p8_continuous_entity"},
+    {"id": "active_runtime_loop", "path": "runtime/active_loop.py", "status": "p8_continuous_entity"},
     {"id": "attention_core", "path": "awareness/attention_core.py", "status": "mvp_foundation"},
-    {"id": "belief_uncertainty_core", "path": "awareness/belief_core.py", "status": "mvp_foundation"},
+    {"id": "belief_uncertainty_core", "path": "awareness/belief_core.py", "status": "p8_deep_ttl"},
     {"id": "world_state", "path": "core/world_state.py", "status": "mvp_foundation"},
     {"id": "core_model_client", "path": "core/model_client.py", "status": "p6_model_assisted"},
     {"id": "core_reasoning", "path": "core/reasoning_core.py", "status": "p6_model_assisted"},
-    {"id": "agency_core", "path": "core/agency_core.py", "status": "p6_model_assisted"},
+    {"id": "agency_core", "path": "core/agency_core.py", "status": "p8_proactive_runtime"},
     {"id": "perception_layer", "path": "core/perception_layer.py", "status": "p6_model_assisted"},
     {"id": "persona_engine", "path": "core/persona_engine.py", "status": "mvp_foundation"},
     {"id": "decision_core", "path": "core/decision_core.py", "status": "p6_model_assisted"},
@@ -89,6 +90,8 @@ CORE_MODULES: list[dict[str, str]] = [
     {"id": "guardian_execution_controller", "path": "core/guardian_controller.py", "status": "mvp_foundation"},
     {"id": "verifier", "path": "core/verifier.py", "status": "p4_completed"},
     {"id": "context_patch_builder", "path": "core/context_patch_builder.py", "status": "mvp_foundation"},
+    {"id": "agent_orchestrator", "path": "runtime/agent_orchestrator.py", "status": "p8_validated_multi_agent"},
+    {"id": "replay_runtime", "path": "rollback_audit/replay_runtime.py", "status": "p8_auto_replay"},
 ]
 
 
@@ -150,6 +153,27 @@ STATE_DEFINITIONS: list[dict[str, Any]] = [
         "freshness": "probe_backed",
     },
     {
+        "id": "channel_state",
+        "file": "state/channel_state.json",
+        "owner": "Interface.ChannelRouter",
+        "purpose": "Multi-channel intake sessions, dedupe records, and local outbox delivery records.",
+        "freshness": "append_only_runtime",
+    },
+    {
+        "id": "active_loop_state",
+        "file": "state/active_loop_state.json",
+        "owner": "Runtime.ActiveRuntimeLoop",
+        "purpose": "Continuous awareness loop lifecycle, schedule, recent ticks, and step outcomes.",
+        "freshness": "scheduled_runtime",
+    },
+    {
+        "id": "replay_runtime_state",
+        "file": "state/replay_runtime_state.json",
+        "owner": "RollbackAudit.ReplayRuntime",
+        "purpose": "Automatic replay/compensation candidates, review job state, and scan timestamps.",
+        "freshness": "audit_derived",
+    },
+    {
         "id": "execution_trace",
         "file": "state/execution_trace.jsonl",
         "owner": "RollbackAudit.ExecutionTrace",
@@ -175,6 +199,7 @@ IMPLEMENTATION_PHASES: list[dict[str, str]] = [
     {"phase": "P5", "name": "Web Control Console completeness", "status": "completed", "validation_state": "build_verified"},
     {"phase": "P6", "name": "End-to-end runtime hardening", "status": "implemented", "validation_state": "live_runtime_validation_pending"},
     {"phase": "P7", "name": "Production operations and safety validation", "status": "implemented", "validation_state": "production_soak_validation_pending"},
+    {"phase": "P8", "name": "Continuous awareness entity runtime", "status": "implemented", "validation_state": "bounded_local_self_tested"},
 ]
 
 

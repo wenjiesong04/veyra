@@ -100,6 +100,13 @@ soak_runner = SoakRunner(
     adapter_resolver=lambda: awareness_loop.agent_registry.selected(),
     verifier=awareness_loop.verifier,
 )
+replay_runtime = ReplayRuntime(
+    state_store=state_store,
+    replay=replay_engine,
+    journal=action_journal,
+    review_queue=review_queue,
+    foresight_engine=foresight_engine,
+)
 active_loop = ActiveRuntimeLoop(
     state_store=state_store,
     runtime_entity=runtime_entity,
@@ -111,13 +118,7 @@ active_loop = ActiveRuntimeLoop(
     task_tracker=awareness_loop.task_tracker,
     adapter_resolver=lambda: awareness_loop.agent_registry.selected(),
     verifier=awareness_loop.verifier,
-)
-replay_runtime = ReplayRuntime(
-    state_store=state_store,
-    replay=replay_engine,
-    journal=action_journal,
-    review_queue=review_queue,
-    foresight_engine=foresight_engine,
+    replay_runtime=replay_runtime,
 )
 agent_orchestrator = AgentOrchestrator(
     state_store=state_store,
@@ -773,10 +774,11 @@ async def belief_status(limit: int = 50):
 @app.post("/belief/refresh")
 async def belief_refresh(request: BeliefRefreshRequest | None = None):
     payload = request or BeliefRefreshRequest()
-    return awareness_loop.belief.refresh(
+    result = awareness_loop.belief.refresh(
         expire_after_seconds=payload.expire_after_seconds,
         prune_expired_after_seconds=payload.prune_expired_after_seconds,
     )
+    return {"status": "success", **result}
 
 
 @app.get("/ops/safety/red-team")

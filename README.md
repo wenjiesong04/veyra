@@ -29,11 +29,19 @@ Endpoints:
 
 - `GET /` runtime identity and status
 - `POST /events/message` normalize a message and run the Awareness Loop
+- `GET /channels` inspect local multi-channel intake state
+- `POST /channels/{channel}/messages` deliver a channel-scoped message with session/dedupe tracking
+- `GET /channels/outbox` inspect local outbox delivery records
+- `GET /channels/sessions` inspect channel session mappings
 - `GET /state` read current Veyra state cache
 - `GET /architecture` read architecture blocks, core module progress, state definitions, and implementation phases
 - `GET /definitions` read lifecycle statuses, operational modes, and risk-level catalog
 - `GET /heartbeat` read the runtime heartbeat
 - `GET /runtime` read runtime identity/lifecycle
+- `GET /runtime/active-loop` inspect the continuous awareness loop
+- `POST /runtime/active-loop/start` start bounded scheduled awareness ticks
+- `POST /runtime/active-loop/stop` stop scheduled awareness ticks
+- `POST /runtime/active-loop/tick` run one awareness tick immediately
 - `GET /logs/events` read event log entries
 - `GET /logs/actions` read action records
 - `GET /reviews/actions` read blocked or review-needed actions
@@ -53,8 +61,14 @@ Endpoints:
 - `GET /audit/journal` inspect correlated event/action/tool/policy/execution/memory/model timeline
 - `GET /audit/replay/{trace_id}` build a non-destructive replay plan
 - `POST /audit/replay/{trace_id}/propose` turn a snapshot-backed replay plan into a guarded review item
+- `GET /audit/replay/runtime/status` inspect automatic replay/compensation jobs
+- `POST /audit/replay/runtime/scan` scan audit logs for replay candidates
+- `POST /audit/replay/runtime/run` create guarded compensation review jobs for pending candidates
 - `GET /audit/time-travel` inspect last-known state from append-only audit logs
 - `GET /agent/status` inspect selected Agent adapter connection status
+- `GET /agents/certification` inspect multi-runtime certification matrix
+- `POST /agents/certification/run` certify OpenClaw/Hermes/Custom runtime surfaces
+- `POST /agents/invoke` invoke one or more validated configured Agent runtimes
 - `GET /agent/tasks/{task_id}` poll selected Agent task status
 - `POST /agent/tasks/refresh` refresh all pending selected Agent tasks
 - `POST /agent/tasks/{task_id}/stop` request selected Agent task stop
@@ -64,6 +78,8 @@ Endpoints:
 - `GET /memory/providers` list available MemoryBridge providers
 - `GET /memory/providers/diagnostics` run read-only MemoryBridge provider diagnostics
 - `POST /memory/providers/diagnostics` optionally run provider diagnostics with a write probe
+- `GET /belief/status` inspect claim TTL, freshness, conflicts, and source trust
+- `POST /belief/refresh` refresh and optionally prune stale/expired claims
 - `GET /agency/intentions` read proactive Agency intention queue
 - `POST /state/refresh-stale` refresh stale belief claims with read-only probes
 - `POST /external/watchlist` add or update an ExternalWorld watch target
@@ -192,6 +208,20 @@ Complex task
   -> MemoryBridge
 ```
 
+Continuous awareness flow:
+
+```text
+Scheduled tick / manual tick
+  -> heartbeat
+  -> pending Agent task refresh
+  -> stale Belief TTL refresh
+  -> proactive local/external probes
+  -> ExternalWorld watchlist refresh
+  -> automatic replay scan + guarded compensation review creation
+  -> retention summary
+  -> active_loop_state + audit record
+```
+
 Agent runtimes are selected through `state/agent_config.json` or the console Agent Runtime panel. The MVP ships a native OpenClaw Gateway adapter plus compatible HTTP adapters for Hermes and a Custom Agent endpoint. OpenClaw remains the default:
 
 ```bash
@@ -211,6 +241,9 @@ Useful endpoints:
 - `GET /agents`
 - `POST /agents/select`
 - `POST /agents/{name}/config`
+- `GET /agents/certification`
+- `POST /agents/certification/run`
+- `POST /agents/invoke`
 - `GET /agent/status`
 - `GET /core/model/status`
 - `POST /core/model/config`
@@ -250,16 +283,16 @@ Hermes and Custom HTTP adapters expect these runtime endpoints by default:
 - `POST /memory/patch`
 - `POST /tasks/{task_id}/stop`
 
-Without a configured base URL, Veyra still builds the task packet but returns `adapter_unconfigured` instead of pretending that an Agent task was sent.
+Without a configured base URL, Veyra still builds the task packet but returns `adapter_unconfigured` instead of pretending that an Agent task was sent. Multi-Agent invocation requires at least one configured and certified runtime; unconfigured runtimes are skipped, R3/R4 requests become review-needed, and R5 requests are blocked.
 
 ## Implemented Architecture Slices
 
-- `core`: Runtime Entity, Awareness Loop, WorldState, Core model reasoning, Decision, Foresight, Guardian, Verifier, Patch/TaskPacket builders
-- `awareness`: Attention, Belief, Uncertainty, Awareness summary/output
-- `interface`: Intake, event schema/normalizer, channel adapters, OpenClaw WebSocket adapter, and Hermes/Custom HTTP Agent adapters
+- `core`: Runtime Entity, Awareness Loop, active runtime loop, WorldState, Core model reasoning, Decision, Foresight, Guardian, Verifier, Patch/TaskPacket builders
+- `awareness`: Attention, Belief TTL/source-trust lifecycle, Uncertainty, Awareness summary/output
+- `interface`: Intake, event schema/normalizer, local multi-channel routing/dedupe/outbox, channel adapters, OpenClaw WebSocket adapter, and Hermes/Custom HTTP Agent adapters
 - `probes`: system, git, port, process, file, log, network, web, MCP, OpenClaw, and Hermes read-only probe envelopes
 - `tool_proxy`: SafeShell, SafeFile, SafeBrowser, and SafeAPI policy gates with trace logging and optional executor hooks
-- `rollback_audit`: snapshot, diff, ActionJournal timeline, replay plan, compensation plan, traces
+- `rollback_audit`: snapshot, diff, ActionJournal timeline, replay plan, automatic replay runtime, compensation review jobs, traces
 - `memory_bridge`: local/selected/runtime/all provider routing, sensitive-memory filtering, provider diagnostics, and external adapter hooks
 - `skills`: built-in skill registry/runtime for fixed low-risk workflows
 - `personas`: Minimalist, Operator, Engineer, Guardian, Steward

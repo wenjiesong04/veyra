@@ -9,25 +9,25 @@
 
 | Block | 代码位置 | 当前状态 | 下一步 |
 | --- | --- | --- | --- |
-| Veyra Core | `core/`, `awareness/`, `decision/`, `foresight/`, `guardian/` | MVP foundation | 强化 Belief/Uncertainty、Agency、Verifier |
-| Interface Adapter / Agent Adapter | `interface/` | MVP foundation | 补完整 Agent contract 测试和错误归一化 |
-| Probe Tools | `probes/` | MVP foundation | 扩展更多真实 runtime probe 和异常模式识别 |
-| Memory Bridge | `memory_bridge/` | MVP foundation | 加敏感信息过滤和过期 memory 标记 |
-| Skill | `skills/` | MVP foundation | 把内置 skill 输出统一成 ExecutionResult |
-| Tool Proxy | `tool_proxy/` | MVP foundation | 扩展真实 Browser/API 执行适配器 |
-| Rollback / Audit | `rollback_audit/` | P4 completed | 扩展 replay 和长期审计留存策略 |
-| Web Control UI | `web/`, `ui/` | P5 completed | 下一步接入更完整的生产监控与告警 |
+| Veyra Core | `core/`, `awareness/`, `decision/`, `foresight/`, `guardian/`, `runtime/active_loop.py` | P8 continuous entity | 生产 supervisor 下的长期运行验收 |
+| Interface Adapter / Agent Adapter | `interface/`, `runtime/agent_orchestrator.py` | P8 multi-channel / multi-Agent | 连接真实 Hermes/Custom 后做多 runtime soak |
+| Probe Tools | `probes/` | P7 implemented | 按真实部署扩展更多环境专属 probe |
+| Memory Bridge | `memory_bridge/` | P8 deep TTL metadata | 外部 memory provider 的生产语义验收 |
+| Skill | `skills/` | P6 implemented | 增加更多低风险内置 skill 时保持 ExecutionResult 统一 |
+| Tool Proxy | `tool_proxy/` | P7 implemented | 按生产 allowlist 开启 Browser/API executor |
+| Rollback / Audit | `rollback_audit/` | P8 auto replay | 真实副作用 replay 继续保持人工确认边界 |
+| Web Control UI | `web/`, `ui/` | P7 fixed workbench | 后续只接入新增生产指标，不引入 mock 数据 |
 
 ## Veyra Core 子模块
 
 | Module | 代码位置 | 当前状态 |
 | --- | --- | --- |
-| Runtime Entity | `core/runtime_entity.py` | MVP foundation |
-| Awareness Loop | `core/awareness_loop.py` | MVP foundation |
+| Runtime Entity | `core/runtime_entity.py` | P8 continuous entity |
+| Awareness Loop | `core/awareness_loop.py`, `runtime/active_loop.py` | P8 continuous entity |
 | Attention Core | `awareness/attention_core.py` | MVP foundation |
-| Belief & Uncertainty Core | `awareness/belief_core.py`, `awareness/uncertainty_core.py` | MVP foundation |
+| Belief & Uncertainty Core | `awareness/belief_core.py`, `awareness/uncertainty_core.py` | P8 deep TTL/source trust |
 | WorldState | `core/world_state.py`, `state/*.json` | MVP foundation |
-| Agency Core | `core/agency_core.py`, `agency/` | Placeholder |
+| Agency Core | `core/agency_core.py`, `agency/` | P8 proactive runtime |
 | Perception Layer | `core/perception_layer.py` | MVP foundation |
 | Persona Engine | `core/persona_engine.py`, `personas/` | MVP foundation |
 | Decision Core | `core/decision_core.py`, `decision/` | MVP foundation |
@@ -35,6 +35,8 @@
 | Guardian / Execution Controller | `core/guardian_controller.py`, `execution/` | MVP foundation |
 | Verifier | `core/verifier.py` | P4 completed |
 | Context / Patch Builder | `core/context_patch_builder.py`, `core/*_patch_builder.py` | MVP foundation |
+| Agent Orchestrator | `runtime/agent_orchestrator.py` | P8 validated multi-Agent |
+| Replay Runtime | `rollback_audit/replay_runtime.py` | P8 automatic replay |
 
 ## 生命周期状态
 
@@ -80,6 +82,9 @@
 | TaskState | `state/task_state.json` | AwarenessLoop | 当前任务、route、status、历史 |
 | AttentionState | `state/attention_state.json` | AttentionCore | 当前关注切片、忽略噪声、上下文范围 |
 | ExecutorState | `state/executor_state.json` | AgentAdapter | 选定执行体、连接状态、能力状态 |
+| ChannelState | `state/channel_state.json` | Interface.ChannelRouter | 多通道 session、dedupe、outbox |
+| ActiveLoopState | `state/active_loop_state.json` | Runtime.ActiveRuntimeLoop | 定时主动循环状态、tick、步骤结果 |
+| ReplayRuntimeState | `state/replay_runtime_state.json` | RollbackAudit.ReplayRuntime | 自动 replay 候选、job、scan 时间 |
 
 ## Probe 与 Belief 规则
 
@@ -151,6 +156,7 @@ P2 已将 Tool Proxy 接入统一策略审查：
 | P5 | Web Control Console completeness | Completed |
 | P6 | End-to-end runtime hardening | Implemented, live runtime validation pending |
 | P7 | Production operations and safety validation | Implemented, production soak validation pending |
+| P8 | Continuous awareness entity runtime | Implemented, bounded local self-tested |
 
 ## Agent Adapter Contract
 
@@ -226,8 +232,13 @@ P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块。当�
 - network / web / hermes / mcp probe 改为真实只读探测，并由 PerceptionLayer 标记常见异常；stale belief 可通过只读 probe 刷新。
 - Memory Bridge 增加外部 adapter hook、敏感信息阻断和 freshness / trust 标记。
 - P7 增加非破坏性红队安全检查、日志保留策略执行和 bounded/session soak API。
+- P8 ActiveRuntimeLoop 增加 `/runtime/active-loop`、start/stop/tick API：定时执行 heartbeat、pending Agent task refresh、stale Belief refresh、主动 probe、ExternalWorld refresh、Replay runtime 和 retention summary；可选 runtime matrix。
+- P8 AgentOrchestrator 增加 `/agents/certification`、`/agents/certification/run`、`/agents/invoke`：用户可以指定一个或多个 Agent；未配置或未认证 adapter 会被跳过，R3/R4 进入 review，R5 阻断。
+- P8 Interface 增加本地多通道 state：`/channels`、`/channels/{channel}/messages`、`/channels/outbox`、`/channels/sessions`，记录 session、dedupe 和 outbox，不伪造外部 IM 平台投递成功。
+- P8 BeliefCore 增加 TTL remaining、source trust、refresh_count、history、expired/stale/conflict 汇总，并开放 `/belief/status` 和 `/belief/refresh`。
+- P8 ReplayRuntime 增加 `/audit/replay/runtime/status|scan|run`，从 ActionJournal 自动扫描失败/需回滚候选，生成受 Guardian review 保护的 R4 compensation proposal，不自动执行 restore。
 
 后续仍需要的是真实环境验收，而不是本地功能补洞。接口现在明确区分 `implemented`、`configured`、`validated`、`validation_pending`，未配置或未连通的真实运行时不会被标成已连接：
 
-- P6：连接真实 OpenClaw/Hermes/Custom 后运行 runtime matrix、长任务停止、结果回传、memory diagnostics 和状态过期刷新验收。
-- P7：配置真实 alert webhook、生产 allowlist 和多 runtime soak session 后做长时间验收。
+- P6/P8：连接真实 OpenClaw/Hermes/Custom 后运行 certification、multi-Agent invoke、runtime matrix、长任务停止、结果回传、memory diagnostics 和状态过期刷新验收。
+- P7/P8：配置真实 alert webhook、生产 allowlist、API supervisor 和多 runtime soak session 后做长时间验收。
