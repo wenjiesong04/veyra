@@ -27,6 +27,19 @@ class WorldStateStore:
             "belief_state.json": {"claims": [], "summary": {"fresh": 0, "stale": 0, "conflict": 0, "total": 0}},
             "task_state.json": {"current_task": None, "history": []},
             "attention_state.json": {"focus": [], "ignored_noise": []},
+            "channel_state.json": {
+                "channels": {
+                    "api": {"enabled": True, "delivery": "local_outbox"},
+                    "cli": {"enabled": True, "delivery": "local_outbox"},
+                    "console": {"enabled": True, "delivery": "local_outbox"},
+                    "webhook": {"enabled": True, "delivery": "local_outbox"},
+                    "feishu": {"enabled": False, "delivery": "local_outbox"},
+                },
+                "sessions": {},
+                "seen_message_ids": {},
+                "inbox": [],
+                "outbox": [],
+            },
             "state_schema.json": {
                 "version": 1,
                 "state_definitions": STATE_DEFINITIONS,
@@ -166,6 +179,7 @@ class WorldStateStore:
             "belief_state": self.read_json("belief_state.json"),
             "task_state": self.read_json("task_state.json"),
             "attention_state": self.read_json("attention_state.json"),
+            "channel_state": self.read_json("channel_state.json"),
             "state_schema": self.read_json("state_schema.json"),
             "review_queue": self.read_json("review_queue.json"),
             "rollback_state": self.read_json("rollback_state.json"),

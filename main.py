@@ -20,6 +20,7 @@ from interface.agent_contract import contract_summary
 from interface.agent_adapter import ExecutionResult
 from interface.event_normalizer import EventNormalizer
 from interface.event_schema import Decision, Route, utc_now_iso
+from interface.intake_gateway import IntakeGateway
 from pydantic import Field
 from rollback_audit.rollback_manager import RollbackManager
 from rollback_audit.diff_tracker import DiffTracker
@@ -50,6 +51,7 @@ state_store = WorldStateStore()
 runtime_entity = RuntimeEntity(state_store=state_store)
 awareness_loop = AwarenessLoop(state_store=state_store, runtime_entity=runtime_entity)
 event_normalizer = EventNormalizer()
+intake_gateway = IntakeGateway(awareness_loop, event_normalizer, state_store=state_store)
 console_dir = Path("ui/console")
 review_queue = ReviewQueue(state_store)
 rollback_manager = RollbackManager(state_store)
@@ -123,6 +125,8 @@ class MessageRequest(BaseModel):
     channel: str = "webhook"
     user_id: str = "local-user"
     session_id: str = "local-session"
+    message_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ReviewDecisionRequest(BaseModel):
@@ -403,13 +407,46 @@ def _deployment_readiness() -> dict[str, Any]:
 
 @app.post("/events/message")
 async def message(request: MessageRequest):
-    event = event_normalizer.user_message(
+    receipt = intake_gateway.receive_message(
         text=request.text,
         channel=request.channel,
         user_id=request.user_id,
         session_id=request.session_id,
+        message_id=request.message_id,
+        metadata=request.metadata,
     )
-    return awareness_loop.handle_event(event).to_dict()
+    if receipt.get("status") == "duplicate":
+        return {"event_id": receipt.get("previous", {}).get("event_id"), "route": "duplicate", "status": "duplicate", "response": "Duplicate message ignored.", "risk_level": "R0", "artifacts": receipt}
+    if receipt.get("status") != "delivered":
+        return {"event_id": None, "route": "block", "status": receipt.get("status"), "response": receipt.get("reason", "Channel intake rejected."), "risk_level": "R0", "artifacts": receipt}
+    return receipt["loop_result"]
+
+
+@app.get("/channels")
+async def channels_status():
+    return intake_gateway.channel_status()
+
+
+@app.post("/channels/{channel}/messages")
+async def channel_message(channel: str, request: MessageRequest):
+    return intake_gateway.receive_message(
+        text=request.text,
+        channel=channel,
+        user_id=request.user_id,
+        session_id=request.session_id,
+        message_id=request.message_id,
+        metadata=request.metadata,
+    )
+
+
+@app.get("/channels/outbox")
+async def channels_outbox(limit: int = 100):
+    return intake_gateway.outbox(limit=limit)
+
+
+@app.get("/channels/sessions")
+async def channels_sessions():
+    return intake_gateway.sessions()
 
 
 @app.get("/state")
@@ -1115,6 +1152,10 @@ async def mvp_status():
     runtime_validation = _runtime_validation_summary(agent_status_data)
     implemented_loops = {
         "direct_answer": True,
+        "multi_channel_intake": True,
+        "channel_outbox": True,
+        "channel_session_mapping": True,
+        "channel_dedupe": True,
         "probe_route": True,
         "skill_route": True,
         "human_review_queue": True,
