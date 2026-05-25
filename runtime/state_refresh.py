@@ -38,7 +38,11 @@ class StateRefresh:
 
     def refresh_stale(self, limit: int = 20) -> dict[str, Any]:
         claims = self.state_store.read_json("belief_state.json").get("claims", [])
-        stale = [claim for claim in claims if isinstance(claim, dict) and claim.get("status") == "stale" and claim.get("next_action") == "refresh_probe"]
+        stale = [
+            claim
+            for claim in claims
+            if isinstance(claim, dict) and claim.get("status") in {"stale", "expired", "conflict"} and claim.get("next_action") == "refresh_probe"
+        ]
         refreshed: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         for claim in stale[:limit]:

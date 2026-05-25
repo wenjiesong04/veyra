@@ -17,6 +17,7 @@ def make_claim(
     observed_at: str | None = None,
     status: str = "fresh",
     next_action: str | None = None,
+    source_trust: float | None = None,
 ) -> dict[str, Any]:
     timestamp = observed_at or utc_now_iso()
     payload: dict[str, Any] = {
@@ -29,6 +30,7 @@ def make_claim(
         "ttl_seconds": ttl_seconds,
         "expires_at": _expires_at(timestamp, ttl_seconds),
         "status": status,
+        "source_trust": _source_trust(source) if source_trust is None else max(0.0, min(1.0, source_trust)),
         "evidence": evidence or {},
     }
     if next_action:
@@ -36,19 +38,30 @@ def make_claim(
     return payload
 
 
-def refresh_claim_status(claim: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+def refresh_claim_status(claim: dict[str, Any], now: datetime | None = None, *, expire_after_seconds: int | None = None) -> dict[str, Any]:
     updated = dict(claim)
-    if updated.get("status") == "conflict":
-        return updated
+    current_time = now or datetime.now(timezone.utc)
     expires_at = _parse_iso(str(updated.get("expires_at") or ""))
     if expires_at is None:
         observed_at = str(updated.get("updated_at") or updated.get("observed_at") or utc_now_iso())
         ttl_seconds = int(updated.get("ttl_seconds") or 0)
         expires_at = _parse_iso(_expires_at(observed_at, ttl_seconds))
         updated["expires_at"] = expires_at.isoformat() if expires_at else None
-    if expires_at and (now or datetime.now(timezone.utc)) > expires_at:
+    observed = _parse_iso(str(updated.get("observed_at") or updated.get("updated_at") or "")) or current_time
+    updated["age_seconds"] = max(0, int((current_time - observed).total_seconds()))
+    if expires_at:
+        updated["ttl_remaining_seconds"] = int((expires_at - current_time).total_seconds())
+    updated.setdefault("source_trust", _source_trust(str(updated.get("source") or "")))
+    if updated.get("status") == "conflict":
+        updated.setdefault("next_action", "refresh_probe")
+        return updated
+    if expires_at and current_time > expires_at:
         updated["status"] = "stale"
         updated["next_action"] = "refresh_probe"
+        updated.setdefault("stale_since", expires_at.isoformat())
+        if expire_after_seconds is not None and (current_time - expires_at).total_seconds() > expire_after_seconds:
+            updated["status"] = "expired"
+            updated["next_action"] = "refresh_probe"
     else:
         updated.setdefault("status", "fresh")
     return updated
@@ -84,6 +97,19 @@ def _claim_value(claim: dict[str, Any]) -> Any:
             if field in evidence:
                 return evidence[field]
     return claim.get("claim")
+
+
+def _source_trust(source: str) -> float:
+    lowered = source.lower()
+    if lowered.startswith("core_model"):
+        return 0.55
+    if lowered in {"event", "user"} or lowered.startswith("channel"):
+        return 0.7
+    if "probe" in lowered:
+        return 0.82
+    if "agent" in lowered or "openclaw" in lowered or "hermes" in lowered:
+        return 0.75
+    return 0.6
 
 
 def _expires_at(timestamp: str, ttl_seconds: int) -> str:

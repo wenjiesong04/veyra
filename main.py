@@ -263,6 +263,11 @@ class ActiveLoopTickRequest(BaseModel):
     include_runtime_matrix: bool = False
 
 
+class BeliefRefreshRequest(BaseModel):
+    expire_after_seconds: int | None = 3600
+    prune_expired_after_seconds: int | None = None
+
+
 class SoakSessionRequest(BaseModel):
     iterations: int = 60
     interval_seconds: float = 60.0
@@ -728,6 +733,20 @@ async def agency_intentions():
     return agency_core.state()
 
 
+@app.get("/belief/status")
+async def belief_status(limit: int = 50):
+    return awareness_loop.belief.ttl_report(limit=limit)
+
+
+@app.post("/belief/refresh")
+async def belief_refresh(request: BeliefRefreshRequest | None = None):
+    payload = request or BeliefRefreshRequest()
+    return awareness_loop.belief.refresh(
+        expire_after_seconds=payload.expire_after_seconds,
+        prune_expired_after_seconds=payload.prune_expired_after_seconds,
+    )
+
+
 @app.get("/ops/safety/red-team")
 async def ops_safety_red_team():
     return safety_validation.run()
@@ -1184,6 +1203,8 @@ async def mvp_status():
         "agent_result_callback": True,
         "agency_intention_queue": True,
         "stale_belief_refresh": True,
+        "belief_ttl_status": True,
+        "belief_source_trust": True,
         "real_probe_envelopes": True,
         "external_memory_bridge_hooks": True,
         "tool_proxy_executor_config": True,

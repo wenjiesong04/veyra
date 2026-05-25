@@ -24,7 +24,20 @@ class WorldStateStore:
             "external_world.json": {"watchlist": [], "summaries": []},
             "executor_state.json": {"selected_agent": "openclaw", "status": "unknown"},
             "risk_state.json": {"current_risk": "R0", "signals": [], "levels": risk_catalog()},
-            "belief_state.json": {"claims": [], "summary": {"fresh": 0, "stale": 0, "conflict": 0, "total": 0}},
+            "belief_state.json": {
+                "claims": [],
+                "summary": {
+                    "fresh": 0,
+                    "stale": 0,
+                    "expired": 0,
+                    "conflict": 0,
+                    "total": 0,
+                    "refreshable": 0,
+                    "by_source": {},
+                    "average_confidence": 0.0,
+                    "average_source_trust": 0.0,
+                },
+            },
             "task_state.json": {"current_task": None, "history": []},
             "attention_state.json": {"focus": [], "ignored_noise": []},
             "channel_state.json": {
