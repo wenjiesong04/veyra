@@ -1,0 +1,82 @@
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from interface.agent_adapter import ExecutionResult
+
+
+class ResultInterpreter:
+    """Turn raw Agent/tool execution output into evidence-oriented observations."""
+
+    def interpret_execution(self, execution: ExecutionResult, verification: dict[str, Any]) -> dict[str, Any]:
+        raw = execution.raw if isinstance(execution.raw, dict) else {}
+        result_text = execution.result.strip()
+        extracted = self._extract_structured_result(raw)
+        summary = extracted or self._compact_text(result_text)
+        return {
+            "status": execution.status,
+            "executor": execution.executor,
+            "summary": summary,
+            "evidence": {
+                "task_id": execution.task_id,
+                "changed_files": execution.changed_files,
+                "tool_calls": execution.tool_calls,
+                "verification_status": verification.get("status"),
+                "verification_verdict": verification.get("verdict"),
+                "raw_keys": sorted(raw.keys()),
+            },
+            "failure_reason": self._failure_reason(execution, verification),
+            "next_action": verification.get("next_action"),
+            "raw_result_type": self._raw_result_type(raw, result_text),
+        }
+
+    def _extract_structured_result(self, raw: dict[str, Any]) -> str:
+        candidates = []
+        for key in ("answer", "summary", "title", "result"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+        results = raw.get("results")
+        if isinstance(results, list) and results:
+            titles = []
+            for item in results[:5]:
+                if isinstance(item, dict):
+                    title = item.get("title") or item.get("name") or item.get("headline")
+                    if title:
+                        titles.append(str(title))
+                elif isinstance(item, str):
+                    titles.append(item)
+            if titles:
+                candidates.append("; ".join(titles))
+        return self._compact_text(candidates[0]) if candidates else ""
+
+    def _failure_reason(self, execution: ExecutionResult, verification: dict[str, Any]) -> str:
+        if execution.status in {"success", "submitted", "running", "pending"}:
+            return ""
+        return str(verification.get("verdict") or verification.get("message") or execution.result or execution.status)
+
+    def _raw_result_type(self, raw: dict[str, Any], result_text: str) -> str:
+        if "results" in raw:
+            return "search_results"
+        if "content" in raw:
+            return "fetched_content"
+        if result_text.startswith("{") or result_text.startswith("["):
+            return "json_text"
+        return "text"
+
+    def _compact_text(self, value: str, limit: int = 900) -> str:
+        text = " ".join(str(value or "").split())
+        if not text:
+            return ""
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3] + "..."
+
+
+def compact_json(value: Any, *, limit: int = 900) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        text = str(value)
+    return text if len(text) <= limit else text[: limit - 3] + "..."

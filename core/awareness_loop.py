@@ -18,7 +18,9 @@ from core.memory_policy_runtime import MemoryPolicyRuntime
 from core.perception_layer import PerceptionLayer
 from core.persona_engine import PersonaEngine
 from core.reasoning_core import CoreReasoning
+from core.result_interpreter import ResultInterpreter
 from core.runtime_entity import RuntimeEntity
+from core.response_synthesizer import ResponseSynthesizer
 from core.task_packet_builder import TaskPacketBuilder
 from core.verifier import Verifier
 from core.veyra_controller import VeyraController
@@ -67,6 +69,8 @@ class AwarenessLoop:
         self.context_builder = ContextPatchBuilder(state_store)
         self.task_packet_builder = TaskPacketBuilder(state_store)
         self.verifier = Verifier()
+        self.result_interpreter = ResultInterpreter()
+        self.response_synthesizer = ResponseSynthesizer()
         self.agent_registry = AgentRegistry(state_store)
         self.runtime_entity.set_selected_agent(self.agent_registry.selected_name())
         self.agent_adapter = self.agent_registry.selected()
@@ -267,6 +271,8 @@ class AwarenessLoop:
             execution = self.agent_adapter.send_task(packet)
             execution = self._poll_if_needed(execution)
             verified = self.verifier.verify_execution_result(execution)
+            interpreted = self.result_interpreter.interpret_execution(execution, verified)
+            synthesized_response = self.response_synthesizer.agent_response(interpreted, verified)
             pending_task = self.task_tracker.register(
                 event_id=event.event_id,
                 route=decision.route.value,
@@ -288,6 +294,7 @@ class AwarenessLoop:
             artifacts = {
                 "task_packet": packet.to_dict(),
                 "execution_result": asdict(execution),
+                "interpreted_result": interpreted,
                 "verification": verified,
                 "memory_write": memory_write,
                 "pending_task": pending_task,
@@ -308,6 +315,7 @@ class AwarenessLoop:
                     "guardian": guardian_decision,
                     "persona": persona_patch,
                     "execution_result": asdict(execution),
+                    "interpreted_result": interpreted,
                     "verification": verified,
                 }
             )
@@ -315,7 +323,7 @@ class AwarenessLoop:
                 event_id=event.event_id,
                 route=decision.route,
                 status=verified["status"],
-                response=execution.result,
+                response=synthesized_response,
                 risk_level=decision.risk_level,
                 artifacts=artifacts,
             )
