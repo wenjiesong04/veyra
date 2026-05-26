@@ -466,6 +466,11 @@ class AwarenessLoop:
         return decision.route in {Route.AGENT, Route.NATIVE_TOOL, Route.HUMAN_REVIEW, Route.ROLLBACK}
 
     def _ask_user_response(self, decision: Decision) -> str:
+        capability = decision.capability_request.get("capability") if isinstance(decision.capability_request, dict) else ""
+        message_type = decision.capability_request.get("message_type") if isinstance(decision.capability_request, dict) else ""
+        if capability == "vision":
+            attachment_label = "图片" if str(message_type or "").lower() in {"image", "img"} else "附件"
+            return f"我已收到{attachment_label}，但当前没有启用可用的图片理解能力。我不会假装看过内容；请启用 Agent vision 能力，或补充图片文字描述。"
         draft = str(decision.model_assist.get("draft_response") or "").strip()
         if draft:
             return draft
@@ -473,7 +478,6 @@ class AwarenessLoop:
         missing_text = "；".join(str(item) for item in missing[:3] if item)
         if missing_text:
             return f"我还需要补充信息：{missing_text}"
-        capability = decision.capability_request.get("capability") if isinstance(decision.capability_request, dict) else ""
         if capability:
             return f"这个请求需要当前不可用的能力 `{capability}`。我不会猜测结果；请补充可验证信息或启用相应能力。"
         return "我需要更多上下文才能可靠处理这个请求。"
