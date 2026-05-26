@@ -63,6 +63,35 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     async def state_health() -> dict[str, Any]:
         return deps["state_store"].state_health()
 
+    @router.get("/capabilities/snapshot")
+    async def capabilities_snapshot() -> dict[str, Any]:
+        return deps["awareness_loop"].capabilities.snapshot()
+
+    @router.post("/capabilities/refresh")
+    async def capabilities_refresh() -> dict[str, Any]:
+        loop = deps["awareness_loop"]
+        adapter = loop.agent_registry.selected()
+        selected_agent = loop.agent_registry.selected_name()
+        snapshot = adapter.fetch_capabilities()
+        snapshot.update(
+            {
+                "runtime": snapshot.get("runtime") or selected_agent,
+                "source": "agent_adapter.fetch_capabilities",
+                "updated_at": utc_now_iso(),
+                "ttl_seconds": 300,
+            }
+        )
+        deps["state_store"].patch_json(
+            "executor_state.json",
+            {
+                "selected_agent": selected_agent,
+                "capability_snapshot": snapshot,
+                "status": snapshot.get("status") or "unknown",
+                "connected": snapshot.get("connected"),
+            },
+        )
+        return loop.capabilities.snapshot()
+
     @router.get("/core/model/status")
     async def core_model_status() -> dict[str, Any]:
         return deps["awareness_loop"].core_reasoning.status()
