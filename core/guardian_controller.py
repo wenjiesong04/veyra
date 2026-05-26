@@ -47,10 +47,14 @@ class GuardianController:
             "forbidden_actions": ["rm -rf", "curl | bash", "drop database", "git push --force", "externalize_secrets"],
             "requires_review": ["service_restart", "config_modify", "file_delete", "paid_api_call"],
             "requires_snapshot": policy.requires_snapshot,
+            "whether_snapshot_required": policy.requires_snapshot,
             "requires_confirmation": policy.requires_confirmation,
             "default_tool_policy": "read-only first",
             "allowed_actions": self._allowed_actions(risk_level),
+            "allowed_tools": self._allowed_tools(risk_level),
             "required_preconditions": self._preconditions_for(risk_level),
+            "file_scope": self._file_scope(risk_level),
+            "network_scope": self._network_scope(risk_level),
             "executor_constraints": [
                 "return evidence for execution claims",
                 "do not escalate risk without ActionProposal",
@@ -80,6 +84,31 @@ class GuardianController:
         if risk_level in {RiskLevel.R3, RiskLevel.R4}:
             return ["prepare_plan", "create_snapshot", "request_confirmation"]
         return ["explain_block", "suggest_safe_alternative"]
+
+    def _allowed_tools(self, risk_level: RiskLevel) -> list[str]:
+        if risk_level == RiskLevel.R0:
+            return []
+        if risk_level == RiskLevel.R1:
+            return ["read_only_probe", "safe_file_read", "safe_browser_read", "safe_api_get"]
+        if risk_level == RiskLevel.R2:
+            return ["read_only_probe", "safe_file_read", "safe_file_write_with_snapshot", "safe_shell_low_risk"]
+        if risk_level in {RiskLevel.R3, RiskLevel.R4}:
+            return ["read_only_probe", "action_proposal", "snapshot", "diff"]
+        return ["action_proposal_for_safe_alternative_only"]
+
+    def _file_scope(self, risk_level: RiskLevel) -> dict[str, object]:
+        return {
+            "default": "read_only" if risk_level in {RiskLevel.R0, RiskLevel.R1} else "scoped_write_with_snapshot",
+            "forbidden": [".env", ".ssh", ".gnupg", "secrets", "private_keys"],
+            "requires_snapshot": risk_level in {RiskLevel.R2, RiskLevel.R3, RiskLevel.R4, RiskLevel.R5},
+        }
+
+    def _network_scope(self, risk_level: RiskLevel) -> dict[str, object]:
+        if risk_level == RiskLevel.R0:
+            return {"default": "none", "external": False}
+        if risk_level == RiskLevel.R1:
+            return {"default": "read_only", "external": True, "state_changing_methods": False}
+        return {"default": "review_required", "external": True, "state_changing_methods": "human_review"}
 
     def _preconditions_for(self, risk_level: RiskLevel) -> list[str]:
         if risk_level == RiskLevel.R0:

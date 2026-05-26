@@ -121,6 +121,8 @@ class AgentOrchestrator:
                 },
                 persona_patch=persona_patch,
                 policy_patch=self.guardian.policy_patch(risk),
+                required_capabilities=decision.required_capabilities,
+                memory_policy=decision.memory_policy,
             )
             execution = adapter.send_task(packet)
             if execution.status in NON_TERMINAL_STATUSES:

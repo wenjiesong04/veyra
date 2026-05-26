@@ -17,7 +17,20 @@ def contract_summary() -> dict[str, Any]:
     return {
         "contract_version": AGENT_CONTRACT_VERSION,
         "task_packet": {
-            "required": ["task_id", "target_agent", "session_id", "user_message", "context_patch", "persona_patch", "policy_patch"],
+            "required": [
+                "task_id",
+                "target_agent",
+                "session_id",
+                "user_message",
+                "user_goal",
+                "required_capabilities",
+                "context_patch",
+                "persona_patch",
+                "policy_patch",
+                "verification_policy",
+                "rollback_requirement",
+                "memory_policy",
+            ],
             "transport": "structured_json_with_rendered_prompt_fallback",
         },
         "execution_result": {
@@ -48,6 +61,11 @@ def validate_task_packet_payload(payload: dict[str, Any]) -> list[str]:
     for key in ["context_patch", "persona_patch", "policy_patch"]:
         if key in payload and not isinstance(payload[key], dict):
             errors.append(f"task_packet.{key} must be an object")
+    if "required_capabilities" in payload and not isinstance(payload["required_capabilities"], list):
+        errors.append("task_packet.required_capabilities must be a list")
+    for key in ["verification_policy", "rollback_requirement"]:
+        if key in payload and not isinstance(payload[key], dict):
+            errors.append(f"task_packet.{key} must be an object")
     return errors
 
 
@@ -57,13 +75,19 @@ def render_prompt_payload(payload: dict[str, Any]) -> str:
             f"Veyra Agent Contract: {AGENT_CONTRACT_VERSION}",
             f"Task ID: {payload.get('task_id', '')}",
             f"Session ID: {payload.get('session_id', '')}",
-            f"User Task: {payload.get('user_message', '')}",
+            f"User Goal: {payload.get('user_goal') or payload.get('user_message', '')}",
+            f"Required Capabilities: {json.dumps(payload.get('required_capabilities', []), ensure_ascii=False)}",
             "Context Patch:",
             json.dumps(payload.get("context_patch", {}), ensure_ascii=False, indent=2, sort_keys=True),
             "Persona Patch:",
             json.dumps(payload.get("persona_patch", {}), ensure_ascii=False, indent=2, sort_keys=True),
             "Policy Patch:",
             json.dumps(payload.get("policy_patch", {}), ensure_ascii=False, indent=2, sort_keys=True),
+            "Verification Policy:",
+            json.dumps(payload.get("verification_policy", {}), ensure_ascii=False, indent=2, sort_keys=True),
+            "Rollback Requirement:",
+            json.dumps(payload.get("rollback_requirement", {}), ensure_ascii=False, indent=2, sort_keys=True),
+            f"Memory Policy: {payload.get('memory_policy', 'forget')}",
         ]
     )
 

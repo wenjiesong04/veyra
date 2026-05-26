@@ -6,6 +6,7 @@ from awareness.belief_core import BeliefCore
 from awareness.uncertainty_core import UncertaintyCore
 from core.model_client import redact_sensitive
 from core.world_state import WorldStateStore
+from interface.event_schema import VeyraEvent
 
 
 class ContextPatchBuilder:
@@ -21,6 +22,7 @@ class ContextPatchBuilder:
         *,
         decision: dict[str, Any] | None = None,
         foresight: dict[str, Any] | None = None,
+        event: VeyraEvent | None = None,
     ) -> dict[str, object]:
         state = self.state_store.read_all()
         relevant_claims = self.belief.relevant_claims(attention_focus)
@@ -33,6 +35,7 @@ class ContextPatchBuilder:
         return {
             "user_goal": user_message,
             "attention_focus": attention_focus,
+            "attachment_metadata": self._attachment_metadata(event),
             "relevant_world_state": self._relevant_world_state(state, attention_focus),
             "executor_state": redact_sensitive(self._state_meta(state["executor_state"], ["selected_agent", "status", "connected", "validation"])),
             "task_state": redact_sensitive(self._state_meta(state["task_state"], ["current_task", "short_term_memory"])),
@@ -99,3 +102,27 @@ class ContextPatchBuilder:
         for item in focus:
             keys.extend(mapping.get(str(item), []))
         return list(dict.fromkeys(keys))
+
+    def _attachment_metadata(self, event: VeyraEvent | None) -> dict[str, Any]:
+        if not event or not isinstance(event.payload, dict):
+            return {"available": False}
+        metadata = event.payload.get("metadata") if isinstance(event.payload.get("metadata"), dict) else {}
+        feishu = metadata.get("feishu") if isinstance(metadata.get("feishu"), dict) else {}
+        message_type = str(feishu.get("message_type") or metadata.get("message_type") or "text")
+        if message_type == "text":
+            return {"available": False, "message_type": "text"}
+        return redact_sensitive(
+            {
+                "available": True,
+                "message_type": message_type,
+                "content_available_to_core": bool(feishu.get("content_text") or metadata.get("content_text")),
+                "content_text": feishu.get("content_text") or metadata.get("content_text") or "",
+                "keys": {
+                    "image_key": feishu.get("image_key") or metadata.get("image_key"),
+                    "file_key": feishu.get("file_key") or metadata.get("file_key"),
+                    "message_id": feishu.get("message_id") or metadata.get("message_id"),
+                },
+            },
+            max_string=220,
+            max_list=6,
+        )

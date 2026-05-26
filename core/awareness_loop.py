@@ -244,7 +244,7 @@ class AwarenessLoop:
             self.agent_adapter = self.agent_registry.selected()
             selected_agent = decision.target_agent or self.agent_registry.selected_name()
             memory_summary = self.memory_bridge.read_summary(event.source.session_id, attention_focus)
-            context_patch = self.context_builder.build(text, attention_focus, decision=decision.to_dict(), foresight=foresight)
+            context_patch = self.context_builder.build(text, attention_focus, decision=decision.to_dict(), foresight=foresight, event=event)
             context_patch["memory_summary"] = memory_summary
             if decision.model_assist:
                 context_patch["core_reasoning"] = {
@@ -261,6 +261,8 @@ class AwarenessLoop:
                 persona_patch=persona_patch,
                 policy_patch=self.guardian.policy_patch(decision.risk_level),
                 context_patch=context_patch,
+                required_capabilities=decision.required_capabilities,
+                memory_policy=decision.memory_policy,
             )
             execution = self.agent_adapter.send_task(packet)
             execution = self._poll_if_needed(execution)

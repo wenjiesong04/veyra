@@ -109,6 +109,11 @@ class VeyraTaskPacket:
     context_patch: dict[str, Any]
     persona_patch: dict[str, Any]
     policy_patch: dict[str, Any]
+    user_goal: str = ""
+    required_capabilities: list[str] = field(default_factory=list)
+    verification_policy: dict[str, Any] = field(default_factory=dict)
+    rollback_requirement: dict[str, Any] = field(default_factory=dict)
+    memory_policy: str = "forget"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
