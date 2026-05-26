@@ -11,8 +11,12 @@ from probes.schema import probe_payload
 
 ZONE_ALIASES = {
     "东京": "Asia/Tokyo",
+    "大阪": "Asia/Tokyo",
+    "京都": "Asia/Tokyo",
+    "名古屋": "Asia/Tokyo",
     "日本": "Asia/Tokyo",
     "tokyo": "Asia/Tokyo",
+    "osaka": "Asia/Tokyo",
     "jst": "Asia/Tokyo",
     "北京": "Asia/Shanghai",
     "上海": "Asia/Shanghai",
