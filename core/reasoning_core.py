@@ -12,16 +12,15 @@ from interface.event_schema import VeyraEvent
 
 CORE_DECISION_SYSTEM = (
     "You are Veyra Core's internal cognition layer, not an external agent runtime. "
-    "Return strict JSON only. Veyra is an Awareness Entity: it uses current state, "
-    "belief freshness, attention focus, risk policy, probes, skills, and selected Agent Runtime "
-    "to decide how to answer or solve the user's message. "
-    "Do not answer from stale claims. If fresh local, external, time, status, or attachment evidence "
-    "is required, choose route=probe or ask a focused clarification in draft_response. "
-    "Use route=agent only for implementation, multi-step execution, complex debugging, or capabilities "
-    "that genuinely need the selected Agent Runtime. Ordinary chat and explanations should stay "
-    "route=direct_answer with a natural draft_response. Probe tools collect evidence; do not expose "
-    "raw internal probe summaries as the final conversational style. "
-    "You cannot approve execution, lower risk, bypass Guardian, or ignore allowed_routes."
+    "Return strict JSON only. Veyra is an Awareness-driven Cognition and Governance Runtime. "
+    "Your job is understanding, reasoning, and structured decision output; you do not execute tools. "
+    "Use the minimal turn context and available_capabilities. Do not claim a capability that is unavailable. "
+    "Do not answer from stale claims. If fresh local, external, time, status, latest, runtime, or attachment "
+    "evidence is required, set freshness_required=true and choose probe when an evidence capability exists, "
+    "or ask_user when it does not. Use agent only for implementation, multi-step execution, complex debugging, "
+    "browser automation, code modification, or long tool chains. Ordinary chat and explanations should stay "
+    "direct_answer with a natural draft_response. You cannot approve execution, lower risk, bypass Guardian, "
+    "or ignore allowed_routes."
 )
 
 CORE_ANSWER_SYSTEM = (
@@ -56,22 +55,21 @@ class CoreReasoning:
         status = self.status()
         if not status.get("configured"):
             return False
+        risk = str(rule_context.get("risk_level") or "R0")
+        if risk == RiskLevel.R5.value:
+            return False
         if status.get("decision_mode") == "always":
+            return True
+        if kind == "decision":
             return True
         if kind in {"perception", "agency", "memory", "external_world"}:
             return True
         if kind in {"answer", "probe_answer"}:
             return True
         route = str(rule_context.get("route") or "")
-        risk = str(rule_context.get("risk_level") or "R0")
         complexity = str(rule_context.get("complexity") or "simple")
         intent = str(rule_context.get("intent") or "unknown")
-        selected_probe = str(rule_context.get("selected_probe") or "")
-        if risk == RiskLevel.R5.value:
-            return False
-        if kind == "foresight" and route in {"direct_answer", "probe"} and risk in {"R0", "R1"} and complexity == "simple":
-            return False
-        if kind == "decision" and route == "probe" and selected_probe in {"time", "port", "process", "git", "system", "openclaw", "hermes", "mcp", "network"}:
+        if kind == "foresight" and route in {"direct_answer", "probe", "ask_user"} and risk in {"R0", "R1"} and complexity == "simple":
             return False
         if route == "direct_answer" and intent in {"information", "unknown"}:
             return True
@@ -93,22 +91,28 @@ class CoreReasoning:
             "attention_focus": attention_focus,
             "rule_decision": redact_sensitive(rule_decision),
             "turn_context": turn_context,
-            "allowed_routes": ["direct_answer", "probe", "skill", "agent", "human_review", "block"],
-            "known_probes": ["time", "system", "git", "port", "process", "file", "log", "network", "web", "openclaw", "hermes", "mcp"],
-            "known_skills": ["diagnose_openclaw", "check_port", "summarize_logs", "safe_git_commit"],
+            "allowed_routes": ["direct_answer", "probe", "skill", "agent", "ask_user", "human_review", "block"],
             "required_json_fields": {
-                "route": "direct_answer|probe|skill|agent|human_review|block",
-                "risk_level": "R0-R5",
-                "intent": "information|action|implementation|conversation|unknown",
+                "intent": "conversation|information|action|implementation|unknown",
                 "complexity": "simple|moderate|complex",
-                "reason": "short rationale",
-                "selected_probe": "only when route=probe",
-                "draft_response": "natural reply when route=direct_answer or clarification is needed",
-                "needs_observation": "boolean",
+                "risk_level": "R0-R5",
+                "freshness_required": "boolean",
+                "needs_probe": "boolean",
+                "needs_agent": "boolean",
+                "needs_user_confirmation": "boolean",
+                "memory_policy": "forget|short_term|long_term",
+                "reasoning_mode": "direct|evidence|execution",
+                "recommended_route": "direct_answer|probe|skill|agent|ask_user|human_review|block",
+                "required_capabilities": "list of capability ids from available_capabilities.capabilities",
+                "capability_request": {
+                    "capability": "capability id if one is needed",
+                    "probe": "probe name only when recommended_route=probe",
+                    "skill": "skill name only when recommended_route=skill",
+                    "reason": "short rationale",
+                },
+                "draft_response": "natural reply when direct_answer or ask_user is appropriate",
                 "context_gaps": "list of missing context/evidence",
-                "memory_policy": {"mode": "ignore|session|long_term", "reason": "why"},
-                "solution_outline": "list for agent/skill plans",
-                "agent_context": "object for agent handoff",
+                "reason": "short rationale",
             },
         }
         result = self.client.complete_json(
@@ -136,7 +140,7 @@ class CoreReasoning:
             "required_json_fields": {
                 "draft_response": "final user-facing reply",
                 "confidence": "0.0-1.0",
-                "memory_policy": {"mode": "ignore|session|long_term", "reason": "why"},
+                "memory_policy": "forget|short_term|long_term",
                 "needs_observation": "boolean",
                 "context_gaps": "list",
             },
@@ -170,7 +174,7 @@ class CoreReasoning:
                 "draft_response": "final user-facing reply grounded in probe_result",
                 "confidence": "0.0-1.0",
                 "used_evidence": "list",
-                "memory_policy": {"mode": "ignore|session|long_term", "reason": "why"},
+                "memory_policy": "forget|short_term|long_term",
             },
         }
         result = self.client.complete_json(

@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from awareness.belief_core import BeliefCore
 from awareness.uncertainty_core import UncertaintyCore
+from core.capability_registry import CapabilityRegistry
 from core.model_client import redact_sensitive
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent
@@ -20,6 +21,7 @@ class TurnContextBuilder:
         self.state_store = state_store
         self.belief = BeliefCore(state_store)
         self.uncertainty = UncertaintyCore()
+        self.capabilities = CapabilityRegistry(state_store)
 
     def build(
         self,
@@ -29,8 +31,8 @@ class TurnContextBuilder:
         event: VeyraEvent | None = None,
         rule_decision: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        state = self.state_store.read_all()
-        relevant_claims = self.belief.relevant_claims(attention_focus, limit=16)
+        state = self._scoped_state()
+        relevant_claims = self.belief.relevant_claims(attention_focus, limit=10)
         fresh_claims = [
             self._claim_summary(claim)
             for claim in relevant_claims
@@ -46,7 +48,7 @@ class TurnContextBuilder:
             {
                 "current_time": self._current_time(),
                 "event": self._event_summary(event, payload_metadata),
-                "conversation_tail": self._conversation_tail(event, limit=8),
+                "conversation_tail": self._conversation_tail(event, limit=4),
                 "input": {
                     "text": user_message,
                     "attachments": self._attachment_summary(payload_metadata),
@@ -63,21 +65,29 @@ class TurnContextBuilder:
                     "uncertainty": self.uncertainty.uncertainty_summary(relevant_claims),
                 },
                 "runtime": {
-                    "executor_state": state.get("executor_state", {}),
+                    "executor_state": self._executor_summary(state.get("executor_state", {})),
                     "task_state": self._task_summary(state.get("task_state", {})),
                     "risk_state": state.get("risk_state", {}),
                     "agent_config": self._agent_summary(state.get("agent_config", {})),
                 },
+                "persona": self._persona_summary(state.get("persona_state", {})),
                 "rule_decision": rule_decision or {},
-                "available_capabilities": {
-                    "routes": ["direct_answer", "probe", "skill", "agent", "human_review", "block", "rollback"],
-                    "probes": ["time", "system", "git", "port", "process", "file", "log", "network", "web", "openclaw", "hermes", "mcp"],
-                    "skills": ["diagnose_openclaw", "check_port", "summarize_logs", "safe_git_commit"],
-                },
+                "available_capabilities": self.capabilities.snapshot(),
             },
             max_string=1400,
             max_list=12,
         )
+
+    def _scoped_state(self) -> dict[str, Any]:
+        return {
+            "user_world": self.state_store.read_json("user_world.json"),
+            "executor_state": self.state_store.read_json("executor_state.json"),
+            "risk_state": self.state_store.read_json("risk_state.json"),
+            "attention_state": self.state_store.read_json("attention_state.json"),
+            "task_state": self.state_store.read_json("task_state.json"),
+            "agent_config": self.state_store.read_json("agent_config.json"),
+            "persona_state": self.state_store.read_json("persona_state.json"),
+        }
 
     def _current_time(self) -> dict[str, Any]:
         local = datetime.now().astimezone()
@@ -182,10 +192,22 @@ class TurnContextBuilder:
         if not isinstance(value, dict):
             return {}
         history = value.get("history") if isinstance(value.get("history"), list) else []
+        short_term = value.get("short_term_memory") if isinstance(value.get("short_term_memory"), list) else []
         return {
             "current_task": value.get("current_task"),
-            "recent_history": history[-5:],
-            "pending_agent_tasks": value.get("pending_agent_tasks", [])[-5:] if isinstance(value.get("pending_agent_tasks"), list) else [],
+            "recent_history": history[-3:],
+            "short_term_memory": short_term[-5:],
+            "pending_agent_tasks": value.get("pending_agent_tasks", [])[-3:] if isinstance(value.get("pending_agent_tasks"), list) else [],
+        }
+
+    def _executor_summary(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        return {
+            "selected_agent": value.get("selected_agent"),
+            "status": value.get("status"),
+            "connected": value.get("connected"),
+            "validation": value.get("validation") if isinstance(value.get("validation"), dict) else {},
         }
 
     def _agent_summary(self, value: Any) -> dict[str, Any]:
@@ -199,6 +221,16 @@ class TurnContextBuilder:
             "selected_agent": selected,
             "selected_agent_kind": selected_config.get("kind"),
             "selected_agent_enabled": selected_config.get("enabled"),
+            "selected_agent_base_url_configured": bool(selected_config.get("base_url")),
             "core_model_enabled": bool(core_model.get("enabled")),
             "core_model_decision_mode": core_model.get("decision_mode"),
+        }
+
+    def _persona_summary(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        return {
+            "active_modes": value.get("active_modes", []),
+            "last_route": (value.get("last_binding") or {}).get("route") if isinstance(value.get("last_binding"), dict) else None,
+            "response_style": (value.get("last_binding") or {}).get("response_style") if isinstance(value.get("last_binding"), dict) else None,
         }

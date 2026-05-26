@@ -6,17 +6,20 @@ from dataclasses import asdict
 from awareness.attention_core import AttentionCore
 from awareness.belief_core import BeliefCore
 from awareness.uncertainty_core import UncertaintyCore
+from core.capability_registry import CapabilityRegistry
 from core.context_patch_builder import ContextPatchBuilder
 from core.definitions import GuardianDecision, LifecycleStatus, RiskLevel
 from core.decision_core import DecisionCore
 from core.foresight_engine import ForesightEngine
 from core.guardian_controller import GuardianController
+from core.memory_policy_runtime import MemoryPolicyRuntime
 from core.perception_layer import PerceptionLayer
 from core.persona_engine import PersonaEngine
 from core.reasoning_core import CoreReasoning
 from core.runtime_entity import RuntimeEntity
 from core.task_packet_builder import TaskPacketBuilder
 from core.verifier import Verifier
+from core.veyra_controller import VeyraController
 from core.world_state import WorldStateStore
 from guardian.review_queue import ReviewQueue
 from interface.agent_contract import NON_TERMINAL_STATUSES
@@ -49,6 +52,7 @@ class AwarenessLoop:
         self.state_store = state_store
         self.runtime_entity = runtime_entity
         self.core_reasoning = CoreReasoning(state_store)
+        self.capabilities = CapabilityRegistry(state_store)
         self.perception = PerceptionLayer(state_store, reasoning=self.core_reasoning)
         self.attention = AttentionCore(state_store)
         self.belief = BeliefCore(state_store)
@@ -73,6 +77,8 @@ class AwarenessLoop:
         )
         self.execution_trace = ExecutionTrace(state_store)
         self.task_tracker = AgentTaskTracker(state_store, self.execution_trace)
+        self.memory_policy_runtime = MemoryPolicyRuntime(state_store, lambda patch: self.memory_bridge.write_patch(patch))
+        self.controller = VeyraController(self.capabilities)
         self.skill_loader = SkillLoader()
         self.skill_runtime = SkillRuntime(state_store)
         self.probes = {
@@ -99,6 +105,7 @@ class AwarenessLoop:
         self.belief.update_from_event(event)
         belief_state = self.belief.refresh()
         decision = self.decision_core.decide(text=text, attention_focus=attention_focus, event=event)
+        decision, controller_plan = self.controller.prepare(decision)
         self.state_store.patch_json("risk_state.json", {"current_risk": decision.risk_level.value})
         persona_patch = self.persona_engine.patch_for(
             text,
@@ -110,7 +117,7 @@ class AwarenessLoop:
         )
         self.persona_engine.record_binding(event, persona_patch)
         self.runtime_entity.operational_mode = list(persona_patch.get("mode", []))
-        foresight = self.foresight.predict_text_action(text, decision.risk_level, decision=decision.to_dict())
+        foresight = self._foresight_for_decision(text, decision)
         guardian_decision = self.guardian.review_text_action(text=text, decision=decision, foresight=foresight)
 
         if guardian_decision["decision"] == GuardianDecision.BLOCK.value:
@@ -121,7 +128,7 @@ class AwarenessLoop:
                 status="blocked",
                 response=guardian_decision["reason"],
                 risk_level=decision.risk_level,
-                artifacts={"guardian": guardian_decision, "foresight": foresight, "persona": persona_patch},
+                artifacts={"guardian": guardian_decision, "foresight": foresight, "persona": persona_patch, "controller": controller_plan.to_dict()},
             )
             self._update(event, result)
             return result
@@ -146,7 +153,7 @@ class AwarenessLoop:
                 status="needs_confirmation",
                 response=response,
                 risk_level=decision.risk_level,
-                artifacts={"guardian": guardian_decision, "foresight": foresight, "review": review, "proposal": proposal, "persona": persona_patch},
+                artifacts={"guardian": guardian_decision, "foresight": foresight, "review": review, "proposal": proposal, "persona": persona_patch, "controller": controller_plan.to_dict()},
             )
             self._update(event, result)
             return result
@@ -157,11 +164,12 @@ class AwarenessLoop:
                 event_id=event.event_id,
                 route=decision.route,
                 status="success",
-                    response=self._direct_answer(event, decision, attention_focus),
+                response=self._direct_answer(event, decision, attention_focus),
                 risk_level=decision.risk_level,
                 artifacts={
                     "attention": attention_focus,
                     "decision": decision.to_dict(),
+                    "controller": controller_plan.to_dict(),
                     "persona": persona_patch,
                     "uncertainty": self.uncertainty.uncertainty_summary(belief_state.get("claims", [])),
                 },
@@ -170,6 +178,19 @@ class AwarenessLoop:
             result = self._run_probe(event, decision, attention_focus)
         elif decision.route == Route.SKILL:
             result = self._run_skill(event, decision.selected_probe or "")
+        elif decision.route == Route.ASK_USER:
+            result = LoopResult(
+                event_id=event.event_id,
+                route=Route.ASK_USER,
+                status="needs_user_input",
+                response=self._ask_user_response(decision),
+                risk_level=decision.risk_level,
+                artifacts={
+                    "decision": decision.to_dict(),
+                    "controller": controller_plan.to_dict(),
+                    "persona": persona_patch,
+                },
+            )
         elif decision.route == Route.AGENT:
             self.agent_adapter = self.agent_registry.selected()
             selected_agent = decision.target_agent or self.agent_registry.selected_name()
@@ -202,7 +223,7 @@ class AwarenessLoop:
                 verification=verified,
             )
             memory_write = None
-            if verified.get("needs_memory_patch"):
+            if verified.get("needs_memory_patch") and decision.memory_policy == "long_term":
                 memory_write = self.memory_bridge.write_patch(
                     {
                         "session_id": event.source.session_id,
@@ -210,6 +231,7 @@ class AwarenessLoop:
                         "executor": execution.executor,
                         "status": execution.status,
                         "result": execution.result,
+                        "memory_policy": decision.memory_policy,
                     }
                 )
             artifacts = {
@@ -219,6 +241,7 @@ class AwarenessLoop:
                 "memory_write": memory_write,
                 "pending_task": pending_task,
                 "decision": decision.to_dict(),
+                "controller": controller_plan.to_dict(),
                 "guardian": guardian_decision,
                 "persona": persona_patch,
             }
@@ -230,6 +253,7 @@ class AwarenessLoop:
                     "executor": execution.executor,
                     "status": verified["status"],
                     "decision": decision.to_dict(),
+                    "controller": controller_plan.to_dict(),
                     "guardian": guardian_decision,
                     "persona": persona_patch,
                     "execution_result": asdict(execution),
@@ -253,6 +277,7 @@ class AwarenessLoop:
                 risk_level=decision.risk_level,
                 artifacts={
                     "decision": decision.to_dict(),
+                    "controller": controller_plan.to_dict(),
                     "guardian": guardian_decision,
                     "persona": persona_patch,
                     "next_action": "submit /actions/proposals with action.type and target details",
@@ -271,6 +296,11 @@ class AwarenessLoop:
             )
 
         result.artifacts.setdefault("persona", persona_patch)
+        result.artifacts.setdefault("controller", controller_plan.to_dict())
+        if result.artifacts.get("memory_write"):
+            result.artifacts["memory_policy_execution"] = {"status": "written", "policy": decision.memory_policy, "write": result.artifacts.get("memory_write")}
+        else:
+            result.artifacts["memory_policy_execution"] = self.memory_policy_runtime.apply(event, decision, result)
         self._update(event, result)
         return result
 
@@ -317,6 +347,36 @@ class AwarenessLoop:
     def _snapshot_id_from_text(self, text: str) -> str | None:
         match = re.search(r"\bsnap_[a-fA-F0-9]{6,32}\b", text)
         return match.group(0) if match else None
+
+    def _foresight_for_decision(self, text: str, decision: Decision) -> dict[str, object]:
+        if not self._foresight_required(decision):
+            return {
+                "status": "skipped",
+                "reason": "foresight_not_required_for_non_execution_turn",
+                "risk_level": decision.risk_level.value,
+                "route": decision.route.value,
+            }
+        return self.foresight.predict_text_action(text, decision.risk_level, decision=decision.to_dict())
+
+    def _foresight_required(self, decision: Decision) -> bool:
+        if decision.risk_level in {RiskLevel.R2, RiskLevel.R3, RiskLevel.R4, RiskLevel.R5}:
+            return True
+        if decision.reasoning_mode == "execution":
+            return True
+        return decision.route in {Route.AGENT, Route.NATIVE_TOOL, Route.HUMAN_REVIEW, Route.ROLLBACK}
+
+    def _ask_user_response(self, decision: Decision) -> str:
+        draft = str(decision.model_assist.get("draft_response") or "").strip()
+        if draft:
+            return draft
+        missing = decision.model_assist.get("context_gaps") if isinstance(decision.model_assist.get("context_gaps"), list) else []
+        missing_text = "；".join(str(item) for item in missing[:3] if item)
+        if missing_text:
+            return f"我还需要补充信息：{missing_text}"
+        capability = decision.capability_request.get("capability") if isinstance(decision.capability_request, dict) else ""
+        if capability:
+            return f"这个请求需要当前不可用的能力 `{capability}`。我不会猜测结果；请补充可验证信息或启用相应能力。"
+        return "我需要更多上下文才能可靠处理这个请求。"
 
     def _run_skill(self, event: VeyraEvent, skill_name: str) -> LoopResult:
         skill = self.skill_loader.load(skill_name)
@@ -435,21 +495,11 @@ class AwarenessLoop:
         draft = str(answer_assist.get("draft_response") or answer_assist.get("response") or "").strip()
         if answer_assist.get("status") == "model_assisted" and draft:
             return draft
-        if probe_name == "time":
-            details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
-            timezone_name = str(details.get("timezone") or raw.get("target") or "local")
-            date_text = str(details.get("date") or "")
-            time_text = str(details.get("time") or "")
-            offset = str(details.get("utc_offset") or "")
-            if date_text and time_text:
-                return f"{timezone_name} 当前时间是 {date_text} {time_text}（{offset}）。"
         return str(raw.get("summary") or verified.get("message") or "Probe completed.")
 
     def _probe_needs_answer_model(self, probe_name: str, raw: dict[str, object]) -> bool:
-        if probe_name in {"time", "port", "process", "git", "system", "openclaw", "hermes", "mcp", "network"}:
-            return False
         details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
-        return bool(details.get("sample") or details.get("results") or probe_name in {"web", "log", "file"})
+        return bool(details.get("sample") or details.get("results") or details.get("content") or probe_name in {"web", "log", "file"})
 
     def _direct_answer(self, event: VeyraEvent, decision: Decision, attention_focus: list[str]) -> str:
         text = str(event.payload.get("text", ""))
@@ -461,11 +511,10 @@ class AwarenessLoop:
         if answer_assist.get("status") == "model_assisted" and draft:
             decision.model_assist = {**decision.model_assist, "answer_assist": answer_assist}
             return draft
-        if "[feishu image message" in text or "attachment_context" in attention_focus:
-            return "我现在只收到图片/附件事件占位，通道还没有把可读的图片内容传给 Veyra Core。请补充文字描述，或接入 OCR/视觉解析后我再判断图里的问题。"
-        if "veyra" in text.lower() or "是什么" in text:
-            return "Veyra 是用于产出实时感知的虚拟实体：Awareness Entity + 高权限 Agent Core Middleware + Agent Governance Layer。"
-        return "我需要更多上下文或 Core 模型生成能力，才能给出可靠回答。"
+        if decision.freshness_required:
+            capability = decision.capability_request.get("capability") if isinstance(decision.capability_request, dict) else ""
+            return f"这个问题需要先获取新鲜证据{f'（{capability}）' if capability else ''}，我不会凭模板猜测。"
+        return "Core Cognition Model 当前未配置或未返回可用草稿；Veyra 不会用固定模板伪造回答。请启用 Core 模型，或把问题改成可由 probe/skill/agent 验证的任务。"
 
     def _update(self, event: VeyraEvent, result: LoopResult) -> None:
         risk_level = result.risk_level.value if hasattr(result.risk_level, "value") else str(result.risk_level)

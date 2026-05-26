@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
+import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -25,6 +28,8 @@ class CoreModelConfig:
     timeout: float = 20.0
     decision_mode: str = "auto"
     max_tokens: int = 700
+    ca_bundle: str = ""
+    retries: int = 1
 
     def configured(self) -> bool:
         return bool(self.enabled and self.base_url and self.model)
@@ -161,6 +166,37 @@ class CoreModelClient:
             timeout=timeout,
             decision_mode=decision_mode if decision_mode in {"auto", "always"} else "auto",
             max_tokens=max(128, min(max_tokens, 2000)),
+            ca_bundle=str(
+                _pick_config_value(
+                    core_model,
+                    selected_agent,
+                    core_key="ca_bundle",
+                    agent_key="model_ca_bundle",
+                    env_key="VEYRA_CORE_MODEL_CA_BUNDLE",
+                    default="",
+                    prefer_agent=agent_enabled and not core_enabled,
+                )
+            ),
+            retries=max(
+                0,
+                min(
+                    int(
+                        _float_or(
+                            _pick_config_value(
+                                core_model,
+                                selected_agent,
+                                core_key="retries",
+                                agent_key="model_retries",
+                                env_key="VEYRA_CORE_MODEL_RETRIES",
+                                default=1,
+                                prefer_agent=agent_enabled and not core_enabled,
+                            ),
+                            1,
+                        )
+                    ),
+                    3,
+                ),
+            ),
         )
 
     def status(self) -> dict[str, Any]:
@@ -182,6 +218,9 @@ class CoreModelClient:
             "api_key_set": bool(config.api_key),
             "decision_mode": config.decision_mode,
             "max_tokens": config.max_tokens,
+            "ca_bundle": _public_ca_bundle_path(self._ca_bundle_path(config)),
+            "proxy": _proxy_summary(),
+            "retries": config.retries,
             "status": "configured" if config.configured() else "unconfigured",
             "missing": missing,
         }
@@ -201,6 +240,7 @@ class CoreModelClient:
             ],
             "temperature": 0,
             "max_tokens": config.max_tokens,
+            "stream": False,
             "response_format": {"type": "json_object"},
         }
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -208,11 +248,30 @@ class CoreModelClient:
         if config.api_key:
             headers["Authorization"] = f"Bearer {config.api_key}"
 
-        try:
-            with urlopen(Request(self._chat_completions_url(config), data=data, headers=headers, method="POST"), timeout=config.timeout) as response:
-                body = response.read().decode("utf-8")
-        except (HTTPError, URLError, TimeoutError, OSError) as exc:
-            return {"status": "error", "purpose": purpose, "error": str(exc)}
+        request = Request(self._chat_completions_url(config), data=data, headers=headers, method="POST")
+        context, ca_bundle = self._ssl_context(config)
+        last_error: Exception | None = None
+        for attempt in range(config.retries + 1):
+            try:
+                with urlopen(request, timeout=config.timeout, context=context) as response:
+                    body = response.read().decode("utf-8")
+                break
+            except HTTPError as exc:
+                return {"status": "http_error", "purpose": purpose, "status_code": exc.code, "error": str(exc), "ca_bundle": _public_ca_bundle_path(ca_bundle)}
+            except (URLError, TimeoutError, OSError, ssl.SSLError) as exc:
+                last_error = exc
+                if attempt >= config.retries:
+                    return {
+                        "status": "error",
+                        "purpose": purpose,
+                        "error": str(exc),
+                        "ca_bundle": _public_ca_bundle_path(ca_bundle),
+                        "proxy": _proxy_summary(),
+                        "attempts": attempt + 1,
+                    }
+                time.sleep(min(0.25 * (attempt + 1), 1.0))
+        else:
+            return {"status": "error", "purpose": purpose, "error": str(last_error or "unknown model transport error")}
 
         try:
             raw = json.loads(body or "{}")
@@ -231,6 +290,7 @@ class CoreModelClient:
             "purpose": purpose,
             "provider": config.provider,
             "model": config.model,
+            "ca_bundle": _public_ca_bundle_path(ca_bundle),
         }
         return parsed
 
@@ -238,6 +298,31 @@ class CoreModelClient:
         if config.base_url.endswith("/chat/completions"):
             return config.base_url
         return f"{config.base_url}/chat/completions"
+
+    def _ssl_context(self, config: CoreModelConfig) -> tuple[ssl.SSLContext, str]:
+        ca_bundle = self._ca_bundle_path(config)
+        if ca_bundle:
+            return ssl.create_default_context(cafile=ca_bundle), ca_bundle
+        return ssl.create_default_context(), ""
+
+    def _ca_bundle_path(self, config: CoreModelConfig) -> str:
+        candidates = [
+            config.ca_bundle,
+            os.getenv("REQUESTS_CA_BUNDLE", ""),
+            os.getenv("SSL_CERT_FILE", ""),
+            os.getenv("CURL_CA_BUNDLE", ""),
+        ]
+        try:
+            import certifi
+
+            candidates.append(certifi.where())
+        except Exception:
+            pass
+        for candidate in candidates:
+            path = str(candidate or "").strip()
+            if path and Path(path).expanduser().exists():
+                return str(Path(path).expanduser())
+        return ""
 
     def _content_from_response(self, raw: dict[str, Any]) -> str:
         choices = raw.get("choices")
@@ -269,6 +354,19 @@ def redact_sensitive(value: Any, *, max_string: int = 1200, max_list: int | None
         text = re.sub(r"(?i)(api[_-]?key|token|secret|password)=([A-Za-z0-9._~+/=-]+)", r"\1=<redacted>", text)
         return text[:max_string]
     return value
+
+
+def _public_ca_bundle_path(path: str) -> str:
+    if not path:
+        return ""
+    return "<certifi>" if "certifi" in path.lower() else redact_sensitive(path)
+
+
+def _proxy_summary() -> dict[str, bool]:
+    return {
+        key: bool(os.getenv(key) or os.getenv(key.lower()))
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
+    }
 
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:

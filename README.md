@@ -302,14 +302,16 @@ Core model flow:
 
 ```text
 User -> Veyra
-  -> deterministic safety baseline + state snapshot
-  -> optional Core model reasoning for intent, route, foresight, perception, agency gaps, and solution outline
-  -> deterministic risk clamp + Foresight + Guardian
-  -> direct answer / probe / skill / selected AgentAdapter
-  -> verifier + model-ranked memory + perception / external world state update
+  -> TurnContextBuilder minimal scoped context
+  -> CoreModelReasoning structured cognition decision
+  -> VeyraController capability/governance gate
+  -> direct answer / probe / skill / ask_user / selected AgentAdapter / block
+  -> Verifier
+  -> memory_policy: forget / short_term / long_term
+  -> state update + response
 ```
 
-The Core model is inside Veyra Core, not inside the selected Agent Runtime. It can improve understanding, planning, impact prediction, memory relevance, ExternalWorld interpretation, and precondition discovery, but it cannot lower a rule-detected risk level or bypass Guardian. Complex Agent tasks receive the Core model's solution outline, decision trace, foresight, executor state, model-ranked memory, and bounded context inside the `VeyraTaskPacket.context_patch`.
+The Core model is inside Veyra Core, not inside the selected Agent Runtime. It is the cognition center for understanding, route recommendation, freshness judgment, risk interpretation, memory policy, and capability requests, but it does not execute tools. The Controller executes only after checking the capability registry and Guardian constraints. Complex Agent tasks receive the Core model's solution outline, decision trace, foresight when required, executor state, model-ranked memory, and bounded context inside the `VeyraTaskPacket.context_patch`.
 
 The same capability can also be attached while configuring a selected runtime with `POST /agents/{name}/config` by setting `use_model_for_core`, `model_base_url`, `model_api_key_env`, and `model`. Top-level `/core/model/config` takes precedence when explicitly enabled.
 

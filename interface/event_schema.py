@@ -27,6 +27,7 @@ class Route(str, Enum):
     NATIVE_TOOL = "native_tool"
     SKILL = "skill"
     AGENT = "agent"
+    ASK_USER = "ask_user"
     HUMAN_REVIEW = "human_review"
     BLOCK = "block"
     ROLLBACK = "rollback"
@@ -64,6 +65,14 @@ class Decision:
     intent: str = "unknown"
     complexity: str = "unknown"
     capability: str = "unknown"
+    freshness_required: bool = False
+    needs_probe: bool = False
+    needs_agent: bool = False
+    needs_user_confirmation: bool = False
+    memory_policy: str = "forget"
+    reasoning_mode: str = "direct"
+    required_capabilities: list[str] = field(default_factory=list)
+    capability_request: dict[str, Any] = field(default_factory=dict)
     signals: list[str] = field(default_factory=list)
     constraints: list[str] = field(default_factory=list)
     model_assist: dict[str, Any] = field(default_factory=dict)

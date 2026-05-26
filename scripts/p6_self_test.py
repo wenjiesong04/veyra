@@ -24,6 +24,7 @@ os.environ.setdefault("VEYRA_AGENCY_ROOT", str(_BOOTSTRAP_ROOT / "agency"))
 
 import main as app_module  # noqa: E402
 from core.agency_core import AgencyCore  # noqa: E402
+from core.capability_registry import CapabilityRegistry  # noqa: E402
 from core.context_patch_builder import ContextPatchBuilder  # noqa: E402
 from core.awareness_loop import AwarenessLoop  # noqa: E402
 from core.decision_core import DecisionCore  # noqa: E402
@@ -33,6 +34,7 @@ from core.guardian_controller import GuardianController  # noqa: E402
 from core.model_client import CoreModelClient  # noqa: E402
 from core.perception_layer import PerceptionLayer  # noqa: E402
 from core.runtime_entity import RuntimeEntity  # noqa: E402
+from core.turn_context_builder import TurnContextBuilder  # noqa: E402
 from core.verifier import Verifier  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
 from execution.action_executor import ActionExecutor  # noqa: E402
@@ -307,6 +309,25 @@ def main() -> int:
             reasoning=FakeCoreReasoning(decision={"status": "model_assisted", "route": "direct_answer", "risk_level": "R0", "reason": "guessed", "draft_response": "猜一个时间"}),
         ).decide("现在东京时间是几点", [])
         expect(time_preserved.route == Route.PROBE and "policy:required_probe_preserved" in time_preserved.signals, "model cannot replace required fresh probe with guess", time_preserved.to_dict())
+
+        capabilities = CapabilityRegistry(app_module.state_store).snapshot()
+        expect(capabilities["capabilities"]["time_probe"]["available"] is True, "capability registry exposes time probe", capabilities)
+        expect(capabilities["capabilities"]["weather_probe"]["available"] is False, "capability registry does not fake weather", capabilities)
+        turn_context = TurnContextBuilder(app_module.state_store).build(user_message="今天北京天气怎么样", attention_focus=["weather"])
+        expect("available_capabilities" in turn_context and "local_world" not in turn_context, "turn context is scoped and capability-aware", turn_context)
+        weather_decision = DecisionCore(app_module.state_store, reasoning=FakeCoreReasoning()).decide("今天北京天气怎么样", [])
+        expect(
+            weather_decision.route == Route.ASK_USER
+            and weather_decision.freshness_required
+            and "weather_probe" in weather_decision.required_capabilities,
+            "missing freshness capability asks instead of guessing",
+            weather_decision.to_dict(),
+        )
+        weather_loop = client.post(
+            "/events/message",
+            json={"text": "今天北京天气怎么样", "channel": "self-test", "user_id": "p6", "session_id": "p6-weather"},
+        ).json()
+        expect(weather_loop["route"] == "ask_user" and weather_loop["status"] == "needs_user_input", "controller asks when live capability is unavailable", weather_loop)
 
         agent_rejected = DecisionCore(
             app_module.state_store,
