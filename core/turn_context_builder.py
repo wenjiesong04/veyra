@@ -44,38 +44,50 @@ class TurnContextBuilder:
             if str(claim.get("status") or "fresh") in {"stale", "expired"} or claim.get("next_action")
         ]
         payload_metadata = event.payload.get("metadata") if event else {}
+        risk_state = state.get("risk_state", {}) if isinstance(state.get("risk_state"), dict) else {}
+        persona = self._persona_summary(state.get("persona_state", {}))
         return redact_sensitive(
             {
-                "current_time": self._current_time(),
-                "event": self._event_summary(event, payload_metadata),
-                "conversation_tail": self._conversation_tail(event, limit=4),
-                "input": {
-                    "text": user_message,
+                "active_context": {
+                    "user_message": user_message,
+                    "current_time": self._current_time(),
+                    "event": self._event_summary(event, payload_metadata),
                     "attachments": self._attachment_summary(payload_metadata),
+                    "attention_focus": attention_focus,
+                    "persona": persona,
+                    "risk": {
+                        "current_risk": risk_state.get("current_risk"),
+                        "signals": risk_state.get("signals", [])[:4] if isinstance(risk_state.get("signals"), list) else [],
+                    },
+                    "rule_decision": self._rule_decision_summary(rule_decision or {}),
                 },
-                "user_world": self._user_world_summary(state.get("user_world", {})),
-                "attention": {
-                    "focus": attention_focus,
-                    "scope": state.get("attention_state", {}).get("context_scope", {}),
+                "short_memory": {
+                    "conversation_tail": self._conversation_tail(event, limit=3),
+                    "user": self._user_world_summary(state.get("user_world", {})),
+                    "task": self._task_summary(state.get("task_state", {})),
                 },
                 "belief": {
-                    "summary": state.get("belief_state", {}).get("summary", {}),
-                    "fresh_claims": fresh_claims[:10],
-                    "stale_or_uncertain_claims": stale_claims[:6],
+                    "summary": self._belief_summary(state.get("belief_state", {}).get("summary", {})),
+                    "fresh_claims": fresh_claims[:4],
+                    "stale_or_uncertain_claims": stale_claims[:3],
                     "uncertainty": self.uncertainty.uncertainty_summary(relevant_claims),
                 },
-                "runtime": {
-                    "executor_state": self._executor_summary(state.get("executor_state", {})),
-                    "task_state": self._task_summary(state.get("task_state", {})),
-                    "risk_state": state.get("risk_state", {}),
-                    "agent_config": self._agent_summary(state.get("agent_config", {})),
+                "stale_beliefs": stale_claims[:3],
+                "runtime_summary": {
+                    "executor": self._executor_summary(state.get("executor_state", {})),
+                    "agent": self._agent_summary(state.get("agent_config", {})),
                 },
-                "persona": self._persona_summary(state.get("persona_state", {})),
-                "rule_decision": rule_decision or {},
-                "available_capabilities": self.capabilities.snapshot(),
+                "available_capabilities": self._capability_summary(self.capabilities.snapshot()),
+                "ignored_state": [
+                    "state_schema",
+                    "full_risk_catalog",
+                    "full_channel_inbox",
+                    "full_agent_memory",
+                    "runtime_history",
+                ],
             },
-            max_string=1400,
-            max_list=12,
+            max_string=600,
+            max_list=8,
         )
 
     def _scoped_state(self) -> dict[str, Any]:
@@ -145,7 +157,7 @@ class TurnContextBuilder:
                 {
                     "direction": "inbound",
                     "received_at": item.get("received_at"),
-                    "text": item.get("text"),
+                    "text": self._clip(item.get("text"), 220),
                     "message_type": feishu.get("message_type") or metadata.get("message_type") or "text",
                     "has_attachment": bool(feishu.get("message_type") and feishu.get("message_type") != "text"),
                 }
@@ -163,8 +175,7 @@ class TurnContextBuilder:
             "available": True,
             "message_type": message_type,
             "content_available_to_core": bool(feishu.get("content_text") or metadata.get("content_text")),
-            "content_summary": feishu.get("content_text") or metadata.get("content_text") or "",
-            "note": "Attachment bytes are not available to Core unless the channel adapter supplies OCR or vision text.",
+            "content_summary": self._clip(feishu.get("content_text") or metadata.get("content_text") or "", 220),
         }
 
     def _claim_summary(self, claim: dict[str, Any]) -> dict[str, Any]:
@@ -183,8 +194,8 @@ class TurnContextBuilder:
         if not isinstance(value, dict):
             return {}
         return {
-            "preferences": value.get("preferences", {}),
-            "current_goal": value.get("current_goal", ""),
+            "preferences": self._limit_mapping(value.get("preferences", {}), 6),
+            "current_goal": self._clip(value.get("current_goal", ""), 180),
             "focus": value.get("focus", []),
         }
 
@@ -194,10 +205,12 @@ class TurnContextBuilder:
         history = value.get("history") if isinstance(value.get("history"), list) else []
         short_term = value.get("short_term_memory") if isinstance(value.get("short_term_memory"), list) else []
         return {
-            "current_task": value.get("current_task"),
-            "recent_history": history[-3:],
-            "short_term_memory": short_term[-5:],
-            "pending_agent_tasks": value.get("pending_agent_tasks", [])[-3:] if isinstance(value.get("pending_agent_tasks"), list) else [],
+            "current_task": self._compact_task_item(value.get("current_task")),
+            "recent_history": [self._compact_task_item(item) for item in history[-2:]],
+            "short_term_memory": [self._compact_task_item(item) for item in short_term[-3:]],
+            "pending_agent_tasks": [self._compact_task_item(item) for item in value.get("pending_agent_tasks", [])[-2:]]
+            if isinstance(value.get("pending_agent_tasks"), list)
+            else [],
         }
 
     def _executor_summary(self, value: Any) -> dict[str, Any]:
@@ -234,3 +247,66 @@ class TurnContextBuilder:
             "last_route": (value.get("last_binding") or {}).get("route") if isinstance(value.get("last_binding"), dict) else None,
             "response_style": (value.get("last_binding") or {}).get("response_style") if isinstance(value.get("last_binding"), dict) else None,
         }
+
+    def _capability_summary(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        capabilities = snapshot.get("capabilities") if isinstance(snapshot.get("capabilities"), dict) else {}
+        compact: dict[str, bool] = {}
+        unavailable: dict[str, str] = {}
+        for name, payload in capabilities.items():
+            if not isinstance(payload, dict):
+                continue
+            available = bool(payload.get("available"))
+            compact[name] = available
+            if not available:
+                unavailable[name] = str(payload.get("status") or "unavailable")
+        return {
+            "schema": snapshot.get("schema"),
+            "capabilities": compact,
+            "unavailable": unavailable,
+            "routes": snapshot.get("routes", {}),
+            "probes": snapshot.get("probes", {}),
+            "skills": snapshot.get("skills", {}),
+            "selected_agent": snapshot.get("selected_agent", {}),
+        }
+
+    def _belief_summary(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        keys = ("fresh", "stale", "expired", "conflict", "total", "refreshable")
+        return {key: value.get(key) for key in keys if key in value}
+
+    def _rule_decision_summary(self, value: dict[str, Any]) -> dict[str, Any]:
+        keys = (
+            "route",
+            "intent",
+            "complexity",
+            "risk_level",
+            "freshness_required",
+            "selected_probe",
+            "memory_policy",
+            "reasoning_mode",
+        )
+        summary = {key: value.get(key) for key in keys if key in value}
+        required = value.get("required_capabilities")
+        if isinstance(required, list):
+            summary["required_capabilities"] = required[:6]
+        return summary
+
+    def _compact_task_item(self, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        return {
+            key: self._clip(value.get(key), 180)
+            for key in ("route", "status", "task", "message", "result", "updated_at")
+            if key in value
+        }
+
+    def _limit_mapping(self, value: Any, limit: int) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        return {str(key): self._clip(item, 220) for key, item in list(value.items())[:limit]}
+
+    def _clip(self, value: Any, limit: int) -> Any:
+        if not isinstance(value, str):
+            return value
+        return value if len(value) <= limit else value[:limit] + "..."

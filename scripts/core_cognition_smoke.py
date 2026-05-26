@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -176,7 +177,9 @@ def _run_cases(*, state_store: WorldStateStore, cases: list[dict[str, Any]], liv
             rule_decision=rule_decision,
         )
         model_trace_count = len(state_store.read_jsonl("core_model_trace.jsonl", limit=10000))
+        started_at = time.perf_counter()
         result = loop.handle_event(event)
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
         model_traces = state_store.read_jsonl("core_model_trace.jsonl", limit=10000)[model_trace_count:]
         after_agent_calls = len(debug_agent.sent_packets) if debug_agent else before_agent_calls
         record = _record_case(
@@ -186,6 +189,7 @@ def _run_cases(*, state_store: WorldStateStore, cases: list[dict[str, Any]], liv
             agent_called=after_agent_calls > before_agent_calls,
             debug_agent=debug_agent,
             model_traces=model_traces,
+            latency_ms=latency_ms,
         )
         record["failures"] = _expectation_failures(record)
         results.append(record)
@@ -209,6 +213,7 @@ def _record_case(
     agent_called: bool,
     debug_agent: DebugAgentAdapter | None,
     model_traces: list[dict[str, Any]],
+    latency_ms: int,
 ) -> dict[str, Any]:
     artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), dict) else {}
     decision = _decision_from_artifacts(artifacts)
@@ -222,12 +227,13 @@ def _record_case(
     task_packet = artifacts.get("task_packet") if isinstance(artifacts.get("task_packet"), dict) else {}
     controller = artifacts.get("controller") if isinstance(artifacts.get("controller"), dict) else {}
     memory_execution = artifacts.get("memory_policy_execution") if isinstance(artifacts.get("memory_policy_execution"), dict) else {}
+    turn_context_summary = _summarize_turn_context(turn_context)
 
     return {
         "case_id": case["id"],
         "expectation": case["expectation"],
         "user_message": case["message"],
-        "turn_context_summary": _summarize_turn_context(turn_context),
+        "turn_context_summary": turn_context_summary,
         "core_model_decision": {
             "status": model_assist.get("status", "skipped"),
             "intent": decision.get("intent"),
@@ -245,6 +251,8 @@ def _record_case(
         "route": result.get("route"),
         "status": result.get("status"),
         "risk_level": result.get("risk_level"),
+        "context_size": turn_context_summary.get("json_chars"),
+        "latency_ms": latency_ms,
         "model_used": bool(decision_model_used or answer_model_used or probe_model_used),
         "model_trace": _summarize_model_trace(model_traces),
         "agent_used": bool(agent_called or task_packet),
@@ -274,29 +282,45 @@ def _summarize_turn_context(turn_context: dict[str, Any]) -> dict[str, Any]:
     unavailable = [
         name
         for name, payload in capability_map.items()
-        if isinstance(payload, dict) and not payload.get("available")
+        if (isinstance(payload, dict) and not payload.get("available")) or (isinstance(payload, bool) and not payload)
     ]
     belief = turn_context.get("belief") if isinstance(turn_context.get("belief"), dict) else {}
-    runtime = turn_context.get("runtime") if isinstance(turn_context.get("runtime"), dict) else {}
+    runtime = turn_context.get("runtime_summary") if isinstance(turn_context.get("runtime_summary"), dict) else {}
+    if not runtime:
+        runtime = turn_context.get("runtime") if isinstance(turn_context.get("runtime"), dict) else {}
+    active = turn_context.get("active_context") if isinstance(turn_context.get("active_context"), dict) else {}
+    short_memory = turn_context.get("short_memory") if isinstance(turn_context.get("short_memory"), dict) else {}
     input_block = turn_context.get("input") if isinstance(turn_context.get("input"), dict) else {}
+    attachments = input_block.get("attachments") if isinstance(input_block.get("attachments"), dict) else active.get("attachments", {})
+    conversation_tail = turn_context.get("conversation_tail")
+    if not isinstance(conversation_tail, list):
+        conversation_tail = short_memory.get("conversation_tail", []) if isinstance(short_memory.get("conversation_tail"), list) else []
     return {
         "json_chars": len(serialized),
         "top_level_keys": sorted(turn_context.keys()),
-        "conversation_tail_count": len(turn_context.get("conversation_tail", [])) if isinstance(turn_context.get("conversation_tail"), list) else 0,
+        "conversation_tail_count": len(conversation_tail),
         "fresh_claim_count": len(belief.get("fresh_claims", [])) if isinstance(belief.get("fresh_claims"), list) else 0,
         "stale_or_uncertain_claim_count": len(belief.get("stale_or_uncertain_claims", [])) if isinstance(belief.get("stale_or_uncertain_claims"), list) else 0,
         "capability_count": len(capability_map),
         "unavailable_capabilities": unavailable,
-        "attachments": input_block.get("attachments", {}),
+        "attachments": attachments,
         "runtime": _compact_runtime(runtime),
     }
 
 
 def _compact_runtime(runtime: dict[str, Any]) -> dict[str, Any]:
-    executor = runtime.get("executor_state") if isinstance(runtime.get("executor_state"), dict) else {}
-    task = runtime.get("task_state") if isinstance(runtime.get("task_state"), dict) else {}
-    risk = runtime.get("risk_state") if isinstance(runtime.get("risk_state"), dict) else {}
-    agent = runtime.get("agent_config") if isinstance(runtime.get("agent_config"), dict) else {}
+    executor = runtime.get("executor") if isinstance(runtime.get("executor"), dict) else {}
+    if not executor:
+        executor = runtime.get("executor_state") if isinstance(runtime.get("executor_state"), dict) else {}
+    task = runtime.get("task") if isinstance(runtime.get("task"), dict) else {}
+    if not task:
+        task = runtime.get("task_state") if isinstance(runtime.get("task_state"), dict) else {}
+    risk = runtime.get("risk") if isinstance(runtime.get("risk"), dict) else {}
+    if not risk:
+        risk = runtime.get("risk_state") if isinstance(runtime.get("risk_state"), dict) else {}
+    agent = runtime.get("agent") if isinstance(runtime.get("agent"), dict) else {}
+    if not agent:
+        agent = runtime.get("agent_config") if isinstance(runtime.get("agent_config"), dict) else {}
     return {
         "executor": {
             "selected_agent": executor.get("selected_agent"),
@@ -370,6 +394,9 @@ def _expectation_failures(record: dict[str, Any]) -> list[str]:
     route = record["route"]
     response = record["final_response"]
     failures: list[str] = []
+    context_size = int(record.get("context_size") or 0)
+    if context_size > 4000:
+        failures.append(f"turn context exceeds 4k chars: {context_size}")
     if case_id == "ordinary_explanation":
         if route != "direct_answer":
             failures.append(f"expected direct_answer, got {route}")
