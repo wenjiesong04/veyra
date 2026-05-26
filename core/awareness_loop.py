@@ -503,6 +503,8 @@ class AwarenessLoop:
 
     def _direct_answer(self, event: VeyraEvent, decision: Decision, attention_focus: list[str]) -> str:
         text = str(event.payload.get("text", ""))
+        if decision.intent == "identity" or "source:governance_identity" in decision.signals:
+            return "我是 Veyra。OpenClaw 是我可以在需要执行复杂任务时治理和调用的 Agent Runtime，不是当前对话身份。"
         draft = decision.model_assist.get("draft_response") if decision.model_assist else ""
         if draft:
             return str(draft)

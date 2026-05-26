@@ -84,6 +84,8 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
 )
 
 VOLATILE_MARKERS = ("现在", "当前", "状态", "最新", "today", "now", "current", "status", "latest")
+IDENTITY_MARKERS = ("你是谁", "你是", "你现在是", "身份", "who are you", "are you")
+GOVERNANCE_ENTITIES = ("veyra", "openclaw", "hermes", "runtime", "agent")
 
 
 class DecisionCore:
@@ -104,6 +106,14 @@ class DecisionCore:
         freshness = self._freshness_for_text(lowered)
         attachment_gap = self._attachment_capability_gap(event)
         signals = intent_signals + complexity_signals + self._risk_signals(risk)
+        priority_decision = self._priority_intent_decision(
+            lowered=lowered,
+            risk=risk,
+            complexity=complexity,
+            signals=signals,
+        )
+        if priority_decision:
+            return priority_decision
         if attachment_gap:
             return self._decision(
                 route=Route.ASK_USER,
@@ -258,6 +268,8 @@ class DecisionCore:
     def _apply_model_assist(self, text: str, attention_focus: list[str], base: Decision, event: VeyraEvent | None = None) -> Decision:
         if not self.reasoning:
             return base
+        if self._is_governance_locked(base):
+            return base
         assist = self.reasoning.decision_assist(text=text, attention_focus=attention_focus, rule_decision=base.to_dict(), event=event)
         if assist.get("status") != "model_assisted":
             return base
@@ -378,6 +390,34 @@ class DecisionCore:
                 "reason": f"{rule.get('name')} requires fresh evidence via {capability}",
             }
         return {"required": False}
+
+    def _priority_intent_decision(self, *, lowered: str, risk: RiskLevel, complexity: str, signals: list[str]) -> Decision | None:
+        if risk in {RiskLevel.R3, RiskLevel.R4, RiskLevel.R5}:
+            return None
+        if not self._is_identity_or_governance_intent(lowered):
+            return None
+        return self._decision(
+            route=Route.DIRECT_ANSWER,
+            risk=RiskLevel.R0,
+            reason="governance identity intent takes priority over runtime keyword probes",
+            intent="identity",
+            complexity=complexity,
+            capability="native_answer",
+            signals=signals + ["intent:identity", "source:governance_identity", "priority:identity"],
+            memory_policy="forget",
+            reasoning_mode="direct",
+            required_capabilities=["native_answer"],
+            constraints=["answer governance identity only", "do not probe runtime keywords"],
+        )
+
+    def _is_identity_or_governance_intent(self, lowered: str) -> bool:
+        has_identity_form = any(marker in lowered for marker in IDENTITY_MARKERS)
+        has_entity = any(entity in lowered for entity in GOVERNANCE_ENTITIES)
+        asks_choice = "还是" in lowered or " or " in lowered
+        return has_identity_form and (has_entity or asks_choice)
+
+    def _is_governance_locked(self, decision: Decision) -> bool:
+        return decision.intent in {"identity", "governance"} or "source:governance_identity" in decision.signals
 
     def _attachment_capability_gap(self, event: VeyraEvent | None) -> dict[str, Any] | None:
         if not event:
