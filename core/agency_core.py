@@ -64,6 +64,47 @@ class AgencyCore:
                     "action_text": "refresh selected agent runtime status with read-only probes",
                 }
             )
+        capability_snapshot = executor.get("capability_snapshot") if isinstance(executor.get("capability_snapshot"), dict) else {}
+        if str(capability_snapshot.get("freshness") or "") in {"stale", "expired"} or self._state_age_exceeds_ttl(capability_snapshot):
+            gaps.append(
+                {
+                    "gap_id": "selected_agent_capability_stale",
+                    "target": "selected_agent.capabilities",
+                    "observed_status": str(capability_snapshot.get("freshness") or "stale"),
+                    "risk_level": RiskLevel.R1.value,
+                    "suggested_action": "refresh_agent_capabilities",
+                    "action_text": "refresh selected agent capability snapshot with read-only AgentAdapter probe",
+                }
+            )
+
+        agent_config = world_state.get("agent_config", {}) if isinstance(world_state.get("agent_config"), dict) else {}
+        core_model = agent_config.get("core_model") if isinstance(agent_config.get("core_model"), dict) else {}
+        if core_model.get("enabled") and (not core_model.get("base_url") or not core_model.get("model")):
+            gaps.append(
+                {
+                    "gap_id": "core_model_provider_unhealthy",
+                    "target": "core_model",
+                    "observed_status": "configuration_incomplete",
+                    "risk_level": RiskLevel.R1.value,
+                    "suggested_action": "review_core_model_config",
+                    "action_text": "suggest reviewing Core model provider configuration before relying on model-assisted cognition",
+                }
+            )
+
+        channel_state = world_state.get("channel_state", {}) if isinstance(world_state.get("channel_state"), dict) else {}
+        feishu_channel = ((channel_state.get("channels") or {}).get("feishu") if isinstance(channel_state.get("channels"), dict) else {}) or {}
+        feishu_ws = world_state.get("feishu_ws_state", {}) if isinstance(world_state.get("feishu_ws_state"), dict) else {}
+        if feishu_channel.get("enabled") and str(feishu_ws.get("status") or "stopped") not in {"running", "connected"}:
+            gaps.append(
+                {
+                    "gap_id": "feishu_intake_disconnected",
+                    "target": "feishu_intake",
+                    "observed_status": str(feishu_ws.get("status") or "stopped"),
+                    "risk_level": RiskLevel.R1.value,
+                    "suggested_action": "check_feishu_intake",
+                    "action_text": "suggest checking Feishu intake connection before expecting proactive delivery",
+                }
+            )
 
         belief = world_state.get("belief_state", {}) if isinstance(world_state.get("belief_state"), dict) else {}
         for claim in belief.get("claims", []) if isinstance(belief.get("claims"), list) else []:
@@ -92,6 +133,36 @@ class AgencyCore:
                     "risk_level": RiskLevel.R2.value,
                     "suggested_action": "suggest_diff_review",
                     "action_text": "suggest reviewing git diff before risky operations",
+                }
+            )
+
+        state_health = self.state_store.state_health() if self.state_store else {}
+        stale_states = state_health.get("stale") if isinstance(state_health.get("stale"), list) else []
+        for item in stale_states[:5]:
+            if not isinstance(item, dict):
+                continue
+            gaps.append(
+                {
+                    "gap_id": f"state_ttl:{item.get('name')}",
+                    "target": item.get("name"),
+                    "observed_status": item.get("health_status"),
+                    "risk_level": RiskLevel.R1.value,
+                    "suggested_action": item.get("next_action") or "refresh_state",
+                    "action_text": f"refresh stale state file {item.get('name')} before using it for execution",
+                }
+            )
+
+        risk_state = world_state.get("risk_state", {}) if isinstance(world_state.get("risk_state"), dict) else {}
+        current_risk = str(risk_state.get("current_risk") or "R0")
+        if current_risk in {"R3", "R4", "R5"}:
+            gaps.append(
+                {
+                    "gap_id": "tool_proxy_high_risk_signal",
+                    "target": "risk_state",
+                    "observed_status": current_risk,
+                    "risk_level": RiskLevel.R2.value,
+                    "suggested_action": "review_recent_tool_proxy_trace",
+                    "action_text": "suggest reviewing high-risk ToolProxy or Guardian signal before further execution",
                 }
             )
 
@@ -205,3 +276,20 @@ class AgencyCore:
                 }
             )
         return merged
+
+    def _state_age_exceeds_ttl(self, value: dict[str, Any]) -> bool:
+        if not isinstance(value, dict):
+            return False
+        updated_at = str(value.get("updated_at") or "")
+        ttl_seconds = int(value.get("ttl_seconds") or 0)
+        if not updated_at or ttl_seconds <= 0:
+            return False
+        from datetime import datetime, timezone
+
+        try:
+            parsed = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - parsed).total_seconds() > ttl_seconds
