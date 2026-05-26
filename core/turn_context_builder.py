@@ -32,7 +32,7 @@ class TurnContextBuilder:
         rule_decision: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         state = self._scoped_state()
-        relevant_claims = self.belief.relevant_claims(attention_focus, limit=10)
+        relevant_claims = self.belief.relevant_claims(attention_focus, limit=4)
         fresh_claims = [
             self._claim_summary(claim)
             for claim in relevant_claims
@@ -68,11 +68,10 @@ class TurnContextBuilder:
                 },
                 "belief": {
                     "summary": self._belief_summary(state.get("belief_state", {}).get("summary", {})),
-                    "fresh_claims": fresh_claims[:4],
-                    "stale_or_uncertain_claims": stale_claims[:3],
+                    "fresh_claims": fresh_claims[:2],
                     "uncertainty": self.uncertainty.uncertainty_summary(relevant_claims),
                 },
-                "stale_beliefs": stale_claims[:3],
+                "stale_beliefs": stale_claims[:1],
                 "runtime_summary": {
                     "executor": self._executor_summary(state.get("executor_state", {})),
                     "agent": self._agent_summary(state.get("agent_config", {})),
@@ -181,11 +180,10 @@ class TurnContextBuilder:
     def _claim_summary(self, claim: dict[str, Any]) -> dict[str, Any]:
         return {
             "key": claim.get("key"),
-            "claim": claim.get("claim"),
+            "claim": self._clip(claim.get("claim"), 160),
             "source": claim.get("source"),
             "status": claim.get("status"),
             "confidence": claim.get("confidence"),
-            "age_seconds": claim.get("age_seconds"),
             "ttl_remaining_seconds": claim.get("ttl_remaining_seconds"),
             "next_action": claim.get("next_action"),
         }
@@ -264,8 +262,8 @@ class TurnContextBuilder:
             "capabilities": compact,
             "unavailable": unavailable,
             "routes": snapshot.get("routes", {}),
-            "probes": snapshot.get("probes", {}),
-            "skills": snapshot.get("skills", {}),
+            "probes": self._availability_flags(snapshot.get("probes", {})),
+            "skills": self._availability_flags(snapshot.get("skills", {})),
             "selected_agent": snapshot.get("selected_agent", {}),
         }
 
@@ -305,6 +303,17 @@ class TurnContextBuilder:
         if not isinstance(value, dict):
             return {}
         return {str(key): self._clip(item, 220) for key, item in list(value.items())[:limit]}
+
+    def _availability_flags(self, value: Any) -> dict[str, bool]:
+        if not isinstance(value, dict):
+            return {}
+        flags: dict[str, bool] = {}
+        for key, payload in value.items():
+            if isinstance(payload, dict):
+                flags[str(key)] = bool(payload.get("available"))
+            else:
+                flags[str(key)] = bool(payload)
+        return flags
 
     def _clip(self, value: Any, limit: int) -> Any:
         if not isinstance(value, str):

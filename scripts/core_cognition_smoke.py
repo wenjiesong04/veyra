@@ -290,6 +290,7 @@ def _summarize_turn_context(turn_context: dict[str, Any]) -> dict[str, Any]:
         runtime = turn_context.get("runtime") if isinstance(turn_context.get("runtime"), dict) else {}
     active = turn_context.get("active_context") if isinstance(turn_context.get("active_context"), dict) else {}
     short_memory = turn_context.get("short_memory") if isinstance(turn_context.get("short_memory"), dict) else {}
+    stale_beliefs = turn_context.get("stale_beliefs") if isinstance(turn_context.get("stale_beliefs"), list) else []
     input_block = turn_context.get("input") if isinstance(turn_context.get("input"), dict) else {}
     attachments = input_block.get("attachments") if isinstance(input_block.get("attachments"), dict) else active.get("attachments", {})
     conversation_tail = turn_context.get("conversation_tail")
@@ -300,7 +301,7 @@ def _summarize_turn_context(turn_context: dict[str, Any]) -> dict[str, Any]:
         "top_level_keys": sorted(turn_context.keys()),
         "conversation_tail_count": len(conversation_tail),
         "fresh_claim_count": len(belief.get("fresh_claims", [])) if isinstance(belief.get("fresh_claims"), list) else 0,
-        "stale_or_uncertain_claim_count": len(belief.get("stale_or_uncertain_claims", [])) if isinstance(belief.get("stale_or_uncertain_claims"), list) else 0,
+        "stale_or_uncertain_claim_count": len(stale_beliefs),
         "capability_count": len(capability_map),
         "unavailable_capabilities": unavailable,
         "attachments": attachments,
