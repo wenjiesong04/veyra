@@ -19,9 +19,10 @@ SUCCESS_STATUSES = {"success", "ok", "verified_success", "partially_success", "s
 class RuntimeTraceRecorder:
     """Append-only routing trace recorder for real runtime traffic."""
 
-    def __init__(self, state_store: WorldStateStore, *, filename: str = "runtime_trace.jsonl") -> None:
+    def __init__(self, state_store: WorldStateStore, *, filename: str = "decision_trace.jsonl", legacy_filename: str = "runtime_trace.jsonl") -> None:
         self.state_store = state_store
         self.filename = filename
+        self.legacy_filename = legacy_filename
 
     def record(
         self,
@@ -35,6 +36,8 @@ class RuntimeTraceRecorder:
     ) -> dict[str, Any]:
         latency_ms = int(max(0.0, time.perf_counter() - started_at) * 1000)
         artifacts = result.artifacts if isinstance(result.artifacts, dict) else {}
+        decision = artifacts.get("decision") if isinstance(artifacts.get("decision"), dict) else self._decision_from_guardian(artifacts)
+        controller = artifacts.get("controller") if isinstance(artifacts.get("controller"), dict) else {}
         model_calls = self._model_calls(artifacts)
         probe_used = self._probe_used(artifacts)
         agent_used = self._agent_used(artifacts)
@@ -53,25 +56,37 @@ class RuntimeTraceRecorder:
             "message_hash": self._hash(str(event.payload.get("text") or "")),
             "message_chars": len(str(event.payload.get("text") or "")),
             "message_preview": self._preview(str(event.payload.get("text") or "")),
+            "user_message_summary": self._preview(str(event.payload.get("text") or "")),
             "received_at": event.timestamp,
             "completed_at": utc_now_iso(),
             "latency_ms": latency_ms,
             "route_trace": redact_sensitive(route_trace or [], max_string=360, max_list=20),
             "final_route": result.route.value,
+            "route": result.route.value,
             "status": status,
             "risk_level": risk_level,
+            "intent": decision.get("intent") or "",
+            "why": controller.get("reason") or decision.get("reason") or "",
+            "freshness_required": bool(decision.get("freshness_required")),
+            "required_capabilities": decision.get("required_capabilities") if isinstance(decision.get("required_capabilities"), list) else [],
+            "native_capability_available": self._capability_availability(decision, agent=False),
+            "agent_capability_available": self._capability_availability(decision, agent=True),
             "model_used": bool(model_calls),
             "model_calls": model_calls,
-            "probe_used": probe_used,
-            "agent_used": agent_used,
+            "probe_used": [probe_used] if probe_used else [],
+            "agent_used": bool(agent_used),
+            "agent_runtime": agent_used,
             "context_chars": int(metrics.get("context_chars") or 0),
             "estimated_tokens": int(metrics.get("estimated_tokens") or 0),
             "context_drift": redact_sensitive(artifacts.get("context_drift") or {}, max_string=480, max_list=12),
             "memory_policy": self._memory_policy(artifacts),
+            "fallback_reason": self._fallback_reason(controller, result, artifacts),
             "failure_reason": failure_reason or self._failure_reason(result, artifacts),
             "openclaw_call": self._openclaw_call(probe_used, agent_used),
         }
         self.state_store.append_jsonl(self.filename, trace)
+        if self.legacy_filename and self.legacy_filename != self.filename:
+            self.state_store.append_jsonl(self.legacy_filename, trace)
         return trace
 
     def record_intake_result(
@@ -108,20 +123,31 @@ class RuntimeTraceRecorder:
                 {"phase": "response", "status": status, "final_route": final_route},
             ],
             "final_route": final_route,
+            "route": final_route,
             "status": status,
             "risk_level": "R0",
+            "intent": "intake",
+            "why": reason,
+            "freshness_required": False,
+            "required_capabilities": [],
+            "native_capability_available": [],
+            "agent_capability_available": [],
             "model_used": False,
             "model_calls": [],
-            "probe_used": None,
-            "agent_used": None,
+            "probe_used": [],
+            "agent_used": False,
+            "agent_runtime": None,
             "context_chars": 0,
             "estimated_tokens": 0,
             "context_drift": {},
             "memory_policy": "",
+            "fallback_reason": reason,
             "failure_reason": reason,
             "openclaw_call": False,
         }
         self.state_store.append_jsonl(self.filename, trace)
+        if self.legacy_filename and self.legacy_filename != self.filename:
+            self.state_store.append_jsonl(self.legacy_filename, trace)
         return trace
 
     def recent(self, *, limit: int = 50, channel: str | None = None) -> dict[str, Any]:
@@ -219,6 +245,27 @@ class RuntimeTraceRecorder:
         packet = artifacts.get("task_packet") if isinstance(artifacts.get("task_packet"), dict) else {}
         if packet.get("target_agent"):
             return str(packet.get("target_agent"))
+        return None
+
+    def _decision_from_guardian(self, artifacts: dict[str, Any]) -> dict[str, Any]:
+        guardian = artifacts.get("guardian") if isinstance(artifacts.get("guardian"), dict) else {}
+        return guardian.get("decision_trace") if isinstance(guardian.get("decision_trace"), dict) else {}
+
+    def _capability_availability(self, decision: dict[str, Any], *, agent: bool) -> list[str]:
+        required = decision.get("required_capabilities") if isinstance(decision.get("required_capabilities"), list) else []
+        output: list[str] = []
+        for capability in required:
+            text = str(capability)
+            is_agent = "." in text or text == "selected_agent_runtime"
+            if is_agent == agent:
+                output.append(text)
+        return output
+
+    def _fallback_reason(self, controller: dict[str, Any], result: LoopResult, artifacts: dict[str, Any]) -> str | None:
+        if controller.get("status") in {"missing_capability", "missing_probe"}:
+            return str(controller.get("reason") or "")
+        if result.route.value == "ask_user":
+            return self._failure_reason(result, artifacts) or "needs_user_input"
         return None
 
     def _context_metrics(self, artifacts: dict[str, Any]) -> dict[str, Any]:

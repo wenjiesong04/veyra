@@ -8,7 +8,7 @@ from core.world_state import WorldStateStore
 
 
 class RoutingMetrics:
-    def __init__(self, state_store: WorldStateStore, *, trace_filename: str = "runtime_trace.jsonl") -> None:
+    def __init__(self, state_store: WorldStateStore, *, trace_filename: str = "decision_trace.jsonl") -> None:
         self.state_store = state_store
         self.trace_filename = trace_filename
 
@@ -73,7 +73,10 @@ class RoutingMetrics:
         return {"status": "success", "items": [self._public_trace(item) for item in failures[-limit:]]}
 
     def _traces(self, limit: int) -> list[dict[str, Any]]:
-        return self.state_store.read_jsonl(self.trace_filename, limit=limit)
+        traces = self.state_store.read_jsonl(self.trace_filename, limit=limit)
+        if not traces and self.trace_filename != "runtime_trace.jsonl":
+            return self.state_store.read_jsonl("runtime_trace.jsonl", limit=limit)
+        return traces
 
     def _avg(self, values: list[int]) -> int:
         return int(sum(values) / len(values)) if values else 0
