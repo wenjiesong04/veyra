@@ -9,14 +9,12 @@ from pydantic import BaseModel
 from core.architecture import architecture_snapshot
 from core.agency_core import AgencyCore
 from core.awareness_loop import AwarenessLoop
-from core.definitions import RiskLevel, classify_text_risk, lifecycle_statuses, normalize_risk, operational_modes, risk_catalog
+from core.definitions import RiskLevel, classify_text_risk, normalize_risk
 from core.foresight_engine import ForesightEngine
-from core.model_client import redact_sensitive
 from core.runtime_entity import RuntimeEntity
 from core.world_state import WorldStateStore
 from execution.action_executor import ActionExecutor
 from guardian.review_queue import ReviewQueue
-from interface.agent_contract import contract_summary
 from interface.agent_adapter import ExecutionResult
 from interface.event_normalizer import EventNormalizer
 from interface.event_schema import Decision, Route, utc_now_iso
@@ -27,8 +25,13 @@ from pydantic import Field
 from rollback_audit.rollback_manager import RollbackManager
 from rollback_audit.diff_tracker import DiffTracker
 from rollback_audit.action_journal import ActionJournal
+from rollback_audit.tool_trace import ToolTrace
 from rollback_audit.replay import Replay
 from rollback_audit.replay_runtime import ReplayRuntime
+from routers.agent_memory import build_agent_memory_router
+from routers.debug_audit import build_debug_audit_router
+from routers.ops_runtime import build_ops_runtime_router
+from routers.runtime_observability import build_runtime_observability_router
 from runtime.active_loop import ActiveRuntimeLoop
 from runtime.agent_orchestrator import AgentOrchestrator
 from runtime.alert_dispatcher import AlertDispatcher
@@ -38,6 +41,7 @@ from runtime.external_world_refresh import ExternalWorldRefresh
 from runtime.ops_monitor import OpsMonitor
 from runtime.proactive_checks import ProactiveChecks
 from runtime.retention_policy import RetentionPolicy
+from runtime.routing_metrics import RoutingMetrics
 from runtime.runtime_matrix import RuntimeMatrix
 from runtime.soak_runner import SoakRunner
 from runtime.state_refresh import StateRefresh
@@ -45,7 +49,6 @@ from tool_proxy.safe_api import SafeAPI
 from tool_proxy.safe_browser import SafeBrowser
 from tool_proxy.safe_file import SafeFile
 from tool_proxy.safe_shell import SafeShell
-from tool_proxy.agent_tool_contract import agent_tool_proxy_contract
 from runtime.safety_validation import SafetyValidation
 
 
@@ -54,6 +57,7 @@ app = FastAPI(title="Veyra", version="0.1.0")
 state_store = WorldStateStore()
 runtime_entity = RuntimeEntity(state_store=state_store)
 awareness_loop = AwarenessLoop(state_store=state_store, runtime_entity=runtime_entity)
+routing_metrics = RoutingMetrics(state_store)
 event_normalizer = EventNormalizer()
 intake_gateway = IntakeGateway(awareness_loop, event_normalizer, state_store=state_store)
 feishu_adapter = FeishuAdapter(intake_gateway, state_store=state_store)
@@ -67,6 +71,7 @@ safe_shell = SafeShell(state_store=state_store)
 safe_file = SafeFile(state_store=state_store)
 safe_browser = SafeBrowser(state_store=state_store)
 safe_api = SafeAPI(state_store=state_store)
+action_proposal_tool_trace = ToolTrace(state_store)
 _tool_proxy_config = state_store.read_json("ops_config.json").get("tool_proxy", {})
 if isinstance(_tool_proxy_config, dict):
     safe_browser.configure_executor(bool(_tool_proxy_config.get("browser_executor_enabled", False)), _tool_proxy_config.get("browser_allowed_hosts"))
@@ -144,18 +149,12 @@ class MessageRequest(BaseModel):
     message_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-
-class ReviewDecisionRequest(BaseModel):
-    reason: str = ""
-
-
 class ShellRequest(BaseModel):
     command: list[str] = Field(min_length=1)
 
 
 class FileReadRequest(BaseModel):
     path: str
-
 
 class FileWriteRequest(BaseModel):
     path: str
@@ -166,85 +165,14 @@ class FileWriteRequest(BaseModel):
 class BrowserOpenRequest(BaseModel):
     url: str
 
-
 class APIProxyRequest(BaseModel):
     payload: dict[str, Any]
-
 
 class ToolProxyConfigRequest(BaseModel):
     browser_executor_enabled: bool | None = None
     api_executor_enabled: bool | None = None
     browser_allowed_hosts: list[str] | None = None
     api_allowed_hosts: list[str] | None = None
-
-
-class MemoryPatchRequest(BaseModel):
-    patch: dict[str, Any]
-    provider: str = "selected"
-
-
-class MemoryDiagnosticsRequest(BaseModel):
-    provider: str = "all"
-    session_id: str = "memory-diagnostics"
-    write_probe: bool = False
-
-
-class ExternalWatchRequest(BaseModel):
-    target: str
-    kind: str | None = None
-    reason: str = ""
-    enabled: bool = True
-
-
-class AgentSelectRequest(BaseModel):
-    name: str
-
-
-class AgentConfigRequest(BaseModel):
-    kind: str | None = None
-    base_url: str | None = None
-    api_key: str | None = None
-    api_key_env: str | None = None
-    enabled: bool | None = None
-    timeout: float | None = None
-    task_path: str | None = None
-    capabilities_path: str | None = None
-    memory_summary_path: str | None = None
-    memory_patch_path: str | None = None
-    status_path_template: str | None = None
-    stop_path_template: str | None = None
-    protocol_min: int | None = None
-    protocol_max: int | None = None
-    use_model_for_core: bool | None = None
-    model_provider: str | None = None
-    model_base_url: str | None = None
-    model_api_key: str | None = None
-    model_api_key_env: str | None = None
-    model: str | None = None
-    model_timeout: float | None = None
-    model_decision_mode: str | None = None
-
-
-class AgentInvokeRequest(BaseModel):
-    text: str
-    agents: list[str] = Field(default_factory=list)
-    mode: str = "fanout"
-    channel: str = "api"
-    user_id: str = "local-user"
-    session_id: str = "multi-agent"
-
-
-class CoreModelConfigRequest(BaseModel):
-    enabled: bool | None = None
-    provider: str | None = None
-    base_url: str | None = None
-    api_key: str | None = None
-    api_key_env: str | None = None
-    model: str | None = None
-    timeout: float | None = None
-    decision_mode: str | None = None
-    max_tokens: int | None = None
-
 
 class ActionProposalRequest(BaseModel):
     proposal_id: str | None = None
@@ -254,60 +182,6 @@ class ActionProposalRequest(BaseModel):
     risk_guess: str = "R2"
     reversible: str = "unknown"
     reason: str = ""
-
-
-class AgentResultRequest(BaseModel):
-    task_id: str
-    executor: str = "external"
-    status: str
-    result: str = ""
-    logs: str = ""
-    changed_files: list[str] = Field(default_factory=list)
-    tool_calls: list[str] = Field(default_factory=list)
-    raw: dict[str, Any] = Field(default_factory=dict)
-
-
-class SoakRequest(BaseModel):
-    iterations: int = 1
-
-
-class ActiveLoopRequest(BaseModel):
-    interval_seconds: float = 300.0
-
-
-class ActiveLoopTickRequest(BaseModel):
-    reason: str = "manual"
-    include_runtime_matrix: bool = False
-
-
-class BeliefRefreshRequest(BaseModel):
-    expire_after_seconds: int | None = 3600
-    prune_expired_after_seconds: int | None = None
-
-
-class CronConfigRequest(BaseModel):
-    job_id: str = "active_awareness_tick"
-    enabled: bool | None = None
-    interval_seconds: float | None = None
-    include_runtime_matrix: bool | None = None
-
-
-class CronRunRequest(BaseModel):
-    job_id: str = "active_awareness_tick"
-    reason: str = "cron_manual"
-
-
-class ReplayRuntimeRequest(BaseModel):
-    limit: int = 200
-    auto_create_reviews: bool = True
-    auto_execute: bool = False
-    allow_r4_restore: bool = False
-
-
-class ReplayRuntimeConfigRequest(BaseModel):
-    auto_execute_enabled: bool | None = None
-    allow_r4_restore: bool | None = None
-
 
 class ChannelConfigRequest(BaseModel):
     enabled: bool | None = None
@@ -330,35 +204,14 @@ class ChannelConfigRequest(BaseModel):
     reply_to_session: bool | None = None
     timeout: float | None = None
 
-
 class FeishuImportRequest(BaseModel):
     path: str | None = None
     enable: bool = True
-
 
 class ChannelSendRequest(BaseModel):
     message: str
     session_id: str = "manual"
     metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class SoakSessionRequest(BaseModel):
-    iterations: int = 60
-    interval_seconds: float = 60.0
-
-
-class AlertingConfigRequest(BaseModel):
-    enabled: bool | None = None
-    local_log: bool | None = None
-    webhook_enabled: bool | None = None
-    webhook_url: str | None = None
-    webhook_url_env: str | None = None
-    min_severity: str | None = None
-
-
-class RetentionEnforceRequest(BaseModel):
-    dry_run: bool = False
-    limit_overrides: dict[str, int] | None = None
 
 
 @app.get("/")
@@ -484,6 +337,73 @@ def _deployment_readiness() -> dict[str, Any]:
     return readiness
 
 
+class _DynamicDeps(dict[str, Any]):
+    def __getitem__(self, key: str) -> Any:
+        value = super().__getitem__(key)
+        return value() if callable(value) else value
+
+
+app.include_router(
+    build_runtime_observability_router(
+        trace_recorder=awareness_loop.runtime_trace,
+        metrics=routing_metrics,
+    )
+)
+app.include_router(
+    build_agent_memory_router(
+        _DynamicDeps(
+            {
+                "awareness_loop": lambda: awareness_loop,
+                "state_store": lambda: state_store,
+                "runtime_entity": lambda: runtime_entity,
+                "runtime_matrix": lambda: runtime_matrix,
+                "agent_orchestrator": lambda: agent_orchestrator,
+            }
+        )
+    )
+)
+app.include_router(
+    build_debug_audit_router(
+        _DynamicDeps(
+            {
+                "state_store": lambda: state_store,
+                "agency_core": lambda: agency_core,
+                "awareness_loop": lambda: awareness_loop,
+                "review_queue": lambda: review_queue,
+                "action_executor": lambda: action_executor,
+                "action_journal": lambda: action_journal,
+                "replay_engine": lambda: replay_engine,
+                "replay_runtime": lambda: replay_runtime,
+                "foresight_engine": lambda: foresight_engine,
+                "proactive_checks": lambda: proactive_checks,
+                "state_refresh": lambda: state_refresh,
+                "external_world_refresh": lambda: external_world_refresh,
+                "diff_tracker": lambda: diff_tracker,
+                "architecture_snapshot": lambda: architecture_snapshot,
+            }
+        )
+    )
+)
+app.include_router(
+    build_ops_runtime_router(
+        _DynamicDeps(
+            {
+                "safety_validation": lambda: safety_validation,
+                "retention_policy": lambda: retention_policy,
+                "ops_monitor": lambda: ops_monitor,
+                "alert_dispatcher": lambda: alert_dispatcher,
+                "deployment_readiness": lambda: _deployment_readiness,
+                "deployment_validator": lambda: deployment_validator,
+                "runtime_matrix": lambda: runtime_matrix,
+                "active_loop": lambda: active_loop,
+                "runtime_cron": lambda: runtime_cron,
+                "soak_runner": lambda: soak_runner,
+            }
+        )
+    )
+)
+
+
 @app.post("/events/message")
 async def message(request: MessageRequest):
     receipt = intake_gateway.receive_message(
@@ -576,86 +496,6 @@ async def feishu_ws_start():
     return feishu_ws_runner.start()
 
 
-@app.get("/state")
-async def state():
-    payload = _public_state(state_store.read_all())
-    payload["agency"] = agency_core.state()
-    return payload
-
-
-@app.get("/core/model/status")
-async def core_model_status():
-    return awareness_loop.core_reasoning.status()
-
-
-@app.post("/core/model/config")
-async def configure_core_model(request: CoreModelConfigRequest):
-    patch = request.model_dump(exclude_none=True)
-    if "decision_mode" in patch and patch["decision_mode"] not in {"auto", "always"}:
-        raise HTTPException(status_code=422, detail="decision_mode must be 'auto' or 'always'")
-    if "provider" in patch and patch["provider"] != "openai_compatible":
-        raise HTTPException(status_code=422, detail="only openai_compatible provider is supported")
-    if "max_tokens" in patch and not 128 <= int(patch["max_tokens"]) <= 2000:
-        raise HTTPException(status_code=422, detail="max_tokens must be between 128 and 2000")
-    config = state_store.read_json("agent_config.json")
-    core_model = config.setdefault("core_model", {})
-    core_model.update(patch)
-    state_store.write_json("agent_config.json", config)
-    return awareness_loop.core_reasoning.status()
-
-
-@app.get("/architecture")
-async def architecture():
-    return architecture_snapshot()
-
-
-@app.get("/definitions")
-async def definitions():
-    return {
-        "risk_levels": risk_catalog(),
-        "lifecycle_statuses": lifecycle_statuses(),
-        "operational_modes": operational_modes(),
-    }
-
-
-@app.get("/heartbeat")
-async def heartbeat():
-    return {"heartbeat": state_store.read_text("heartbeat.md")}
-
-
-@app.get("/logs/events")
-async def event_logs(limit: int = 100):
-    return {"items": state_store.read_jsonl("event_log.jsonl", limit=limit)}
-
-
-@app.get("/logs/actions")
-async def action_logs(limit: int = 100):
-    return {"items": state_store.read_jsonl("action_record.jsonl", limit=limit)}
-
-
-@app.get("/reviews/actions")
-async def action_reviews(status: str | None = None, limit: int = 100):
-    return {"items": review_queue.list(status=status)[-limit:]}
-
-
-@app.post("/reviews/{review_id}/approve")
-async def approve_review(review_id: str, request: ReviewDecisionRequest):
-    try:
-        review = review_queue.decide(review_id, "approved", request.reason)
-        execution = action_executor.execute_review(review)
-        return review_queue.update_execution(review_id, execution)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.post("/reviews/{review_id}/reject")
-async def reject_review(review_id: str, request: ReviewDecisionRequest):
-    try:
-        return review_queue.decide(review_id, "rejected", request.reason)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
 @app.get("/tool-proxy/status")
 async def tool_proxy_status():
     return _tool_proxy_status()
@@ -729,333 +569,6 @@ async def rollback_snapshot_diff(snapshot_id: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.get("/logs/tools")
-async def tool_logs(limit: int = 100):
-    return {"items": state_store.read_jsonl("tool_call_log.jsonl", limit=limit)}
-
-
-@app.get("/logs/policy")
-async def policy_logs(limit: int = 100):
-    return {"items": state_store.read_jsonl("policy_trace.jsonl", limit=limit)}
-
-
-@app.get("/logs/execution")
-async def execution_logs(limit: int = 100):
-    return {"items": state_store.read_jsonl("execution_trace.jsonl", limit=limit)}
-
-
-@app.get("/logs/rollback")
-async def rollback_logs(limit: int = 100):
-    return {"items": state_store.read_jsonl("rollback_log.jsonl", limit=limit)}
-
-
-@app.get("/logs/memory")
-async def memory_logs(limit: int = 100):
-    return {"items": state_store.read_jsonl("memory_log.jsonl", limit=limit)}
-
-
-@app.get("/logs/core-model")
-async def core_model_logs(limit: int = 100):
-    return {"items": state_store.read_jsonl("core_model_trace.jsonl", limit=limit)}
-
-
-@app.get("/logs/alerts")
-async def alert_logs(limit: int = 100):
-    return {"items": state_store.read_jsonl("alert_log.jsonl", limit=limit)}
-
-
-@app.get("/audit/journal")
-async def audit_journal(
-    limit: int = 100,
-    event_id: str | None = None,
-    task_id: str | None = None,
-    trace_id: str | None = None,
-):
-    return action_journal.timeline(limit=limit, event_id=event_id, task_id=task_id, trace_id=trace_id)
-
-
-@app.get("/audit/time-travel")
-async def audit_time_travel(until: str | None = None, limit: int = 200):
-    return action_journal.time_travel(until=until, limit=limit)
-
-
-@app.get("/audit/replay/{trace_id}")
-async def audit_replay(trace_id: str):
-    return replay_engine.replay(trace_id)
-
-
-def _create_replay_review(payload: dict[str, Any]) -> dict[str, Any]:
-    if payload.get("proposal_status") != "ready":
-        return payload
-    proposal = payload["proposal"]
-    snapshot_id = str(payload.get("snapshot_id") or proposal.get("action", {}).get("snapshot_id") or "")
-    task_text = f"Replay compensation: restore snapshot {snapshot_id}"
-    review = review_queue.create(
-        event_id=str(payload.get("plan", {}).get("event_id") or f"replay_{snapshot_id}"),
-        task_text=task_text,
-        risk_level="R4",
-        foresight=foresight_engine.predict_text_action(task_text, RiskLevel.R4),
-        guardian_decision={
-            "decision": "ask_user",
-            "risk_level": "R4",
-            "reason": "Replay compensation restores prior filesystem state and requires explicit approval.",
-        },
-        proposal=proposal,
-    )
-    return {"status": "needs_confirmation", "review": review, "proposal": proposal, "plan": payload.get("plan")}
-
-
-@app.post("/audit/replay/{trace_id}/propose")
-async def audit_replay_propose(trace_id: str):
-    return _create_replay_review(replay_engine.compensation_proposal(trace_id=trace_id))
-
-
-@app.get("/audit/replay/event/{event_id}")
-async def audit_replay_event(event_id: str):
-    return replay_engine.plan(event_id=event_id)
-
-
-@app.post("/audit/replay/event/{event_id}/propose")
-async def audit_replay_event_propose(event_id: str):
-    return _create_replay_review(replay_engine.compensation_proposal(event_id=event_id))
-
-
-@app.get("/audit/replay/runtime/status")
-async def audit_replay_runtime_status():
-    return replay_runtime.status()
-
-
-@app.post("/audit/replay/runtime/scan")
-async def audit_replay_runtime_scan(request: ReplayRuntimeRequest | None = None):
-    payload = request or ReplayRuntimeRequest()
-    return replay_runtime.scan(limit=payload.limit)
-
-
-@app.post("/audit/replay/runtime/run")
-async def audit_replay_runtime_run(request: ReplayRuntimeRequest | None = None):
-    payload = request or ReplayRuntimeRequest()
-    scan = replay_runtime.scan(limit=payload.limit)
-    run = replay_runtime.run_pending(
-        auto_create_reviews=payload.auto_create_reviews,
-        auto_execute=payload.auto_execute,
-        allow_r4_restore=payload.allow_r4_restore,
-        limit=min(payload.limit, 50),
-    )
-    return {"status": "success", "scan": scan, "run": run}
-
-
-@app.post("/audit/replay/runtime/config")
-async def audit_replay_runtime_config(request: ReplayRuntimeConfigRequest):
-    return replay_runtime.configure(
-        auto_execute_enabled=request.auto_execute_enabled,
-        allow_r4_restore=request.allow_r4_restore,
-    )
-
-
-@app.post("/audit/replay/runtime/execute")
-async def audit_replay_runtime_execute(request: ReplayRuntimeRequest | None = None):
-    payload = request or ReplayRuntimeRequest(auto_execute=True, allow_r4_restore=True)
-    replay_runtime.configure(auto_execute_enabled=True, allow_r4_restore=payload.allow_r4_restore)
-    scan = replay_runtime.scan(limit=payload.limit)
-    run = replay_runtime.run_pending(
-        auto_create_reviews=True,
-        auto_execute=True,
-        allow_r4_restore=payload.allow_r4_restore,
-        limit=min(payload.limit, 50),
-    )
-    return {"status": "success", "scan": scan, "run": run}
-
-
-@app.post("/proactive/check")
-async def proactive_check():
-    return proactive_checks.run_read_only()
-
-
-@app.post("/state/refresh-stale")
-async def refresh_stale_state():
-    return state_refresh.refresh_stale()
-
-
-@app.post("/external/refresh")
-async def refresh_external_world(limit: int = 10):
-    return external_world_refresh.refresh_watchlist(limit=limit)
-
-
-@app.post("/external/watchlist")
-async def add_external_watch(request: ExternalWatchRequest):
-    external = state_store.read_json("external_world.json")
-    watchlist = external.setdefault("watchlist", [])
-    if not isinstance(watchlist, list):
-        watchlist = []
-        external["watchlist"] = watchlist
-    item = request.model_dump()
-    existing = [entry for entry in watchlist if isinstance(entry, dict) and entry.get("target") == request.target]
-    if existing:
-        existing[0].update(item)
-    else:
-        watchlist.append(item)
-    state_store.write_json("external_world.json", external)
-    return external
-
-
-@app.get("/agency/intentions")
-async def agency_intentions():
-    return agency_core.state()
-
-
-@app.get("/personas/status")
-async def personas_status():
-    return {"status": "success", **state_store.read_json("persona_state.json")}
-
-
-@app.get("/belief/status")
-async def belief_status(limit: int = 50):
-    return awareness_loop.belief.ttl_report(limit=limit)
-
-
-@app.post("/belief/refresh")
-async def belief_refresh(request: BeliefRefreshRequest | None = None):
-    payload = request or BeliefRefreshRequest()
-    result = awareness_loop.belief.refresh(
-        expire_after_seconds=payload.expire_after_seconds,
-        prune_expired_after_seconds=payload.prune_expired_after_seconds,
-    )
-    return {"status": "success", **result}
-
-
-@app.get("/ops/safety/red-team")
-async def ops_safety_red_team():
-    return safety_validation.run()
-
-
-@app.get("/ops/retention")
-async def ops_retention():
-    return retention_policy.summary()
-
-
-@app.post("/ops/retention/enforce")
-async def ops_retention_enforce(request: RetentionEnforceRequest | None = None):
-    payload = request or RetentionEnforceRequest()
-    return retention_policy.enforce(dry_run=payload.dry_run, limits=payload.limit_overrides)
-
-
-@app.get("/ops/health")
-async def ops_health():
-    return ops_monitor.health()
-
-
-@app.get("/ops/alerts")
-async def ops_alerts():
-    return ops_monitor.alerts()
-
-
-@app.get("/ops/alerting")
-async def ops_alerting_status():
-    return alert_dispatcher.status()
-
-
-@app.post("/ops/alerting/config")
-async def ops_alerting_config(request: AlertingConfigRequest):
-    return alert_dispatcher.configure(request.model_dump(exclude_none=True))
-
-
-@app.post("/ops/alerts/dispatch")
-async def ops_alerts_dispatch(min_severity: str | None = None):
-    return alert_dispatcher.dispatch(min_severity=min_severity)
-
-
-@app.get("/ops/deployment")
-async def ops_deployment():
-    return _deployment_readiness()
-
-
-@app.get("/ops/deployment/config")
-async def ops_deployment_config():
-    return deployment_validator.validate()
-
-
-@app.get("/ops/runtime-matrix")
-async def ops_runtime_matrix_status():
-    return runtime_matrix.status()
-
-
-@app.post("/ops/runtime-matrix/run")
-async def ops_runtime_matrix_run(write_memory_probe: bool = False):
-    return runtime_matrix.run(write_memory_probe=write_memory_probe)
-
-
-@app.get("/runtime/active-loop")
-async def runtime_active_loop_status():
-    return active_loop.status()
-
-
-@app.post("/runtime/active-loop/start")
-async def runtime_active_loop_start(request: ActiveLoopRequest):
-    return active_loop.start(interval_seconds=request.interval_seconds)
-
-
-@app.post("/runtime/active-loop/stop")
-async def runtime_active_loop_stop():
-    return active_loop.stop()
-
-
-@app.post("/runtime/active-loop/tick")
-async def runtime_active_loop_tick(request: ActiveLoopTickRequest | None = None):
-    payload = request or ActiveLoopTickRequest()
-    return active_loop.tick(reason=payload.reason, include_runtime_matrix=payload.include_runtime_matrix)
-
-
-@app.get("/runtime/cron")
-async def runtime_cron_status():
-    return runtime_cron.status()
-
-
-@app.post("/runtime/cron/config")
-async def runtime_cron_config(request: CronConfigRequest):
-    return runtime_cron.configure(
-        job_id=request.job_id,
-        enabled=request.enabled,
-        interval_seconds=request.interval_seconds,
-        include_runtime_matrix=request.include_runtime_matrix,
-    )
-
-
-@app.post("/runtime/cron/run")
-async def runtime_cron_run(request: CronRunRequest | None = None):
-    payload = request or CronRunRequest()
-    return runtime_cron.run_once(job_id=payload.job_id, reason=payload.reason)
-
-
-@app.post("/runtime/cron/run-due")
-async def runtime_cron_run_due():
-    return runtime_cron.run_due()
-
-
-@app.post("/ops/soak")
-async def ops_soak(request: SoakRequest):
-    return soak_runner.run(iterations=request.iterations)
-
-
-@app.get("/ops/soak/status")
-async def ops_soak_status():
-    return soak_runner.status()
-
-
-@app.post("/ops/soak/start")
-async def ops_soak_start(request: SoakSessionRequest):
-    return soak_runner.start(iterations=request.iterations, interval_seconds=request.interval_seconds)
-
-
-@app.post("/ops/soak/stop")
-async def ops_soak_stop():
-    return soak_runner.stop()
-
-
-@app.get("/rollback/diff")
-async def rollback_diff(full: bool = False):
-    return diff_tracker.git_diff_text() if full else diff_tracker.git_diff()
-
-
 @app.post("/actions/proposals")
 async def action_proposal(request: ActionProposalRequest):
     validation_error = _validate_action_proposal(request)
@@ -1078,16 +591,36 @@ async def action_proposal(request: ActionProposalRequest):
         foresight=foresight,
     )
     if risk == "R5":
+        tool_trace = _record_action_proposal_trace(request, "blocked", guardian_decision)
+        verification = _verify_action_proposal_result(
+            request=request,
+            action_text=action_text,
+            status="blocked",
+            guardian_decision=guardian_decision,
+            tool_trace=tool_trace,
+        )
         state_store.append_jsonl(
             "action_record.jsonl",
             {
                 "event_id": request.proposal_id or "proposal",
                 "route": "block",
                 "status": "blocked",
-                "artifacts": {"proposal": request.model_dump(), "guardian_decision": guardian_decision},
+                "artifacts": {
+                    "proposal": request.model_dump(),
+                    "guardian_decision": guardian_decision,
+                    "tool_trace": tool_trace,
+                    "verification": verification,
+                },
             },
         )
-        return {"status": "blocked", "decision": "block", "risk_level": risk, "guardian_decision": guardian_decision}
+        return {
+            "status": "blocked",
+            "decision": "block",
+            "risk_level": risk,
+            "guardian_decision": guardian_decision,
+            "tool_trace": tool_trace,
+            "verification": verification,
+        }
     if risk in {"R3", "R4"}:
         review = review_queue.create(
             event_id=request.proposal_id or f"proposal_{utc_now_iso()}",
@@ -1097,12 +630,52 @@ async def action_proposal(request: ActionProposalRequest):
             guardian_decision=guardian_decision,
             proposal=request.model_dump(),
         )
-        return {"status": "needs_confirmation", "decision": "ask_user", "guardian_decision": guardian_decision, "review": review}
+        tool_trace = _record_action_proposal_trace(request, "needs_confirmation", guardian_decision, review=review)
+        verification = _verify_action_proposal_result(
+            request=request,
+            action_text=action_text,
+            status="pending",
+            guardian_decision=guardian_decision,
+            tool_trace=tool_trace,
+            review=review,
+        )
+        state_store.append_jsonl(
+            "action_record.jsonl",
+            {
+                "event_id": request.proposal_id or "proposal",
+                "route": "human_review",
+                "status": "needs_confirmation",
+                "artifacts": {
+                    "proposal": request.model_dump(),
+                    "guardian_decision": guardian_decision,
+                    "review": review,
+                    "tool_trace": tool_trace,
+                    "verification": verification,
+                },
+            },
+        )
+        return {
+            "status": "needs_confirmation",
+            "decision": "ask_user",
+            "guardian_decision": guardian_decision,
+            "review": review,
+            "tool_trace": tool_trace,
+            "verification": verification,
+        }
     execution = action_executor.execute_review(
         {
             "review_id": request.proposal_id or "direct_action",
             "proposal": request.model_dump(),
         }
+    )
+    tool_trace = execution.get("tool_trace") if isinstance(execution.get("tool_trace"), dict) else _record_action_proposal_trace(request, execution.get("status", "unknown"), guardian_decision)
+    verification = _verify_action_proposal_result(
+        request=request,
+        action_text=action_text,
+        status=str(execution.get("status") or "unknown"),
+        guardian_decision=guardian_decision,
+        tool_trace=tool_trace,
+        execution=execution,
     )
     state_store.append_jsonl(
         "action_record.jsonl",
@@ -1110,7 +683,13 @@ async def action_proposal(request: ActionProposalRequest):
             "event_id": request.proposal_id or "direct_action",
             "route": "native_tool",
             "status": execution.get("status", "unknown"),
-            "artifacts": {"proposal": request.model_dump(), "guardian_decision": guardian_decision, "execution_result": execution},
+            "artifacts": {
+                "proposal": request.model_dump(),
+                "guardian_decision": guardian_decision,
+                "execution_result": execution,
+                "tool_trace": tool_trace,
+                "verification": verification,
+            },
         },
     )
     return {
@@ -1118,88 +697,9 @@ async def action_proposal(request: ActionProposalRequest):
         "decision": guardian_decision.get("decision", "allow"),
         "guardian_decision": guardian_decision,
         "execution_result": execution,
+        "tool_trace": tool_trace,
+        "verification": verification,
     }
-
-
-@app.get("/agent/tasks/{task_id}")
-async def agent_task_status(task_id: str):
-    awareness_loop.agent_adapter = awareness_loop.agent_registry.selected()
-    execution = awareness_loop.agent_adapter.fetch_task_status(task_id)
-    verified = awareness_loop.verifier.verify_execution_result(execution)
-    trace = awareness_loop.execution_trace.record(
-        {
-            "event_id": f"poll_{task_id}",
-            "route": "agent",
-            "task_id": execution.task_id,
-            "executor": execution.executor,
-            "status": verified["status"],
-            "execution_result": execution.to_dict(),
-            "verification": verified,
-        }
-    )
-    state_store.patch_json("task_state.json", {"current_task": {"task_id": task_id, "route": "agent", "status": verified["status"]}})
-    awareness_loop.task_tracker.apply_result(execution=execution, verification=verified, event_id=f"poll_{task_id}")
-    return {"execution_result": execution.to_dict(), "verification": verified, "execution_trace": trace}
-
-
-@app.post("/agent/tasks/refresh")
-async def agent_tasks_refresh():
-    awareness_loop.agent_adapter = awareness_loop.agent_registry.selected()
-    return awareness_loop.task_tracker.refresh_pending(awareness_loop.agent_adapter, awareness_loop.verifier)
-
-
-@app.post("/agent/results")
-async def agent_result_callback(request: AgentResultRequest):
-    execution = ExecutionResult(
-        task_id=request.task_id,
-        executor=request.executor,
-        status=request.status,
-        result=request.result,
-        logs=request.logs,
-        changed_files=request.changed_files,
-        tool_calls=request.tool_calls,
-        raw=request.raw,
-    )
-    verified = awareness_loop.verifier.verify_execution_result(execution)
-    trace = awareness_loop.execution_trace.record(
-        {
-            "event_id": f"callback_{execution.task_id}",
-            "route": "agent",
-            "task_id": execution.task_id,
-            "executor": execution.executor,
-            "status": verified["status"],
-            "execution_result": execution.to_dict(),
-            "verification": verified,
-        }
-    )
-    task_update = awareness_loop.task_tracker.apply_result(execution=execution, verification=verified, event_id=f"callback_{execution.task_id}")
-    memory_write = None
-    if verified.get("needs_memory_patch"):
-        memory_write = awareness_loop.memory_bridge.write_patch(
-            {
-                "session_id": str(request.raw.get("session_id") or "agent-callback"),
-                "task": str(request.raw.get("task") or request.task_id),
-                "executor": execution.executor,
-                "status": execution.status,
-                "result": execution.result,
-            }
-        )
-    return {
-        "status": verified["status"],
-        "execution_result": execution.to_dict(),
-        "verification": verified,
-        "execution_trace": trace,
-        "task_update": task_update,
-        "memory_write": memory_write,
-    }
-
-
-@app.post("/agent/tasks/{task_id}/stop")
-async def agent_task_stop(task_id: str):
-    awareness_loop.agent_adapter = awareness_loop.agent_registry.selected()
-    stopped = awareness_loop.agent_adapter.stop_task(task_id)
-    state_store.append_jsonl("action_record.jsonl", {"route": "agent_stop", "status": "stopped" if stopped else "not_stopped", "artifacts": {"task_id": task_id}})
-    return {"task_id": task_id, "stopped": stopped}
 
 
 def _validate_action_proposal(request: ActionProposalRequest) -> str | None:
@@ -1262,109 +762,109 @@ def _proposal_decision(risk_level: RiskLevel, action_text: str, request: ActionP
     )
 
 
-def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
-    public = redact_sensitive(payload)
-    agent_config = public.get("agent_config") if isinstance(public.get("agent_config"), dict) else {}
-    if isinstance(agent_config, dict):
-        core_model = agent_config.get("core_model") if isinstance(agent_config.get("core_model"), dict) else {}
-        if isinstance(core_model, dict):
-            original = payload.get("agent_config", {}).get("core_model", {}) if isinstance(payload.get("agent_config"), dict) else {}
-            core_model["api_key_set"] = bool(original.get("api_key")) if isinstance(original, dict) else False
-            core_model["api_key"] = "<redacted>" if core_model.get("api_key") else ""
-    return public
-
-
-@app.get("/agent/status")
-async def agent_status():
-    awareness_loop.agent_adapter = awareness_loop.agent_registry.selected()
-    status = awareness_loop.agent_adapter.connection_status()
-    state_store.patch_json("executor_state.json", {"selected_agent": awareness_loop.agent_registry.selected_name(), **status})
-    return status
-
-
-@app.get("/agent/contract")
-async def agent_contract():
-    return {**contract_summary(), "tool_proxy_contract": agent_tool_proxy_contract()}
-
-
-@app.get("/agents")
-async def agents():
-    status = awareness_loop.agent_registry.list_status()
-    state_store.patch_json("executor_state.json", status)
-    return status
-
-
-@app.get("/agents/certification")
-async def agents_certification_status():
-    return runtime_matrix.status()
-
-
-@app.post("/agents/certification/run")
-async def agents_certification_run(write_memory_probe: bool = False):
-    return runtime_matrix.run(write_memory_probe=write_memory_probe)
-
-
-@app.post("/agents/invoke")
-async def agents_invoke(request: AgentInvokeRequest):
-    return agent_orchestrator.invoke(
-        text=request.text,
-        agents=request.agents,
-        mode=request.mode,
-        channel=request.channel,
-        user_id=request.user_id,
-        session_id=request.session_id,
+def _record_action_proposal_trace(
+    request: ActionProposalRequest,
+    status: str,
+    guardian_decision: dict[str, Any],
+    *,
+    review: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = {
+        "status": status,
+        "trace_id": request.proposal_id,
+        "operation": "action_proposal_guard",
+        "review_id": (review or {}).get("review_id"),
+        "reason": guardian_decision.get("reason"),
+    }
+    return action_proposal_tool_trace.record(
+        tool="action_proposal",
+        action_type=str(request.action.get("type") or "unknown"),
+        target=_action_trace_target(request.action),
+        result=result,
+        review=guardian_decision,
+        approved_by=(review or {}).get("review_id"),
     )
 
 
-@app.post("/agents/select")
-async def select_agent(request: AgentSelectRequest):
-    try:
-        status = awareness_loop.agent_registry.select(request.name)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    runtime_entity.set_selected_agent(request.name)
-    awareness_loop.agent_adapter = awareness_loop.agent_registry.selected()
-    return status
-
-
-@app.post("/agents/{name}/config")
-async def configure_agent(name: str, request: AgentConfigRequest):
-    payload = request.model_dump()
-    if payload.get("model_decision_mode") and payload["model_decision_mode"] not in {"auto", "always"}:
-        raise HTTPException(status_code=422, detail="model_decision_mode must be 'auto' or 'always'")
-    status = awareness_loop.agent_registry.upsert(name, payload)
-    if status.get("selected_agent") == name:
-        awareness_loop.agent_adapter = awareness_loop.agent_registry.selected()
-    return status
-
-
-@app.get("/memory/summary")
-async def memory_summary(session_id: str = "console-session", provider: str = "selected"):
-    return awareness_loop.memory_bridge.read_summary(session_id, provider=provider)
-
-
-@app.get("/memory/providers")
-async def memory_providers():
-    return awareness_loop.memory_bridge.provider_status()
-
-
-@app.get("/memory/providers/diagnostics")
-async def memory_provider_diagnostics(provider: str = "all", session_id: str = "memory-diagnostics"):
-    return awareness_loop.memory_bridge.provider_diagnostics(provider=provider, session_id=session_id, write_probe=False)
-
-
-@app.post("/memory/providers/diagnostics")
-async def memory_provider_diagnostics_write(request: MemoryDiagnosticsRequest):
-    return awareness_loop.memory_bridge.provider_diagnostics(
-        provider=request.provider,
-        session_id=request.session_id,
-        write_probe=request.write_probe,
+def _verify_action_proposal_result(
+    *,
+    request: ActionProposalRequest,
+    action_text: str,
+    status: str,
+    guardian_decision: dict[str, Any],
+    tool_trace: dict[str, Any],
+    execution: dict[str, Any] | None = None,
+    review: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    execution_status = _verifier_status(status)
+    raw = {
+        "action_proposals": [
+            {
+                "proposal_id": request.proposal_id,
+                "status": status,
+                "decision": guardian_decision.get("decision"),
+                "review_id": (review or {}).get("review_id"),
+            }
+        ],
+        "guardian_decision": guardian_decision,
+        "tool_proxy_traces": [tool_trace] if tool_trace else [],
+        "review_id": (review or {}).get("review_id"),
+    }
+    if execution:
+        raw["execution_result"] = execution
+        if execution.get("approved_by"):
+            raw["approved_by"] = execution.get("approved_by")
+    return awareness_loop.verifier.verify_execution_result(
+        ExecutionResult(
+            task_id=request.proposal_id or "action_proposal",
+            executor="tool_proxy",
+            status=execution_status,
+            result=_execution_summary(execution, guardian_decision, status),
+            tool_calls=[action_text] if action_text and execution_status in {"success", "blocked", "pending"} else [],
+            raw=raw,
+        )
     )
 
 
-@app.post("/memory/patch")
-async def memory_patch(request: MemoryPatchRequest):
-    return awareness_loop.memory_bridge.write_patch(request.patch, provider=request.provider)
+def _verifier_status(status: str) -> str:
+    normalized = str(status or "unknown")
+    if normalized in {"ok", "success"}:
+        return "success"
+    if normalized in {"blocked", "block"}:
+        return "blocked"
+    if normalized in {"needs_confirmation", "pending"}:
+        return "pending"
+    if normalized in {"error", "failed", "timeout"}:
+        return "failed"
+    return normalized
+
+
+def _execution_summary(execution: dict[str, Any] | None, guardian_decision: dict[str, Any], status: str) -> str:
+    if execution:
+        if execution.get("stdout"):
+            return str(execution.get("stdout")).strip()[:500]
+        if execution.get("content"):
+            return "file content read through Tool Proxy"
+        if execution.get("reason"):
+            return str(execution.get("reason"))
+    return str(guardian_decision.get("reason") or status)
+
+
+def _action_trace_target(action: dict[str, Any]) -> Any:
+    action_type = action.get("type")
+    if action_type == "shell_command":
+        command = action.get("command")
+        return command if isinstance(command, list) else str(command or "")
+    if action_type in {"file_read", "file_write"}:
+        return {"path": action.get("path"), "content_chars": len(str(action.get("content") or ""))}
+    if action_type == "browser_open":
+        return {"url": action.get("url")}
+    if action_type == "api_request":
+        payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+        return {"method": payload.get("method", "GET"), "url": payload.get("url") or payload.get("endpoint")}
+    if action_type == "rollback_restore":
+        return {"snapshot_id": action.get("snapshot_id")}
+    return action
 
 
 @app.get("/mvp/status")
@@ -1441,6 +941,11 @@ async def mvp_status():
         "runtime_cron_placeholder_removed": True,
         "agent_tool_proxy_contract": True,
         "agent_tool_bypass_verification": True,
+        "runtime_routing_traces": True,
+        "runtime_telemetry_metrics": True,
+        "context_drift_detection": True,
+        "tool_proxy_guard_smoke": True,
+        "route_layer_split_phase1": True,
         "web_console": console_dir.exists(),
     }
     return {

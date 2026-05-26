@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from awareness.belief_core import BeliefCore
 from awareness.uncertainty_core import UncertaintyCore
 from core.capability_registry import CapabilityRegistry
+from core.context_drift_detector import ContextDriftDetector
 from core.model_client import redact_sensitive
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent
@@ -22,6 +23,7 @@ class TurnContextBuilder:
         self.belief = BeliefCore(state_store)
         self.uncertainty = UncertaintyCore()
         self.capabilities = CapabilityRegistry(state_store)
+        self.drift_detector = ContextDriftDetector()
 
     def build(
         self,
@@ -46,7 +48,7 @@ class TurnContextBuilder:
         payload_metadata = event.payload.get("metadata") if event else {}
         risk_state = state.get("risk_state", {}) if isinstance(state.get("risk_state"), dict) else {}
         persona = self._persona_summary(state.get("persona_state", {}))
-        return redact_sensitive(
+        context = redact_sensitive(
             {
                 "active_context": {
                     "user_message": user_message,
@@ -68,10 +70,10 @@ class TurnContextBuilder:
                 },
                 "belief": {
                     "summary": self._belief_summary(state.get("belief_state", {}).get("summary", {})),
-                    "fresh_claims": fresh_claims[:2],
+                    "fresh_claims": fresh_claims[:1],
                     "uncertainty": self.uncertainty.uncertainty_summary(relevant_claims),
                 },
-                "stale_beliefs": stale_claims[:1],
+                "stale_beliefs": self._stale_belief_summary(stale_claims),
                 "runtime_summary": {
                     "executor": self._executor_summary(state.get("executor_state", {})),
                     "agent": self._agent_summary(state.get("agent_config", {})),
@@ -85,9 +87,33 @@ class TurnContextBuilder:
                     "runtime_history",
                 ],
             },
-            max_string=600,
-            max_list=8,
+            max_string=420,
+            max_list=6,
         )
+        context, drift_report = self.drift_detector.apply(context, decision=rule_decision or {})
+        context["_context_metrics"] = {
+            "context_chars": drift_report["remediated_context_chars"],
+            "estimated_tokens": drift_report["remediated_estimated_tokens"],
+        }
+        context["_context_drift"] = {
+            "drift_score": drift_report["drift_score"],
+            "drift_reasons": drift_report["drift_reasons"],
+            "suggested_action": drift_report["suggested_action"],
+            "warning": drift_report["warning"],
+        }
+        if drift_report["warning"]:
+            self.state_store.append_jsonl(
+                "context_drift_log.jsonl",
+                {
+                    "event_id": event.event_id if event else None,
+                    "drift_score": drift_report["drift_score"],
+                    "drift_reasons": drift_report["drift_reasons"],
+                    "suggested_action": drift_report["suggested_action"],
+                    "context_chars": drift_report["context_chars"],
+                    "remediated_context_chars": drift_report["remediated_context_chars"],
+                },
+            )
+        return context
 
     def _scoped_state(self) -> dict[str, Any]:
         return {
@@ -187,6 +213,17 @@ class TurnContextBuilder:
             "ttl_remaining_seconds": claim.get("ttl_remaining_seconds"),
             "next_action": claim.get("next_action"),
         }
+
+    def _stale_belief_summary(self, stale_claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not stale_claims:
+            return []
+        return [
+            {
+                "count": len(stale_claims),
+                "keys": [claim.get("key") for claim in stale_claims[:3]],
+                "suggested_action": "refresh_or_exclude_stale_beliefs",
+            }
+        ]
 
     def _user_world_summary(self, value: Any) -> dict[str, Any]:
         if not isinstance(value, dict):

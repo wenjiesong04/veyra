@@ -1,3 +1,4 @@
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -49,15 +50,40 @@ class IntakeGateway:
         message_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        started_at = time.perf_counter()
         channel_id = self.router.resolve(channel)
         state = self._channel_state()
         config = self._channel_config(state, channel_id)
         if not self.auth_policy.allow(channel_id, user_id, config):
+            self._record_intake_trace(
+                text=text,
+                channel=channel_id,
+                user_id=user_id,
+                session_id=session_id,
+                message_id=message_id,
+                metadata=metadata or {},
+                started_at=started_at,
+                status="blocked",
+                final_route="block",
+                reason="channel or user is not allowed",
+            )
             return {"status": "blocked", "reason": "channel or user is not allowed", "channel": channel_id}
         mapped_session = self.session_mapper.map(channel_id, user_id, session_id)
         dedupe_id = message_id or f"msg_{uuid4().hex[:12]}"
         seen = state.setdefault("seen_message_ids", {})
         if isinstance(seen, dict) and dedupe_id in seen:
+            self._record_intake_trace(
+                text=text,
+                channel=channel_id,
+                user_id=user_id,
+                session_id=mapped_session,
+                message_id=dedupe_id,
+                metadata=metadata or {},
+                started_at=started_at,
+                status="duplicate",
+                final_route="duplicate",
+                reason="duplicate message ignored",
+            )
             return {"status": "duplicate", "message_id": dedupe_id, "channel": channel_id, "session_id": mapped_session, "previous": seen[dedupe_id]}
 
         event = self.normalizer.user_message(text=text, channel=channel_id, user_id=user_id, session_id=mapped_session, metadata=metadata or {})
@@ -171,3 +197,33 @@ class IntakeGateway:
         inbox.append(item)
         state["inbox"] = inbox[-500:]
         self._write_channel_state(state)
+
+    def _record_intake_trace(
+        self,
+        *,
+        text: str,
+        channel: str,
+        user_id: str,
+        session_id: str,
+        message_id: str | None,
+        metadata: dict[str, Any],
+        started_at: float,
+        status: str,
+        final_route: str,
+        reason: str,
+    ) -> None:
+        recorder = getattr(self.awareness_loop, "runtime_trace", None)
+        if not recorder:
+            return
+        recorder.record_intake_result(
+            text=text,
+            channel=channel,
+            user_id=user_id,
+            session_id=session_id,
+            message_id=message_id,
+            metadata=metadata,
+            started_at=started_at,
+            status=status,
+            final_route=final_route,
+            reason=reason,
+        )

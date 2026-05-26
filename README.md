@@ -4,6 +4,8 @@ Virtual Entity for Yielding Real-time Awareness.
 
 Veyra v0.1 is an awareness-first Agent governance skeleton. It receives events, updates local awareness state, evaluates risk, chooses a route, and either answers directly, runs a read-only probe, blocks unsafe actions, or generates a `VeyraTaskPacket` for the selected Agent Runtime.
 
+Veyra is now in the Runtime Stabilization phase. The core closed loop is complete; the next work should prioritize real Feishu soak testing, telemetry, context drift control, ToolProxy closed-loop verification, and gradual UI/router decomposition rather than blindly adding more modules.
+
 ## Current v0.1 Loop
 
 ```text
@@ -16,6 +18,7 @@ User/Event
   -> Foresight + Guardian
   -> Direct / Probe / Agent / Human Review / Block
   -> Verifier
+  -> RuntimeTrace + ContextDrift telemetry
   -> WorldState + Audit update
 ```
 
@@ -53,6 +56,13 @@ Endpoints:
 - `POST /runtime/cron/config` configure the active awareness scheduler job
 - `POST /runtime/cron/run` run a scheduler job immediately
 - `POST /runtime/cron/run-due` run due scheduler jobs
+- `GET /runtime/traces/recent` inspect the latest routing traces, including real Feishu traffic
+- `GET /runtime/traces/{trace_id}` inspect one routing trace
+- `GET /runtime/soak/status` inspect Feishu runtime soak health from observed traces
+- `GET /runtime/metrics/summary` inspect route distribution, latency, model/probe/agent counts, failures, and context size
+- `GET /runtime/metrics/routes` inspect route counts and shares
+- `GET /runtime/metrics/model-cost` inspect estimated token volume and model call counts
+- `GET /runtime/metrics/failures` inspect recent runtime failures
 - `GET /logs/events` read event log entries
 - `GET /logs/actions` read action records
 - `GET /reviews/actions` read blocked or review-needed actions
@@ -174,6 +184,8 @@ Self-tests use temporary `VEYRA_STATE_ROOT` and `VEYRA_AGENCY_ROOT` directories 
 
 Implementation progress and the current architecture map are tracked in
 [`docs/implementation_progress.md`](docs/implementation_progress.md).
+Route ownership and the first-stage `main.py` split are tracked in
+[`docs/main_route_inventory.md`](docs/main_route_inventory.md).
 
 ```text
 User message
@@ -206,7 +218,7 @@ Agent / Tool ActionProposal
   -> R0-R2: execute through ActionExecutor
   -> R3-R4: write ReviewQueue and wait for approval
   -> Approve: execute proposal through SafeShell / SafeFile
-  -> ToolTrace + ActionRecord
+  -> GuardianDecision + ToolTrace + Verifier + ActionRecord/Audit
   -> Reject: audit only, no execution
 ```
 
@@ -303,6 +315,7 @@ Core model flow:
 ```text
 User -> Veyra
   -> TurnContextBuilder minimal scoped context
+  -> ContextDriftDetector warning/remediation
   -> CoreModelReasoning structured cognition decision
   -> VeyraController capability/governance gate
   -> direct answer / probe / skill / ask_user / selected AgentAdapter / block
@@ -316,6 +329,10 @@ The Core model is inside Veyra Core, not inside the selected Agent Runtime. It i
 The same capability can also be attached while configuring a selected runtime with `POST /agents/{name}/config` by setting `use_model_for_core`, `model_base_url`, `model_api_key_env`, and `model`. Top-level `/core/model/config` takes precedence when explicitly enabled.
 
 Agent tool governance is part of the task contract. Veyra adds `policy_patch.tool_proxy_contract` to every Agent task packet. R3-R4 tool actions must go through `/actions/proposals` and return approval evidence; R5 actions are blocked. The Verifier rejects or downgrades Agent success claims when high-risk `tool_calls` lack ActionProposal, review, policy, or Tool Proxy trace evidence.
+
+Runtime observability now records each message route into `runtime_trace.jsonl` with redacted source identifiers, latency, final route, model/probe/agent usage, context size, drift warnings, memory policy, failure reason, and OpenClaw involvement. The telemetry APIs are backend-first so the console can consume them later without another route redesign.
+
+`ContextDriftDetector` runs after `TurnContextBuilder` builds a compact turn packet and before Core reasoning consumes it. High drift scores remove stale beliefs, lower history/memory weight, compact context, and record `context_drift_log.jsonl` warnings.
 
 MemoryBridge supports `local`, `selected`, explicit runtime names such as `openclaw` / `hermes` / `custom`, and `all` provider fan-out. Writes still pass the sensitive-memory filter before local storage or external adapter submission.
 
@@ -344,6 +361,7 @@ Without a configured base URL, Veyra still builds the task packet but returns `a
 - `probes`: system, git, port, process, file, log, network, web, MCP, OpenClaw, and Hermes read-only probe envelopes
 - `tool_proxy`: SafeShell, SafeFile, SafeBrowser, and SafeAPI policy gates with trace logging and optional executor hooks
 - `rollback_audit`: snapshot, diff, ActionJournal timeline, replay plan, automatic replay runtime, compensation review jobs, guarded auto-execute, traces
+- `routers`: first-stage FastAPI route split for runtime observability, debug/audit/state, ops/runtime, agent, and memory surfaces; `main.py` remains runtime wiring only
 - `memory_bridge`: local/selected/runtime/all provider routing, sensitive-memory filtering, provider diagnostics, and external adapter hooks
 - `skills`: built-in skill registry/runtime for fixed low-risk workflows
 - `personas`: Minimalist, Operator, Engineer, Guardian, Steward

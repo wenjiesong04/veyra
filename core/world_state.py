@@ -165,6 +165,8 @@ class WorldStateStore:
             "memory_log.jsonl",
             "core_model_trace.jsonl",
             "alert_log.jsonl",
+            "runtime_trace.jsonl",
+            "context_drift_log.jsonl",
         ]:
             path = self.root / name
             if not path.exists():

@@ -56,6 +56,7 @@ class FeishuAdapter:
                     "chat_id": chat_id,
                     "chat_type": message.get("chat_type"),
                     "message_type": message.get("message_type"),
+                    "source": source,
                     "content_text": self._content_text(message),
                     "attachment_id": self._attachment_id(message),
                     "sender_id": redact_sensitive(sender_id),

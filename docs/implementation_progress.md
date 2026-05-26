@@ -38,6 +38,9 @@
 | Agent Orchestrator | `runtime/agent_orchestrator.py` | P8 validated multi-Agent |
 | Runtime Cron | `runtime/cron.py` | P9 bounded scheduler |
 | Replay Runtime | `rollback_audit/replay_runtime.py` | P9 guarded auto-execute |
+| Runtime Trace / Metrics | `runtime/routing_trace.py`, `runtime/routing_metrics.py`, `routers/runtime_observability.py` | Runtime Stabilization telemetry |
+| Context Drift Detector | `core/context_drift_detector.py`, `core/turn_context_builder.py` | Runtime Stabilization context guard |
+| Route Split | `routers/`, `docs/main_route_inventory.md` | `main.py` first-stage route slimming |
 
 ## 生命周期状态
 
@@ -146,6 +149,7 @@ P2 已将 Tool Proxy 接入统一策略审查：
 - `SafeBrowser`: URL scheme / 本地文件 / 外部目标审查，执行器未配置时只返回审查结果
 - `SafeAPI`: HTTP method / 敏感字段 / 状态变更请求审查，执行器未配置时只返回审查结果
 - `PolicyTrace`: 将 allow / allow_with_constraints / ask_user / block 写入 `policy_trace.jsonl`
+- `ActionProposal`: 写入 GuardianDecision、ToolTrace、Verifier verdict 和 ActionRecord/Audit；高危动作不能直接执行。
 
 ## 当前实施阶段
 
@@ -161,6 +165,7 @@ P2 已将 Tool Proxy 接入统一策略审查：
 | P7 | Production operations and safety validation | Implemented, production soak validation pending |
 | P8 | Continuous awareness entity runtime | Implemented, bounded local self-tested |
 | P9 | Chat app integration and guarded automation | Implemented, Feishu local OpenAPI self-tested |
+| P10 | Runtime Stabilization | Implemented, real Feishu soak pending |
 
 ## Agent Adapter Contract
 
@@ -245,8 +250,14 @@ P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块。当�
 - P9 Runtime Cron 将 `runtime/cron.py` 从占位替换为持久化 bounded scheduler，可触发 active awareness tick，不执行任意外部命令。
 - P9 PersonaEngine 绑定 channel/risk/route/Agent policy，写入 `persona_state.json`，并进入 Agent task packet、execution trace 和 runtime API。
 - P9 ReplayRuntime 增加 `/audit/replay/runtime/config` 和 `/audit/replay/runtime/execute`：只有显式配置和请求同时允许 R4 snapshot restore 时，才会自动 approve review 并通过 ActionExecutor 执行 restore。
+- P10 RuntimeTraceRecorder 记录真实消息 routing trace：route chain、latency、model/probe/agent 使用、context chars、estimated tokens、final route、failure reason 和 OpenClaw involvement；敏感 token、secret、完整私密消息不会写入 trace。
+- P10 Telemetry API 增加 `/runtime/traces/recent`、`/runtime/traces/{trace_id}`、`/runtime/soak/status`、`/runtime/metrics/summary|routes|model-cost|failures`，供后续 UI 直接消费。
+- P10 ContextDriftDetector 在 TurnContextBuilder 后、Core reasoning 前检测 context 过大、stale belief 注入、governance/persona 污染、上一轮 Agent 错误影响、persona 异常切换和 memory 过度注入；高分时压缩 context、移除 stale beliefs、降低历史权重并记录 warning。
+- P10 ToolProxy guard smoke 覆盖文件读、普通文件写、`rm -rf`、`.env` 读取、restart service、`git push --force`；所有高危动作必须有 trace，不能直接执行。
+- P10 `main.py` 第一阶段从 1679 行降到 998 行；路由清单和 domain 分类见 `docs/main_route_inventory.md`。当前只做 route layer split，不移动核心业务逻辑。
 
 后续仍需要的是真实环境验收，而不是本地功能补洞。接口现在明确区分 `implemented`、`configured`、`validated`、`validation_pending`，未配置或未连通的真实运行时不会被标成已连接：
 
 - P6/P8/P9：连接真实 OpenClaw/Hermes/Custom 和 Feishu 后运行 certification、multi-Agent invoke、runtime matrix、长任务停止、结果回传、memory diagnostics、Feishu callback/send 和状态过期刷新验收。
 - P7/P8/P9：配置真实 alert webhook、生产 allowlist、API supervisor 和多 runtime/chat soak session 后做长时间验收。
+- P10：下一阶段重点是真实飞书长测、Telemetry UI、Context Drift 调参、ToolProxy 闭环生产验证和 UI 拆分；不建议继续盲目新增模块。

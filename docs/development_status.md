@@ -1,6 +1,8 @@
 # Veyra Development Status
 
-Updated after continuous awareness runtime hardening.
+Updated after Runtime Stabilization hardening.
+
+Veyra has moved from feature-complete MVP into Runtime Stabilization. The core closed loop is complete; current work should make the runtime observable, debuggable, stable under real Feishu traffic, and resistant to context/tool bypass drift. Do not keep adding unrelated modules before the live Feishu soak, telemetry dashboard, context drift, ToolProxy closed-loop, and UI/router split are validated.
 
 ## Data Reality
 
@@ -13,6 +15,7 @@ Current local `state/` data may contain older self-test records from earlier dev
 | Runtime / lifecycle | `RuntimeEntity` and `/runtime` | Real process-local runtime state |
 | WorldState | `state/*.json` via `WorldStateStore` | Real local state cache, currently includes development/test updates |
 | Event/action/tool/policy/execution logs | `state/*.jsonl` | Real append-only runtime logs, currently includes self-test traffic |
+| Runtime routing traces | `state/runtime_trace.jsonl` | Real per-message route/latency/model/probe/agent/context telemetry with redacted identifiers |
 | OpenClaw/Hermes/Custom agent status | Adapter probes and `/agents` | Real configured adapter status; unconfigured adapters report that state |
 | Console UI data | Backend API fetches | Live API data, no seeded fake dashboard objects |
 
@@ -30,6 +33,7 @@ Current local `state/` data may contain older self-test records from earlier dev
 | P7 Production operations and safety validation | Implemented, live validation pending | Non-destructive red-team validation, retention summary/enforcement, runtime matrix, bounded/session soak APIs, Ops health, alerts, local/webhook alert dispatch, deployment config validation, and deployment readiness checks exist. `/ops/deployment` and `/ops/runtime-matrix` report not_configured or validation_pending instead of pretending live production readiness. |
 | P8 Continuous awareness entity runtime | Implemented, local self-tested | Scheduled active-loop ticks, multi-channel intake state, multi-Agent certification/invocation, deeper Belief TTL/source trust, and automatic replay candidate scanning with guarded compensation review creation. Live external runtime validation still depends on configured OpenClaw/Hermes/Custom services. |
 | P9 Chat app integration and guarded automation | Implemented, Feishu local OpenAPI self-tested | Feishu channel config, outbound message delivery, URL verification, message callbacks, local WebSocket long-connection intake, OpenClaw config import, runtime cron scheduler, persona channel/Agent binding, and explicit guarded replay auto-execution. Live Feishu validation requires real app credentials and either callback URL or long-connection mode. |
+| P10 Runtime Stabilization | Implemented, live soak pending | Runtime trace recorder, telemetry summary APIs, ContextDriftDetector, ToolProxy guard smoke, and first-stage `main.py` route split are implemented. Real Feishu soak must validate stability under real user traffic. |
 
 ## Eight Architecture Blocks
 
@@ -62,6 +66,7 @@ Current local `state/` data may contain older self-test records from earlier dev
 | Guardian / Execution Controller | MVP implemented | Risk policy, confirmation gate, block/allow decisions, tool proxy enforcement |
 | Verifier | P4 completed | Evidence-backed verdicts and rollback/probe/memory next actions |
 | Context / Patch Builder | MVP implemented | Context, policy, persona, task packet generation |
+| Context Drift Detector | Runtime Stabilization | Detects oversize context, stale belief injection, persona/governance pollution, previous Agent-result bias, and memory over-injection; high drift scores compact context and log warnings |
 | Active Runtime Loop | P8 implemented | Bounded scheduled ticks for heartbeat, task refresh, stale state refresh, proactive probes, ExternalWorld refresh, replay runtime, retention, and optional runtime matrix |
 | Runtime Cron | P9 implemented | Persistent bounded scheduler state for active awareness tick jobs; placeholder removed |
 | Agent Orchestrator | P8 implemented | Multi-Agent invoke endpoint that dispatches only to configured/certified runtimes and skips unconfigured adapters honestly |
@@ -72,7 +77,7 @@ Current local `state/` data may contain older self-test records from earlier dev
 
 | Surface | Purpose |
 | --- | --- |
-| `/runtime`, `/state`, `/heartbeat`, `/runtime/active-loop`, `/runtime/active-loop/*`, `/runtime/cron/*` | Runtime identity, state cache, heartbeat, continuous awareness loop control, and bounded scheduler control |
+| `/runtime`, `/state`, `/heartbeat`, `/runtime/active-loop`, `/runtime/active-loop/*`, `/runtime/cron/*`, `/runtime/traces/*`, `/runtime/soak/status` | Runtime identity, state cache, heartbeat, continuous awareness loop control, bounded scheduler control, real-message routing traces, and Feishu soak status |
 | `/architecture`, `/definitions`, `/mvp/status` | Architecture metadata, risk/lifecycle/mode definitions, implementation flags, and validation status |
 | `/events/message`, `/channels`, `/channels/{channel}/config`, `/channels/{channel}/messages`, `/channels/{channel}/send`, `/channels/outbox`, `/channels/sessions`, `/integrations/feishu/events`, `/integrations/feishu/import-openclaw`, `/integrations/feishu/ws/*` | Standard user-message event entry plus local/Feishu multi-channel intake, config, dedupe, session, delivery, callback, OpenClaw config import, WebSocket long connection, and outbox state |
 | `/core/model/status`, `/core/model/config`, `/logs/core-model` | Core model config/status and redacted model reasoning audit |
@@ -84,6 +89,7 @@ Current local `state/` data may contain older self-test records from earlier dev
 | `/rollback/*`, `/audit/journal`, `/audit/time-travel`, `/audit/replay/*`, `/audit/replay/runtime/*` | Snapshot, diff, restore, git diff, correlated journal, time-travel summary, replay plans, guarded replay compensation proposals, automatic replay runtime state, and explicit guarded auto-execute |
 | `/personas/status` | Persona mode, channel, risk, route, Agent, token budget, and policy binding audit |
 | `/ops/health`, `/ops/alerts`, `/ops/alerts/dispatch`, `/ops/alerting`, `/ops/deployment`, `/ops/deployment/config`, `/ops/runtime-matrix`, `/ops/runtime-matrix/run`, `/ops/soak`, `/ops/soak/status`, `/ops/soak/start`, `/ops/soak/stop`, `/ops/safety/red-team`, `/ops/retention`, `/ops/retention/enforce` | Operational health, alerts, local/webhook alert dispatch, deployment readiness/config validation, runtime matrix with validation metadata, bounded/session soak, red-team safety, and retention checks/enforcement |
+| `/runtime/metrics/summary`, `/runtime/metrics/routes`, `/runtime/metrics/model-cost`, `/runtime/metrics/failures` | Backend-first telemetry dashboard data: route distribution, latency, Core model/Agent/Probe counts, failure list, context size, token-volume estimate, and OpenClaw call share |
 | `/logs/events`, `/logs/actions`, `/logs/tools`, `/logs/policy`, `/logs/execution`, `/logs/rollback`, `/logs/memory` | Audit and trace surfaces |
 | `/console` | Awareness & Agent Control Console |
 
@@ -100,7 +106,8 @@ The current codebase follows the original design direction:
 - Simple tasks are handled directly or through probes/skills.
 - Complex Agent tasks receive state, background, policy, model-ranked memory, decision trace, foresight, and Core model solution outline through `VeyraTaskPacket.context_patch`.
 - Agent tasks include `policy_patch.tool_proxy_contract`; Verifier flags high-risk `tool_calls` that lack ActionProposal, review, policy, or Tool Proxy trace evidence.
-- High-risk actions go through Guardian, policy trace, review, and Tool Proxy.
+- High-risk actions go through Guardian, policy trace, review, ToolTrace, Verifier, and Audit.
+- Every real message can now be traced by route, latency, model/probe/agent usage, context size, final route, and failure reason without storing full private message content or secrets.
 - Execution results now require verifier evidence instead of blind trust.
 - Rollback/Audit records snapshots, diffs, traces, and restores.
 - The console is an Awareness & Agent Control Console rather than a plain chat box.
@@ -114,3 +121,4 @@ Remaining live validation gates:
 - Browser/API execution has configurable executor hooks and host allowlists; live production allowlists still need environment-specific validation.
 - Replay compensation is implemented as review-backed snapshot restore; automatic runtime scan creates guarded review jobs, and explicit auto-execute can restore snapshots only when both config and request allow R4 restore.
 - Long-running soak now has controlled session APIs; alert delivery supports local audit log and optional configured webhook, with webhook delivery requiring a configured endpoint.
+- Runtime Stabilization still needs a real Feishu soak: configure live Feishu credentials, send real user messages through callback or WebSocket intake, inspect `/runtime/traces/recent`, `/runtime/soak/status`, and `/runtime/metrics/*`, then tune only the runtime behavior that fails under observation.

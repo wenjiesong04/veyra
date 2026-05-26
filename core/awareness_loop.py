@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import asdict
+from typing import Any
 
 from awareness.attention_core import AttentionCore
 from awareness.belief_core import BeliefCore
@@ -41,6 +43,7 @@ from probes.time_probe import TimeProbe
 from probes.web_probe import WebProbe
 from rollback_audit.execution_trace import ExecutionTrace
 from runtime.agent_task_tracker import AgentTaskTracker
+from runtime.routing_trace import RuntimeTraceRecorder
 from skills.skill_loader import SkillLoader
 from skills.skill_runtime import SkillRuntime
 
@@ -79,6 +82,7 @@ class AwarenessLoop:
         self.task_tracker = AgentTaskTracker(state_store, self.execution_trace)
         self.memory_policy_runtime = MemoryPolicyRuntime(state_store, lambda patch: self.memory_bridge.write_patch(patch))
         self.controller = VeyraController(self.capabilities)
+        self.runtime_trace = RuntimeTraceRecorder(state_store)
         self.skill_loader = SkillLoader()
         self.skill_runtime = SkillRuntime(state_store)
         self.probes = {
@@ -97,6 +101,16 @@ class AwarenessLoop:
         }
 
     def handle_event(self, event: VeyraEvent) -> LoopResult:
+        started_at = time.perf_counter()
+        route_trace: list[dict[str, object]] = [
+            {
+                "phase": "intake",
+                "status": "received",
+                "channel": event.source.channel,
+                "event_id": event.event_id,
+            }
+        ]
+        context_observability: dict[str, Any] = {}
         self.runtime_entity.set_status(LifecycleStatus.THINKING.value)
         text = event.payload.get("text", "")
         self.state_store.append_jsonl("event_log.jsonl", {"event": event.to_dict(), "phase": "sense"})
@@ -104,8 +118,37 @@ class AwarenessLoop:
         attention_focus = self.attention.focus_for_text(text)
         self.belief.update_from_event(event)
         belief_state = self.belief.refresh()
+        turn_context = self.core_reasoning.turn_context.build(
+            user_message=text,
+            attention_focus=attention_focus,
+            event=event,
+            rule_decision={},
+        )
+        context_observability = {
+            "context_metrics": turn_context.get("_context_metrics", {}) if isinstance(turn_context, dict) else {},
+            "context_drift": turn_context.get("_context_drift", {}) if isinstance(turn_context, dict) else {},
+        }
+        route_trace.append(
+            {
+                "phase": "awareness_loop",
+                "status": "context_built",
+                "attention_focus": attention_focus[:8],
+                "context_chars": context_observability.get("context_metrics", {}).get("context_chars"),
+                "drift_score": context_observability.get("context_drift", {}).get("drift_score"),
+            }
+        )
         decision = self.decision_core.decide(text=text, attention_focus=attention_focus, event=event)
+        route_trace.append(
+            {
+                "phase": "core_cognition",
+                "route": decision.route.value,
+                "risk_level": decision.risk_level.value,
+                "intent": decision.intent,
+                "model_status": decision.model_assist.get("status") if isinstance(decision.model_assist, dict) else None,
+            }
+        )
         decision, controller_plan = self.controller.prepare(decision)
+        route_trace.append({"phase": "controller", **controller_plan.to_dict()})
         self.state_store.patch_json("risk_state.json", {"current_risk": decision.risk_level.value})
         persona_patch = self.persona_engine.patch_for(
             text,
@@ -119,6 +162,14 @@ class AwarenessLoop:
         self.runtime_entity.operational_mode = list(persona_patch.get("mode", []))
         foresight = self._foresight_for_decision(text, decision)
         guardian_decision = self.guardian.review_text_action(text=text, decision=decision, foresight=foresight)
+        route_trace.append(
+            {
+                "phase": "guardian",
+                "decision": guardian_decision.get("decision"),
+                "risk_level": guardian_decision.get("risk_level"),
+                "reason": guardian_decision.get("reason"),
+            }
+        )
 
         if guardian_decision["decision"] == GuardianDecision.BLOCK.value:
             self.runtime_entity.set_status(LifecycleStatus.BLOCKED.value)
@@ -130,8 +181,7 @@ class AwarenessLoop:
                 risk_level=decision.risk_level,
                 artifacts={"guardian": guardian_decision, "foresight": foresight, "persona": persona_patch, "controller": controller_plan.to_dict()},
             )
-            self._update(event, result)
-            return result
+            return self._finalize_event(event, result, started_at, route_trace, context_observability)
 
         if guardian_decision["decision"] == GuardianDecision.ASK_USER.value:
             self.runtime_entity.set_status(LifecycleStatus.WAITING_CONFIRMATION.value)
@@ -155,8 +205,7 @@ class AwarenessLoop:
                 risk_level=decision.risk_level,
                 artifacts={"guardian": guardian_decision, "foresight": foresight, "review": review, "proposal": proposal, "persona": persona_patch, "controller": controller_plan.to_dict()},
             )
-            self._update(event, result)
-            return result
+            return self._finalize_event(event, result, started_at, route_trace, context_observability)
 
         self.runtime_entity.set_status(LifecycleStatus.ACTING.value)
         if decision.route == Route.DIRECT_ANSWER:
@@ -301,6 +350,47 @@ class AwarenessLoop:
             result.artifacts["memory_policy_execution"] = {"status": "written", "policy": decision.memory_policy, "write": result.artifacts.get("memory_write")}
         else:
             result.artifacts["memory_policy_execution"] = self.memory_policy_runtime.apply(event, decision, result)
+        return self._finalize_event(event, result, started_at, route_trace, context_observability)
+
+    def _finalize_event(
+        self,
+        event: VeyraEvent,
+        result: LoopResult,
+        started_at: float,
+        route_trace: list[dict[str, object]],
+        context_observability: dict[str, Any],
+    ) -> LoopResult:
+        context_metrics = context_observability.get("context_metrics") if isinstance(context_observability.get("context_metrics"), dict) else {}
+        context_drift = context_observability.get("context_drift") if isinstance(context_observability.get("context_drift"), dict) else {}
+        result.artifacts.setdefault("context_metrics", context_metrics)
+        result.artifacts.setdefault("context_drift", context_drift)
+        route_trace.append({"phase": "route_execution", "route": result.route.value, "status": result.status})
+        verification = result.artifacts.get("verification") if isinstance(result.artifacts.get("verification"), dict) else {}
+        if verification:
+            route_trace.append(
+                {
+                    "phase": "verifier",
+                    "status": verification.get("status"),
+                    "verdict": verification.get("verdict"),
+                    "next_action": verification.get("next_action"),
+                }
+            )
+        memory_policy = result.artifacts.get("memory_policy_execution") if isinstance(result.artifacts.get("memory_policy_execution"), dict) else {}
+        if memory_policy:
+            route_trace.append({"phase": "memory_policy", "status": memory_policy.get("status"), "policy": memory_policy.get("policy")})
+        route_trace.append({"phase": "response", "status": result.status, "final_route": result.route.value})
+        trace = self.runtime_trace.record(
+            event=event,
+            result=result,
+            started_at=started_at,
+            route_trace=route_trace,
+            context_metrics=context_metrics,
+        )
+        result.artifacts["runtime_trace"] = {
+            "trace_id": trace["trace_id"],
+            "latency_ms": trace["latency_ms"],
+            "final_route": trace["final_route"],
+        }
         self._update(event, result)
         return result
 
