@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from core.capability_registry import CapabilityRegistry
+from core.delegation_policy import DelegationPolicy
 from interface.event_schema import Decision, Route
 
 
@@ -28,13 +29,15 @@ class VeyraController:
 
     def __init__(self, capability_registry: CapabilityRegistry) -> None:
         self.capabilities = capability_registry
+        self.delegation_policy = DelegationPolicy(capability_registry)
 
     def prepare(self, decision: Decision) -> tuple[Decision, ControllerPlan]:
-        normalized = self._add_route_capability(decision)
+        delegated, delegation_trace = self.delegation_policy.apply(decision)
+        normalized = self._add_route_capability(delegated)
         required = list(dict.fromkeys(normalized.required_capabilities))
         missing = self.capabilities.missing(required)
         if normalized.route == Route.BLOCK:
-            return normalized, ControllerPlan(Route.BLOCK, "ready", "guardian block route selected", missing)
+            return normalized, ControllerPlan(Route.BLOCK, "ready", delegation_trace.get("reason", "guardian block route selected"), missing)
         if missing:
             adjusted = replace(
                 normalized,
@@ -71,7 +74,7 @@ class VeyraController:
                 signals=list(dict.fromkeys(normalized.signals + ["controller:agent_required"])),
             )
             return adjusted, ControllerPlan(Route.AGENT, "rerouted", "execution requires agent runtime", [])
-        return normalized, ControllerPlan(normalized.route, "ready", "route is executable", [])
+        return normalized, ControllerPlan(normalized.route, "ready", str(delegation_trace.get("reason") or "route is executable"), [])
 
     def _add_route_capability(self, decision: Decision) -> Decision:
         required = list(decision.required_capabilities)

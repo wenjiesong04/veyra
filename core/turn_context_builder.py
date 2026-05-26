@@ -287,22 +287,55 @@ class TurnContextBuilder:
         capabilities = snapshot.get("capabilities") if isinstance(snapshot.get("capabilities"), dict) else {}
         compact: dict[str, bool] = {}
         unavailable: dict[str, str] = {}
+        always_keep = {
+            "native_answer",
+            "time_probe",
+            "port_probe",
+            "git_probe",
+            "process_probe",
+            "file_probe",
+            "openclaw_probe",
+            "guardian",
+            "verifier",
+            "rollback_audit",
+            "web_search",
+            "weather_probe",
+            "vision",
+            "selected_agent_runtime",
+        }
         for name, payload in capabilities.items():
             if not isinstance(payload, dict):
                 continue
             available = bool(payload.get("available"))
+            namespace = str(payload.get("namespace") or "")
+            if name not in always_keep and not available and namespace == "agent":
+                continue
             compact[name] = available
             if not available:
                 unavailable[name] = str(payload.get("status") or "unavailable")
         return {
             "schema": snapshot.get("schema"),
             "capabilities": compact,
-            "unavailable": unavailable,
-            "routes": snapshot.get("routes", {}),
-            "probes": self._availability_flags(snapshot.get("probes", {})),
-            "skills": self._availability_flags(snapshot.get("skills", {})),
+            "missing_capabilities": self._missing_capability_summary(snapshot.get("missing_capabilities", [])),
             "selected_agent": snapshot.get("selected_agent", {}),
         }
+
+    def _missing_capability_summary(self, value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        output: list[dict[str, Any]] = []
+        for item in value[:4]:
+            if not isinstance(item, dict):
+                continue
+            output.append(
+                {
+                    "capability": item.get("capability"),
+                    "reason": self._clip(item.get("reason"), 120),
+                    "native_status": ((item.get("native") or {}).get("status") if isinstance(item.get("native"), dict) else None),
+                    "agent_status": ((item.get("agent") or {}).get("status") if isinstance(item.get("agent"), dict) else None),
+                }
+            )
+        return output
 
     def _belief_summary(self, value: Any) -> dict[str, Any]:
         if not isinstance(value, dict):

@@ -77,6 +77,7 @@ AGENT_CAPABILITY_NAMES = (
 
 GENERIC_TO_AGENT_CAPABILITY: dict[str, str] = {
     "web_search": "web_search",
+    "weather_probe": "web_search",
     "web_url_probe": "web_fetch",
     "vision": "vision",
     "selected_agent_runtime": "runtime",
@@ -287,6 +288,15 @@ class CapabilityRegistry:
                 route="block",
                 executor="guardian",
                 description="Policy block for forbidden requests.",
+                updated_at=now,
+            ),
+            "verifier": Capability(
+                capability_id="verifier",
+                available=True,
+                kind="governance",
+                route="direct_answer",
+                executor="verifier",
+                description="Verify Agent, tool, and probe results before user synthesis.",
                 updated_at=now,
             ),
             "rollback_audit": Capability(
