@@ -95,6 +95,20 @@ class BeliefCore:
             "newest": claims[-limit:],
         }
 
+    def stale_report(self, limit: int = 50) -> dict[str, Any]:
+        belief = self.refresh()
+        stale = [
+            claim
+            for claim in self._rank_claims(belief.get("claims", []))
+            if str(claim.get("status") or "") in {"stale", "expired", "conflict"} or claim.get("next_action") == "refresh_probe"
+        ]
+        return {
+            "status": "success",
+            "summary": belief.get("summary", {}),
+            "items": stale[-limit:],
+            "next_action": "refresh_probe" if stale else None,
+        }
+
     def summary_from_claims(self, claims: list[dict[str, Any]]) -> dict[str, Any]:
         summary: dict[str, Any] = {
             "fresh": 0,

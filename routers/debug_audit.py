@@ -59,6 +59,10 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
         payload["agency"] = deps["agency_core"].state()
         return payload
 
+    @router.get("/state/health")
+    async def state_health() -> dict[str, Any]:
+        return deps["state_store"].state_health()
+
     @router.get("/core/model/status")
     async def core_model_status() -> dict[str, Any]:
         return deps["awareness_loop"].core_reasoning.status()
@@ -281,6 +285,14 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     @router.get("/belief/status")
     async def belief_status(limit: int = 50) -> dict[str, Any]:
         return deps["awareness_loop"].belief.ttl_report(limit=limit)
+
+    @router.get("/belief/stale")
+    async def belief_stale(limit: int = 50) -> dict[str, Any]:
+        return deps["awareness_loop"].belief.stale_report(limit=limit)
+
+    @router.get("/attention/active")
+    async def attention_active() -> dict[str, Any]:
+        return deps["awareness_loop"].attention.active_scope()
 
     @router.post("/belief/refresh")
     async def belief_refresh(request: BeliefRefreshRequest | None = None) -> dict[str, Any]:

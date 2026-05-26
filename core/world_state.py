@@ -4,10 +4,36 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from datetime import datetime, timezone
 
 from core.architecture import STATE_DEFINITIONS
 from core.definitions import lifecycle_statuses, operational_modes, risk_catalog
 from interface.event_schema import utc_now_iso
+
+STATE_METADATA: dict[str, dict[str, Any]] = {
+    "user_world.json": {"source": "veyra_core", "ttl_seconds": 86400, "confidence": 0.72},
+    "local_world.json": {"source": "local_probe_cache", "ttl_seconds": 300, "confidence": 0.82},
+    "external_world.json": {"source": "external_watchlist", "ttl_seconds": 1800, "confidence": 0.62},
+    "executor_state.json": {"source": "agent_registry", "ttl_seconds": 300, "confidence": 0.75},
+    "risk_state.json": {"source": "guardian", "ttl_seconds": 600, "confidence": 0.82},
+    "belief_state.json": {"source": "belief_core", "ttl_seconds": 300, "confidence": 0.72},
+    "task_state.json": {"source": "awareness_loop", "ttl_seconds": 1800, "confidence": 0.7},
+    "attention_state.json": {"source": "attention_core", "ttl_seconds": 300, "confidence": 0.76},
+    "persona_state.json": {"source": "persona_engine", "ttl_seconds": 1800, "confidence": 0.72},
+    "channel_state.json": {"source": "intake_gateway", "ttl_seconds": 3600, "confidence": 0.72},
+    "state_schema.json": {"source": "architecture", "ttl_seconds": 604800, "confidence": 0.9},
+    "review_queue.json": {"source": "guardian_review_queue", "ttl_seconds": 3600, "confidence": 0.8},
+    "agent_memory.json": {"source": "memory_bridge", "ttl_seconds": 1800, "confidence": 0.68},
+    "agent_config.json": {"source": "agent_config", "ttl_seconds": 86400, "confidence": 0.72},
+    "rollback_state.json": {"source": "rollback_audit", "ttl_seconds": 86400, "confidence": 0.82},
+    "replay_runtime_state.json": {"source": "replay_runtime", "ttl_seconds": 3600, "confidence": 0.72},
+    "ops_soak_state.json": {"source": "ops_soak_runner", "ttl_seconds": 3600, "confidence": 0.7},
+    "active_loop_state.json": {"source": "active_runtime_loop", "ttl_seconds": 600, "confidence": 0.78},
+    "runtime_cron_state.json": {"source": "runtime_cron", "ttl_seconds": 3600, "confidence": 0.78},
+    "feishu_ws_state.json": {"source": "feishu_ws_runner", "ttl_seconds": 600, "confidence": 0.65},
+    "ops_runtime_matrix.json": {"source": "runtime_matrix", "ttl_seconds": 1800, "confidence": 0.74},
+    "ops_config.json": {"source": "ops_config", "ttl_seconds": 86400, "confidence": 0.8},
+}
 
 
 class WorldStateStore:
@@ -146,6 +172,7 @@ class WorldStateStore:
                 },
             },
         }
+        defaults = {name: self._with_state_metadata(name, payload) for name, payload in defaults.items()}
         for name, payload in defaults.items():
             path = self.root / name
             if not path.exists():
@@ -166,6 +193,7 @@ class WorldStateStore:
             "core_model_trace.jsonl",
             "alert_log.jsonl",
             "runtime_trace.jsonl",
+            "decision_trace.jsonl",
             "context_drift_log.jsonl",
         ]:
             path = self.root / name
@@ -191,6 +219,7 @@ class WorldStateStore:
         return merged
 
     def write_json(self, name: str, payload: dict[str, Any]) -> None:
+        payload = self._with_state_metadata(name, payload)
         payload.setdefault("updated_at", utc_now_iso())
         (self.root / name).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -251,3 +280,114 @@ class WorldStateStore:
             "feishu_ws_state": self.read_json("feishu_ws_state.json"),
             "ops_config": self.read_json("ops_config.json"),
         }
+
+    def state_health(self) -> dict[str, Any]:
+        items = [self._state_file_health(name) for name in STATE_METADATA]
+        heartbeat = self._heartbeat_health()
+        items.append(heartbeat)
+        counts: dict[str, int] = {}
+        for item in items:
+            health = str(item.get("health_status") or "unknown")
+            counts[health] = counts.get(health, 0) + 1
+        return {
+            "status": "success",
+            "summary": counts,
+            "items": items,
+            "stale": [item for item in items if item.get("health_status") in {"stale", "expired", "missing", "invalid"}],
+        }
+
+    def _with_state_metadata(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if name not in STATE_METADATA:
+            return payload
+        metadata = STATE_METADATA[name]
+        enriched = dict(payload)
+        enriched.setdefault("source", metadata["source"])
+        enriched.setdefault("confidence", metadata["confidence"])
+        enriched.setdefault("ttl_seconds", metadata["ttl_seconds"])
+        enriched.setdefault("status", "fresh")
+        enriched.setdefault("updated_at", utc_now_iso())
+        return enriched
+
+    def _state_file_health(self, name: str) -> dict[str, Any]:
+        path = self.root / name
+        metadata = STATE_METADATA[name]
+        if not path.exists():
+            return {
+                "name": name,
+                "source": metadata["source"],
+                "status": "missing",
+                "health_status": "missing",
+                "confidence": 0.0,
+                "ttl_seconds": metadata["ttl_seconds"],
+                "age_seconds": None,
+                "next_action": "recreate_default_state",
+            }
+        try:
+            payload = self.read_json(name)
+        except json.JSONDecodeError:
+            return {
+                "name": name,
+                "source": metadata["source"],
+                "status": "invalid",
+                "health_status": "invalid",
+                "confidence": 0.0,
+                "ttl_seconds": metadata["ttl_seconds"],
+                "age_seconds": None,
+                "next_action": "repair_state_json",
+            }
+        updated_at = str(payload.get("updated_at") or "")
+        age_seconds = self._age_seconds(updated_at)
+        ttl_seconds = int(payload.get("ttl_seconds") or metadata["ttl_seconds"])
+        confidence = float(payload.get("confidence") or metadata["confidence"])
+        if age_seconds is None:
+            health_status = "uncertain"
+        elif ttl_seconds > 0 and age_seconds > ttl_seconds * 2:
+            health_status = "expired"
+        elif ttl_seconds > 0 and age_seconds > ttl_seconds:
+            health_status = "stale"
+        else:
+            health_status = "fresh"
+        return {
+            "name": name,
+            "source": payload.get("source") or metadata["source"],
+            "status": payload.get("status") or "unknown",
+            "health_status": health_status,
+            "confidence": confidence,
+            "ttl_seconds": ttl_seconds,
+            "updated_at": updated_at,
+            "age_seconds": age_seconds,
+            "next_action": "refresh_probe" if health_status in {"stale", "expired", "uncertain"} else None,
+        }
+
+    def _heartbeat_health(self) -> dict[str, Any]:
+        text = self.read_text("heartbeat.md")
+        updated_at = ""
+        for line in text.splitlines():
+            if line.startswith("updated_at:"):
+                updated_at = line.split(":", 1)[1].strip()
+                break
+        age_seconds = self._age_seconds(updated_at)
+        ttl_seconds = 300
+        health_status = "uncertain" if age_seconds is None else "expired" if age_seconds > ttl_seconds * 2 else "stale" if age_seconds > ttl_seconds else "fresh"
+        return {
+            "name": "heartbeat.md",
+            "source": "runtime_entity",
+            "status": "online" if "status: online" in text else "unknown",
+            "health_status": health_status,
+            "confidence": 0.82 if text else 0.0,
+            "ttl_seconds": ttl_seconds,
+            "updated_at": updated_at,
+            "age_seconds": age_seconds,
+            "next_action": "heartbeat_tick" if health_status in {"stale", "expired", "uncertain"} else None,
+        }
+
+    def _age_seconds(self, value: str) -> int | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - parsed).total_seconds()))

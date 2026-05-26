@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
 
@@ -58,3 +60,17 @@ class AttentionCore:
         if "current_time" in focus:
             probe_priority.append("time_probe")
         return {"probe_priority": list(dict.fromkeys(probe_priority))}
+
+    def active_scope(self) -> dict[str, Any]:
+        state = self.state_store.read_json("attention_state.json")
+        focus = state.get("focus") if isinstance(state.get("focus"), list) else []
+        return {
+            "status": "success",
+            "source": state.get("source") or "attention_core",
+            "updated_at": state.get("updated_at"),
+            "confidence": state.get("confidence", 0.76),
+            "ttl_seconds": state.get("ttl_seconds", 300),
+            "focus": focus,
+            "context_scope": state.get("context_scope") if isinstance(state.get("context_scope"), dict) else self._context_scope([str(item) for item in focus]),
+            "ignored_noise": state.get("ignored_noise") if isinstance(state.get("ignored_noise"), list) else [],
+        }
