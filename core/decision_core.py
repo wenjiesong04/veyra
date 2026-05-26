@@ -86,6 +86,8 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
 VOLATILE_MARKERS = ("现在", "当前", "状态", "最新", "today", "now", "current", "status", "latest")
 IDENTITY_MARKERS = ("你是谁", "你是", "你现在是", "身份", "who are you", "are you")
 GOVERNANCE_ENTITIES = ("veyra", "openclaw", "hermes", "runtime", "agent")
+PREFERENCE_SCOPE_MARKERS = ("以后", "今后", "下次", "记住", "默认", "总是", "一直", "from now on", "remember", "always", "prefer")
+PREFERENCE_CONTENT_MARKERS = ("回答", "直接", "简短", "详细", "中文", "英文", "风格", "语气", "格式", "偏好", "style", "language")
 
 
 class DecisionCore:
@@ -114,6 +116,14 @@ class DecisionCore:
         )
         if priority_decision:
             return priority_decision
+        preference_decision = self._preference_decision(
+            lowered=lowered,
+            risk=risk,
+            complexity=complexity,
+            signals=signals,
+        )
+        if preference_decision:
+            return preference_decision
         if attachment_gap:
             return self._decision(
                 route=Route.ASK_USER,
@@ -270,6 +280,8 @@ class DecisionCore:
             return base
         if self._is_governance_locked(base):
             return base
+        if self._is_preference_locked(base):
+            return base
         assist = self.reasoning.decision_assist(text=text, attention_focus=attention_focus, rule_decision=base.to_dict(), event=event)
         if assist.get("status") != "model_assisted":
             return base
@@ -418,6 +430,33 @@ class DecisionCore:
 
     def _is_governance_locked(self, decision: Decision) -> bool:
         return decision.intent in {"identity", "governance"} or "source:governance_identity" in decision.signals
+
+    def _preference_decision(self, *, lowered: str, risk: RiskLevel, complexity: str, signals: list[str]) -> Decision | None:
+        if risk != RiskLevel.R0:
+            return None
+        if not self._is_preference_intent(lowered):
+            return None
+        return self._decision(
+            route=Route.DIRECT_ANSWER,
+            risk=RiskLevel.R0,
+            reason="long-term user preference detected",
+            intent="preference",
+            complexity=complexity,
+            capability="native_answer",
+            signals=signals + ["intent:preference", "memory:preference", "priority:memory_policy"],
+            memory_policy="long_term",
+            reasoning_mode="direct",
+            required_capabilities=["native_answer"],
+            constraints=["acknowledge preference", "write preference memory patch", "no tool execution"],
+        )
+
+    def _is_preference_intent(self, lowered: str) -> bool:
+        has_scope = any(marker in lowered for marker in PREFERENCE_SCOPE_MARKERS)
+        has_content = any(marker in lowered for marker in PREFERENCE_CONTENT_MARKERS)
+        return has_scope and has_content
+
+    def _is_preference_locked(self, decision: Decision) -> bool:
+        return decision.intent == "preference" or "memory:preference" in decision.signals
 
     def _attachment_capability_gap(self, event: VeyraEvent | None) -> dict[str, Any] | None:
         if not event:

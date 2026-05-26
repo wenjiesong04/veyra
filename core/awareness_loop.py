@@ -505,6 +505,8 @@ class AwarenessLoop:
         text = str(event.payload.get("text", ""))
         if decision.intent == "identity" or "source:governance_identity" in decision.signals:
             return "我是 Veyra。OpenClaw 是我可以在需要执行复杂任务时治理和调用的 Agent Runtime，不是当前对话身份。"
+        if decision.intent == "preference" or "memory:preference" in decision.signals:
+            return "记住了。之后我会尽量更直接，除非问题本身需要先说明风险、证据或执行边界。"
         draft = decision.model_assist.get("draft_response") if decision.model_assist else ""
         if draft:
             return str(draft)

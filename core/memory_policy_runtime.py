@@ -53,6 +53,16 @@ class MemoryPolicyRuntime:
             "trust": "verified",
             "memory_policy": policy,
         }
+        if decision.intent == "preference" or "memory:preference" in decision.signals:
+            patch.update(
+                {
+                    "memory_type": "user_preference",
+                    "preference": {
+                        "source_text": str(event.payload.get("text", ""))[:500],
+                        "scope": "response_style",
+                    },
+                }
+            )
         written = self.long_term_writer(patch)
         return {"status": written.get("status", "unknown"), "policy": policy, "write": written}
 
