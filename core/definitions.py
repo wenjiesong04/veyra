@@ -126,6 +126,7 @@ FORBIDDEN_ACTION_PATTERNS: tuple[str, ...] = (
     r"\brm\s+-rf\b",
     r"\bcurl\b.*\|\s*\bbash\b",
     r"\bdrop\s+database\b",
+    r"\bdrop\s+table\b",
     r"\btruncate\s+table\b",
     r"\bgit\s+push\s+--force\b",
     r"\b(?:cat|type|less|more)\s+\.env\b.*(?:send|upload|post|外发)",

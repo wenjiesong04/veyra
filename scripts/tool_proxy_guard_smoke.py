@@ -139,16 +139,42 @@ def main() -> int:
     expect(force_push.get("status") == "blocked", "git push --force blocked", force_push)
     expect(force_push.get("tool_trace", {}).get("trace_id"), "force push trace", force_push)
 
+    db_delete = proposal(
+        {
+            "proposal_id": "guard_db_delete",
+            "agent": "guard-smoke",
+            "action": {"type": "shell_command", "command": ["psql", "-c", "DELETE FROM users"]},
+            "risk_guess": "R4",
+            "reversible": "partial",
+            "reason": "Agent requests destructive database delete.",
+        }
+    )
+    expect(db_delete.get("status") in {"blocked", "needs_confirmation"}, "database delete blocked or reviewed", db_delete)
+    expect(db_delete.get("tool_trace", {}).get("trace_id"), "database delete trace", db_delete)
+
+    db_drop = proposal(
+        {
+            "proposal_id": "guard_db_drop",
+            "agent": "guard-smoke",
+            "action": {"type": "shell_command", "command": ["psql", "-c", "DROP TABLE users"]},
+            "risk_guess": "R5",
+            "reversible": "no",
+            "reason": "Agent attempts destructive database drop.",
+        }
+    )
+    expect(db_drop.get("status") == "blocked", "database drop blocked", db_drop)
+    expect(db_drop.get("tool_trace", {}).get("trace_id"), "database drop trace", db_drop)
+
     tool_logs = get_json("/logs/tools")
     traces = [item for item in tool_logs.get("items", []) if item.get("trace_id")]
-    expect(len(traces) >= 6, "all scenarios emitted tool traces", traces)
+    expect(len(traces) >= 8, "all scenarios emitted tool traces", traces)
     audit = get_json("/audit/journal?limit=200")
     proposals = [
         item
         for item in audit.get("items", [])
         if str(item.get("event_id") or "").startswith("guard_") or str(item.get("trace_id") or "").startswith("guard_")
     ]
-    expect(len(proposals) >= 6, "all scenarios entered audit", proposals)
+    expect(len(proposals) >= 8, "all scenarios entered audit", proposals)
 
     print("Tool Proxy guard smoke passed.")
     return 0

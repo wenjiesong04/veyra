@@ -52,7 +52,7 @@ class ToolPolicy:
                 "reason": reason,
                 "policy": policy.to_dict(),
                 "required_preconditions": ["do not execute"],
-                "forbidden": ["rm -rf", "curl | bash", "drop database", "git push --force", "externalize_secrets"],
+                "forbidden": ["rm -rf", "curl | bash", "drop database", "drop table", "truncate table", "git push --force", "externalize_secrets"],
             }
         if risk_level in {RiskLevel.R3, RiskLevel.R4} or policy.requires_confirmation:
             return {
@@ -61,7 +61,7 @@ class ToolPolicy:
                 "reason": reason,
                 "policy": policy.to_dict(),
                 "required_preconditions": ["explain impact", "confirm target", "record rollback path"],
-                "forbidden": ["rm -rf", "curl | bash", "drop database", "git push --force", "externalize_secrets"],
+                "forbidden": ["rm -rf", "curl | bash", "drop database", "drop table", "truncate table", "git push --force", "externalize_secrets"],
             }
         return {
             "decision": policy.default_decision.value,
@@ -69,7 +69,7 @@ class ToolPolicy:
             "reason": reason,
             "policy": policy.to_dict(),
             "required_preconditions": ["read-only first"] if risk_level == RiskLevel.R1 else ["record evidence"],
-            "forbidden": ["rm -rf", "curl | bash", "drop database", "git push --force", "externalize_secrets"],
+            "forbidden": ["rm -rf", "curl | bash", "drop database", "drop table", "truncate table", "git push --force", "externalize_secrets"],
         }
 
     def _is_sensitive_path(self, target: Path) -> bool:
