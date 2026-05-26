@@ -514,7 +514,7 @@ class AwarenessLoop:
         if decision.freshness_required:
             capability = decision.capability_request.get("capability") if isinstance(decision.capability_request, dict) else ""
             return f"这个问题需要先获取新鲜证据{f'（{capability}）' if capability else ''}，我不会凭模板猜测。"
-        return "Core Cognition Model 当前未配置或未返回可用草稿；Veyra 不会用固定模板伪造回答。请启用 Core 模型，或把问题改成可由 probe/skill/agent 验证的任务。"
+        return "我现在无法稳定访问认知模型，所以可能没法把这个问题分析得很好。你愿意的话，我可以先基于当前上下文继续给一个简短判断。"
 
     def _update(self, event: VeyraEvent, result: LoopResult) -> None:
         risk_level = result.risk_level.value if hasattr(result.risk_level, "value") else str(result.risk_level)
