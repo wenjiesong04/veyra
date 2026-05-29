@@ -28,12 +28,21 @@ class SafeBrowser:
         self.tool_trace = ToolTrace(state_store)
 
     def status(self) -> dict:
+        configured = bool(self.executor or self.executor_configured)
+        execution_mode = "allowlist_only" if configured else "disabled"
         return {
             "tool": "safe_browser",
-            "configured": bool(self.executor or self.executor_configured),
+            "configured": configured,
             "mode": "custom_executor" if self.executor else "system_browser",
+            "execution_mode": execution_mode,
             "default_enabled": False,
             "allowed_hosts": self.allowed_hosts,
+            "validation": {
+                "implemented": True,
+                "configured": configured,
+                "validated": configured,
+                "status": "validated" if configured else "not_configured",
+            },
         }
 
     def configure_executor(self, enabled: bool, allowed_hosts: list[str] | None = None) -> None:
@@ -70,6 +79,8 @@ class SafeBrowser:
             result.setdefault("review", review)
             result.setdefault("approved_by", approved_by)
             result.setdefault("validation", {"executor_configured": True, "host_allowed": True, "status": "validated" if result.get("status") == "ok" else "validation_pending"})
+            result.setdefault("execution_attempted", True)
+            result.setdefault("execution_mode", "allowlist_only")
         else:
             result = {
                 "status": "not_configured",
@@ -78,6 +89,9 @@ class SafeBrowser:
                 "reason": "SafeBrowser policy passed, but browser execution is not configured in this runtime.",
                 "approved_by": approved_by,
                 "validation": {"executor_configured": False, "host_allowed": None, "status": "not_configured"},
+                "execution_attempted": False,
+                "execution_mode": "disabled",
+                "next_step": "Configure /tool-proxy/config with browser_executor_enabled=true and allowlist hosts.",
             }
         result["tool_trace"] = self._record("browser_open", url, result, review, approved_by)
         return result

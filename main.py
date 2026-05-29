@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,26 @@ from runtime.safety_validation import SafetyValidation
 
 app = FastAPI(title="Veyra", version="0.1.0")
 
+
+def _env_bool(name: str) -> bool | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _env_hosts(name: str) -> list[str] | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    hosts = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    return hosts or None
+
 state_store = WorldStateStore()
 runtime_entity = RuntimeEntity(state_store=state_store)
 awareness_loop = AwarenessLoop(state_store=state_store, runtime_entity=runtime_entity)
@@ -74,6 +95,24 @@ safe_browser = SafeBrowser(state_store=state_store)
 safe_api = SafeAPI(state_store=state_store)
 action_proposal_tool_trace = ToolTrace(state_store)
 _tool_proxy_config = state_store.read_json("ops_config.json").get("tool_proxy", {})
+_tool_proxy_env_overrides: dict[str, Any] = {}
+if isinstance(_tool_proxy_config, dict):
+    env_browser_enabled = _env_bool("VEYRA_TOOL_PROXY_BROWSER_ENABLED")
+    env_api_enabled = _env_bool("VEYRA_TOOL_PROXY_API_ENABLED")
+    env_browser_hosts = _env_hosts("VEYRA_TOOL_PROXY_BROWSER_ALLOWED_HOSTS")
+    env_api_hosts = _env_hosts("VEYRA_TOOL_PROXY_API_ALLOWED_HOSTS")
+    if env_browser_enabled is not None:
+        _tool_proxy_config["browser_executor_enabled"] = env_browser_enabled
+        _tool_proxy_env_overrides["browser_executor_enabled"] = "VEYRA_TOOL_PROXY_BROWSER_ENABLED"
+    if env_api_enabled is not None:
+        _tool_proxy_config["api_executor_enabled"] = env_api_enabled
+        _tool_proxy_env_overrides["api_executor_enabled"] = "VEYRA_TOOL_PROXY_API_ENABLED"
+    if env_browser_hosts is not None:
+        _tool_proxy_config["browser_allowed_hosts"] = env_browser_hosts
+        _tool_proxy_env_overrides["browser_allowed_hosts"] = "VEYRA_TOOL_PROXY_BROWSER_ALLOWED_HOSTS"
+    if env_api_hosts is not None:
+        _tool_proxy_config["api_allowed_hosts"] = env_api_hosts
+        _tool_proxy_env_overrides["api_allowed_hosts"] = "VEYRA_TOOL_PROXY_API_ALLOWED_HOSTS"
 if isinstance(_tool_proxy_config, dict):
     safe_browser.configure_executor(bool(_tool_proxy_config.get("browser_executor_enabled", False)), _tool_proxy_config.get("browser_allowed_hosts"))
     safe_api.configure_executor(bool(_tool_proxy_config.get("api_executor_enabled", False)), _tool_proxy_config.get("api_allowed_hosts"))
@@ -171,9 +210,11 @@ class FileWriteRequest(BaseModel):
 
 class BrowserOpenRequest(BaseModel):
     url: str
+    approved_by: str | None = None
 
 class APIProxyRequest(BaseModel):
     payload: dict[str, Any]
+    approved_by: str | None = None
 
 class ToolProxyConfigRequest(BaseModel):
     browser_executor_enabled: bool | None = None
@@ -253,6 +294,7 @@ def _tool_proxy_status() -> dict[str, Any]:
         "file": {"tool": "safe_file", "configured": True, "mode": "local_filesystem"},
         "browser": safe_browser.status(),
         "api": safe_api.status(),
+        "environment_overrides": _tool_proxy_env_overrides,
     }
 
 
@@ -554,12 +596,12 @@ async def tool_proxy_file_write(request: FileWriteRequest):
 
 @app.post("/tool-proxy/browser/open")
 async def tool_proxy_browser_open(request: BrowserOpenRequest):
-    return safe_browser.open(request.url)
+    return safe_browser.open(request.url, approved_by=request.approved_by)
 
 
 @app.post("/tool-proxy/api/request")
 async def tool_proxy_api_request(request: APIProxyRequest):
-    return safe_api.request(request.payload)
+    return safe_api.request(request.payload, approved_by=request.approved_by)
 
 
 @app.post("/rollback/snapshot")
