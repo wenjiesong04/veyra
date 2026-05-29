@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
 import httpx
@@ -66,7 +67,7 @@ class ChannelAdapter:
         payload = {
             "receive_id": target["receive_id"],
             "msg_type": "text",
-            "content": json.dumps({"text": message}, ensure_ascii=False),
+            "content": json.dumps({"text": self._format_feishu_text(message)}, ensure_ascii=False),
         }
         try:
             with httpx.Client(timeout=timeout) as client:
@@ -153,3 +154,50 @@ class ChannelAdapter:
             "msg": body.get("msg"),
             "message_id": data.get("message_id"),
         }
+
+    def _format_feishu_text(self, message: str) -> str:
+        lines = str(message or "").splitlines()
+        output: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                if output and output[-1] != "":
+                    output.append("")
+                continue
+            if stripped.startswith("|") and stripped.endswith("|"):
+                row = self._table_row_to_text(stripped)
+                if row is None:
+                    continue
+                if row:
+                    output.append(row)
+                continue
+            output.append(self._strip_markdown(stripped))
+        compact: list[str] = []
+        for line in output:
+            if line == "" and (not compact or compact[-1] == ""):
+                continue
+            compact.append(line)
+        return "\n".join(compact).strip()[:3500] or "（空响应）"
+
+    def _table_row_to_text(self, line: str) -> str | None:
+        cells = [self._strip_markdown(cell.strip()) for cell in line.strip("|").split("|")]
+        if len(cells) < 2:
+            return None
+        if all(not cell or set(cell) <= {"-", ":"} for cell in cells):
+            return None
+        first = cells[0].lower()
+        second = cells[1].lower()
+        if first in {"项目", "字段", "item"} and second in {"数据", "值", "value"}:
+            return None
+        key = cells[0]
+        value = " / ".join(cell for cell in cells[1:] if cell)
+        if not key and not value:
+            return None
+        return f"{key}：{value}" if key and value else key or value
+
+    def _strip_markdown(self, text: str) -> str:
+        output = str(text or "")
+        output = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1（\2）", output)
+        output = output.replace("**", "").replace("`", "")
+        output = re.sub(r"^\s*[-*]\s*", "", output)
+        return output.strip()

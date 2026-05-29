@@ -203,6 +203,11 @@ class ChannelConfigRequest(BaseModel):
     encrypt_key_env: str | None = None
     reply_to_session: bool | None = None
     timeout: float | None = None
+    agent_follow_up_enabled: bool | None = None
+    agent_follow_up_timeout_seconds: float | None = None
+    agent_follow_up_interval_seconds: float | None = None
+    agent_follow_up_first_progress_seconds: float | None = None
+    agent_follow_up_progress_interval_seconds: float | None = None
 
 class FeishuImportRequest(BaseModel):
     path: str | None = None

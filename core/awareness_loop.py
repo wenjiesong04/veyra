@@ -725,6 +725,8 @@ class AwarenessLoop:
             return
         timeout_seconds = float(channel_config.get("agent_follow_up_timeout_seconds") or 180)
         interval_seconds = float(channel_config.get("agent_follow_up_interval_seconds") or 2)
+        first_progress_seconds = float(channel_config.get("agent_follow_up_first_progress_seconds") or 30)
+        progress_interval_seconds = float(channel_config.get("agent_follow_up_progress_interval_seconds") or 90)
         thread = threading.Thread(
             target=self._run_agent_follow_up,
             kwargs={
@@ -732,6 +734,8 @@ class AwarenessLoop:
                 "execution": execution,
                 "timeout_seconds": max(10.0, min(timeout_seconds, 900.0)),
                 "interval_seconds": max(1.0, min(interval_seconds, 15.0)),
+                "first_progress_seconds": max(10.0, min(first_progress_seconds, 180.0)),
+                "progress_interval_seconds": max(30.0, min(progress_interval_seconds, 600.0)),
             },
             daemon=True,
             name=f"veyra-followup-{execution.task_id[:10]}",
@@ -745,9 +749,14 @@ class AwarenessLoop:
         execution: ExecutionResult,
         timeout_seconds: float,
         interval_seconds: float,
+        first_progress_seconds: float,
+        progress_interval_seconds: float,
     ) -> None:
         deadline = time.monotonic() + timeout_seconds
+        started = time.monotonic()
         last = execution
+        last_progress_at = started
+        progress_sent = 0
         adapter = self.agent_registry.get(execution.executor)
         while time.monotonic() < deadline:
             try:
@@ -765,27 +774,76 @@ class AwarenessLoop:
             if last.status not in NON_TERMINAL_STATUSES:
                 interpreted = self.result_interpreter.interpret_execution(last, verification)
                 summary = self.response_synthesizer.agent_response(interpreted, verification)
-                follow_up_message = f"任务后续更新：{summary}"
-                metadata = {
-                    "route": "agent_follow_up",
-                    "status": verification.get("status"),
-                    "event_id": event.event_id,
-                    "task_id": last.task_id,
-                    "executor": last.executor,
-                }
-                inbound = event.payload.get("metadata") if isinstance(event.payload.get("metadata"), dict) else {}
-                if inbound:
-                    metadata["inbound"] = inbound
-                    feishu = inbound.get("feishu") if isinstance(inbound.get("feishu"), dict) else {}
-                    if feishu:
-                        metadata["feishu"] = feishu
-                ChannelAdapter(self.state_store, channel=event.source.channel).send(
-                    event.source.session_id,
-                    follow_up_message,
-                    metadata=metadata,
+                self._send_agent_follow_up(
+                    event=event,
+                    execution=last,
+                    status=str(verification.get("status") or ""),
+                    follow_up_kind="final",
+                    message=f"任务后续更新：{summary}",
                 )
                 return
+            now = time.monotonic()
+            elapsed_seconds = int(now - started)
+            if elapsed_seconds >= int(first_progress_seconds) and (progress_sent == 0 or now - last_progress_at >= progress_interval_seconds):
+                self._send_agent_follow_up(
+                    event=event,
+                    execution=last,
+                    status=str(verification.get("status") or "partially_success"),
+                    follow_up_kind="progress",
+                    message=f"任务仍在执行中（{last.status}，已跟进 {elapsed_seconds}s）。我会继续追踪，完成后自动回你。",
+                )
+                progress_sent += 1
+                last_progress_at = now
             time.sleep(interval_seconds)
+        verification = self.verifier.verify_execution_result(last)
+        self.task_tracker.apply_result(
+            execution=last,
+            verification=verification,
+            event_id=event.event_id,
+            route=Route.AGENT.value,
+        )
+        self._send_agent_follow_up(
+            event=event,
+            execution=last,
+            status=str(verification.get("status") or "partially_success"),
+            follow_up_kind="timeout",
+            message=(
+                f"任务目前仍是 `{last.status}`，已超过 {int(timeout_seconds)}s 仍未结束。"
+                "我建议你回复“继续跟进”让我继续追踪，或缩小范围后我马上重试。"
+            ),
+        )
+
+    def _send_agent_follow_up(
+        self,
+        *,
+        event: VeyraEvent,
+        execution: ExecutionResult,
+        status: str,
+        follow_up_kind: str,
+        message: str,
+    ) -> None:
+        metadata: dict[str, Any] = {
+            "route": "agent_follow_up",
+            "status": status,
+            "follow_up_kind": follow_up_kind,
+            "event_id": event.event_id,
+            "task_id": execution.task_id,
+            "executor": execution.executor,
+        }
+        inbound = event.payload.get("metadata") if isinstance(event.payload.get("metadata"), dict) else {}
+        if inbound:
+            metadata["inbound"] = inbound
+            feishu = inbound.get("feishu") if isinstance(inbound.get("feishu"), dict) else {}
+            if feishu:
+                metadata["feishu"] = feishu
+        try:
+            ChannelAdapter(self.state_store, channel=event.source.channel).send(
+                event.source.session_id,
+                message,
+                metadata=metadata,
+            )
+        except Exception:
+            return
 
     def _channel_config(self, channel: str) -> dict[str, Any]:
         state = self.state_store.read_json("channel_state.json")
