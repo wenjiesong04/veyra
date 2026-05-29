@@ -216,6 +216,12 @@ function App() {
   const [runtimeMatrix, setRuntimeMatrix] = useState<Record<string, JsonValue> | null>(null);
   const [deploymentReadiness, setDeploymentReadiness] = useState<Record<string, JsonValue> | null>(null);
   const [alertingStatus, setAlertingStatus] = useState<Record<string, JsonValue> | null>(null);
+  const [runtimeTraceRecent, setRuntimeTraceRecent] = useState<LogResponse>({ items: [] });
+  const [runtimeMetricsSummary, setRuntimeMetricsSummary] = useState<Record<string, JsonValue> | null>(null);
+  const [runtimeMetricsRoutes, setRuntimeMetricsRoutes] = useState<Record<string, JsonValue> | null>(null);
+  const [runtimeMetricsModelCost, setRuntimeMetricsModelCost] = useState<Record<string, JsonValue> | null>(null);
+  const [runtimeMetricsFailures, setRuntimeMetricsFailures] = useState<LogResponse>({ items: [] });
+  const [runtimeSoakTelemetry, setRuntimeSoakTelemetry] = useState<Record<string, JsonValue> | null>(null);
   const [architecture, setArchitecture] = useState<ArchitectureSnapshot | null>(null);
   const [definitions, setDefinitions] = useState<Definitions | null>(null);
   const [heartbeat, setHeartbeat] = useState("");
@@ -265,6 +271,12 @@ function App() {
       runtimeMatrixData,
       deploymentData,
       alertingData,
+      runtimeTraceData,
+      runtimeMetricsSummaryData,
+      runtimeMetricsRoutesData,
+      runtimeMetricsCostData,
+      runtimeMetricsFailureData,
+      runtimeSoakTelemetryData,
       architectureData,
       definitionsData,
       heartbeatData,
@@ -297,6 +309,12 @@ function App() {
       fetchJson<Record<string, JsonValue>>("/ops/runtime-matrix"),
       fetchJson<Record<string, JsonValue>>("/ops/deployment"),
       fetchJson<Record<string, JsonValue>>("/ops/alerting"),
+      fetchJson<LogResponse>("/runtime/traces/recent?limit=20"),
+      fetchJson<Record<string, JsonValue>>("/runtime/metrics/summary?limit=1000"),
+      fetchJson<Record<string, JsonValue>>("/runtime/metrics/routes?limit=1000"),
+      fetchJson<Record<string, JsonValue>>("/runtime/metrics/model-cost?limit=1000"),
+      fetchJson<LogResponse>("/runtime/metrics/failures?limit=20"),
+      fetchJson<Record<string, JsonValue>>("/runtime/soak/status"),
       fetchJson<ArchitectureSnapshot>("/architecture"),
       fetchJson<Definitions>("/definitions"),
       fetchJson<{ heartbeat: string }>("/heartbeat"),
@@ -329,6 +347,12 @@ function App() {
     setRuntimeMatrix(runtimeMatrixData);
     setDeploymentReadiness(deploymentData);
     setAlertingStatus(alertingData);
+    setRuntimeTraceRecent(runtimeTraceData);
+    setRuntimeMetricsSummary(runtimeMetricsSummaryData);
+    setRuntimeMetricsRoutes(runtimeMetricsRoutesData);
+    setRuntimeMetricsModelCost(runtimeMetricsCostData);
+    setRuntimeMetricsFailures(runtimeMetricsFailureData);
+    setRuntimeSoakTelemetry(runtimeSoakTelemetryData);
     setArchitecture(architectureData);
     setDefinitions(definitionsData);
     setHeartbeat(heartbeatData.heartbeat);
@@ -687,6 +711,12 @@ function App() {
   const coreModelConfigured = coreModelStatus?.configured === true ? "configured" : String(coreModelStatus?.status ?? "unconfigured");
   const opsStatus = String(opsHealth?.status ?? "unknown");
   const deploymentStatus = String(deploymentReadiness?.status ?? "unknown");
+  const runtimeTelemetrySummary = asRecord(runtimeMetricsSummary);
+  const runtimeTelemetryRouteDistribution = asRecord(runtimeTelemetrySummary.route_distribution);
+  const runtimeTelemetryRoutesRaw = asRecord(runtimeMetricsRoutes).items;
+  const runtimeTelemetryRoutes = Array.isArray(runtimeTelemetryRoutesRaw) ? (runtimeTelemetryRoutesRaw as Array<Record<string, JsonValue>>) : [];
+  const runtimeTraceItems = runtimeTraceRecent.items.slice(-6).reverse();
+  const runtimeFailureItems = runtimeMetricsFailures.items.slice(-6).reverse();
 
   return (
     <main className="appShell">
@@ -1289,6 +1319,80 @@ function App() {
             </button>
           </div>
           <JsonBlock value={{ alerting: alertingStatus ?? { status: "not loaded" }, recent_alerts: alertLogs.items.slice(-5).reverse() }} />
+        </Section>
+        <Section title="Runtime Telemetry" icon={<ScrollText size={18} />}>
+          <div className="traceSummary">
+            <Metric label="Trace Window" value={String(runtimeTelemetrySummary.window_size ?? runtimeTraceRecent.items.length)} />
+            <Metric label="Avg Latency" value={`${String(runtimeTelemetrySummary.avg_latency_ms ?? 0)} ms`} />
+            <Metric label="Agent Calls" value={String(runtimeTelemetrySummary.agent_calls ?? 0)} />
+            <Metric label="Blocks" value={String(runtimeTelemetrySummary.block_count ?? 0)} />
+          </div>
+          <div className="traceSummary">
+            {Object.entries(runtimeTelemetryRouteDistribution).slice(0, 6).map(([route, count]) => (
+              <Metric key={route} label={route} value={String(count)} />
+            ))}
+          </div>
+          <div className="dataTable traceTable">
+            <div className="dataTableHead">
+              <span>Trace</span>
+              <span>Channel</span>
+              <span>Route</span>
+              <span>Status</span>
+              <span>Latency</span>
+              <span>Failure</span>
+            </div>
+            {runtimeTraceItems.map((item, index) => (
+              <div className="dataTableRow" key={String(item.trace_id ?? index)}>
+                <code>{String(item.trace_id ?? "-")}</code>
+                <span>{String(item.channel ?? "-")}</span>
+                <span>{String(item.final_route ?? item.route ?? "-")}</span>
+                <StatusPill value={String(item.status ?? "unknown")} />
+                <span>{String(item.latency_ms ?? "-")} ms</span>
+                <code>{String(item.failure_reason ?? "-")}</code>
+              </div>
+            ))}
+            {!runtimeTraceItems.length ? <div className="emptyState"><ScrollText size={18} />No runtime traces yet.</div> : null}
+          </div>
+          <div className="dataTable traceTable">
+            <div className="dataTableHead">
+              <span>Route</span>
+              <span>Count</span>
+              <span>Share</span>
+            </div>
+            {runtimeTelemetryRoutes.slice(-6).map((item, index) => (
+              <div className="dataTableRow" key={index}>
+                <span>{String(item.route ?? "-")}</span>
+                <strong>{String(item.count ?? 0)}</strong>
+                <span>{String(item.share ?? 0)}</span>
+              </div>
+            ))}
+            {!runtimeTelemetryRoutes.length ? <div className="emptyState"><ListChecks size={18} />No route metrics yet.</div> : null}
+          </div>
+          <div className="dataTable traceTable">
+            <div className="dataTableHead">
+              <span>Trace</span>
+              <span>Route</span>
+              <span>Failure</span>
+              <span>Completed</span>
+            </div>
+            {runtimeFailureItems.map((item, index) => (
+              <div className="dataTableRow" key={String(item.trace_id ?? index)}>
+                <code>{String(item.trace_id ?? "-")}</code>
+                <span>{String(item.final_route ?? item.route ?? "-")}</span>
+                <code>{String(item.failure_reason ?? "-")}</code>
+                <small>{String(item.completed_at ?? "-")}</small>
+              </div>
+            ))}
+            {!runtimeFailureItems.length ? <div className="emptyState"><CheckCircle2 size={18} />No failures in current window.</div> : null}
+          </div>
+          <JsonBlock
+            value={{
+              summary: runtimeMetricsSummary ?? { status: "not loaded" },
+              routes: runtimeMetricsRoutes ?? { status: "not loaded" },
+              model_cost: runtimeMetricsModelCost ?? { status: "not loaded" },
+              soak: runtimeSoakTelemetry ?? { status: "not loaded" },
+            }}
+          />
         </Section>
       </section>
 
