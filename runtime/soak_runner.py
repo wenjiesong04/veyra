@@ -4,6 +4,7 @@ import threading
 from typing import Any
 from uuid import uuid4
 
+from core.model_client import redact_sensitive
 from interface.event_schema import utc_now_iso
 from runtime.agent_task_tracker import AgentTaskTracker
 from runtime.proactive_checks import ProactiveChecks
@@ -25,6 +26,7 @@ class SoakRunner:
         safety_validation: SafetyValidation,
         adapter_resolver: Any,
         verifier: Any,
+        external_runtime_probe: Any | None = None,
     ) -> None:
         self.proactive_checks = proactive_checks
         self.task_tracker = task_tracker
@@ -33,6 +35,7 @@ class SoakRunner:
         self.safety_validation = safety_validation
         self.adapter_resolver = adapter_resolver
         self.verifier = verifier
+        self.external_runtime_probe = external_runtime_probe
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -50,9 +53,11 @@ class SoakRunner:
                     "proactive": self.proactive_checks.run_read_only(),
                     "retention": self.retention_policy.summary(),
                     "safety": self.safety_validation.run(),
+                    "external_runtime": self._external_runtime_status(),
                 }
             )
         status = "success" if all(run["safety"]["status"] == "passed" for run in runs) else "failed"
+        external_validation = self._external_runtime_validation(runs)
         result = {
             "status": status,
             "iterations": iterations,
@@ -60,7 +65,9 @@ class SoakRunner:
             "validation": {
                 "bounded": True,
                 "read_only": True,
-                "status": "validated" if status == "success" else "validation_pending",
+                "safety_status": "validated" if status == "success" else "failed",
+                "external_runtime": external_validation,
+                "status": self._validation_status(status=status, external_status=external_validation.get("status", "not_configured")),
             },
         }
         self.retention_policy.state_store.append_jsonl("action_record.jsonl", {"route": "ops_soak", "status": status, "artifacts": {"iterations": iterations, "validation": result["validation"]}})
@@ -179,3 +186,57 @@ class SoakRunner:
     def _patch_state(self, patch: dict[str, Any]) -> None:
         state = self._read_state()
         self._write_state({**state, **patch, "updated_at": utc_now_iso()})
+
+    def _external_runtime_status(self) -> dict[str, Any]:
+        if not self.external_runtime_probe:
+            return {
+                "status": "not_configured",
+                "validation": {"status": "not_configured"},
+                "reason": "external runtime probe is not configured",
+            }
+        try:
+            result = self.external_runtime_probe()
+        except Exception as exc:
+            return {"status": "error", "validation": {"status": "error"}, "reason": str(exc)}
+        if not isinstance(result, dict):
+            return {"status": "error", "validation": {"status": "error"}, "reason": "external runtime probe did not return dict"}
+        validation = result.get("validation") if isinstance(result.get("validation"), dict) else {}
+        if "status" not in validation:
+            validation["status"] = str(result.get("status") or "validation_pending")
+        return {**result, "validation": validation}
+
+    def _external_runtime_validation(self, runs: list[dict[str, Any]]) -> dict[str, Any]:
+        statuses: list[str] = []
+        for run in runs:
+            external = run.get("external_runtime") if isinstance(run.get("external_runtime"), dict) else {}
+            validation = external.get("validation") if isinstance(external.get("validation"), dict) else {}
+            statuses.append(str(validation.get("status") or external.get("status") or "validation_pending"))
+        by_status: dict[str, int] = {}
+        for item in statuses:
+            by_status[item] = by_status.get(item, 0) + 1
+        latest = runs[-1].get("external_runtime") if runs else {}
+        if any(item == "error" for item in statuses):
+            status = "error"
+        elif any(item == "validation_pending" for item in statuses):
+            status = "validation_pending"
+        elif any(item == "validated" for item in statuses):
+            status = "validated"
+        else:
+            status = "not_configured"
+        return {
+            "status": status,
+            "samples": len(statuses),
+            "by_status": by_status,
+            "latest": redact_sensitive(latest, max_string=1400, max_list=40),
+        }
+
+    def _validation_status(self, *, status: str, external_status: str) -> str:
+        if status != "success":
+            return "validation_pending"
+        if external_status == "error":
+            return "validation_pending"
+        if external_status == "validation_pending":
+            return "validation_pending"
+        if external_status == "validated":
+            return "validated"
+        return "not_configured"

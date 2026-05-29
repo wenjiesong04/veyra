@@ -102,6 +102,14 @@ def build_ops_runtime_router(deps: dict[str, Any]) -> APIRouter:
     async def ops_runtime_matrix_run(write_memory_probe: bool = False) -> dict[str, Any]:
         return deps["runtime_matrix"].run(write_memory_probe=write_memory_probe)
 
+    @router.get("/ops/external-runtime")
+    async def ops_external_runtime_status() -> dict[str, Any]:
+        return deps["external_runtime_probe"].status(run_runtime_matrix=False, write_memory_probe=False)
+
+    @router.post("/ops/external-runtime/probe")
+    async def ops_external_runtime_probe(write_memory_probe: bool = False) -> dict[str, Any]:
+        return deps["external_runtime_probe"].status(run_runtime_matrix=True, write_memory_probe=write_memory_probe)
+
     @router.get("/runtime/active-loop")
     async def runtime_active_loop_status() -> dict[str, Any]:
         return deps["active_loop"].status()

@@ -38,6 +38,7 @@ from runtime.alert_dispatcher import AlertDispatcher
 from runtime.cron import Cron
 from runtime.deployment_config import DeploymentConfigValidator
 from runtime.external_world_refresh import ExternalWorldRefresh
+from runtime.external_runtime_probe import ExternalRuntimeProbe
 from runtime.ops_monitor import OpsMonitor
 from runtime.proactive_checks import ProactiveChecks
 from runtime.retention_policy import RetentionPolicy
@@ -101,6 +102,11 @@ ops_monitor = OpsMonitor(
 alert_dispatcher = AlertDispatcher(state_store, ops_monitor)
 deployment_validator = DeploymentConfigValidator(state_store)
 runtime_matrix = RuntimeMatrix(state_store, awareness_loop.agent_registry, awareness_loop.memory_bridge)
+external_runtime_probe = ExternalRuntimeProbe(
+    runtime_matrix=runtime_matrix,
+    feishu_status_resolver=feishu_ws_runner.status,
+    channel_status_resolver=intake_gateway.channel_status,
+)
 soak_runner = SoakRunner(
     proactive_checks=proactive_checks,
     task_tracker=awareness_loop.task_tracker,
@@ -109,6 +115,7 @@ soak_runner = SoakRunner(
     safety_validation=safety_validation,
     adapter_resolver=lambda: awareness_loop.agent_registry.selected(),
     verifier=awareness_loop.verifier,
+    external_runtime_probe=lambda: external_runtime_probe.status(run_runtime_matrix=True, write_memory_probe=False),
 )
 replay_runtime = ReplayRuntime(
     state_store=state_store,
@@ -401,6 +408,7 @@ app.include_router(
                 "deployment_readiness": lambda: _deployment_readiness,
                 "deployment_validator": lambda: deployment_validator,
                 "runtime_matrix": lambda: runtime_matrix,
+                "external_runtime_probe": lambda: external_runtime_probe,
                 "active_loop": lambda: active_loop,
                 "runtime_cron": lambda: runtime_cron,
                 "soak_runner": lambda: soak_runner,
