@@ -201,6 +201,16 @@ class TurnContextBuilder:
             "message_type": message_type,
             "content_available_to_core": bool(feishu.get("content_text") or metadata.get("content_text")),
             "content_summary": self._clip(feishu.get("content_text") or metadata.get("content_text") or "", 220),
+            "attachment_fetch_status": (
+                (feishu.get("attachment_fetch") or {}).get("status")
+                if isinstance(feishu.get("attachment_fetch"), dict)
+                else None
+            ),
+            "attachment_local_path": (
+                (feishu.get("attachment_fetch") or {}).get("local_path")
+                if isinstance(feishu.get("attachment_fetch"), dict)
+                else None
+            ),
         }
 
     def _claim_summary(self, claim: dict[str, Any]) -> dict[str, Any]:
@@ -286,7 +296,6 @@ class TurnContextBuilder:
     def _capability_summary(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         capabilities = snapshot.get("capabilities") if isinstance(snapshot.get("capabilities"), dict) else {}
         compact: dict[str, bool] = {}
-        unavailable: dict[str, str] = {}
         always_keep = {
             "native_answer",
             "time_probe",
@@ -308,16 +317,19 @@ class TurnContextBuilder:
                 continue
             available = bool(payload.get("available"))
             namespace = str(payload.get("namespace") or "")
-            if name not in always_keep and not available and namespace == "agent":
+            if name not in always_keep and not (available and namespace == "agent"):
                 continue
             compact[name] = available
-            if not available:
-                unavailable[name] = str(payload.get("status") or "unavailable")
+        selected_agent = snapshot.get("selected_agent") if isinstance(snapshot.get("selected_agent"), dict) else {}
         return {
             "schema": snapshot.get("schema"),
             "capabilities": compact,
             "missing_capabilities": self._missing_capability_summary(snapshot.get("missing_capabilities", [])),
-            "selected_agent": snapshot.get("selected_agent", {}),
+            "selected_agent": {
+                "name": selected_agent.get("name"),
+                "kind": selected_agent.get("kind"),
+                "base_url_configured": selected_agent.get("base_url_configured"),
+            },
         }
 
     def _missing_capability_summary(self, value: Any) -> list[dict[str, Any]]:

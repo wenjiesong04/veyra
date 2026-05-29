@@ -120,7 +120,15 @@ class ContextPatchBuilder:
                 "keys": {
                     "image_key": feishu.get("image_key") or metadata.get("image_key"),
                     "file_key": feishu.get("file_key") or metadata.get("file_key"),
+                    "media_key": feishu.get("media_key") or metadata.get("media_key"),
+                    "attachment_id": feishu.get("attachment_id") or metadata.get("attachment_id"),
                     "message_id": feishu.get("message_id") or metadata.get("message_id"),
+                },
+                "attachment_fetch": {
+                    "status": ((feishu.get("attachment_fetch") or {}).get("status") if isinstance(feishu.get("attachment_fetch"), dict) else None),
+                    "content_type": ((feishu.get("attachment_fetch") or {}).get("content_type") if isinstance(feishu.get("attachment_fetch"), dict) else None),
+                    "size_bytes": ((feishu.get("attachment_fetch") or {}).get("size_bytes") if isinstance(feishu.get("attachment_fetch"), dict) else None),
+                    "local_path": ((feishu.get("attachment_fetch") or {}).get("local_path") if isinstance(feishu.get("attachment_fetch"), dict) else None),
                 },
             },
             max_string=220,

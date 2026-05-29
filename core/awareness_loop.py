@@ -549,8 +549,26 @@ class AwarenessLoop:
 
     def _run_probe(self, event: VeyraEvent, decision: Decision, attention_focus: list[str]) -> LoopResult:
         text = event.payload.get("text", "")
-        probe_name = decision.selected_probe or "system"
-        probe = self.probes.get(probe_name, self.probes["system"])
+        probe_name = (decision.selected_probe or "").strip()
+        if not probe_name:
+            return LoopResult(
+                event_id=event.event_id,
+                route=Route.ASK_USER,
+                status="needs_user_input",
+                response="这个请求需要明确且可执行的探针名称；我不会在缺少探针时默认执行 system_probe。",
+                risk_level=RiskLevel.R1,
+                artifacts={"decision": decision.to_dict(), "next_action": "provide a concrete probe target"},
+            )
+        probe = self.probes.get(probe_name)
+        if not probe:
+            return LoopResult(
+                event_id=event.event_id,
+                route=Route.ASK_USER,
+                status="needs_user_input",
+                response=f"当前不支持探针 `{probe_name}`。请改用可执行探针后再试。",
+                risk_level=RiskLevel.R1,
+                artifacts={"decision": decision.to_dict(), "next_action": "use a supported probe"},
+            )
         raw = probe.run(text)
         state_patch = self.perception.interpret_probe_result(raw)
         belief_state = self.belief.refresh()
@@ -611,9 +629,6 @@ class AwarenessLoop:
             return "我是 Veyra。OpenClaw 是我可以在需要执行复杂任务时治理和调用的 Agent Runtime，不是当前对话身份。"
         if decision.intent == "preference" or "memory:preference" in decision.signals:
             return "记住了。之后我会尽量更直接，除非问题本身需要先说明风险、证据或执行边界。"
-        draft = decision.model_assist.get("draft_response") if decision.model_assist else ""
-        if draft:
-            return str(draft)
         answer_assist = self.core_reasoning.answer_assist(text=text, attention_focus=attention_focus, decision=decision.to_dict(), event=event)
         draft = str(answer_assist.get("draft_response") or answer_assist.get("response") or "").strip()
         if answer_assist.get("status") == "model_assisted" and draft:

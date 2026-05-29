@@ -290,6 +290,9 @@ class DecisionCore:
         risk = self._max_risk(base.risk_level, model_risk)
         candidate_route = self._route_from_model(assist.get("recommended_route") or assist.get("route"), base.route)
         policy_signals: list[str] = []
+        candidate_route, preserved_signal = self._preserve_rule_route(base, candidate_route)
+        if preserved_signal:
+            policy_signals.append(preserved_signal)
         model_freshness_required = bool(assist.get("freshness_required") or assist.get("needs_probe"))
         if (base.freshness_required or model_freshness_required) and candidate_route == Route.DIRECT_ANSWER:
             if base.selected_probe or self._selected_probe_from_model(assist, None):
@@ -547,12 +550,12 @@ class DecisionCore:
         return route
 
     def _selected_probe_from_model(self, assist: dict[str, Any], default: str | None) -> str:
-        allowed = {"time", "system", "git", "port", "process", "file", "log", "network", "web", "openclaw", "hermes", "mcp"}
         capability_request = assist.get("capability_request") if isinstance(assist.get("capability_request"), dict) else {}
-        selected = str(assist.get("selected_probe") or assist.get("probe") or capability_request.get("probe") or default or "")
-        if selected in allowed:
-            return selected
-        return "system" if default else ""
+        selected = str(assist.get("selected_probe") or assist.get("probe") or capability_request.get("probe") or "")
+        normalized = self._canonical_probe_name(selected)
+        if normalized:
+            return normalized
+        return self._canonical_probe_name(default or "")
 
     def _agent_allowed_by_policy(self, text: str, base: Decision, assist: dict[str, Any]) -> bool:
         lowered = text.lower()
@@ -570,6 +573,42 @@ class DecisionCore:
         capability_request = assist.get("capability_request") if isinstance(assist.get("capability_request"), dict) else {}
         selected = str(assist.get("selected_skill") or assist.get("skill") or capability_request.get("skill") or default or "")
         return selected if selected in allowed else (default or "")
+
+    def _canonical_probe_name(self, value: str) -> str:
+        token = str(value or "").strip().lower()
+        if not token:
+            return ""
+        aliases = {
+            "time_probe": "time",
+            "system_probe": "system",
+            "git_probe": "git",
+            "port_probe": "port",
+            "process_probe": "process",
+            "file_probe": "file",
+            "log_probe": "log",
+            "network_probe": "network",
+            "web_probe": "web",
+            "web_url_probe": "web",
+            "openclaw_probe": "openclaw",
+            "hermes_probe": "hermes",
+            "mcp_probe": "mcp",
+        }
+        canonical = aliases.get(token, token)
+        allowed = {"time", "system", "git", "port", "process", "file", "log", "network", "web", "openclaw", "hermes", "mcp"}
+        return canonical if canonical in allowed else ""
+
+    def _preserve_rule_route(self, base: Decision, candidate: Route) -> tuple[Route, str]:
+        if candidate == base.route:
+            return candidate, ""
+        if base.route == Route.AGENT and candidate in {Route.DIRECT_ANSWER, Route.PROBE, Route.SKILL}:
+            return Route.AGENT, "policy:rule_agent_route_preserved"
+        if base.route == Route.PROBE and candidate in {Route.DIRECT_ANSWER, Route.AGENT, Route.SKILL}:
+            return Route.PROBE, "policy:rule_probe_route_preserved"
+        if base.route == Route.SKILL and candidate in {Route.DIRECT_ANSWER, Route.PROBE, Route.AGENT}:
+            return Route.SKILL, "policy:rule_skill_route_preserved"
+        if base.route == Route.ASK_USER and candidate == Route.DIRECT_ANSWER:
+            return Route.ASK_USER, "policy:rule_ask_user_route_preserved"
+        return candidate, ""
 
     def _capability_for_route(self, route: Route, default: str) -> str:
         return {

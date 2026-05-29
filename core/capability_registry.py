@@ -87,7 +87,7 @@ AGENT_CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
     "web_search": ("web_search", "search", "browser.search", "tools.web_search"),
     "web_fetch": ("web_fetch", "fetch", "browser.fetch", "tools.web_fetch"),
     "browser": ("browser", "browser_automation", "tools.browser"),
-    "vision": ("vision", "image", "image_understanding", "multimodal"),
+    "vision": ("vision", "image", "image_understanding", "multimodal", "media"),
     "code_edit": ("code_edit", "edit", "patch", "workspace_edit"),
     "shell": ("shell", "terminal", "command", "bash"),
     "file": ("file", "filesystem", "fs", "workspace_file"),
@@ -369,20 +369,22 @@ class CapabilityRegistry:
         return output
 
     def _advertised_agent_capabilities(self, selected_agent: str, selected_config: dict[str, Any]) -> dict[str, Any]:
-        values = set(self._string_list(selected_config.get("capabilities")))
-        values.update(self._string_list(selected_config.get("tools")))
+        values = set(self._collect_capability_tokens(selected_config.get("capabilities")))
+        values.update(self._collect_capability_tokens(selected_config.get("tools")))
         features = selected_config.get("features") if isinstance(selected_config.get("features"), dict) else {}
         values.update(name for name, enabled in features.items() if enabled)
         snapshot = self._executor_capability_snapshot(selected_agent)
         snapshot_capabilities = snapshot.get("capabilities") if isinstance(snapshot.get("capabilities"), dict) else {}
         snapshot_tools = snapshot.get("tools") if isinstance(snapshot.get("tools"), list) else []
         snapshot_features = snapshot.get("features") if isinstance(snapshot.get("features"), dict) else {}
-        values.update(self._string_list(snapshot_tools))
+        values.update(self._collect_capability_tokens(snapshot_tools))
+        values.update(self._collect_capability_tokens(snapshot.get("raw")))
         values.update(name for name, enabled in snapshot_features.items() if enabled)
         for item in snapshot_capabilities.values():
             if isinstance(item, dict):
-                values.update(self._string_list(item.get("tools")))
-                values.update(self._string_list(item.get("skills")))
+                values.update(self._collect_capability_tokens(item.get("tools")))
+                values.update(self._collect_capability_tokens(item.get("skills")))
+                values.update(self._collect_capability_tokens(item.get("raw")))
         output: dict[str, Any] = {
             "_source": snapshot.get("source") or self._agent_capability_source(selected_config),
             "_updated_at": snapshot.get("updated_at") or selected_config.get("updated_at") or utc_now_iso(),
@@ -397,6 +399,16 @@ class CapabilityRegistry:
     def _executor_capability_snapshot(self, selected_agent: str) -> dict[str, Any]:
         executor = self.state_store.read_json("executor_state.json")
         snapshot = executor.get("capability_snapshot") if isinstance(executor.get("capability_snapshot"), dict) else {}
+        if not snapshot:
+            capabilities = executor.get("capabilities") if isinstance(executor.get("capabilities"), dict) else {}
+            if capabilities:
+                snapshot = {
+                    **capabilities,
+                    "runtime": capabilities.get("runtime") or selected_agent,
+                    "updated_at": capabilities.get("updated_at") or executor.get("updated_at"),
+                    "ttl_seconds": capabilities.get("ttl_seconds") or 300,
+                    "source": "executor_state.capabilities",
+                }
         if snapshot and str(snapshot.get("runtime") or snapshot.get("agent") or selected_agent) != selected_agent:
             return {}
         if not snapshot:
@@ -458,6 +470,53 @@ class CapabilityRegistry:
         if isinstance(value, str) and value:
             return [value]
         return []
+
+    def _collect_capability_tokens(self, value: Any) -> set[str]:
+        tokens: set[str] = set()
+        if isinstance(value, str):
+            token = value.strip().lower()
+            if token:
+                tokens.add(token)
+            return tokens
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                tokens.update(self._collect_capability_tokens(item))
+            return tokens
+        if isinstance(value, dict):
+            for key in ("id", "name", "kind", "type", "runtime", "group", "namespace"):
+                token = str(value.get(key) or "").strip().lower()
+                if token:
+                    tokens.add(token)
+            groups = value.get("groups")
+            if isinstance(groups, list):
+                for item in groups:
+                    token = str(item or "").strip().lower()
+                    if token:
+                        tokens.add(token)
+            features = value.get("features")
+            if isinstance(features, dict):
+                for feature, enabled in features.items():
+                    if enabled:
+                        token = str(feature or "").strip().lower()
+                        if token:
+                            tokens.add(token)
+            capabilities = value.get("capabilities")
+            if isinstance(capabilities, dict):
+                for capability, payload in capabilities.items():
+                    if isinstance(payload, dict):
+                        if payload.get("available"):
+                            token = str(capability or "").strip().lower()
+                            if token:
+                                tokens.add(token)
+                        tokens.update(self._collect_capability_tokens(payload))
+                    elif payload:
+                        token = str(capability or "").strip().lower()
+                        if token:
+                            tokens.add(token)
+            for nested_key in ("tools", "skills", "items", "raw", "optional_methods", "required_methods"):
+                if nested_key in value:
+                    tokens.update(self._collect_capability_tokens(value.get(nested_key)))
+        return tokens
 
     def _agent_available(self, agents: dict[str, Any], name: str) -> bool:
         agent = agents.get(name) if isinstance(agents.get(name), dict) else {}
