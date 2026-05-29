@@ -16,6 +16,7 @@ from core.definitions import RiskLevel  # noqa: E402
 from core.runtime_entity import RuntimeEntity  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
 from interface.event_normalizer import EventNormalizer  # noqa: E402
+from interface.event_schema import utc_now_iso  # noqa: E402
 from interface.event_schema import Decision, Route  # noqa: E402
 
 
@@ -153,6 +154,55 @@ def main() -> int:
                 "probe_alias_normalized",
                 normalized_probe == "time",
                 f"selected_probe={normalized_probe}",
+            )
+        )
+
+        channel_state = state_store.read_json("channel_state.json")
+        inbox = channel_state.get("inbox") if isinstance(channel_state.get("inbox"), list) else []
+        outbox = channel_state.get("outbox") if isinstance(channel_state.get("outbox"), list) else []
+        inbox.append(
+            {
+                "message_id": "ctx-in-1",
+                "event_id": "evt_ctx_in_1",
+                "channel": "smoke",
+                "user_id": "dialogue-regression",
+                "session_id": "dialogue-regression-session",
+                "text": "上一轮问题",
+                "metadata": {},
+                "received_at": utc_now_iso(),
+            }
+        )
+        outbox.append(
+            {
+                "channel": "smoke",
+                "session_id": "dialogue-regression-session",
+                "message": "上一轮回答",
+                "metadata": {"route": "direct_answer"},
+                "status": "queued",
+                "created_at": utc_now_iso(),
+                "delivery": "local_outbox",
+            }
+        )
+        channel_state["inbox"] = inbox
+        channel_state["outbox"] = outbox
+        state_store.write_json("channel_state.json", channel_state)
+        context = loop.core_reasoning.turn_context.build(
+            user_message="继续说下去",
+            attention_focus=[],
+            event=event,
+            rule_decision={},
+        )
+        conversation_tail = (
+            ((context.get("short_memory") if isinstance(context.get("short_memory"), dict) else {}).get("conversation_tail"))
+            if isinstance(context, dict)
+            else []
+        )
+        directions = {str(item.get("direction")) for item in conversation_tail if isinstance(item, dict)}
+        cases.append(
+            _result(
+                "conversation_tail_keeps_inbound_and_outbound",
+                "inbound" in directions and "outbound" in directions,
+                f"directions={sorted(directions)}",
             )
         )
 

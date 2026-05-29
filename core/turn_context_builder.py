@@ -64,9 +64,12 @@ class TurnContextBuilder:
                     "rule_decision": self._rule_decision_summary(rule_decision or {}),
                 },
                 "short_memory": {
-                    "conversation_tail": self._conversation_tail(event, limit=3),
+                    "conversation_tail": self._conversation_tail(event, limit=6),
                     "user": self._user_world_summary(state.get("user_world", {})),
-                    "task": self._task_summary(state.get("task_state", {})),
+                    "task": self._task_summary(
+                        state.get("task_state", {}),
+                        session_id=event.source.session_id if event else None,
+                    ),
                 },
                 "belief": {
                     "summary": self._belief_summary(state.get("belief_state", {}).get("summary", {})),
@@ -171,6 +174,7 @@ class TurnContextBuilder:
             return []
         state = self.state_store.read_json("channel_state.json")
         inbox = state.get("inbox") if isinstance(state.get("inbox"), list) else []
+        outbox = state.get("outbox") if isinstance(state.get("outbox"), list) else []
         session_id = event.source.session_id
         tail: list[dict[str, Any]] = []
         for item in inbox:
@@ -187,6 +191,20 @@ class TurnContextBuilder:
                     "has_attachment": bool(feishu.get("message_type") and feishu.get("message_type") != "text"),
                 }
             )
+        for item in outbox:
+            if not isinstance(item, dict) or item.get("session_id") != session_id:
+                continue
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            tail.append(
+                {
+                    "direction": "outbound",
+                    "received_at": item.get("created_at"),
+                    "text": self._clip(item.get("message"), 220),
+                    "message_type": "text",
+                    "route": metadata.get("route"),
+                }
+            )
+        tail.sort(key=lambda item: str(item.get("received_at") or ""))
         return tail[-limit:]
 
     def _attachment_summary(self, metadata: Any) -> dict[str, Any]:
@@ -244,18 +262,33 @@ class TurnContextBuilder:
             "focus": value.get("focus", []),
         }
 
-    def _task_summary(self, value: Any) -> dict[str, Any]:
+    def _task_summary(self, value: Any, *, session_id: str | None = None) -> dict[str, Any]:
         if not isinstance(value, dict):
             return {}
         history = value.get("history") if isinstance(value.get("history"), list) else []
         short_term = value.get("short_term_memory") if isinstance(value.get("short_term_memory"), list) else []
+        pending = value.get("pending_agent_tasks") if isinstance(value.get("pending_agent_tasks"), list) else []
+        if session_id:
+            history = [
+                item
+                for item in history
+                if not isinstance(item, dict) or not item.get("session_id") or str(item.get("session_id")) == session_id
+            ]
+            short_term = [
+                item
+                for item in short_term
+                if not isinstance(item, dict) or not item.get("session_id") or str(item.get("session_id")) == session_id
+            ]
+            pending = [
+                item
+                for item in pending
+                if not isinstance(item, dict) or not item.get("session_id") or str(item.get("session_id")) == session_id
+            ]
         return {
             "current_task": self._compact_task_item(value.get("current_task")),
             "recent_history": [self._compact_task_item(item) for item in history[-2:]],
             "short_term_memory": [self._compact_task_item(item) for item in short_term[-3:]],
-            "pending_agent_tasks": [self._compact_task_item(item) for item in value.get("pending_agent_tasks", [])[-2:]]
-            if isinstance(value.get("pending_agent_tasks"), list)
-            else [],
+            "pending_agent_tasks": [self._compact_task_item(item) for item in pending[-2:]],
         }
 
     def _executor_summary(self, value: Any) -> dict[str, Any]:

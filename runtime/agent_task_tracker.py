@@ -23,6 +23,9 @@ class AgentTaskTracker:
         route: str,
         execution: ExecutionResult,
         verification: dict[str, Any],
+        session_id: str | None = None,
+        channel: str | None = None,
+        user_id: str | None = None,
     ) -> dict[str, Any] | None:
         if execution.status not in NON_TERMINAL_STATUSES:
             return None
@@ -34,6 +37,9 @@ class AgentTaskTracker:
             "status": execution.status,
             "verification_status": verification.get("status"),
             "next_action": verification.get("next_action"),
+            "session_id": session_id,
+            "channel": channel,
+            "user_id": user_id,
             "registered_at": utc_now_iso(),
             "last_polled_at": None,
             "poll_count": 0,

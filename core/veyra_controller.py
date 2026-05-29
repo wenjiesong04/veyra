@@ -39,6 +39,27 @@ class VeyraController:
         if normalized.route == Route.BLOCK:
             return normalized, ControllerPlan(Route.BLOCK, "ready", delegation_trace.get("reason", "guardian block route selected"), missing)
         if missing:
+            if self._should_agent_fallback(normalized):
+                adjusted = replace(
+                    normalized,
+                    route=Route.AGENT,
+                    reason=f"agent-first capability fallback: {', '.join(item.get('capability', '') for item in missing)}",
+                    capability="selected_agent_runtime",
+                    needs_agent=True,
+                    needs_user_confirmation=False,
+                    required_capabilities=["selected_agent_runtime"],
+                    signals=list(dict.fromkeys(normalized.signals + ["controller:agent_first_fallback"])),
+                    constraints=list(
+                        dict.fromkeys(
+                            normalized.constraints
+                            + [
+                                "selected Agent Runtime should continue execution when native capabilities are missing",
+                                "must disclose unsupported capability explicitly if execution still cannot proceed",
+                            ]
+                        )
+                    ),
+                )
+                return adjusted, ControllerPlan(Route.AGENT, "rerouted", adjusted.reason, missing)
             adjusted = replace(
                 normalized,
                 route=Route.ASK_USER,
@@ -75,6 +96,24 @@ class VeyraController:
             )
             return adjusted, ControllerPlan(Route.AGENT, "rerouted", "execution requires agent runtime", [])
         return normalized, ControllerPlan(normalized.route, "ready", str(delegation_trace.get("reason") or "route is executable"), [])
+
+    def _should_agent_fallback(self, decision: Decision) -> bool:
+        if decision.risk_level.value not in {"R0", "R1"}:
+            return False
+        if decision.route not in {Route.DIRECT_ANSWER, Route.PROBE, Route.ASK_USER}:
+            return False
+        if decision.intent in {"identity", "preference"}:
+            return False
+        if not self.capabilities.is_available("selected_agent_runtime"):
+            return False
+        config = self.capabilities.state_store.read_json("agent_config.json")
+        routing = config.get("routing") if isinstance(config.get("routing"), dict) else {}
+        mode = str(routing.get("dialogue_route") or "").strip().lower()
+        if mode in {"agent_first", "all_to_agent", "agent"}:
+            return True
+        if mode in {"hybrid", "native_first", "native"}:
+            return False
+        return bool(routing.get("agent_first_dialogue", False))
 
     def _add_route_capability(self, decision: Decision) -> Decision:
         required = list(decision.required_capabilities)

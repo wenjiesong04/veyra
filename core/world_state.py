@@ -109,6 +109,10 @@ class WorldStateStore:
             "agent_memory.json": {"items": []},
             "agent_config.json": {
                 "selected_agent": "openclaw",
+                "routing": {
+                    "dialogue_route": "hybrid",
+                    "agent_first_dialogue": False,
+                },
                 "core_model": {
                     "enabled": False,
                     "provider": "openai_compatible",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
 from dataclasses import asdict
 from typing import Any
@@ -28,6 +29,7 @@ from core.world_state import WorldStateStore
 from guardian.review_queue import ReviewQueue
 from interface.agent_contract import NON_TERMINAL_STATUSES
 from interface.agent_adapter import ExecutionResult
+from interface.channel_adapter import ChannelAdapter
 from interface.agent_registry import AgentRegistry
 from interface.event_schema import Decision, LoopResult, Route, VeyraEvent
 from memory_bridge.local_memory_bridge import LocalMemoryBridge
@@ -278,7 +280,11 @@ class AwarenessLoop:
                 route=decision.route.value,
                 execution=execution,
                 verification=verified,
+                session_id=event.source.session_id,
+                channel=event.source.channel,
+                user_id=event.source.user_id,
             )
+            self._schedule_agent_follow_up(event=event, decision=decision, execution=execution)
             memory_write = None
             if verified.get("needs_memory_patch") and decision.memory_policy == "long_term":
                 memory_write = self.memory_bridge.write_patch(
@@ -658,8 +664,13 @@ class AwarenessLoop:
     def _poll_if_needed(self, execution: ExecutionResult) -> ExecutionResult:
         if execution.status not in NON_TERMINAL_STATUSES:
             return execution
+        timeout_seconds, interval_seconds = self._agent_poll_windows()
         try:
-            polled = self.agent_adapter.poll_task(execution.task_id, timeout_seconds=2.0, interval_seconds=0.5)
+            polled = self.agent_adapter.poll_task(
+                execution.task_id,
+                timeout_seconds=timeout_seconds,
+                interval_seconds=interval_seconds,
+            )
         except Exception as exc:  # Adapter polling must not erase the submitted evidence.
             execution.raw["poll_error"] = str(exc)
             return execution
@@ -677,10 +688,107 @@ class AwarenessLoop:
         history.append(
             {
                 "event_id": event.event_id,
+                "session_id": event.source.session_id,
                 "route": result.route.value,
                 "status": result.status,
                 "risk_level": result.risk_level.value,
+                "message": str(event.payload.get("text", ""))[:280],
+                "result": str(result.response or "")[:320],
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
         )
         state["history"] = history[-100:]
         self.state_store.write_json("task_state.json", state)
+
+    def _agent_poll_windows(self) -> tuple[float, float]:
+        config = self.state_store.read_json("agent_config.json")
+        selected_agent = str(config.get("selected_agent") or "openclaw")
+        agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
+        selected = agents.get(selected_agent) if isinstance(agents.get(selected_agent), dict) else {}
+        try:
+            timeout_seconds = float(selected.get("poll_timeout_seconds") or 18.0)
+        except (TypeError, ValueError):
+            timeout_seconds = 18.0
+        try:
+            interval_seconds = float(selected.get("poll_interval_seconds") or 1.0)
+        except (TypeError, ValueError):
+            interval_seconds = 1.0
+        timeout_seconds = max(2.0, min(timeout_seconds, 60.0))
+        interval_seconds = max(0.3, min(interval_seconds, 5.0))
+        return timeout_seconds, interval_seconds
+
+    def _schedule_agent_follow_up(self, *, event: VeyraEvent, decision: Decision, execution: ExecutionResult) -> None:
+        if execution.status not in NON_TERMINAL_STATUSES:
+            return
+        channel_config = self._channel_config(event.source.channel)
+        if channel_config.get("agent_follow_up_enabled", True) is False:
+            return
+        timeout_seconds = float(channel_config.get("agent_follow_up_timeout_seconds") or 180)
+        interval_seconds = float(channel_config.get("agent_follow_up_interval_seconds") or 2)
+        thread = threading.Thread(
+            target=self._run_agent_follow_up,
+            kwargs={
+                "event": event,
+                "execution": execution,
+                "timeout_seconds": max(10.0, min(timeout_seconds, 900.0)),
+                "interval_seconds": max(1.0, min(interval_seconds, 15.0)),
+            },
+            daemon=True,
+            name=f"veyra-followup-{execution.task_id[:10]}",
+        )
+        thread.start()
+
+    def _run_agent_follow_up(
+        self,
+        *,
+        event: VeyraEvent,
+        execution: ExecutionResult,
+        timeout_seconds: float,
+        interval_seconds: float,
+    ) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        last = execution
+        adapter = self.agent_registry.get(execution.executor)
+        while time.monotonic() < deadline:
+            try:
+                last = adapter.fetch_task_status(execution.task_id)
+            except Exception:
+                time.sleep(interval_seconds)
+                continue
+            verification = self.verifier.verify_execution_result(last)
+            self.task_tracker.apply_result(
+                execution=last,
+                verification=verification,
+                event_id=event.event_id,
+                route=Route.AGENT.value,
+            )
+            if last.status not in NON_TERMINAL_STATUSES:
+                interpreted = self.result_interpreter.interpret_execution(last, verification)
+                summary = self.response_synthesizer.agent_response(interpreted, verification)
+                follow_up_message = f"任务后续更新：{summary}"
+                metadata = {
+                    "route": "agent_follow_up",
+                    "status": verification.get("status"),
+                    "event_id": event.event_id,
+                    "task_id": last.task_id,
+                    "executor": last.executor,
+                }
+                inbound = event.payload.get("metadata") if isinstance(event.payload.get("metadata"), dict) else {}
+                if inbound:
+                    metadata["inbound"] = inbound
+                    feishu = inbound.get("feishu") if isinstance(inbound.get("feishu"), dict) else {}
+                    if feishu:
+                        metadata["feishu"] = feishu
+                ChannelAdapter(self.state_store, channel=event.source.channel).send(
+                    event.source.session_id,
+                    follow_up_message,
+                    metadata=metadata,
+                )
+                return
+            time.sleep(interval_seconds)
+
+    def _channel_config(self, channel: str) -> dict[str, Any]:
+        state = self.state_store.read_json("channel_state.json")
+        channels = state.get("channels") if isinstance(state.get("channels"), dict) else {}
+        config = channels.get(channel) if isinstance(channels.get(channel), dict) else {}
+        return config

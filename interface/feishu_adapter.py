@@ -53,11 +53,12 @@ class FeishuAdapter:
         chat_id = str(message.get("chat_id") or "")
         sender_id = sender.get("sender_id") if isinstance(sender.get("sender_id"), dict) else {}
         user_id = str(sender_id.get("open_id") or sender_id.get("user_id") or sender_id.get("union_id") or "feishu-user")
+        session_key = self._session_key(chat_id=chat_id, user_id=user_id)
         receipt = self.gateway.receive_message(
             text=text,
             channel="feishu",
             user_id=user_id,
-            session_id=chat_id or message_id or "feishu-session",
+            session_id=session_key,
             message_id=message_id or None,
             metadata={
                 "feishu": {
@@ -78,6 +79,13 @@ class FeishuAdapter:
             },
         )
         return {"status": "received", "event_type": str(header.get("event_type") or "im.message.receive_v1"), "source": source, "message_id": message_id, "receipt": receipt}
+
+    def _session_key(self, *, chat_id: str, user_id: str) -> str:
+        if chat_id:
+            return chat_id
+        if user_id:
+            return f"user_{user_id}"
+        return "feishu-session"
 
     def _message_text(self, message: dict[str, Any]) -> str:
         message_type = str(message.get("message_type") or "")
