@@ -727,6 +727,7 @@ class AwarenessLoop:
         interval_seconds = float(channel_config.get("agent_follow_up_interval_seconds") or 2)
         first_progress_seconds = float(channel_config.get("agent_follow_up_first_progress_seconds") or 30)
         progress_interval_seconds = float(channel_config.get("agent_follow_up_progress_interval_seconds") or 90)
+        missing_snapshot_fail_count = int(channel_config.get("agent_missing_snapshot_fail_count") or 8)
         thread = threading.Thread(
             target=self._run_agent_follow_up,
             kwargs={
@@ -736,6 +737,7 @@ class AwarenessLoop:
                 "interval_seconds": max(1.0, min(interval_seconds, 15.0)),
                 "first_progress_seconds": max(10.0, min(first_progress_seconds, 180.0)),
                 "progress_interval_seconds": max(30.0, min(progress_interval_seconds, 600.0)),
+                "missing_snapshot_fail_count": max(3, min(missing_snapshot_fail_count, 60)),
             },
             daemon=True,
             name=f"veyra-followup-{execution.task_id[:10]}",
@@ -751,12 +753,14 @@ class AwarenessLoop:
         interval_seconds: float,
         first_progress_seconds: float,
         progress_interval_seconds: float,
+        missing_snapshot_fail_count: int,
     ) -> None:
         deadline = time.monotonic() + timeout_seconds
         started = time.monotonic()
         last = execution
         last_progress_at = started
         progress_sent = 0
+        missing_snapshot_count = 0
         adapter = self.agent_registry.get(execution.executor)
         while time.monotonic() < deadline:
             try:
@@ -771,6 +775,22 @@ class AwarenessLoop:
                 event_id=event.event_id,
                 route=Route.AGENT.value,
             )
+            if self._task_missing_from_runtime_snapshot(last):
+                missing_snapshot_count += 1
+            else:
+                missing_snapshot_count = 0
+            if missing_snapshot_count >= missing_snapshot_fail_count:
+                self._auto_finalize_task_failure(
+                    event=event,
+                    execution=last,
+                    reason="task_missing_from_runtime_snapshot",
+                    message=(
+                        "任务后续更新：Agent 运行时连续多次未返回该任务状态，"
+                        "我已自动结束本次任务以避免一直 pending。你可以回复“重试一次”让我重新发起。"
+                    ),
+                    details={"missing_snapshot_count": missing_snapshot_count},
+                )
+                return
             if last.status not in NON_TERMINAL_STATUSES:
                 interpreted = self.result_interpreter.interpret_execution(last, verification)
                 summary = self.response_synthesizer.agent_response(interpreted, verification)
@@ -795,22 +815,60 @@ class AwarenessLoop:
                 progress_sent += 1
                 last_progress_at = now
             time.sleep(interval_seconds)
-        verification = self.verifier.verify_execution_result(last)
-        self.task_tracker.apply_result(
+        self._auto_finalize_task_failure(
+            event=event,
             execution=last,
+            reason="follow_up_timeout",
+            message=(
+                f"任务后续更新：该任务超过 {int(timeout_seconds)}s 仍未完成，"
+                "我已自动结束本次任务，避免无限等待。你可以回复“重试一次”让我立即重发。"
+            ),
+            details={"timeout_seconds": int(timeout_seconds), "last_status": last.status},
+        )
+
+    def _task_missing_from_runtime_snapshot(self, execution: ExecutionResult) -> bool:
+        if execution.status not in NON_TERMINAL_STATUSES:
+            return False
+        text = str(execution.result or "").lower()
+        return "not present in the current status snapshot" in text
+
+    def _auto_finalize_task_failure(
+        self,
+        *,
+        event: VeyraEvent,
+        execution: ExecutionResult,
+        reason: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        failed_raw = dict(execution.raw or {})
+        failed_raw.update(
+            {
+                "auto_finalized": True,
+                "auto_finalize_reason": reason,
+                **(details or {}),
+            }
+        )
+        failed = ExecutionResult(
+            task_id=execution.task_id,
+            executor=execution.executor,
+            status="failed",
+            result=f"Auto-finalized by Veyra follow-up policy: {reason}.",
+            raw=failed_raw,
+        )
+        verification = self.verifier.verify_execution_result(failed)
+        self.task_tracker.apply_result(
+            execution=failed,
             verification=verification,
             event_id=event.event_id,
             route=Route.AGENT.value,
         )
         self._send_agent_follow_up(
             event=event,
-            execution=last,
-            status=str(verification.get("status") or "partially_success"),
-            follow_up_kind="timeout",
-            message=(
-                f"任务目前仍是 `{last.status}`，已超过 {int(timeout_seconds)}s 仍未结束。"
-                "我建议你回复“继续跟进”让我继续追踪，或缩小范围后我马上重试。"
-            ),
+            execution=failed,
+            status=str(verification.get("status") or "failed"),
+            follow_up_kind="auto_finalized",
+            message=message,
         )
 
     def _send_agent_follow_up(

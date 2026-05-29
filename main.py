@@ -208,6 +208,7 @@ class ChannelConfigRequest(BaseModel):
     agent_follow_up_interval_seconds: float | None = None
     agent_follow_up_first_progress_seconds: float | None = None
     agent_follow_up_progress_interval_seconds: float | None = None
+    agent_missing_snapshot_fail_count: int | None = None
 
 class FeishuImportRequest(BaseModel):
     path: str | None = None

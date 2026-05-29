@@ -97,6 +97,7 @@ class WorldStateStore:
                         "agent_follow_up_interval_seconds": 2,
                         "agent_follow_up_first_progress_seconds": 30,
                         "agent_follow_up_progress_interval_seconds": 90,
+                        "agent_missing_snapshot_fail_count": 8,
                     },
                 },
                 "sessions": {},
