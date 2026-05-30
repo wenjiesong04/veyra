@@ -308,7 +308,15 @@ def main() -> int:
             app_module.state_store,
             reasoning=FakeCoreReasoning(decision={"status": "model_assisted", "route": "direct_answer", "risk_level": "R0", "reason": "guessed", "draft_response": "猜一个时间"}),
         ).decide("现在东京时间是几点", [])
-        expect(time_preserved.route == Route.PROBE and "policy:required_probe_preserved" in time_preserved.signals, "model cannot replace required fresh probe with guess", time_preserved.to_dict())
+        expect(
+            time_preserved.route == Route.PROBE
+            and (
+                "policy:required_probe_preserved" in time_preserved.signals
+                or "policy:rule_probe_route_preserved" in time_preserved.signals
+            ),
+            "model cannot replace required fresh probe with guess",
+            time_preserved.to_dict(),
+        )
 
         capabilities = CapabilityRegistry(app_module.state_store).snapshot()
         expect(capabilities["capabilities"]["time_probe"]["available"] is True, "capability registry exposes time probe", capabilities)

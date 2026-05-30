@@ -103,25 +103,22 @@ class WorldStateStore:
 
     def _migrate_legacy_layout(self) -> None:
         for logical_name, relative in STATE_FILE_LAYOUT.items():
-            target = self.root / relative
-            legacy = self.root / logical_name
-            if not legacy.is_file():
-                continue
-            if target.exists():
-                legacy.unlink()
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            legacy.replace(target)
+            self._migrate_legacy_file(logical_name, self.root / relative, self.root / logical_name)
         for logical_name in JSONL_FILES:
-            legacy = self.root / logical_name
-            target = self.path_for(logical_name)
-            if not legacy.is_file():
-                continue
-            if target.exists():
+            self._migrate_legacy_file(logical_name, self.path_for(logical_name), self.root / logical_name)
+
+    def _migrate_legacy_file(self, logical_name: str, target: Path, legacy: Path) -> None:
+        if not legacy.is_file():
+            return
+        if target.exists():
+            if legacy.stat().st_mtime > target.stat().st_mtime:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                legacy.replace(target)
+            else:
                 legacy.unlink()
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            legacy.replace(target)
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        legacy.replace(target)
 
     def _ensure_defaults(self) -> None:
         defaults: dict[str, Any] = {

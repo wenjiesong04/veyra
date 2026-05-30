@@ -441,8 +441,7 @@ class OpenClawAdapter(AgentAdapter):
                     result=execution.result,
                 )
                 return execution
-            if execution.status == "running" and str(wait_payload.get("status") or "").lower() != "timeout":
-                return execution
+            return execution
 
         listen_seconds = min(max(wait_timeout_ms / 1000.0, 0.5), 8.0)
         try:
@@ -458,9 +457,6 @@ class OpenClawAdapter(AgentAdapter):
                 result=execution.result,
             )
             return execution
-
-        if wait_payload is not None:
-            return self._execution_from_agent_wait(task_id, wait_payload)
 
         return self._fetch_task_status_legacy(task_id)
 

@@ -55,6 +55,7 @@ class LocalMemoryBridge:
                 "created_at": utc_now_iso(),
             }
             state.setdefault("items", []).append(item)
+            state["items"] = state["items"][-200:]
             self.state_store.write_json("agent_memory.json", state)
             external = self._external_write(filtered, provider)
             result = {"status": "written", "item": item, "external_write": external}
