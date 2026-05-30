@@ -29,7 +29,7 @@ class RetentionPolicy:
     def summary(self, limits: dict[str, int] | None = None) -> dict[str, Any]:
         files = []
         for name, limit in self._active_limits(limits).items():
-            path = self.state_store.root / name
+            path = self.state_store.path_for(name)
             count = len(self._read_lines(path))
             files.append(
                 {
@@ -48,7 +48,7 @@ class RetentionPolicy:
         files = []
         changed = 0
         for name, limit in active_limits.items():
-            path = self.state_store.root / name
+            path = self.state_store.path_for(name)
             lines = self._read_lines(path)
             entries = len(lines)
             if entries <= limit:

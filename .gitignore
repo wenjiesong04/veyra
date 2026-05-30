@@ -7,19 +7,18 @@ web/*.tsbuildinfo
 web/vite.config.js
 web/vite.config.d.ts
 
+state/local/openclaw_device.json
 state/openclaw_device.json
 
 # Runtime state / logs / snapshots
+state/logs/*.jsonl
 state/*.jsonl
 state/snapshots/
+state/runtime/*_state.json
+state/local/*_state.json
+state/external/*_state.json
+state/user/*_state.json
 state/*_state.json
-state/action_record.jsonl
-state/event_log.jsonl
-state/tool_call_log.jsonl
-state/memory_log.jsonl
-state/rollback_log.jsonl
-state/execution_trace.jsonl
-state/policy_trace.jsonl
 state/mvp_self_test_tool_file.txt
 
 # IDE

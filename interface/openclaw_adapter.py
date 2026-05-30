@@ -66,7 +66,7 @@ class OpenClawAdapter(AgentAdapter):
             configured_wait = self._float_env("OPENCLAW_TASK_WAIT_TIMEOUT", 75.0)
         self.task_wait_timeout = max(15.0, min(float(configured_wait), 300.0))
         self.scopes = self._scopes(os.getenv("OPENCLAW_SCOPES", "operator.read,operator.write"))
-        self.device_store = Path(os.getenv("OPENCLAW_DEVICE_STORE", "state/openclaw_device.json"))
+        self.device_store = Path(os.getenv("OPENCLAW_DEVICE_STORE", "state/local/openclaw_device.json"))
         self.protocol_min = protocol_min if protocol_min is not None else self._int_env("OPENCLAW_PROTOCOL_MIN", DEFAULT_OPENCLAW_PROTOCOL_MIN)
         configured_max = protocol_max if protocol_max is not None else self._int_env("OPENCLAW_PROTOCOL_MAX", DEFAULT_OPENCLAW_PROTOCOL_MAX)
         self.protocol_max = max(self.protocol_min, configured_max)

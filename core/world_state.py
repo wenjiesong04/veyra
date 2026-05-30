@@ -10,6 +10,56 @@ from core.architecture import STATE_DEFINITIONS
 from core.definitions import lifecycle_statuses, operational_modes, risk_catalog
 from interface.event_schema import utc_now_iso
 
+STATE_WORLD_USER = "user"
+STATE_WORLD_LOCAL = "local"
+STATE_WORLD_EXTERNAL = "external"
+STATE_RUNTIME = "runtime"
+STATE_CONFIG = "config"
+STATE_LOGS = "logs"
+
+JSONL_FILES = [
+    "event_log.jsonl",
+    "action_record.jsonl",
+    "tool_call_log.jsonl",
+    "policy_trace.jsonl",
+    "execution_trace.jsonl",
+    "rollback_log.jsonl",
+    "memory_log.jsonl",
+    "core_model_trace.jsonl",
+    "alert_log.jsonl",
+    "runtime_trace.jsonl",
+    "decision_trace.jsonl",
+    "context_drift_log.jsonl",
+]
+
+STATE_FILE_LAYOUT: dict[str, str] = {
+    "user_world.json": f"{STATE_WORLD_USER}/user_world.json",
+    "agent_memory.json": f"{STATE_WORLD_USER}/agent_memory.json",
+    "review_queue.json": f"{STATE_WORLD_USER}/review_queue.json",
+    "local_world.json": f"{STATE_WORLD_LOCAL}/local_world.json",
+    "executor_state.json": f"{STATE_WORLD_LOCAL}/executor_state.json",
+    "belief_state.json": f"{STATE_WORLD_LOCAL}/belief_state.json",
+    "feishu_ws_state.json": f"{STATE_WORLD_LOCAL}/feishu_ws_state.json",
+    "openclaw_device.json": f"{STATE_WORLD_LOCAL}/openclaw_device.json",
+    "external_world.json": f"{STATE_WORLD_EXTERNAL}/external_world.json",
+    "ops_runtime_matrix.json": f"{STATE_WORLD_EXTERNAL}/ops_runtime_matrix.json",
+    "task_state.json": f"{STATE_RUNTIME}/task_state.json",
+    "attention_state.json": f"{STATE_RUNTIME}/attention_state.json",
+    "persona_state.json": f"{STATE_RUNTIME}/persona_state.json",
+    "channel_state.json": f"{STATE_RUNTIME}/channel_state.json",
+    "risk_state.json": f"{STATE_RUNTIME}/risk_state.json",
+    "active_loop_state.json": f"{STATE_RUNTIME}/active_loop_state.json",
+    "runtime_cron_state.json": f"{STATE_RUNTIME}/runtime_cron_state.json",
+    "rollback_state.json": f"{STATE_RUNTIME}/rollback_state.json",
+    "replay_runtime_state.json": f"{STATE_RUNTIME}/replay_runtime_state.json",
+    "ops_soak_state.json": f"{STATE_RUNTIME}/ops_soak_state.json",
+    "agent_config.json": f"{STATE_CONFIG}/agent_config.json",
+    "ops_config.json": f"{STATE_CONFIG}/ops_config.json",
+    "state_schema.json": f"{STATE_CONFIG}/state_schema.json",
+    **{name: f"{STATE_LOGS}/{name}" for name in JSONL_FILES},
+    "heartbeat.md": "heartbeat.md",
+}
+
 STATE_METADATA: dict[str, dict[str, Any]] = {
     "user_world.json": {"source": "veyra_core", "ttl_seconds": 86400, "confidence": 0.72},
     "local_world.json": {"source": "local_probe_cache", "ttl_seconds": 300, "confidence": 0.82},
@@ -41,7 +91,37 @@ class WorldStateStore:
         selected_root = os.getenv("VEYRA_STATE_ROOT", "state") if str(root) == "state" else root
         self.root = Path(selected_root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_layout()
         self._ensure_defaults()
+
+    def path_for(self, name: str) -> Path:
+        relative = STATE_FILE_LAYOUT.get(name, name)
+        return self.root / relative
+
+    def relative_path_for(self, name: str) -> str:
+        return str(self.path_for(name).relative_to(self.root))
+
+    def _migrate_legacy_layout(self) -> None:
+        for logical_name, relative in STATE_FILE_LAYOUT.items():
+            target = self.root / relative
+            legacy = self.root / logical_name
+            if not legacy.is_file():
+                continue
+            if target.exists():
+                legacy.unlink()
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            legacy.replace(target)
+        for logical_name in JSONL_FILES:
+            legacy = self.root / logical_name
+            target = self.path_for(logical_name)
+            if not legacy.is_file():
+                continue
+            if target.exists():
+                legacy.unlink()
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            legacy.replace(target)
 
     def _ensure_defaults(self) -> None:
         defaults: dict[str, Any] = {
@@ -184,7 +264,8 @@ class WorldStateStore:
         }
         defaults = {name: self._with_state_metadata(name, payload) for name, payload in defaults.items()}
         for name, payload in defaults.items():
-            path = self.root / name
+            path = self.path_for(name)
+            path.parent.mkdir(parents=True, exist_ok=True)
             if not path.exists():
                 path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
                 continue
@@ -192,29 +273,17 @@ class WorldStateStore:
             merged = self._merge_missing(current, payload)
             if merged != current:
                 path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
-        for name in [
-            "event_log.jsonl",
-            "action_record.jsonl",
-            "tool_call_log.jsonl",
-            "policy_trace.jsonl",
-            "execution_trace.jsonl",
-            "rollback_log.jsonl",
-            "memory_log.jsonl",
-            "core_model_trace.jsonl",
-            "alert_log.jsonl",
-            "runtime_trace.jsonl",
-            "decision_trace.jsonl",
-            "context_drift_log.jsonl",
-        ]:
-            path = self.root / name
+        for name in JSONL_FILES:
+            path = self.path_for(name)
+            path.parent.mkdir(parents=True, exist_ok=True)
             if not path.exists():
                 path.write_text("", encoding="utf-8")
-        heartbeat = self.root / "heartbeat.md"
+        heartbeat = self.path_for("heartbeat.md")
         if not heartbeat.exists():
             heartbeat.write_text(f"# Veyra Heartbeat\n\nstatus: online\nupdated_at: {utc_now_iso()}\n", encoding="utf-8")
 
     def read_json(self, name: str) -> dict[str, Any]:
-        path = self.root / name
+        path = self.path_for(name)
         if not path.exists():
             return {}
         return json.loads(path.read_text(encoding="utf-8") or "{}")
@@ -231,7 +300,9 @@ class WorldStateStore:
     def write_json(self, name: str, payload: dict[str, Any]) -> None:
         payload = self._with_state_metadata(name, payload)
         payload.setdefault("updated_at", utc_now_iso())
-        (self.root / name).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        path = self.path_for(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def patch_json(self, name: str, patch: dict[str, Any]) -> dict[str, Any]:
         current = self.read_json(name)
@@ -241,11 +312,13 @@ class WorldStateStore:
 
     def append_jsonl(self, name: str, payload: dict[str, Any]) -> None:
         payload.setdefault("timestamp", utc_now_iso())
-        with (self.root / name).open("a", encoding="utf-8") as handle:
+        path = self.path_for(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def read_jsonl(self, name: str, limit: int = 100) -> list[dict[str, Any]]:
-        path = self.root / name
+        path = self.path_for(name)
         if not path.exists():
             return []
         rows: list[dict[str, Any]] = []
@@ -259,11 +332,13 @@ class WorldStateStore:
         return rows[-limit:]
 
     def read_text(self, name: str) -> str:
-        path = self.root / name
+        path = self.path_for(name)
         return path.read_text(encoding="utf-8") if path.exists() else ""
 
     def write_text(self, name: str, content: str) -> None:
-        (self.root / name).write_text(content, encoding="utf-8")
+        path = self.path_for(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
 
     def read_all(self) -> dict[str, Any]:
         return {
@@ -319,11 +394,12 @@ class WorldStateStore:
         return enriched
 
     def _state_file_health(self, name: str) -> dict[str, Any]:
-        path = self.root / name
+        path = self.path_for(name)
         metadata = STATE_METADATA[name]
         if not path.exists():
             return {
                 "name": name,
+                "path": self.relative_path_for(name),
                 "source": metadata["source"],
                 "status": "missing",
                 "health_status": "missing",
@@ -337,6 +413,7 @@ class WorldStateStore:
         except json.JSONDecodeError:
             return {
                 "name": name,
+                "path": self.relative_path_for(name),
                 "source": metadata["source"],
                 "status": "invalid",
                 "health_status": "invalid",
@@ -359,6 +436,7 @@ class WorldStateStore:
             health_status = "fresh"
         return {
             "name": name,
+            "path": self.relative_path_for(name),
             "source": payload.get("source") or metadata["source"],
             "status": payload.get("status") or "unknown",
             "health_status": health_status,
