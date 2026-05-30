@@ -101,7 +101,7 @@ class ActiveRuntimeLoop:
             self._step("proactive", lambda: self.proactive_checks.run_read_only(timeout_seconds=12)),
             self._step("external_world", lambda: self.external_world_refresh.refresh_watchlist(limit=5)),
             self._step("replay_runtime", lambda: self._run_replay_runtime()),
-            self._step("retention", lambda: self.retention_policy.summary()),
+            self._step("retention", lambda: self._retention_tick()),
         ]
         if include_runtime_matrix:
             steps.append(self._step("runtime_matrix", lambda: self.runtime_matrix.run(write_memory_probe=False)))
@@ -151,6 +151,20 @@ class ActiveRuntimeLoop:
     def _heartbeat(self) -> dict[str, Any]:
         self.runtime_entity.set_status(self.runtime_entity.lifecycle.status)
         return {"status": "success", "heartbeat": self.runtime_entity.lifecycle.last_heartbeat_at}
+
+    def _retention_tick(self) -> dict[str, Any]:
+        summary = self.retention_policy.summary()
+        over_limit = [item for item in summary.get("files", []) if item.get("status") == "over_limit"]
+        if not over_limit:
+            return {"status": "ok", "policy": summary.get("policy"), "files_checked": len(summary.get("files", [])), "changed": 0}
+        enforced = self.retention_policy.enforce()
+        return {
+            "status": "success",
+            "policy": enforced.get("policy"),
+            "changed": enforced.get("changed", 0),
+            "over_limit_before": len(over_limit),
+            "files": enforced.get("files", []),
+        }
 
     def _run_replay_runtime(self) -> dict[str, Any]:
         if self.replay_runtime is None:

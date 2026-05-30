@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from core.world_state import WorldStateStore
@@ -11,6 +12,9 @@ from rollback_audit.execution_trace import ExecutionTrace
 
 class AgentTaskTracker:
     """Persists non-terminal Agent tasks and refreshes them later."""
+
+    DEFAULT_STALE_AFTER_HOURS = 6.0
+    DEFAULT_FORCE_PRUNE_AFTER_HOURS = 24.0
 
     def __init__(self, state_store: WorldStateStore, execution_trace: ExecutionTrace | None = None) -> None:
         self.state_store = state_store
@@ -93,6 +97,7 @@ class AgentTaskTracker:
         return {"pending_agent_tasks": task_state["pending_agent_tasks"], "matched": matched}
 
     def refresh_pending(self, adapter: AgentAdapter, verifier: Any, limit: int = 20) -> dict[str, Any]:
+        prune_report = self.prune_stale_pending(adapter, verifier)
         pending = self.state_store.read_json("task_state.json").get("pending_agent_tasks", [])
         refreshed: list[dict[str, Any]] = []
         for item in list(pending)[:limit]:
@@ -114,7 +119,108 @@ class AgentTaskTracker:
             )
             self.apply_result(execution=execution, verification=verification, event_id=str(item.get("event_id") or ""), route=str(item.get("route") or "agent"))
             refreshed.append({"execution_result": execution.to_dict(), "verification": verification, "execution_trace": trace})
-        return {"status": "success", "refreshed": refreshed, "remaining": self.state_store.read_json("task_state.json").get("pending_agent_tasks", [])}
+        return {
+            "status": "success",
+            "pruned": prune_report.get("pruned", []),
+            "refreshed": refreshed,
+            "remaining": self.state_store.read_json("task_state.json").get("pending_agent_tasks", []),
+        }
+
+    def prune_stale_pending(
+        self,
+        adapter: AgentAdapter,
+        verifier: Any,
+        *,
+        stale_after_hours: float = DEFAULT_STALE_AFTER_HOURS,
+        force_after_hours: float = DEFAULT_FORCE_PRUNE_AFTER_HOURS,
+    ) -> dict[str, Any]:
+        task_state = self.state_store.read_json("task_state.json")
+        pending = list(task_state.get("pending_agent_tasks", []))
+        if not pending:
+            return {"status": "success", "pruned": [], "remaining_count": 0}
+
+        kept: list[dict[str, Any]] = []
+        pruned: list[dict[str, Any]] = []
+        now = datetime.now(timezone.utc)
+        for item in pending:
+            task_id = str(item.get("task_id") or "")
+            if not task_id:
+                continue
+            age_hours = self._age_hours(item.get("registered_at"), now)
+            if age_hours is not None and age_hours >= force_after_hours:
+                pruned.append(self._finalize_pruned(item, reason="force_prune_after_max_age", age_hours=age_hours))
+                continue
+            if age_hours is not None and age_hours >= stale_after_hours and str(item.get("status") or "") in NON_TERMINAL_STATUSES:
+                execution = adapter.fetch_task_status(task_id)
+                verification = verifier.verify_execution_result(execution)
+                if execution.status in NON_TERMINAL_STATUSES:
+                    pruned.append(
+                        self._finalize_pruned(
+                            item,
+                            reason="stale_non_terminal_after_poll",
+                            age_hours=age_hours,
+                            execution=execution,
+                            verification=verification,
+                        )
+                    )
+                    continue
+                self.apply_result(
+                    execution=execution,
+                    verification=verification,
+                    event_id=str(item.get("event_id") or ""),
+                    route=str(item.get("route") or "agent"),
+                )
+                if execution.status not in NON_TERMINAL_STATUSES:
+                    continue
+            kept.append(item)
+
+        task_state["pending_agent_tasks"] = kept[-100:]
+        self.state_store.write_json("task_state.json", task_state)
+        return {"status": "success", "pruned": pruned, "remaining_count": len(kept)}
+
+    def _finalize_pruned(
+        self,
+        item: dict[str, Any],
+        *,
+        reason: str,
+        age_hours: float | None,
+        execution: ExecutionResult | None = None,
+        verification: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        task_id = str(item.get("task_id") or "")
+        failed = execution or ExecutionResult(
+            task_id=task_id,
+            executor=str(item.get("executor") or "openclaw"),
+            status="error",
+            result="Stale pending agent task pruned after supervision timeout.",
+            raw={"auto_pruned": True, "prune_reason": reason, "age_hours": age_hours},
+        )
+        verified = verification or {"status": "verified_failed", "verdict": "stale_pending_pruned", "next_action": "retry_or_ignore"}
+        self.execution_trace.record(
+            {
+                "event_id": item.get("event_id") or f"prune_{task_id}",
+                "route": item.get("route") or "agent",
+                "task_id": task_id,
+                "executor": failed.executor,
+                "status": verified["status"],
+                "execution_result": failed.to_dict(),
+                "verification": verified,
+                "prune_reason": reason,
+            }
+        )
+        return {"task_id": task_id, "reason": reason, "age_hours": age_hours, "execution_result": failed.to_dict()}
+
+    @staticmethod
+    def _age_hours(value: Any, now: datetime) -> float | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, (now - parsed).total_seconds() / 3600.0)
 
     def _upsert_pending(self, task: dict[str, Any]) -> None:
         task_state = self.state_store.read_json("task_state.json")
