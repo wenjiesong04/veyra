@@ -621,7 +621,7 @@ class AwarenessLoop:
 
     def _probe_response(self, *, probe_name: str, raw: dict[str, object], verified: dict[str, object], answer_assist: dict[str, object]) -> str:
         draft = str(answer_assist.get("draft_response") or answer_assist.get("response") or "").strip()
-        if answer_assist.get("status") == "model_assisted" and draft:
+        if answer_assist.get("status") == "model_assisted" and draft and self._probe_draft_is_usable(probe_name=probe_name, raw=raw, draft=draft):
             return draft
         return str(raw.get("summary") or verified.get("message") or "Probe completed.")
 
@@ -637,13 +637,115 @@ class AwarenessLoop:
             return "记住了。之后我会尽量更直接，除非问题本身需要先说明风险、证据或执行边界。"
         answer_assist = self.core_reasoning.answer_assist(text=text, attention_focus=attention_focus, decision=decision.to_dict(), event=event)
         draft = str(answer_assist.get("draft_response") or answer_assist.get("response") or "").strip()
-        if answer_assist.get("status") == "model_assisted" and draft:
+        if answer_assist.get("status") == "model_assisted" and draft and self._direct_draft_is_usable(text=text, decision=decision, draft=draft, answer_assist=answer_assist):
             decision.model_assist = {**decision.model_assist, "answer_assist": answer_assist}
             return draft
         if decision.freshness_required:
             capability = decision.capability_request.get("capability") if isinstance(decision.capability_request, dict) else ""
             return f"这个问题需要先获取新鲜证据{f'（{capability}）' if capability else ''}，我不会凭模板猜测。"
-        return "我现在无法稳定访问认知模型，所以可能没法把这个问题分析得很好。你愿意的话，我可以先基于当前上下文继续给一个简短判断。"
+        return self._direct_answer_degraded(text=text, decision=decision, answer_assist=answer_assist)
+
+    def _probe_draft_is_usable(self, *, probe_name: str, raw: dict[str, object], draft: str) -> bool:
+        if self._looks_like_low_quality_template(draft):
+            return False
+        summary = str(raw.get("summary") or "").strip()
+        if not summary:
+            return True
+        anchors = self._probe_evidence_anchors(probe_name=probe_name, raw=raw, summary=summary)
+        if not anchors:
+            return True
+        lowered = draft.lower()
+        return any(anchor in lowered for anchor in anchors)
+
+    def _probe_evidence_anchors(self, *, probe_name: str, raw: dict[str, object], summary: str) -> list[str]:
+        details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
+        anchors: list[str] = []
+        if probe_name == "time_probe":
+            anchors.extend(
+                [
+                    str(details.get("timezone") or "").strip().lower(),
+                    str(details.get("date") or "").strip().lower(),
+                    str(details.get("time") or "").strip().lower(),
+                    str(details.get("utc_offset") or "").strip().lower(),
+                ]
+            )
+        elif probe_name == "weather_probe":
+            current = details.get("current") if isinstance(details.get("current"), dict) else {}
+            anchors.extend(
+                [
+                    str(details.get("location") or "").strip().lower(),
+                    str(details.get("weather_description") or "").strip().lower(),
+                    str(current.get("temperature_2m") or "").strip().lower(),
+                    str(current.get("time") or "").strip().lower(),
+                ]
+            )
+        elif probe_name == "web_probe":
+            anchors.extend(
+                [
+                    str(details.get("url") or "").strip().lower(),
+                    str(details.get("status_code") or "").strip().lower(),
+                ]
+            )
+        elif probe_name in {"port_probe", "openclaw_probe", "hermes_probe"}:
+            anchors.extend(
+                [
+                    str(raw.get("status") or "").strip().lower(),
+                    str(raw.get("host") or details.get("host") or "").strip().lower(),
+                    str(raw.get("port") or details.get("port") or "").strip().lower(),
+                ]
+            )
+        anchors.extend(token.lower() for token in re.findall(r"[A-Za-z0-9_:/+.-]{3,}", summary))
+        return [item for item in anchors if item]
+
+    def _direct_draft_is_usable(self, *, text: str, decision: Decision, draft: str, answer_assist: dict[str, object]) -> bool:
+        if self._looks_like_low_quality_template(draft):
+            return False
+        confidence_raw = answer_assist.get("confidence")
+        try:
+            confidence = float(confidence_raw) if confidence_raw is not None else None
+        except (TypeError, ValueError):
+            confidence = None
+        if confidence is not None and confidence < 0.45:
+            return False
+        if bool(answer_assist.get("needs_observation")) and not decision.freshness_required:
+            return False
+        lowered_question = text.lower()
+        lowered_draft = draft.lower()
+        if decision.intent in {"information", "unknown"} and any(marker in lowered_question for marker in ("为什么", "是什么", "解释", "说明", "how", "what", "why")):
+            if len(draft) < 24:
+                return False
+        if "openclaw" in lowered_draft and "openclaw" not in lowered_question and decision.intent != "identity":
+            return False
+        if "hermes" in lowered_draft and "hermes" not in lowered_question and decision.intent != "identity":
+            return False
+        return True
+
+    def _looks_like_low_quality_template(self, text: str) -> bool:
+        lowered = text.strip().lower()
+        if len(lowered) < 4:
+            return True
+        markers = (
+            "无法稳定访问认知模型",
+            "我不能保证准确",
+            "可能不太准确",
+            "作为ai",
+            "无法访问互联网",
+            "请稍后再试",
+            "我现在无法",
+        )
+        return any(marker in lowered for marker in markers)
+
+    def _direct_answer_degraded(self, *, text: str, decision: Decision, answer_assist: dict[str, object]) -> str:
+        compact = " ".join(text.split())
+        snippet = compact[:48] + ("..." if len(compact) > 48 else "")
+        gaps = answer_assist.get("context_gaps") if isinstance(answer_assist.get("context_gaps"), list) else []
+        if gaps:
+            gap_text = "；".join(str(item) for item in gaps[:2] if item)
+            if gap_text:
+                return f"针对「{snippet}」，我这轮无法产出足够可靠的直答（缺口：{gap_text}）。我先不乱猜；你可以让我改走可验证探针，或补充约束后我再回答。"
+        if decision.intent in {"information", "unknown"}:
+            return f"针对「{snippet}」，我这轮拿不到稳定的认知模型输出。为避免误导，我先不编结论；你可以让我改走探针取证，或把问题拆成可验证的小点继续。"
+        return "我这轮无法给出稳定直答。为避免误导，我先不输出未经验证的结论；请补充上下文或改为可验证路径。"
 
     def _update(self, event: VeyraEvent, result: LoopResult) -> None:
         risk_level = result.risk_level.value if hasattr(result.risk_level, "value") else str(result.risk_level)

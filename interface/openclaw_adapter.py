@@ -4,6 +4,7 @@ import json
 import os
 import base64
 import hashlib
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,7 @@ from interface.event_schema import VeyraTaskPacket
 DEFAULT_OPENCLAW_PROTOCOL_MIN = 3
 DEFAULT_OPENCLAW_PROTOCOL_MAX = 4
 OPENCLAW_REQUIRED_METHODS = ("chat.send",)
-OPENCLAW_OPTIONAL_METHODS = ("health", "status", "tools.catalog", "skills.status")
+OPENCLAW_OPTIONAL_METHODS = ("health", "status", "tools.catalog", "skills.status", "agent.wait", "chat.history")
 
 
 class OpenClawGatewayError(RuntimeError):
@@ -49,6 +50,7 @@ class OpenClawAdapter(AgentAdapter):
         timeout: float = 20.0,
         protocol_min: int | None = None,
         protocol_max: int | None = None,
+        task_wait_timeout: float | None = None,
         **_: Any,
     ) -> None:
         raw_url = base_url or os.getenv("OPENCLAW_GATEWAY_URL") or os.getenv("OPENCLAW_BASE_URL", "")
@@ -59,12 +61,17 @@ class OpenClawAdapter(AgentAdapter):
         self.timeout = timeout
         self.connect_timeout = min(max(timeout, 1.0), 5.0)
         self.session_key = os.getenv("OPENCLAW_SESSION_KEY", "main")
-        self.task_wait_timeout = float(os.getenv("OPENCLAW_TASK_WAIT_TIMEOUT", "30"))
+        configured_wait = task_wait_timeout
+        if configured_wait is None:
+            configured_wait = self._float_env("OPENCLAW_TASK_WAIT_TIMEOUT", 75.0)
+        self.task_wait_timeout = max(15.0, min(float(configured_wait), 300.0))
         self.scopes = self._scopes(os.getenv("OPENCLAW_SCOPES", "operator.read,operator.write"))
         self.device_store = Path(os.getenv("OPENCLAW_DEVICE_STORE", "state/openclaw_device.json"))
         self.protocol_min = protocol_min if protocol_min is not None else self._int_env("OPENCLAW_PROTOCOL_MIN", DEFAULT_OPENCLAW_PROTOCOL_MIN)
         configured_max = protocol_max if protocol_max is not None else self._int_env("OPENCLAW_PROTOCOL_MAX", DEFAULT_OPENCLAW_PROTOCOL_MAX)
         self.protocol_max = max(self.protocol_min, configured_max)
+        self._run_cache: dict[str, dict[str, Any]] = {}
+        self._run_cache_lock = threading.Lock()
 
     def send_task(self, task_packet: VeyraTaskPacket) -> ExecutionResult:
         validation_errors = validate_task_packet_payload(task_packet.to_dict())
@@ -94,21 +101,26 @@ class OpenClawAdapter(AgentAdapter):
         text = self._message_text(final.get("message"))
         run_id = str(raw.get("run_id") or raw.get("chat_send", {}).get("runId") or task_packet.task_id)
         if final.get("state") == "final":
-            return ExecutionResult(
+            execution = ExecutionResult(
                 task_id=run_id,
                 executor="openclaw",
                 status="success",
                 result=text or "OpenClaw finished with no text.",
                 raw=self._redact_payload(raw),
             )
+            self._remember_chat_run(run_id, final_event=final, status="success", result=text)
+            return execution
         if final.get("state") == "error":
-            return ExecutionResult(
+            execution = ExecutionResult(
                 task_id=run_id,
                 executor="openclaw",
                 status="error",
                 result=str(final.get("errorMessage") or "OpenClaw task failed."),
                 raw=self._redact_payload(raw),
             )
+            self._remember_chat_run(run_id, final_event=final, status="error", result=execution.result)
+            return execution
+        self._remember_chat_run(run_id, final_event=final, status="submitted", result=f"Task submitted to OpenClaw. run_id={run_id}")
         return ExecutionResult(
             task_id=run_id,
             executor="openclaw",
@@ -169,44 +181,19 @@ class OpenClawAdapter(AgentAdapter):
                 result="OpenClaw adapter is not connected. Configure OPENCLAW_GATEWAY_URL or OPENCLAW_BASE_URL before polling tasks.",
                 raw={"configured": False},
             )
-        try:
-            status = self._gateway_request("status", {})
-        except OpenClawGatewayError as exc:
-            return ExecutionResult(
-                task_id=task_id,
-                executor="openclaw",
-                status=exc.status,
-                result=f"OpenClaw task status request failed: {exc.message}",
-                raw=self._redact_payload({"error": exc.details}),
-            )
-        tasks = status.get("tasks") if isinstance(status.get("tasks"), dict) else {}
-        active = tasks.get("active")
-        known_task = self._find_task(status, task_id)
-        if known_task:
-            state = str(known_task.get("state") or known_task.get("status") or "running")
-            normalized = "success" if state in {"final", "done", "completed"} else "error" if state in {"error", "failed"} else "running"
-            return ExecutionResult(
-                task_id=task_id,
-                executor="openclaw",
-                status=normalized,
-                result=str(known_task.get("result") or known_task.get("message") or f"OpenClaw task {task_id} is {normalized}."),
-                raw=self._redact_payload({"task": known_task, "status": status}),
-            )
-        if isinstance(active, int) and active > 0:
-            return ExecutionResult(
-                task_id=task_id,
-                executor="openclaw",
-                status="running",
-                result=f"OpenClaw has {active} active task(s); task {task_id} has not reached a final event yet.",
-                raw=self._redact_payload({"status": status}),
-            )
-        return ExecutionResult(
-            task_id=task_id,
-            executor="openclaw",
-            status="submitted",
-            result=f"OpenClaw task {task_id} is not present in the current status snapshot.",
-            raw=self._redact_payload({"status": status}),
-        )
+        cached = self._cached_execution(task_id)
+        if cached:
+            return cached
+        return self._resolve_chat_run(task_id, wait_timeout_ms=self._status_wait_ms())
+
+    def poll_task(self, task_id: str, timeout_seconds: float = 0.0, interval_seconds: float = 1.0) -> ExecutionResult:
+        if timeout_seconds <= 0:
+            return self.fetch_task_status(task_id)
+        cached = self._cached_execution(task_id)
+        if cached:
+            return cached
+        wait_ms = int(max(1.0, min(float(timeout_seconds), 300.0)) * 1000)
+        return self._resolve_chat_run(task_id, wait_timeout_ms=wait_ms)
 
     def stop_task(self, task_id: str) -> bool:
         if not self.gateway_url:
@@ -293,6 +280,7 @@ class OpenClawAdapter(AgentAdapter):
                 "memory_summary": True,
                 "memory_patch": True,
                 "task_status": True,
+                "task_poll": "agent.wait+chat.history",
                 "stop_task": True,
                 "tool_proxy_enforced": True,
             },
@@ -431,6 +419,258 @@ class OpenClawAdapter(AgentAdapter):
             if payload.get("state") in {"final", "error"}:
                 return payload
         return {"state": "submitted", "reason": "timeout_waiting_for_final_event"}
+
+    def _resolve_chat_run(self, task_id: str, *, wait_timeout_ms: int) -> ExecutionResult:
+        cached = self._cached_execution(task_id)
+        if cached:
+            return cached
+
+        wait_payload: dict[str, Any] | None = None
+        try:
+            wait_payload = self._agent_wait(task_id, wait_timeout_ms)
+        except OpenClawGatewayError:
+            wait_payload = None
+
+        if wait_payload is not None:
+            execution = self._execution_from_agent_wait(task_id, wait_payload)
+            if execution.status in {"success", "error"}:
+                self._remember_chat_run(
+                    task_id,
+                    final_event=execution.raw.get("final_event") if isinstance(execution.raw.get("final_event"), dict) else {},
+                    status=execution.status,
+                    result=execution.result,
+                )
+                return execution
+            if execution.status == "running" and str(wait_payload.get("status") or "").lower() != "timeout":
+                return execution
+
+        listen_seconds = min(max(wait_timeout_ms / 1000.0, 0.5), 8.0)
+        try:
+            final_event = self._listen_for_chat_run(task_id, listen_seconds)
+        except OpenClawGatewayError:
+            final_event = {}
+        if final_event.get("state") in {"final", "error"}:
+            execution = self._execution_from_chat_event(task_id, final_event)
+            self._remember_chat_run(
+                task_id,
+                final_event=final_event,
+                status=execution.status,
+                result=execution.result,
+            )
+            return execution
+
+        if wait_payload is not None:
+            return self._execution_from_agent_wait(task_id, wait_payload)
+
+        return self._fetch_task_status_legacy(task_id)
+
+    def _agent_wait(self, run_id: str, timeout_ms: int) -> dict[str, Any]:
+        payload = self._gateway_request(
+            "agent.wait",
+            {
+                "runId": run_id,
+                "timeoutMs": max(0, int(timeout_ms)),
+            },
+        )
+        if payload.get("status") == "method_unavailable":
+            raise OpenClawGatewayError("method_unavailable", "OpenClaw gateway does not expose agent.wait")
+        return payload if isinstance(payload, dict) else {"runId": run_id, "status": "timeout"}
+
+    def _fetch_chat_history(self, *, limit: int = 8) -> dict[str, Any]:
+        payload = self._gateway_request(
+            "chat.history",
+            {
+                "sessionKey": self.session_key,
+                "limit": max(1, min(int(limit), 50)),
+            },
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    def _execution_from_agent_wait(self, task_id: str, wait_payload: dict[str, Any]) -> ExecutionResult:
+        wait_status = str(wait_payload.get("status") or "timeout").lower()
+        normalized = self._normalize_wait_status(wait_status)
+        if normalized == "running":
+            return ExecutionResult(
+                task_id=task_id,
+                executor="openclaw",
+                status="running",
+                result=f"OpenClaw chat run {task_id} is still in progress.",
+                raw=self._redact_payload({"agent_wait": wait_payload, "poll_method": "agent.wait"}),
+            )
+        if normalized == "error":
+            error_text = str(wait_payload.get("error") or wait_payload.get("stopReason") or "OpenClaw task failed.")
+            return ExecutionResult(
+                task_id=task_id,
+                executor="openclaw",
+                status="error",
+                result=error_text,
+                raw=self._redact_payload({"agent_wait": wait_payload, "poll_method": "agent.wait"}),
+            )
+
+        result_text = self._result_text_for_run(task_id, wait_payload)
+        return ExecutionResult(
+            task_id=task_id,
+            executor="openclaw",
+            status="success",
+            result=result_text or "OpenClaw finished with no text.",
+            raw=self._redact_payload({"agent_wait": wait_payload, "poll_method": "agent.wait"}),
+        )
+
+    def _execution_from_chat_event(self, task_id: str, final_event: dict[str, Any]) -> ExecutionResult:
+        text = self._message_text(final_event.get("message"))
+        if final_event.get("state") == "error":
+            return ExecutionResult(
+                task_id=task_id,
+                executor="openclaw",
+                status="error",
+                result=str(final_event.get("errorMessage") or "OpenClaw task failed."),
+                raw=self._redact_payload({"final_event": final_event, "poll_method": "chat.events"}),
+            )
+        return ExecutionResult(
+            task_id=task_id,
+            executor="openclaw",
+            status="success",
+            result=text or "OpenClaw finished with no text.",
+            raw=self._redact_payload({"final_event": final_event, "poll_method": "chat.events"}),
+        )
+
+    def _listen_for_chat_run(self, run_id: str, timeout_seconds: float) -> dict[str, Any]:
+        events: list[dict[str, Any]] = []
+        with self._open_socket() as ws:
+            self._connect(ws, events)
+            return self._wait_for_chat_final(ws, run_id, events)
+
+    def _fetch_task_status_legacy(self, task_id: str) -> ExecutionResult:
+        try:
+            status = self._gateway_request("status", {})
+        except OpenClawGatewayError as exc:
+            return ExecutionResult(
+                task_id=task_id,
+                executor="openclaw",
+                status=exc.status,
+                result=f"OpenClaw task status request failed: {exc.message}",
+                raw=self._redact_payload({"error": exc.details, "poll_method": "status.snapshot"}),
+            )
+        known_task = self._find_task(status, task_id)
+        if known_task:
+            state = str(known_task.get("state") or known_task.get("status") or "running")
+            normalized = "success" if state in {"final", "done", "completed"} else "error" if state in {"error", "failed"} else "running"
+            return ExecutionResult(
+                task_id=task_id,
+                executor="openclaw",
+                status=normalized,
+                result=str(known_task.get("result") or known_task.get("message") or f"OpenClaw task {task_id} is {normalized}."),
+                raw=self._redact_payload({"task": known_task, "status": status, "poll_method": "status.snapshot"}),
+            )
+        tasks = status.get("tasks") if isinstance(status.get("tasks"), dict) else {}
+        active = tasks.get("active")
+        if isinstance(active, int) and active > 0:
+            return ExecutionResult(
+                task_id=task_id,
+                executor="openclaw",
+                status="running",
+                result=f"OpenClaw has {active} active task(s); task {task_id} has not reached a final event yet.",
+                raw=self._redact_payload({"status": status, "poll_method": "status.snapshot"}),
+            )
+        if self._is_chat_run_id(task_id):
+            return ExecutionResult(
+                task_id=task_id,
+                executor="openclaw",
+                status="running",
+                result=f"OpenClaw chat run {task_id} is still in progress; gateway status snapshot has no per-run detail.",
+                raw=self._redact_payload({"status": status, "poll_method": "status.snapshot"}),
+            )
+        return ExecutionResult(
+            task_id=task_id,
+            executor="openclaw",
+            status="submitted",
+            result=f"OpenClaw task {task_id} is not present in the current status snapshot.",
+            raw=self._redact_payload({"status": status, "poll_method": "status.snapshot"}),
+        )
+
+    def _result_text_for_run(self, task_id: str, wait_payload: dict[str, Any]) -> str:
+        cached = self._run_cache.get(task_id) if isinstance(self._run_cache.get(task_id), dict) else {}
+        cached_text = str(cached.get("result") or "").strip()
+        if cached_text and not cached_text.startswith("Task submitted to OpenClaw."):
+            return cached_text
+        final_event = cached.get("final_event") if isinstance(cached.get("final_event"), dict) else {}
+        text = self._message_text(final_event.get("message"))
+        if text:
+            return text
+        try:
+            history = self._fetch_chat_history(limit=12)
+        except OpenClawGatewayError:
+            history = {}
+        return self._latest_assistant_text(history)
+
+    def _latest_assistant_text(self, history: dict[str, Any]) -> str:
+        messages = history.get("messages") if isinstance(history.get("messages"), list) else []
+        for item in reversed(messages):
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").lower()
+            if role not in {"assistant", "model"}:
+                continue
+            text = self._message_text(item)
+            if text:
+                return text
+        return ""
+
+    def _remember_chat_run(
+        self,
+        run_id: str,
+        *,
+        final_event: dict[str, Any] | None = None,
+        status: str,
+        result: str,
+    ) -> None:
+        with self._run_cache_lock:
+            current = self._run_cache.get(run_id) if isinstance(self._run_cache.get(run_id), dict) else {}
+            self._run_cache[run_id] = {
+                **current,
+                "run_id": run_id,
+                "status": status,
+                "result": result,
+                "final_event": final_event or current.get("final_event") or {},
+                "updated_at": time.time(),
+            }
+
+    def _cached_execution(self, task_id: str) -> ExecutionResult | None:
+        with self._run_cache_lock:
+            cached = self._run_cache.get(task_id)
+        if not isinstance(cached, dict):
+            return None
+        status = str(cached.get("status") or "")
+        if status not in {"success", "error"}:
+            return None
+        final_event = cached.get("final_event") if isinstance(cached.get("final_event"), dict) else {}
+        return ExecutionResult(
+            task_id=task_id,
+            executor="openclaw",
+            status=status,
+            result=str(cached.get("result") or self._message_text(final_event.get("message")) or ""),
+            raw=self._redact_payload({"cached_run": cached, "poll_method": "run_cache"}),
+        )
+
+    def _status_wait_ms(self) -> int:
+        configured = self._float_env("OPENCLAW_STATUS_WAIT_MS", 800.0)
+        return int(max(100.0, min(configured, 5000.0)))
+
+    @staticmethod
+    def _normalize_wait_status(status: str) -> str:
+        normalized = status.lower().strip()
+        if normalized in {"ok", "done", "completed", "final", "success"}:
+            return "success"
+        if normalized in {"error", "failed", "aborted"}:
+            return "error"
+        if normalized == "timeout":
+            return "running"
+        return "running"
+
+    @staticmethod
+    def _is_chat_run_id(task_id: str) -> bool:
+        lowered = task_id.lower()
+        return lowered.startswith("veyra-") or lowered.startswith("run-") or lowered.startswith("chat-")
 
     def _recv(self, ws: Any, deadline: float) -> str:
         remaining = max(0.1, deadline - time.monotonic())
@@ -766,6 +1006,13 @@ class OpenClawAdapter(AgentAdapter):
     def _int_env(name: str, default: int) -> int:
         try:
             return int(os.getenv(name, str(default)))
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _float_env(name: str, default: float) -> float:
+        try:
+            return float(os.getenv(name, str(default)))
         except ValueError:
             return default
 

@@ -76,6 +76,18 @@ def main() -> int:
             )
         )
 
+        low_quality_draft = "我现在无法稳定访问认知模型，所以请稍后再试。"
+        loop.core_reasoning.answer_assist = lambda **_: {"status": "model_assisted", "draft_response": low_quality_draft}  # type: ignore[method-assign]
+        response = loop._direct_answer(event, decision, [])
+        rejects_low_quality = response != low_quality_draft and "探针" in response
+        cases.append(
+            _result(
+                "direct_answer_rejects_low_quality_template",
+                rejects_low_quality,
+                f"response={response}",
+            )
+        )
+
         probe_decision = Decision(
             route=Route.PROBE,
             risk_level=RiskLevel.R1,
@@ -154,6 +166,25 @@ def main() -> int:
                 "probe_alias_normalized",
                 normalized_probe == "time",
                 f"selected_probe={normalized_probe}",
+            )
+        )
+
+        probe_raw = {
+            "probe": "time_probe",
+            "summary": "Asia/Tokyo 当前时间是 2026-05-29 14:28:55 (UTC+09:00).",
+            "details": {"timezone": "Asia/Tokyo", "time": "14:28:55", "utc_offset": "UTC+09:00"},
+        }
+        probe_answer = loop._probe_response(
+            probe_name="time_probe",
+            raw=probe_raw,
+            verified={"message": "probe ok"},
+            answer_assist={"status": "model_assisted", "draft_response": "我猜现在大概是晚上。"},
+        )
+        cases.append(
+            _result(
+                "probe_answer_rejects_ungrounded_model_draft",
+                probe_answer == probe_raw["summary"],
+                f"response={probe_answer}",
             )
         )
 
