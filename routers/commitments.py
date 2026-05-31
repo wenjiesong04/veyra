@@ -16,6 +16,7 @@ class CommitmentCreateRequest(BaseModel):
     schedule: dict[str, Any] = Field(default_factory=dict)
     payload: dict[str, Any] = Field(default_factory=dict)
     risk_level: str = "R0"
+    next_run_at: str | None = None
 
 
 class CommitmentPushRequest(BaseModel):
@@ -44,7 +45,7 @@ def build_commitments_router(deps: dict[str, Any]) -> APIRouter:
 
     @router.post("/commitments")
     async def create_commitment(request: CommitmentCreateRequest) -> dict[str, Any]:
-        item = deps["commitment_core"].create_commitment(request.model_dump())
+        item = deps["commitment_core"].create_commitment(request.model_dump(exclude_none=True))
         return {"status": "success", "commitment": item}
 
     @router.post("/commitments/{commitment_id}/confirm")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from core.commitment_core import CommitmentCore
@@ -14,6 +15,8 @@ from probes.weather_probe import WeatherProbe
 
 class CommitmentPushRuntime:
     """Execute due user commitments with Guardian-gated outbound delivery."""
+
+    DELIVERY_OK_STATUSES = {"sent", "queued", "not_configured"}
 
     def __init__(
         self,
@@ -34,19 +37,37 @@ class CommitmentPushRuntime:
         processed: list[dict[str, Any]] = []
         for commitment in due:
             processed.append(self._push_one(commitment, reason=reason))
-        status = "success" if processed and all(item.get("status") == "sent" for item in processed) else ("idle" if not processed else "degraded")
+        delivered = [item for item in processed if item.get("status") in self.DELIVERY_OK_STATUSES]
+        if not processed:
+            status = "idle"
+        elif len(delivered) == len(processed):
+            status = "success"
+        elif delivered:
+            status = "degraded"
+        else:
+            status = "degraded"
         result = {"status": status, "reason": reason, "due_count": len(due), "processed_count": len(processed), "processed": processed}
         self.state_store.append_jsonl(
             "action_record.jsonl",
-            {"route": "commitment_push_due", "status": status, "artifacts": {"reason": reason, "processed_count": len(processed)}},
+            {"route": "commitment_push_due", "status": status, "artifacts": {"reason": reason, "processed_count": len(processed), "due_count": len(due)}},
         )
         return result
 
     def _push_one(self, commitment: dict[str, Any], *, reason: str) -> dict[str, Any]:
         commitment_id = str(commitment.get("commitment_id"))
-        message = self._build_message(commitment)
+        fresh = self.commitment_core.get_commitment(commitment_id) or commitment
+        pushable, skip_reason = self.commitment_core.pushable_reason(fresh)
+        if not pushable:
+            result = {"commitment_id": commitment_id, "status": "skipped", "reason": skip_reason}
+            self.commitment_core.touch_attempt(commitment_id)
+            self._audit_push_attempt(commitment_id, result, reason=reason)
+            return result
+
+        message, weather_probe = self._build_message(fresh)
         if not message:
-            return {"commitment_id": commitment_id, "status": "skipped", "reason": "empty_message"}
+            result = {"commitment_id": commitment_id, "status": "skipped", "reason": "empty_message"}
+            self._audit_push_attempt(commitment_id, result, reason=reason)
+            return result
 
         decision = Decision(
             route=Route.DIRECT_ANSWER,
@@ -55,51 +76,80 @@ class CommitmentPushRuntime:
             intent="information",
             complexity="simple",
             capability="native_answer",
-            signals=["commitment:push", f"kind:{commitment.get('kind')}"],
+            signals=["commitment:push", f"kind:{fresh.get('kind')}"],
             constraints=["read-only proactive notification", "no destructive side effects"],
         )
         foresight = self.foresight.predict_text_action(message, RiskLevel.R0, decision=decision.to_dict())
         guardian = self.guardian.review_text_action(text=message, decision=decision, foresight=foresight)
         if guardian.get("decision") not in {"allow", "allow_with_constraints"}:
+            self.commitment_core.touch_attempt(commitment_id)
             self.commitment_core.record_push(
                 commitment_id,
                 push_result={"status": "blocked", "guardian": guardian.get("decision")},
                 message=message,
+                advance_schedule=False,
+                count_run=False,
             )
-            return {
+            result = {
                 "commitment_id": commitment_id,
                 "status": "blocked",
-                "guardian": guardian,
+                "guardian": guardian.get("decision"),
                 "reason": guardian.get("reason"),
+                "weather_probe_status": weather_probe.get("status") if weather_probe else None,
             }
+            self._audit_push_attempt(commitment_id, result, reason=reason)
+            return result
 
-        channel = str(commitment.get("channel") or "api")
-        session_id = str(commitment.get("session_id") or "local-session")
+        channel = str(fresh.get("channel") or "api")
+        session_id = str(fresh.get("session_id") or "local-session")
         delivery = ChannelAdapter(self.state_store, channel=channel).send(
             session_id,
             message,
             metadata={
                 "route": "commitment_push",
                 "commitment_id": commitment_id,
-                "kind": commitment.get("kind"),
+                "kind": fresh.get("kind"),
                 "push_reason": reason,
                 "risk_level": RiskLevel.R0.value,
                 "guardian": guardian.get("decision"),
                 "pushed_at": utc_now_iso(),
             },
         )
-        self.commitment_core.record_push(commitment_id, push_result=delivery, message=message)
-        return {
+        delivery_status = str(delivery.get("delivery_status") or delivery.get("status") or "")
+        if delivery_status not in self.DELIVERY_OK_STATUSES and delivery.get("status") not in self.DELIVERY_OK_STATUSES:
+            result = {
+                "commitment_id": commitment_id,
+                "status": "delivery_failed",
+                "delivery": delivery,
+                "guardian": guardian.get("decision"),
+            }
+            self.commitment_core.record_push(
+                commitment_id,
+                push_result=delivery,
+                message=message,
+                advance_schedule=False,
+                count_run=False,
+            )
+            self._audit_push_attempt(commitment_id, result, reason=reason)
+            return result
+
+        updated = self.commitment_core.record_push(commitment_id, push_result=delivery, message=message)
+        result = {
             "commitment_id": commitment_id,
             "status": delivery.get("status"),
-            "delivery_status": delivery.get("delivery_status") or delivery.get("status"),
+            "delivery_status": delivery_status or delivery.get("status"),
             "channel": channel,
             "session_id": session_id,
             "guardian": guardian.get("decision"),
             "message_preview": message[:240],
+            "weather_probe_status": weather_probe.get("status") if weather_probe else None,
+            "next_run_at": (updated or {}).get("next_run_at"),
+            "push_history_count": len((updated or {}).get("push_history") or []),
         }
+        self._audit_push_attempt(commitment_id, result, reason=reason)
+        return result
 
-    def _build_message(self, commitment: dict[str, Any]) -> str:
+    def _build_message(self, commitment: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
         kind = str(commitment.get("kind") or "")
         payload = commitment.get("payload") if isinstance(commitment.get("payload"), dict) else {}
         title = str(commitment.get("title") or "提醒")
@@ -107,7 +157,9 @@ class CommitmentPushRuntime:
             location = str(payload.get("location") or "北京")
             raw = self.weather_probe.run(f"{location}天气")
             summary = str(raw.get("summary") or "暂时无法获取天气。")
-            return f"【每日天气】{summary}"
+            if str(raw.get("status") or "") in {"missing_target", "unavailable", "error", "http_error"}:
+                summary = f"暂时无法获取{location}天气（{raw.get('status')}）"
+            return f"【每日天气】{summary}", raw
         if kind == "learning_digest":
             topic = str(payload.get("topic") or "学习")
             phase = str(payload.get("phase") or "进行中")
@@ -117,6 +169,16 @@ class CommitmentPushRuntime:
                 "用你自己的话总结今天学到的要点",
             ]
             tip = tips[int(commitment.get("run_count") or 0) % len(tips)]
-            return f"【学习辅导·{topic}】当前阶段：{phase}。今日建议：{tip}。如需调整计划或推送频率，直接告诉我即可。"
+            return f"【学习辅导·{topic}】当前阶段：{phase}。今日建议：{tip}。如需调整计划或推送频率，直接告诉我即可。", None
         note = str(payload.get("note") or title)
-        return f"【定时提醒】{note}"
+        return f"【定时提醒】{note}", None
+
+    def _audit_push_attempt(self, commitment_id: str, result: dict[str, Any], *, reason: str) -> None:
+        self.state_store.append_jsonl(
+            "action_record.jsonl",
+            {
+                "route": "commitment_push_attempt",
+                "status": result.get("status"),
+                "artifacts": {"commitment_id": commitment_id, "reason": reason, "result": result},
+            },
+        )

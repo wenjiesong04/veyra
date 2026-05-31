@@ -28,6 +28,7 @@ class CommitmentCore:
     STATE_FILE = "user_commitments.json"
     MAX_COMMITMENTS = 200
     MAX_HISTORY = 50
+    PUSH_COOLDOWN_SECONDS = 60
 
     def __init__(self, state_store: WorldStateStore) -> None:
         self.state_store = state_store
@@ -101,7 +102,6 @@ class CommitmentCore:
             {
                 "status": "active",
                 "confirmed_at": utc_now_iso(),
-                "next_run_at": None,
             },
             recompute_next_run=True,
         )
@@ -116,6 +116,9 @@ class CommitmentCore:
         now = now or datetime.now(timezone.utc)
         due: list[dict[str, Any]] = []
         for item in self.list_commitments(status="active"):
+            pushable, _reason = self.pushable_reason(item, now=now)
+            if not pushable:
+                continue
             next_run = self._parse_time(item.get("next_run_at"))
             if next_run is None or next_run <= now:
                 due.append(item)
@@ -123,7 +126,32 @@ class CommitmentCore:
                 break
         return due
 
-    def record_push(self, commitment_id: str, *, push_result: dict[str, Any], message: str) -> dict[str, Any] | None:
+    def pushable_reason(self, commitment: dict[str, Any], *, now: datetime | None = None) -> tuple[bool, str]:
+        now = now or datetime.now(timezone.utc)
+        status = str(commitment.get("status") or "")
+        if status != "active":
+            return False, f"status:{status}"
+        if not commitment.get("confirmed_at"):
+            return False, "not_confirmed"
+        for field in ("last_run_at", "last_attempt_at"):
+            last = self._parse_time(commitment.get(field))
+            if last is not None and (now - last).total_seconds() < self.PUSH_COOLDOWN_SECONDS:
+                return False, "push_cooldown"
+        return True, "ok"
+
+    def touch_attempt(self, commitment_id: str) -> None:
+        """Record a push attempt without advancing schedule (cooldown / audit)."""
+        self._patch_commitment(commitment_id, {"last_attempt_at": utc_now_iso()})
+
+    def record_push(
+        self,
+        commitment_id: str,
+        *,
+        push_result: dict[str, Any],
+        message: str,
+        advance_schedule: bool = True,
+        count_run: bool = True,
+    ) -> dict[str, Any] | None:
         item = self.get_commitment(commitment_id)
         if not item:
             return None
@@ -137,15 +165,13 @@ class CommitmentCore:
             }
         )
         schedule = item.get("schedule") if isinstance(item.get("schedule"), dict) else {}
-        return self._patch_commitment(
-            commitment_id,
-            {
-                "last_run_at": utc_now_iso(),
-                "run_count": int(item.get("run_count") or 0) + 1,
-                "push_history": history[-self.MAX_HISTORY :],
-                "next_run_at": self._compute_next_run_at(schedule),
-            },
-        )
+        patch: dict[str, Any] = {"push_history": history[-self.MAX_HISTORY :]}
+        if count_run:
+            patch["last_run_at"] = utc_now_iso()
+            patch["run_count"] = int(item.get("run_count") or 0) + 1
+        if advance_schedule:
+            patch["next_run_at"] = self._compute_next_run_at(schedule)
+        return self._patch_commitment(commitment_id, patch)
 
     def process_turn(
         self,
@@ -298,7 +324,7 @@ class CommitmentCore:
                 continue
             item.update(patch)
             item["updated_at"] = utc_now_iso()
-            if recompute_next_run or patch.get("next_run_at") is None:
+            if recompute_next_run:
                 schedule = item.get("schedule") if isinstance(item.get("schedule"), dict) else {}
                 item["next_run_at"] = self._compute_next_run_at(schedule)
             commitments[index] = item
