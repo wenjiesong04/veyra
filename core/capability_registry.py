@@ -152,13 +152,13 @@ class CapabilityRegistry:
         )
         capabilities["weather_probe"] = Capability(
             capability_id="weather_probe",
-            available=False,
+            available=True,
             kind="probe",
             route="probe",
-            executor="none",
-            description="Current weather lookup.",
-            status="not_implemented",
-            reason="No weather provider is configured in Veyra Core.",
+            executor="weather_probe",
+            description="Current weather lookup via Open-Meteo.",
+            status="available",
+            reason="",
             updated_at=now,
         )
         capabilities["vision"] = Capability(

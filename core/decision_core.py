@@ -13,7 +13,7 @@ from interface.event_schema import Decision, Route, VeyraEvent
 FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
     {
         "name": "current_weather",
-        "probe": None,
+        "probe": "weather_probe",
         "capability": "weather_probe",
         "markers": ("天气", "weather", "temperature", "气温"),
     },

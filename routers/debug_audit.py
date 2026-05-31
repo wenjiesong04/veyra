@@ -57,6 +57,9 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     async def state() -> dict[str, Any]:
         payload = _public_state(deps["state_store"].read_all())
         payload["agency"] = deps["agency_core"].state()
+        commitment_core = deps.get("commitment_core")
+        if commitment_core is not None:
+            payload["commitments"] = commitment_core.list_commitments()
         return payload
 
     @router.get("/state/health")

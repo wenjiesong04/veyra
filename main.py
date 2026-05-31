@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from core.architecture import architecture_snapshot
 from core.agency_core import AgencyCore
 from core.awareness_loop import AwarenessLoop
+from core.commitment_core import CommitmentCore
 from core.definitions import RiskLevel, classify_text_risk, normalize_risk
 from core.foresight_engine import ForesightEngine
 from core.runtime_entity import RuntimeEntity
@@ -30,10 +31,12 @@ from rollback_audit.tool_trace import ToolTrace
 from rollback_audit.replay import Replay
 from rollback_audit.replay_runtime import ReplayRuntime
 from routers.agent_memory import build_agent_memory_router
+from routers.commitments import build_commitments_router
 from routers.debug_audit import build_debug_audit_router
 from routers.ops_runtime import build_ops_runtime_router
 from routers.runtime_observability import build_runtime_observability_router
 from runtime.active_loop import ActiveRuntimeLoop
+from runtime.commitment_push import CommitmentPushRuntime
 from runtime.agent_orchestrator import AgentOrchestrator
 from runtime.alert_dispatcher import AlertDispatcher
 from runtime.cron import Cron
@@ -78,7 +81,14 @@ def _env_hosts(name: str) -> list[str] | None:
 
 state_store = WorldStateStore()
 runtime_entity = RuntimeEntity(state_store=state_store)
-awareness_loop = AwarenessLoop(state_store=state_store, runtime_entity=runtime_entity)
+commitment_core = CommitmentCore(state_store)
+awareness_loop = AwarenessLoop(state_store=state_store, runtime_entity=runtime_entity, commitment_core=commitment_core)
+commitment_push = CommitmentPushRuntime(
+    state_store=state_store,
+    commitment_core=commitment_core,
+    guardian=awareness_loop.guardian,
+    foresight=awareness_loop.foresight,
+)
 routing_metrics = RoutingMetrics(state_store)
 event_normalizer = EventNormalizer()
 intake_gateway = IntakeGateway(awareness_loop, event_normalizer, state_store=state_store)
@@ -176,8 +186,9 @@ active_loop = ActiveRuntimeLoop(
     adapter_resolver=lambda: awareness_loop.agent_registry.selected(),
     verifier=awareness_loop.verifier,
     replay_runtime=replay_runtime,
+    commitment_push=commitment_push,
 )
-runtime_cron = Cron(state_store=state_store, active_loop=active_loop)
+runtime_cron = Cron(state_store=state_store, active_loop=active_loop, commitment_push=commitment_push)
 agent_orchestrator = AgentOrchestrator(
     state_store=state_store,
     registry=awareness_loop.agent_registry,
@@ -418,11 +429,22 @@ app.include_router(
     )
 )
 app.include_router(
+    build_commitments_router(
+        _DynamicDeps(
+            {
+                "commitment_core": lambda: commitment_core,
+                "commitment_push": lambda: commitment_push,
+            }
+        )
+    )
+)
+app.include_router(
     build_debug_audit_router(
         _DynamicDeps(
             {
                 "state_store": lambda: state_store,
                 "agency_core": lambda: agency_core,
+                "commitment_core": lambda: commitment_core,
                 "awareness_loop": lambda: awareness_loop,
                 "review_queue": lambda: review_queue,
                 "action_executor": lambda: action_executor,
@@ -995,6 +1017,9 @@ async def mvp_status():
         "active_loop_manual_tick": True,
         "runtime_cron_scheduler": True,
         "runtime_cron_placeholder_removed": True,
+        "user_commitments": True,
+        "commitment_proactive_push": True,
+        "weather_probe_native": True,
         "agent_tool_proxy_contract": True,
         "agent_tool_bypass_verification": True,
         "runtime_routing_traces": True,

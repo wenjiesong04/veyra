@@ -27,6 +27,7 @@ class ActiveRuntimeLoop:
         adapter_resolver: Callable[[], Any],
         verifier: Any,
         replay_runtime: Any | None = None,
+        commitment_push: Any | None = None,
     ) -> None:
         self.state_store = state_store
         self.runtime_entity = runtime_entity
@@ -36,6 +37,7 @@ class ActiveRuntimeLoop:
         self.runtime_matrix = runtime_matrix
         self.retention_policy = retention_policy
         self.replay_runtime = replay_runtime
+        self.commitment_push = commitment_push
         self.task_tracker = task_tracker
         self.adapter_resolver = adapter_resolver
         self.verifier = verifier
@@ -100,6 +102,7 @@ class ActiveRuntimeLoop:
             self._step("stale_state", lambda: self.state_refresh.refresh_stale(limit=20)),
             self._step("proactive", lambda: self.proactive_checks.run_read_only(timeout_seconds=12)),
             self._step("external_world", lambda: self.external_world_refresh.refresh_watchlist(limit=5)),
+            self._step("commitment_push", lambda: self._commitment_push_tick()),
             self._step("replay_runtime", lambda: self._run_replay_runtime()),
             self._step("retention", lambda: self._retention_tick()),
         ]
@@ -166,6 +169,11 @@ class ActiveRuntimeLoop:
             "files": enforced.get("files", []),
         }
 
+    def _commitment_push_tick(self) -> dict[str, Any]:
+        if self.commitment_push is None:
+            return {"status": "not_configured"}
+        return self.commitment_push.run_due(limit=10, reason="active_loop")
+
     def _run_replay_runtime(self) -> dict[str, Any]:
         if self.replay_runtime is None:
             return {"status": "not_configured"}
@@ -180,7 +188,24 @@ class ActiveRuntimeLoop:
 
     def _compact_result(self, value: Any) -> Any:
         if isinstance(value, dict):
-            return {key: value.get(key) for key in ("status", "autonomy_level", "state_gaps", "summary", "validation", "refreshed", "skipped", "remaining_stale", "created_count", "processed_count") if key in value}
+            return {
+                key: value.get(key)
+                for key in (
+                    "status",
+                    "autonomy_level",
+                    "state_gaps",
+                    "summary",
+                    "validation",
+                    "refreshed",
+                    "skipped",
+                    "remaining_stale",
+                    "created_count",
+                    "processed_count",
+                    "due_count",
+                    "processed_count",
+                )
+                if key in value
+            }
         return value
 
     def _append_tick(self, tick: dict[str, Any]) -> None:

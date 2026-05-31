@@ -320,7 +320,7 @@ def main() -> int:
 
         capabilities = CapabilityRegistry(app_module.state_store).snapshot()
         expect(capabilities["capabilities"]["time_probe"]["available"] is True, "capability registry exposes time probe", capabilities)
-        expect(capabilities["capabilities"]["weather_probe"]["available"] is False, "capability registry does not fake weather", capabilities)
+        expect(capabilities["capabilities"]["weather_probe"]["available"] is True, "weather_probe is a native read-only probe", capabilities)
         turn_context = TurnContextBuilder(app_module.state_store).build(user_message="今天北京天气怎么样", attention_focus=["weather"])
         expect("available_capabilities" in turn_context and "local_world" not in turn_context, "turn context is scoped and capability-aware", turn_context)
         weather_decision = DecisionCore(app_module.state_store, reasoning=FakeCoreReasoning()).decide("今天北京天气怎么样", [])

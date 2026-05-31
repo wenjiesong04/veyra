@@ -44,6 +44,7 @@ from probes.port_probe import PortProbe
 from probes.process_probe import ProcessProbe
 from probes.system_probe import SystemProbe
 from probes.time_probe import TimeProbe
+from probes.weather_probe import WeatherProbe
 from probes.web_probe import WebProbe
 from rollback_audit.execution_trace import ExecutionTrace
 from runtime.agent_task_tracker import AgentTaskTracker
@@ -55,9 +56,16 @@ from skills.skill_runtime import SkillRuntime
 class AwarenessLoop:
     """Sense -> Understand -> Focus -> Evaluate -> Decide -> Act -> Observe -> Verify -> Update."""
 
-    def __init__(self, state_store: WorldStateStore, runtime_entity: RuntimeEntity) -> None:
+    def __init__(
+        self,
+        state_store: WorldStateStore,
+        runtime_entity: RuntimeEntity,
+        *,
+        commitment_core: Any | None = None,
+    ) -> None:
         self.state_store = state_store
         self.runtime_entity = runtime_entity
+        self.commitment_core = commitment_core
         self.core_reasoning = CoreReasoning(state_store)
         self.capabilities = CapabilityRegistry(state_store)
         self.perception = PerceptionLayer(state_store, reasoning=self.core_reasoning)
@@ -93,6 +101,7 @@ class AwarenessLoop:
         self.skill_runtime = SkillRuntime(state_store)
         self.probes = {
             "time": TimeProbe(),
+            "weather_probe": WeatherProbe(),
             "system": SystemProbe(),
             "git": GitProbe(),
             "port": PortProbe(),
@@ -395,6 +404,11 @@ class AwarenessLoop:
         if memory_policy:
             route_trace.append({"phase": "memory_policy", "status": memory_policy.get("status"), "policy": memory_policy.get("policy")})
         route_trace.append({"phase": "response", "status": result.status, "final_route": result.route.value})
+        commitment_turn = self._process_commitment_turn(event, result)
+        if commitment_turn:
+            result.artifacts["commitment"] = commitment_turn
+            result.response = self._apply_commitment_followup(result.response, commitment_turn)
+            route_trace.append({"phase": "commitment", "status": commitment_turn.get("status"), "actions": commitment_turn.get("actions", [])})
         trace = self.runtime_trace.record(
             event=event,
             result=result,
@@ -746,6 +760,23 @@ class AwarenessLoop:
         if decision.intent in {"information", "unknown"}:
             return f"针对「{snippet}」，我这轮拿不到稳定的认知模型输出。为避免误导，我先不编结论；你可以让我改走探针取证，或把问题拆成可验证的小点继续。"
         return "我这轮无法给出稳定直答。为避免误导，我先不输出未经验证的结论；请补充上下文或改为可验证路径。"
+
+    def _process_commitment_turn(self, event: VeyraEvent, result: LoopResult) -> dict[str, Any] | None:
+        if self.commitment_core is None:
+            return None
+        text = str(event.payload.get("text", ""))
+        return self.commitment_core.process_turn(
+            event=event,
+            user_text=text,
+            assistant_response=result.response,
+            route=result.route.value,
+            status=result.status,
+        )
+
+    def _apply_commitment_followup(self, response: str, commitment_turn: dict[str, Any]) -> str:
+        if self.commitment_core is None:
+            return response
+        return self.commitment_core.append_followup_to_response(response, commitment_turn)
 
     def _update(self, event: VeyraEvent, result: LoopResult) -> None:
         risk_level = result.risk_level.value if hasattr(result.risk_level, "value") else str(result.risk_level)

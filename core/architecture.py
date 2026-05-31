@@ -105,6 +105,13 @@ STATE_DEFINITIONS: list[dict[str, Any]] = [
         "freshness": "task_scoped",
     },
     {
+        "id": "user_commitments",
+        "file": "state/user/user_commitments.json",
+        "owner": "CommitmentCore",
+        "purpose": "User commitments, schedules, and proactive push contracts.",
+        "freshness": "event_scoped",
+    },
+    {
         "id": "local_world",
         "file": "state/local/local_world.json",
         "owner": "WorldState.LocalWorld",

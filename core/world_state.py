@@ -34,6 +34,7 @@ JSONL_FILES = [
 
 STATE_FILE_LAYOUT: dict[str, str] = {
     "user_world.json": f"{STATE_WORLD_USER}/user_world.json",
+    "user_commitments.json": f"{STATE_WORLD_USER}/user_commitments.json",
     "agent_memory.json": f"{STATE_WORLD_USER}/agent_memory.json",
     "review_queue.json": f"{STATE_WORLD_USER}/review_queue.json",
     "local_world.json": f"{STATE_WORLD_LOCAL}/local_world.json",
@@ -62,6 +63,7 @@ STATE_FILE_LAYOUT: dict[str, str] = {
 
 STATE_METADATA: dict[str, dict[str, Any]] = {
     "user_world.json": {"source": "veyra_core", "ttl_seconds": 86400, "confidence": 0.72},
+    "user_commitments.json": {"source": "commitment_core", "ttl_seconds": 86400, "confidence": 0.85},
     "local_world.json": {"source": "local_probe_cache", "ttl_seconds": 300, "confidence": 0.82},
     "external_world.json": {"source": "external_watchlist", "ttl_seconds": 1800, "confidence": 0.62},
     "executor_state.json": {"source": "agent_registry", "ttl_seconds": 300, "confidence": 0.75},
@@ -123,6 +125,7 @@ class WorldStateStore:
     def _ensure_defaults(self) -> None:
         defaults: dict[str, Any] = {
             "user_world.json": {"preferences": {"language": "zh-CN", "style": "direct_structured"}, "current_goal": ""},
+            "user_commitments.json": {"commitments": [], "updated_at": None},
             "local_world.json": {"current_project": str(Path.cwd()), "probes": {}, "last_probe_at": None, "updated_at": utc_now_iso()},
             "external_world.json": {"watchlist": [], "summaries": []},
             "executor_state.json": {"selected_agent": "openclaw", "status": "unknown"},

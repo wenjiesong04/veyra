@@ -15,10 +15,12 @@ class Cron:
     """
 
     DEFAULT_JOB_ID = "active_awareness_tick"
+    COMMITMENT_PUSH_JOB_ID = "commitment_push_due"
 
-    def __init__(self, *, state_store: WorldStateStore, active_loop: Any) -> None:
+    def __init__(self, *, state_store: WorldStateStore, active_loop: Any, commitment_push: Any | None = None) -> None:
         self.state_store = state_store
         self.active_loop = active_loop
+        self.commitment_push = commitment_push
         self._ensure_state()
 
     def status(self) -> dict[str, Any]:
@@ -88,14 +90,20 @@ class Cron:
         return {"status": status, "processed_count": len(processed), "processed": processed, "runtime": self.status()}
 
     def _execute_job(self, job_id: str, job: dict[str, Any], *, reason: str) -> dict[str, Any]:
-        if job_id != self.DEFAULT_JOB_ID:
-            result = {"status": "unsupported", "reason": f"Unsupported cron job: {job_id}"}
-        else:
+        if job_id == self.DEFAULT_JOB_ID:
             tick = self.active_loop.tick(
                 reason=reason,
                 include_runtime_matrix=bool(job.get("include_runtime_matrix", False)),
             )
             result = {"status": "success", "result_status": tick.get("status"), "job_id": job_id, "tick": tick}
+        elif job_id == self.COMMITMENT_PUSH_JOB_ID:
+            if self.commitment_push is None:
+                result = {"status": "not_configured", "reason": "commitment push runtime is not wired"}
+            else:
+                push = self.commitment_push.run_due(limit=int(job.get("limit") or 10), reason=reason)
+                result = {"status": push.get("status"), "result_status": push.get("status"), "job_id": job_id, "push": push}
+        else:
+            result = {"status": "unsupported", "reason": f"Unsupported cron job: {job_id}"}
         job["last_run_at"] = utc_now_iso()
         job["last_result_status"] = result.get("result_status") or result.get("status")
         job["run_count"] = int(job.get("run_count") or 0) + 1
@@ -106,11 +114,26 @@ class Cron:
     def _ensure_state(self) -> None:
         state = self.state_store.read_json("runtime_cron_state.json")
         if not state:
-            self._write_state({"status": "configured", "jobs": {self.DEFAULT_JOB_ID: self._default_job()}, "updated_at": utc_now_iso()})
+            self._write_state(
+                {
+                    "status": "configured",
+                    "jobs": {
+                        self.DEFAULT_JOB_ID: self._default_job(),
+                        self.COMMITMENT_PUSH_JOB_ID: self._default_commitment_job(),
+                    },
+                    "updated_at": utc_now_iso(),
+                }
+            )
             return
         jobs = state.setdefault("jobs", {})
+        changed = False
         if self.DEFAULT_JOB_ID not in jobs:
             jobs[self.DEFAULT_JOB_ID] = self._default_job()
+            changed = True
+        if self.COMMITMENT_PUSH_JOB_ID not in jobs:
+            jobs[self.COMMITMENT_PUSH_JOB_ID] = self._default_commitment_job()
+            changed = True
+        if changed:
             state["updated_at"] = utc_now_iso()
             self._write_state(state)
 
@@ -120,6 +143,18 @@ class Cron:
             "enabled": True,
             "interval_seconds": 300.0,
             "include_runtime_matrix": False,
+            "last_run_at": None,
+            "next_run_at": utc_now_iso(),
+            "run_count": 0,
+            "updated_at": utc_now_iso(),
+        }
+
+    def _default_commitment_job(self) -> dict[str, Any]:
+        return {
+            "job_id": self.COMMITMENT_PUSH_JOB_ID,
+            "enabled": True,
+            "interval_seconds": 60.0,
+            "limit": 10,
             "last_run_at": None,
             "next_run_at": utc_now_iso(),
             "run_count": 0,
