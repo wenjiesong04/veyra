@@ -16,7 +16,9 @@ from probes.weather_probe import WeatherProbe
 class CommitmentPushRuntime:
     """Execute due user commitments with Guardian-gated outbound delivery."""
 
-    DELIVERY_OK_STATUSES = {"sent", "queued", "not_configured"}
+    DELIVERY_ADVANCE_STATUSES = {"sent", "delivered", "provider_sent"}
+    DELIVERY_QUEUE_STATUSES = {"queued", "local_queued"}
+    DELIVERY_ATTENTION_STATUSES = {"not_configured"}
 
     def __init__(
         self,
@@ -37,16 +39,25 @@ class CommitmentPushRuntime:
         processed: list[dict[str, Any]] = []
         for commitment in due:
             processed.append(self._push_one(commitment, reason=reason))
-        delivered = [item for item in processed if item.get("status") in self.DELIVERY_OK_STATUSES]
+        delivered = [item for item in processed if item.get("status") == "delivered"]
+        queued = [item for item in processed if item.get("status") == "queued"]
         if not processed:
             status = "idle"
         elif len(delivered) == len(processed):
             status = "success"
-        elif delivered:
+        elif delivered or queued:
             status = "degraded"
         else:
             status = "degraded"
-        result = {"status": status, "reason": reason, "due_count": len(due), "processed_count": len(processed), "processed": processed}
+        result = {
+            "status": status,
+            "reason": reason,
+            "due_count": len(due),
+            "processed_count": len(processed),
+            "delivered_count": len(delivered),
+            "queued_count": len(queued),
+            "processed": processed,
+        }
         self.state_store.append_jsonl(
             "action_record.jsonl",
             {"route": "commitment_push_due", "status": status, "artifacts": {"reason": reason, "processed_count": len(processed), "due_count": len(due)}},
@@ -63,7 +74,7 @@ class CommitmentPushRuntime:
             self._audit_push_attempt(commitment_id, result, reason=reason)
             return result
 
-        message, weather_probe = self._build_message(fresh)
+        message, message_context = self._build_message(fresh)
         if not message:
             result = {"commitment_id": commitment_id, "status": "skipped", "reason": "empty_message"}
             self._audit_push_attempt(commitment_id, result, reason=reason)
@@ -95,8 +106,10 @@ class CommitmentPushRuntime:
                 "status": "blocked",
                 "guardian": guardian.get("decision"),
                 "reason": guardian.get("reason"),
-                "weather_probe_status": weather_probe.get("status") if weather_probe else None,
+                "weather_probe_status": self._weather_probe_status(message_context),
+                "candidate_id": self._candidate_id(message_context),
             }
+            self._mark_push_candidate(message_context, "blocked")
             self._audit_push_attempt(commitment_id, result, reason=reason)
             return result
 
@@ -116,33 +129,42 @@ class CommitmentPushRuntime:
             },
         )
         delivery_status = str(delivery.get("delivery_status") or delivery.get("status") or "")
-        if delivery_status not in self.DELIVERY_OK_STATUSES and delivery.get("status") not in self.DELIVERY_OK_STATUSES:
-            result = {
-                "commitment_id": commitment_id,
-                "status": "delivery_failed",
-                "delivery": delivery,
-                "guardian": guardian.get("decision"),
-            }
+        normalized_status = self._delivery_status(delivery)
+        if normalized_status != "delivered":
+            self.commitment_core.touch_attempt(commitment_id)
             self.commitment_core.record_push(
                 commitment_id,
-                push_result=delivery,
+                push_result={"status": normalized_status, "delivery_status": delivery_status, "delivery": delivery},
                 message=message,
                 advance_schedule=False,
                 count_run=False,
             )
+            self._mark_push_candidate(message_context, normalized_status)
+            result = {
+                "commitment_id": commitment_id,
+                "status": normalized_status,
+                "delivery_status": delivery_status or delivery.get("status"),
+                "delivery": delivery,
+                "guardian": guardian.get("decision"),
+                "message_preview": message[:240],
+                "weather_probe_status": self._weather_probe_status(message_context),
+                "candidate_id": self._candidate_id(message_context),
+            }
             self._audit_push_attempt(commitment_id, result, reason=reason)
             return result
 
-        updated = self.commitment_core.record_push(commitment_id, push_result=delivery, message=message)
+        updated = self.commitment_core.record_push(commitment_id, push_result={**delivery, "status": "delivered"}, message=message)
+        self._mark_push_candidate(message_context, "delivered")
         result = {
             "commitment_id": commitment_id,
-            "status": delivery.get("status"),
+            "status": "delivered",
             "delivery_status": delivery_status or delivery.get("status"),
             "channel": channel,
             "session_id": session_id,
             "guardian": guardian.get("decision"),
             "message_preview": message[:240],
-            "weather_probe_status": weather_probe.get("status") if weather_probe else None,
+            "weather_probe_status": self._weather_probe_status(message_context),
+            "candidate_id": self._candidate_id(message_context),
             "next_run_at": (updated or {}).get("next_run_at"),
             "push_history_count": len((updated or {}).get("push_history") or []),
         }
@@ -163,6 +185,13 @@ class CommitmentPushRuntime:
         if kind == "learning_digest":
             topic = str(payload.get("topic") or "学习")
             phase = str(payload.get("phase") or "进行中")
+            candidate = self._next_push_candidate(str(commitment.get("commitment_id") or ""))
+            if candidate:
+                title_text = str(candidate.get("title") or topic)
+                url = str(candidate.get("url") or "")
+                snippet = str(candidate.get("snippet") or "")
+                message = f"【学习资料·{topic}】{title_text}\n{snippet[:220]}\n链接：{url}\n如需调整计划或推送频率，直接告诉我即可。"
+                return message, {"kind": "external_candidate", "candidate_id": candidate.get("candidate_id")}
             tips = [
                 "回顾上一轮笔记并列出 3 个不懂的概念",
                 "完成一小节练习并记录错题",
@@ -182,3 +211,57 @@ class CommitmentPushRuntime:
                 "artifacts": {"commitment_id": commitment_id, "reason": reason, "result": result},
             },
         )
+
+    def _delivery_status(self, delivery: dict[str, Any]) -> str:
+        status_values = {str(delivery.get("status") or ""), str(delivery.get("delivery_status") or "")}
+        if status_values & self.DELIVERY_ADVANCE_STATUSES:
+            return "delivered"
+        if status_values & self.DELIVERY_QUEUE_STATUSES:
+            return "queued"
+        if status_values & self.DELIVERY_ATTENTION_STATUSES:
+            return "requires_user_attention"
+        return "failed"
+
+    def _weather_probe_status(self, message_context: dict[str, Any] | None) -> str | None:
+        if isinstance(message_context, dict) and message_context.get("probe") == "weather_probe":
+            return str(message_context.get("status") or "")
+        return None
+
+    def _candidate_id(self, message_context: dict[str, Any] | None) -> str | None:
+        if isinstance(message_context, dict) and message_context.get("kind") == "external_candidate":
+            return str(message_context.get("candidate_id") or "")
+        return None
+
+    def _next_push_candidate(self, commitment_id: str) -> dict[str, Any] | None:
+        external = self.state_store.read_json("external_world.json")
+        candidates = external.get("push_candidates") if isinstance(external.get("push_candidates"), list) else []
+        eligible = [
+            item
+            for item in candidates
+            if isinstance(item, dict) and item.get("commitment_id") == commitment_id and item.get("status") in {"new", "queued", "failed"}
+        ]
+        if not eligible:
+            return None
+        return sorted(eligible, key=lambda item: float(item.get("score") or 0), reverse=True)[0]
+
+    def _mark_push_candidate(self, message_context: dict[str, Any] | None, status: str) -> None:
+        candidate_id = self._candidate_id(message_context)
+        if not candidate_id:
+            return
+        external = self.state_store.read_json("external_world.json")
+        candidates = external.get("push_candidates") if isinstance(external.get("push_candidates"), list) else []
+        changed = False
+        for item in candidates:
+            if not isinstance(item, dict) or item.get("candidate_id") != candidate_id:
+                continue
+            item["status"] = status
+            item["updated_at"] = utc_now_iso()
+            if status == "delivered":
+                item["delivered_at"] = utc_now_iso()
+            else:
+                item["last_attempt_at"] = utc_now_iso()
+            changed = True
+            break
+        if changed:
+            external["push_candidates"] = candidates[-100:]
+            self.state_store.write_json("external_world.json", external)

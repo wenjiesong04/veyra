@@ -140,6 +140,9 @@ def compact_channel_outbox_item(item: dict[str, Any]) -> dict[str, Any]:
             "message_id": metadata.get("message_id"),
             "route": metadata.get("route"),
             "status": metadata.get("status"),
+            "commitment_id": metadata.get("commitment_id"),
+            "kind": metadata.get("kind"),
+            "push_reason": metadata.get("push_reason"),
         }
     return compact
 

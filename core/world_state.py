@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from core.architecture import STATE_DEFINITIONS
 from core.definitions import lifecycle_statuses, operational_modes, risk_catalog
@@ -313,7 +314,7 @@ class WorldStateStore:
 
     def _write_json_atomic(self, path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(path)
 

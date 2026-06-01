@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from core.state_compact import compact_channel_outbox_item
 from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
 
@@ -27,11 +28,12 @@ class ChannelAdapter:
             "message": message,
             "metadata": metadata,
             "status": "queued",
+            "delivery_status": "local_queued",
             "created_at": utc_now_iso(),
             "delivery": str(config.get("delivery") or "local_outbox"),
         }
         if config.get("enabled") is False:
-            item.update({"status": "not_configured", "reason": f"{self.channel} channel is disabled."})
+            item.update({"status": "not_configured", "delivery_status": "not_configured", "reason": f"{self.channel} channel is disabled."})
         elif item["delivery"] == "feishu" or self.channel == "feishu":
             item.update(self._send_feishu(session_id=session_id, message=message, metadata=metadata, config=config))
         if self.state_store:
@@ -40,8 +42,8 @@ class ChannelAdapter:
             if not isinstance(outbox, list):
                 outbox = []
                 state["outbox"] = outbox
-            outbox.append(item)
-            state["outbox"] = outbox[-500:]
+            outbox.append(compact_channel_outbox_item(item))
+            state["outbox"] = outbox[-200:]
             self.state_store.write_json("channel_state.json", state)
         return item
 

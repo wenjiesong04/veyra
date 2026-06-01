@@ -163,8 +163,8 @@ def run_happy_path(client: Any, state_root: Path | None, report: Report) -> str:
     expect(first is not None, "due commitment processed", processed)
     expect(first.get("guardian") in {"allow", "allow_with_constraints"}, "guardian decision recorded", first)
     expect(
-        first.get("status") in {"queued", "sent", "not_configured"},
-        "delivery reaches channel adapter or outbox",
+        first.get("status") in {"queued", "delivered", "requires_user_attention"},
+        "delivery reaches channel adapter with normalized status",
         first,
     )
     if first.get("weather_probe_status"):
@@ -181,9 +181,13 @@ def run_happy_path(client: Any, state_root: Path | None, report: Report) -> str:
     updated = refreshed["commitment"]
     history = updated.get("push_history") if isinstance(updated.get("push_history"), list) else []
     expect(len(history) >= 1, "push_history appended", history)
-    expect(updated.get("last_run_at"), "last_run_at updated", updated)
     next_run = updated.get("next_run_at")
-    expect(next_run and next_run > past_iso(), "next_run_at advanced", {"before": past_iso(), "after": next_run})
+    if first.get("status") == "delivered":
+        expect(updated.get("last_run_at"), "delivered push updates last_run_at", updated)
+        expect(next_run and next_run > past_iso(), "delivered push advances next_run_at", {"before": past_iso(), "after": next_run})
+    else:
+        expect(not updated.get("last_run_at"), "queued/unconfigured push does not set last_run_at", updated)
+        expect(next_run == commitment.get("next_run_at"), "queued/unconfigured push does not advance next_run_at", {"before": commitment.get("next_run_at"), "after": next_run})
 
     audit = read_action_routes(state_root, client, {"commitment_push_due", "commitment_push_attempt"})
     expect(any(row.get("route") == "commitment_push_due" for row in audit), "commitment_push_due audit exists", audit[-3:])
@@ -222,7 +226,7 @@ def run_security_checks(client: Any, state_root: Path | None, report: Report) ->
     pending_id = pending["commitment"]["commitment_id"]
     pending_due = client.post("/commitments/run-due", {"limit": 10, "reason": "acceptance_pending"})
     processed = pending_due.get("processed") if isinstance(pending_due.get("processed"), list) else []
-    expect(not any(row.get("commitment_id") == pending_id and row.get("status") in {"queued", "sent"} for row in processed), "pending not delivered", processed)
+    expect(not any(row.get("commitment_id") == pending_id and row.get("status") in {"queued", "delivered"} for row in processed), "pending not delivered", processed)
     pending_state = client.get(f"/commitments/{pending_id}")["commitment"]
     expect(len(pending_state.get("push_history") or []) == 0, "pending has no push_history", pending_state)
 
@@ -277,7 +281,7 @@ def run_security_checks(client: Any, state_root: Path | None, report: Report) ->
     dup_id = dup["commitment"]["commitment_id"]
     first = client.post("/commitments/run-due", {"limit": 5, "reason": "acceptance_dup_1"})
     first_row = next((row for row in first.get("processed", []) if row.get("commitment_id") == dup_id), {})
-    expect(first_row.get("status") in {"queued", "sent", "not_configured"}, "first duplicate-window push delivered", first_row)
+    expect(first_row.get("status") in {"queued", "delivered", "requires_user_attention"}, "first duplicate-window push attempted", first_row)
     second = client.post("/commitments/run-due", {"limit": 5, "reason": "acceptance_dup_2"})
     second_row = next((row for row in second.get("processed", []) if row.get("commitment_id") == dup_id), None)
     if second_row:
