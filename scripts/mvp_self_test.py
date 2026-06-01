@@ -16,8 +16,10 @@ _TEST_RUNTIME = TemporaryDirectory(prefix="veyra-mvp-")
 TEST_ROOT = Path(_TEST_RUNTIME.name)
 TEST_STATE_ROOT = TEST_ROOT / "state"
 TEST_AGENCY_ROOT = TEST_ROOT / "agency"
-os.environ.setdefault("VEYRA_STATE_ROOT", str(TEST_STATE_ROOT))
-os.environ.setdefault("VEYRA_AGENCY_ROOT", str(TEST_AGENCY_ROOT))
+os.environ["VEYRA_STATE_DIR"] = str(TEST_STATE_ROOT)
+os.environ["VEYRA_STATE_ROOT"] = str(TEST_STATE_ROOT)
+os.environ["VEYRA_AGENCY_DIR"] = str(TEST_AGENCY_ROOT)
+os.environ["VEYRA_AGENCY_ROOT"] = str(TEST_AGENCY_ROOT)
 
 from main import app  # noqa: E402
 from core.verifier import Verifier  # noqa: E402

@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from core.definitions import RiskLevel
 from core.reasoning_core import CoreReasoning, safe_model_risk
+from core.state_compact import compact_intention
 from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
 
@@ -30,7 +31,7 @@ class AgencyCore:
         self.state_store = state_store
         self.reasoning = reasoning or (CoreReasoning(state_store) if state_store else None)
         self.model_assist_enabled = model_assist_enabled
-        selected_root = os.getenv("VEYRA_AGENCY_ROOT", "agency") if str(agency_root) == "agency" else agency_root
+        selected_root = self._selected_agency_root(agency_root)
         self.agency_root = Path(selected_root)
         self.intention_path = self.agency_root / "intention_queue.json"
         self.goals_path = self.agency_root / "goals.json"
@@ -38,6 +39,17 @@ class AgencyCore:
         self.agency_root.mkdir(parents=True, exist_ok=True)
         if not self.intention_path.exists():
             self.intention_path.write_text("[]", encoding="utf-8")
+
+    def _selected_agency_root(self, agency_root: str | Path) -> str | Path:
+        if str(agency_root) != "agency":
+            return agency_root
+        explicit = os.getenv("VEYRA_AGENCY_DIR") or os.getenv("VEYRA_AGENCY_ROOT")
+        if explicit:
+            return explicit
+        env = os.getenv("VEYRA_ENV", "").strip().lower()
+        if env in {"dev", "prod", "test"}:
+            return Path("agency") / env
+        return "agency"
 
     def state(self) -> dict[str, Any]:
         return {
@@ -212,7 +224,8 @@ class AgencyCore:
         return data if isinstance(data, list) else []
 
     def write_intentions(self, intentions: list[dict[str, Any]]) -> None:
-        self.intention_path.write_text(json.dumps(intentions, ensure_ascii=False, indent=2), encoding="utf-8")
+        compacted = [compact_intention(item) for item in intentions if isinstance(item, dict)]
+        self.intention_path.write_text(json.dumps(compacted, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _read_json(self, path: Path, default: Any) -> Any:
         if not path.exists():

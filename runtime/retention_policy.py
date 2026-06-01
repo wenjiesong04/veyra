@@ -106,10 +106,17 @@ class RetentionPolicy:
                 "status": "previewed" if dry_run else "enforced",
             },
         }
-        self.state_store.append_jsonl(
-            "action_record.jsonl",
-            {"route": "ops_retention_enforce", "status": "dry_run" if dry_run else "success", "artifacts": result},
-        )
+        if not dry_run:
+            self.state_store.append_jsonl("action_record.jsonl", {"route": "ops_retention_enforce", "status": "success", "artifacts": result})
+            audit_trim = self._truncate_to_limit(
+                "action_record.jsonl",
+                active_limits.get("action_record.jsonl", 0),
+                archive_root,
+                status="truncated_after_audit",
+            )
+            if audit_trim:
+                files.append(audit_trim)
+                result["post_audit_retention"] = audit_trim
         return result
 
     def _active_limits(self, limits: dict[str, int] | None = None) -> dict[str, int]:
@@ -125,3 +132,33 @@ class RetentionPolicy:
 
     def _write_lines(self, path: Path, lines: list[str]) -> None:
         path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+    def _truncate_to_limit(self, name: str, limit: int, archive_root: Path, *, status: str) -> dict[str, Any] | None:
+        if limit <= 0:
+            return None
+        path = self.state_store.path_for(name)
+        lines = self._read_lines(path)
+        entries = len(lines)
+        if entries <= limit:
+            return None
+
+        pruned_entries = entries - limit
+        archive_lines = lines[:pruned_entries]
+        retained_lines = lines[pruned_entries:]
+        archive_payload = "\n".join(archive_lines)
+        archive_bytes = (archive_payload + ("\n" if archive_payload else "")).encode("utf-8")
+        archive_name = f"{Path(name).stem}-{utc_now_iso().replace(':', '').replace('.', '')}-{uuid4().hex[:8]}.jsonl"
+        archive_path = archive_root / archive_name
+        archive_root.mkdir(parents=True, exist_ok=True)
+        archive_path.write_bytes(archive_bytes)
+        self._write_lines(path, retained_lines)
+        return {
+            "file": name,
+            "entries": entries,
+            "limit": limit,
+            "status": status,
+            "pruned_entries": pruned_entries,
+            "retained_entries": len(retained_lines),
+            "archive_path": str(archive_path.relative_to(self.state_store.root)),
+            "archive_sha256": hashlib.sha256(archive_bytes).hexdigest(),
+        }

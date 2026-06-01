@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from core.architecture import STATE_DEFINITIONS
 from core.definitions import lifecycle_statuses, operational_modes, risk_catalog
+from core.state_compact import compact_action_record
 from interface.event_schema import utc_now_iso
 
 STATE_WORLD_USER = "user"
@@ -90,11 +91,22 @@ STATE_METADATA: dict[str, dict[str, Any]] = {
 
 class WorldStateStore:
     def __init__(self, root: str | Path = "state") -> None:
-        selected_root = os.getenv("VEYRA_STATE_ROOT", "state") if str(root) == "state" else root
+        selected_root = self._selected_root(root)
         self.root = Path(selected_root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._migrate_legacy_layout()
         self._ensure_defaults()
+
+    def _selected_root(self, root: str | Path) -> str | Path:
+        if str(root) != "state":
+            return root
+        explicit = os.getenv("VEYRA_STATE_DIR") or os.getenv("VEYRA_STATE_ROOT")
+        if explicit:
+            return explicit
+        env = os.getenv("VEYRA_ENV", "").strip().lower()
+        if env in {"dev", "prod", "test"}:
+            return Path("state") / env
+        return "state"
 
     def path_for(self, name: str) -> Path:
         relative = STATE_FILE_LAYOUT.get(name, name)
@@ -286,7 +298,21 @@ class WorldStateStore:
         path = self.path_for(name)
         if not path.exists():
             return {}
-        return json.loads(path.read_text(encoding="utf-8") or "{}")
+        raw = path.read_text(encoding="utf-8") or "{}"
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            return {
+                "_state_corrupt": True,
+                "_parse_error": str(exc),
+                "_file": self.relative_path_for(name),
+            }
+
+    def _write_json_atomic(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
 
     def _merge_missing(self, current: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
         merged = dict(current)
@@ -300,9 +326,7 @@ class WorldStateStore:
     def write_json(self, name: str, payload: dict[str, Any]) -> None:
         payload = self._with_state_metadata(name, payload)
         payload.setdefault("updated_at", utc_now_iso())
-        path = self.path_for(name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._write_json_atomic(self.path_for(name), payload)
 
     def patch_json(self, name: str, patch: dict[str, Any]) -> dict[str, Any]:
         current = self.read_json(name)
@@ -312,6 +336,8 @@ class WorldStateStore:
 
     def append_jsonl(self, name: str, payload: dict[str, Any]) -> None:
         payload.setdefault("timestamp", utc_now_iso())
+        if name == "action_record.jsonl":
+            payload = compact_action_record(payload)
         path = self.path_for(name)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:

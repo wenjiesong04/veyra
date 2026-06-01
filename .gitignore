@@ -11,6 +11,7 @@ state/local/openclaw_device.json
 state/openclaw_device.json
 
 # Runtime state / logs / snapshots
+state/
 state/logs/*.jsonl
 state/*.jsonl
 state/snapshots/
@@ -20,6 +21,7 @@ state/external/*_state.json
 state/user/*_state.json
 state/*_state.json
 state/mvp_self_test_tool_file.txt
+agency/intention_queue.json
 
 # IDE
 .idea/

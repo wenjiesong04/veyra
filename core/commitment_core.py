@@ -363,7 +363,7 @@ class CommitmentCore:
     def _sync_agency_goal(self, commitment: dict[str, Any]) -> None:
         if commitment.get("status") != "active":
             return
-        agency_root = Path(os.getenv("VEYRA_AGENCY_ROOT", "agency"))
+        agency_root = self._selected_agency_root()
         goals_path = agency_root / "goals.json"
         if not goals_path.parent.exists():
             return
@@ -387,6 +387,15 @@ class CommitmentCore:
             goals_path.write_text(json.dumps(goals, ensure_ascii=False, indent=2), encoding="utf-8")
         except OSError:
             return
+
+    def _selected_agency_root(self) -> Path:
+        explicit = os.getenv("VEYRA_AGENCY_DIR") or os.getenv("VEYRA_AGENCY_ROOT")
+        if explicit:
+            return Path(explicit)
+        env = os.getenv("VEYRA_ENV", "").strip().lower()
+        if env in {"dev", "prod", "test"}:
+            return Path("agency") / env
+        return Path("agency")
 
     def _normalize_schedule(self, schedule: dict[str, Any]) -> dict[str, Any]:
         kind = str(schedule.get("kind") or "daily")

@@ -188,7 +188,7 @@ class ActiveRuntimeLoop:
 
     def _compact_result(self, value: Any) -> Any:
         if isinstance(value, dict):
-            return {
+            compact = {
                 key: value.get(key)
                 for key in (
                     "status",
@@ -196,7 +196,6 @@ class ActiveRuntimeLoop:
                     "state_gaps",
                     "summary",
                     "validation",
-                    "refreshed",
                     "skipped",
                     "remaining_stale",
                     "created_count",
@@ -206,6 +205,17 @@ class ActiveRuntimeLoop:
                 )
                 if key in value
             }
+            refreshed = value.get("refreshed")
+            if isinstance(refreshed, list):
+                compact["refreshed"] = [
+                    {
+                        "claim": item.get("claim"),
+                        "status": (item.get("probe_result") or {}).get("status") if isinstance(item.get("probe_result"), dict) else item.get("status"),
+                    }
+                    for item in refreshed[:8]
+                    if isinstance(item, dict)
+                ]
+            return compact
         return value
 
     def _append_tick(self, tick: dict[str, Any]) -> None:

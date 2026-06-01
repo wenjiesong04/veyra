@@ -57,9 +57,8 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     async def state() -> dict[str, Any]:
         payload = _public_state(deps["state_store"].read_all())
         payload["agency"] = deps["agency_core"].state()
-        commitment_core = deps.get("commitment_core")
-        if commitment_core is not None:
-            payload["commitments"] = commitment_core.list_commitments()
+        if "commitment_core" in deps:
+            payload["commitments"] = deps["commitment_core"].list_commitments()
         return payload
 
     @router.get("/state/health")
@@ -102,6 +101,12 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     @router.post("/core/model/config")
     async def configure_core_model(request: CoreModelConfigRequest) -> dict[str, Any]:
         patch = request.model_dump(exclude_none=True)
+        clear_direct_api_key = False
+        if "api_key" in patch:
+            if str(patch.get("api_key") or "").strip():
+                raise HTTPException(status_code=422, detail="Do not store direct API keys in Veyra state; set api_key_env and provide the secret through the environment.")
+            clear_direct_api_key = True
+            patch.pop("api_key", None)
         if "decision_mode" in patch and patch["decision_mode"] not in {"auto", "always"}:
             raise HTTPException(status_code=422, detail="decision_mode must be 'auto' or 'always'")
         if "provider" in patch and patch["provider"] != "openai_compatible":
@@ -111,6 +116,8 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
         state_store = deps["state_store"]
         config = state_store.read_json("agent_config.json")
         core_model = config.setdefault("core_model", {})
+        if clear_direct_api_key:
+            core_model.pop("api_key", None)
         core_model.update(patch)
         state_store.write_json("agent_config.json", config)
         return deps["awareness_loop"].core_reasoning.status()
