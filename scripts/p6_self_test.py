@@ -325,17 +325,18 @@ def main() -> int:
         expect("available_capabilities" in turn_context and "local_world" not in turn_context, "turn context is scoped and capability-aware", turn_context)
         weather_decision = DecisionCore(app_module.state_store, reasoning=FakeCoreReasoning()).decide("今天北京天气怎么样", [])
         expect(
-            weather_decision.route == Route.ASK_USER
+            weather_decision.route == Route.PROBE
             and weather_decision.freshness_required
+            and weather_decision.selected_probe == "weather_probe"
             and "weather_probe" in weather_decision.required_capabilities,
-            "missing freshness capability asks instead of guessing",
+            "weather freshness routes to weather_probe",
             weather_decision.to_dict(),
         )
         weather_loop = client.post(
             "/events/message",
             json={"text": "今天北京天气怎么样", "channel": "self-test", "user_id": "p6", "session_id": "p6-weather"},
         ).json()
-        expect(weather_loop["route"] == "ask_user" and weather_loop["status"] == "needs_user_input", "controller asks when live capability is unavailable", weather_loop)
+        expect(weather_loop["route"] == "probe", "controller runs weather probe when capability is available", weather_loop)
 
         agent_rejected = DecisionCore(
             app_module.state_store,
@@ -714,7 +715,7 @@ def main() -> int:
 
         model_status = client.get("/core/model/status")
         expect(model_status.status_code == 200 and model_status.json()["status"] == "unconfigured", "core model status endpoint", model_status.text)
-        configured_model = client.post(
+        rejected_key = client.post(
             "/core/model/config",
             json={
                 "enabled": True,
@@ -722,12 +723,24 @@ def main() -> int:
                 "base_url": "http://127.0.0.1:65535/v1",
                 "model": "veyra-self-test-model",
                 "api_key": "secret-self-test-key",
+            },
+        )
+        expect(rejected_key.status_code == 422, "core model rejects direct api key", rejected_key.text)
+        configured_model = client.post(
+            "/core/model/config",
+            json={
+                "enabled": True,
+                "provider": "openai_compatible",
+                "base_url": "http://127.0.0.1:65535/v1",
+                "model": "veyra-self-test-model",
+                "api_key_env": "VEYRA_CORE_MODEL_API_KEY",
                 "decision_mode": "always",
             },
         )
         expect(configured_model.status_code == 200 and configured_model.json()["configured"], "core model config endpoint", configured_model.text)
+        expect(configured_model.json()["api_key_env"] == "VEYRA_CORE_MODEL_API_KEY", "core model status keeps api key env", configured_model.json())
         state_payload = client.get("/state").json()
-        expect(state_payload["agent_config"]["core_model"]["api_key"] == "<redacted>", "state endpoint redacts core model api key", state_payload["agent_config"]["core_model"])
+        expect(state_payload["agent_config"]["core_model"].get("api_key") in {"", None}, "state endpoint has no direct core model api key", state_payload["agent_config"]["core_model"])
 
     print("P6 self-test passed.")
     return 0

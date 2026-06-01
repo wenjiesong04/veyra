@@ -14,11 +14,13 @@ from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent, utc_now_iso
 
 
-AFFIRM_MARKERS = ("好的", "可以", "行", "同意", "要", "需要", "没问题", "ok", "yes", "sure", "开启", "启用")
+AFFIRM_EXACT_MARKERS = ("好的", "好", "可以", "行", "同意", "确认", "没问题", "ok", "yes", "sure", "开启", "启用")
+AFFIRM_MARKERS = ("好的", "可以", "行", "同意", "确认", "没问题", "ok", "yes", "sure", "开启", "启用")
+AFFIRM_PHRASES = ("同意开启", "确认开启", "帮我开启", "可以开启", "开始推送", "开启推送", "订阅", "subscribe")
 DECLINE_MARKERS = ("不用", "不要", "取消", "算了", "不需要", "no", "decline", "stop")
 DAILY_MARKERS = ("每天", "每日", "每天早上", "每天早晨", "定时", "定期", "daily", "every morning", "each day")
 WEATHER_MARKERS = ("天气", "气温", "weather", "下雨", "晴天")
-LEARNING_MARKERS = ("学习", "深度学习", "入门", "教程", "课程", "复习", "learn", "study")
+LEARNING_MARKERS = ("学习", "深度学习", "机器学习", "入门", "教程", "课程", "复习", "learn", "study")
 PUSH_MARKERS = ("推送", "提醒", "通知", "告诉我", "发给我", "push", "notify", "remind")
 
 
@@ -26,7 +28,9 @@ class CommitmentCore:
     """User commitments: goals, schedules, and proactive push contracts."""
 
     STATE_FILE = "user_commitments.json"
+    GOAL_STATE_FILE = "user_goals.json"
     MAX_COMMITMENTS = 200
+    MAX_GOALS = 100
     MAX_HISTORY = 50
     PUSH_COOLDOWN_SECONDS = 60
 
@@ -94,6 +98,7 @@ class CommitmentCore:
         self._write_state(state)
         self._sync_user_world(item)
         self._sync_agency_goal(item)
+        self._sync_goal_permission_from_commitment(item)
         return item
 
     def confirm_commitment(self, commitment_id: str) -> dict[str, Any] | None:
@@ -200,6 +205,10 @@ class CommitmentCore:
             if cancelled:
                 return {"status": "declined", "commitment": cancelled, "actions": ["cancelled_pending"]}
 
+        learning_goal = self._maybe_record_learning_goal(user_text=user_text, event=event)
+        if learning_goal:
+            return learning_goal
+
         extracted = self._extract_from_user_text(user_text, event=event)
         if extracted:
             created = self.create_commitment(extracted)
@@ -219,6 +228,9 @@ class CommitmentCore:
         return result
 
     def append_followup_to_response(self, response: str, turn_result: dict[str, Any]) -> str:
+        override = str(turn_result.get("response_override") or "").strip()
+        if override:
+            return override
         followup = str(turn_result.get("followup_offer") or "").strip()
         if not followup:
             return response
@@ -264,6 +276,220 @@ class CommitmentCore:
             }
         )
 
+    def _maybe_record_learning_goal(self, *, user_text: str, event: VeyraEvent) -> dict[str, Any] | None:
+        lowered = (user_text or "").lower()
+        if not any(marker in lowered for marker in LEARNING_MARKERS):
+            return None
+        if not self._looks_like_learning_goal_request(user_text) and not self._mentions_push_intent(lowered):
+            return None
+        topic = self._extract_learning_topic(user_text)
+        goal = self._upsert_user_goal(
+            {
+                "kind": "learning",
+                "status": "active",
+                "title": f"学习目标：{topic}",
+                "topic": topic,
+                "user_id": event.source.user_id,
+                "channel": event.source.channel,
+                "session_id": event.source.session_id,
+                "source_event_id": event.event_id,
+                "last_user_text": user_text[:500],
+                "plan": self._learning_plan(topic),
+                "permissions": {
+                    "store_progress": "granted_by_request",
+                    "external_search": "pending_confirmation",
+                    "proactive_push": "pending_confirmation",
+                },
+            }
+        )
+        digest = self._ensure_learning_digest_offer(goal=goal, event=event, user_text=user_text)
+        if digest:
+            goal["commitment_id"] = digest.get("commitment_id")
+            permissions = goal.setdefault("permissions", {})
+            if isinstance(permissions, dict) and digest.get("status") == "active":
+                permissions["external_search"] = "granted_for_digest"
+                permissions["proactive_push"] = "granted"
+            self._replace_user_goal(goal)
+        self._sync_learning_goal_to_user_world(goal, digest)
+        actions = ["recorded_learning_goal"]
+        if digest:
+            actions.append("offered_learning_digest" if digest.get("status") == "pending_confirmation" else "activated_learning_digest")
+        return {
+            "status": "goal_recorded",
+            "goal": goal,
+            "commitment": digest,
+            "actions": actions,
+            "response_override": self._learning_goal_response(goal, digest),
+        }
+
+    def _ensure_learning_digest_offer(self, *, goal: dict[str, Any], event: VeyraEvent, user_text: str) -> dict[str, Any] | None:
+        topic = str(goal.get("topic") or "学习计划")
+        existing = [
+            item
+            for item in self.list_commitments(user_id=event.source.user_id, session_id=event.source.session_id)
+            if item.get("kind") == "learning_digest"
+            and item.get("status") in {"active", "pending_confirmation"}
+            and str((item.get("payload") or {}).get("topic") or "") == topic
+        ]
+        if existing:
+            return existing[-1]
+        status = "active" if self._is_explicit_push_authorization((user_text or "").lower()) else "pending_confirmation"
+        return self.create_commitment(
+            {
+                "kind": "learning_digest",
+                "status": status,
+                "title": f"学习资料摘要：{topic}",
+                "user_id": event.source.user_id,
+                "channel": event.source.channel,
+                "session_id": event.source.session_id,
+                "source_event_id": event.event_id,
+                "schedule": self._default_learning_schedule(user_text),
+                "payload": {"topic": topic, "phase": "getting_started", "goal_id": goal.get("goal_id")},
+            }
+        )
+
+    def _upsert_user_goal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now_iso()
+        state = self._read_goal_state()
+        goals = state.get("goals") if isinstance(state.get("goals"), list) else []
+        topic = str(payload.get("topic") or "")
+        kind = str(payload.get("kind") or "generic")
+        user_id = str(payload.get("user_id") or "local-user")
+        updated: dict[str, Any] | None = None
+        for goal in goals:
+            if not isinstance(goal, dict):
+                continue
+            if goal.get("kind") == kind and goal.get("topic") == topic and goal.get("user_id") == user_id and goal.get("status") != "archived":
+                goal.update(payload)
+                goal["updated_at"] = now
+                updated = goal
+                break
+        if updated is None:
+            updated = {
+                "goal_id": f"goal_{uuid4().hex[:12]}",
+                "created_at": now,
+                "updated_at": now,
+                **payload,
+            }
+            goals.append(updated)
+        state["goals"] = [goal for goal in goals if isinstance(goal, dict)][-self.MAX_GOALS :]
+        state["updated_at"] = now
+        self._write_goal_state(state)
+        return updated
+
+    def _replace_user_goal(self, updated_goal: dict[str, Any]) -> None:
+        goal_id = updated_goal.get("goal_id")
+        if not goal_id:
+            return
+        state = self._read_goal_state()
+        goals = state.get("goals") if isinstance(state.get("goals"), list) else []
+        for index, goal in enumerate(goals):
+            if isinstance(goal, dict) and goal.get("goal_id") == goal_id:
+                updated_goal["updated_at"] = utc_now_iso()
+                goals[index] = updated_goal
+                state["goals"] = goals[-self.MAX_GOALS :]
+                state["updated_at"] = utc_now_iso()
+                self._write_goal_state(state)
+                return
+
+    def _sync_learning_goal_to_user_world(self, goal: dict[str, Any], commitment: dict[str, Any] | None) -> None:
+        topic = str(goal.get("topic") or goal.get("title") or "学习计划")
+        user_world = self.state_store.read_json("user_world.json")
+        user_world["current_goal"] = f"learning:{topic}"[:180]
+        user_world["goal_id"] = goal.get("goal_id")
+        user_world["goal_kind"] = goal.get("kind")
+        user_world["learning_topic"] = topic
+        if commitment:
+            user_world["commitment_id"] = commitment.get("commitment_id")
+            user_world["commitment_kind"] = commitment.get("kind")
+        user_world["updated_at"] = utc_now_iso()
+        self.state_store.write_json("user_world.json", user_world)
+
+    def _sync_goal_permission_from_commitment(self, commitment: dict[str, Any]) -> None:
+        if commitment.get("kind") != "learning_digest":
+            return
+        payload = commitment.get("payload") if isinstance(commitment.get("payload"), dict) else {}
+        goal_id = payload.get("goal_id")
+        if not goal_id:
+            return
+        state = self._read_goal_state()
+        goals = state.get("goals") if isinstance(state.get("goals"), list) else []
+        changed = False
+        for goal in goals:
+            if not isinstance(goal, dict) or goal.get("goal_id") != goal_id:
+                continue
+            goal["commitment_id"] = commitment.get("commitment_id")
+            permissions = goal.setdefault("permissions", {})
+            if isinstance(permissions, dict):
+                status = str(commitment.get("status") or "")
+                if status == "active":
+                    permissions["external_search"] = "granted_for_digest"
+                    permissions["proactive_push"] = "granted"
+                elif status in {"cancelled", "paused"}:
+                    permissions["proactive_push"] = status
+                else:
+                    permissions["proactive_push"] = "pending_confirmation"
+            goal["updated_at"] = utc_now_iso()
+            changed = True
+            break
+        if changed:
+            state["goals"] = goals[-self.MAX_GOALS :]
+            state["updated_at"] = utc_now_iso()
+            self._write_goal_state(state)
+
+    def _learning_plan(self, topic: str) -> dict[str, Any]:
+        return {
+            "phase": "getting_started",
+            "steps": [
+                {"name": "建立地图", "focus": f"列出 {topic} 的核心概念、前置知识和目标产出。"},
+                {"name": "补基础", "focus": "按缺口补数学、编程或领域背景，只补会阻塞下一步的部分。"},
+                {"name": "做小项目", "focus": "用一个可运行的小练习验证理解，保留过程和问题。"},
+                {"name": "复盘迭代", "focus": "每周根据完成度调整材料难度和下一步计划。"},
+            ],
+            "checkpoints": ["今天确定目标与基础水平", "3 天内完成第一份学习地图", "7 天内完成一个最小练习"],
+        }
+
+    def _learning_goal_response(self, goal: dict[str, Any], commitment: dict[str, Any] | None) -> str:
+        topic = str(goal.get("topic") or "这个主题")
+        plan = goal.get("plan") if isinstance(goal.get("plan"), dict) else self._learning_plan(topic)
+        steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+        lines = [f"可以。我已把「{topic}」记录为你的学习目标。", "", "先按这个方案启动："]
+        for index, step in enumerate(steps[:4], start=1):
+            if isinstance(step, dict):
+                lines.append(f"{index}. {step.get('name')}：{step.get('focus')}")
+        checkpoints = plan.get("checkpoints") if isinstance(plan.get("checkpoints"), list) else []
+        if checkpoints:
+            lines.append("")
+            lines.append("近期检查点：" + "；".join(str(item) for item in checkpoints[:3]))
+        if commitment and commitment.get("status") == "active":
+            lines.append("")
+            lines.append("你已明确要求推送，我会按当前频率整理学习资料摘要。")
+        else:
+            lines.append("")
+            lines.append("我还可以定期检索公开资料、课程或论文摘要并推送给你。回复「好的」或「同意开启」才会开启；回复「不用」则只保留学习目标。")
+        return "\n".join(lines)
+
+    def _looks_like_learning_goal_request(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        markers = (
+            "开始学习",
+            "我要学",
+            "我想学",
+            "想学习",
+            "准备学",
+            "打算学",
+            "帮我",
+            "学习计划",
+            "入门",
+            "课程",
+            "复习",
+            "learn",
+            "study",
+        )
+        if any(marker in lowered for marker in markers):
+            return True
+        return bool(re.search(r"(?:我要|我想|想|准备|开始|打算).{0,8}(?:学习|学)", text or ""))
+
     def _extract_from_user_text(self, text: str, *, event: VeyraEvent) -> dict[str, Any] | None:
         lowered = (text or "").lower()
         if not self._mentions_push_intent(lowered) and not any(marker in lowered for marker in LEARNING_MARKERS):
@@ -273,7 +499,7 @@ class CommitmentCore:
             location = self._extract_location(text)
             return {
                 "kind": "weather_daily",
-                "status": "active" if self._is_affirmation(lowered) else "pending_confirmation",
+                "status": "active" if self._is_explicit_push_authorization(lowered) else "pending_confirmation",
                 "title": f"每日天气（{location or '默认地点'}）",
                 "user_id": event.source.user_id,
                 "channel": event.source.channel,
@@ -287,7 +513,7 @@ class CommitmentCore:
             topic = self._extract_learning_topic(text)
             return {
                 "kind": "learning_digest",
-                "status": "active" if self._is_affirmation(lowered) else "pending_confirmation",
+                "status": "active" if self._is_explicit_push_authorization(lowered) else "pending_confirmation",
                 "title": f"学习辅导：{topic}",
                 "user_id": event.source.user_id,
                 "channel": event.source.channel,
@@ -336,6 +562,7 @@ class CommitmentCore:
         state["updated_at"] = utc_now_iso()
         self._write_state(state)
         self._sync_user_world(updated)
+        self._sync_goal_permission_from_commitment(updated)
         return updated
 
     def _read_state(self) -> dict[str, Any]:
@@ -343,6 +570,12 @@ class CommitmentCore:
 
     def _write_state(self, state: dict[str, Any]) -> None:
         self.state_store.write_json(self.STATE_FILE, state)
+
+    def _read_goal_state(self) -> dict[str, Any]:
+        return self.state_store.read_json(self.GOAL_STATE_FILE) or {"goals": [], "updated_at": None}
+
+    def _write_goal_state(self, state: dict[str, Any]) -> None:
+        self.state_store.write_json(self.GOAL_STATE_FILE, state)
 
     def _sync_user_world(self, commitment: dict[str, Any]) -> None:
         if commitment.get("status") not in {"active", "pending_confirmation"}:
@@ -473,34 +706,62 @@ class CommitmentCore:
     def _extract_location(self, text: str) -> str:
         patterns = [
             r"(?:在|于)\s*([^\s，,。.?！!]{2,16}?)(?:的)?(?:天气|气温)",
-            r"(?:今天|现在|当前)?\s*([^\s，,。.?！!]{2,16}?)(?:的)?天气",
+            r"([^\s，,。.?！!]{2,16}?)(?:今天|现在|当前|明天|今日)?(?:的)?(?:天气|气温)",
         ]
         for pattern in patterns:
             match = re.search(pattern, text or "")
             if match:
-                location = match.group(1).strip(" 的？?！!，,")
-                for prefix in ("今天", "现在", "当前"):
-                    if location.startswith(prefix) and len(location) > len(prefix):
-                        location = location[len(prefix) :]
-                return location
+                location = self._clean_location(match.group(1))
+                if location:
+                    return location
         for token in ("北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "西安", "南京", "重庆"):
             if token in (text or ""):
                 return token
         return ""
 
+    def _clean_location(self, value: str) -> str:
+        location = (value or "").strip(" 的？?！!，,。")
+        for prefix in ("今天", "现在", "当前", "明天", "今日"):
+            if location.startswith(prefix) and len(location) > len(prefix):
+                location = location[len(prefix) :]
+        for suffix in ("今天", "现在", "当前", "明天", "今日", "的"):
+            if location.endswith(suffix) and len(location) > len(suffix):
+                location = location[: -len(suffix)]
+        return location.strip(" 的？?！!，,。")
+
     def _extract_learning_topic(self, text: str) -> str:
-        match = re.search(r"(?:学习|学|入门|掌握)\s*([^\s，,。.?！!]{2,32})", text or "")
+        match = re.search(r"(?:学习|学|入门|掌握)\s*([^\s，,。.?！!？]{2,32})", text or "")
         if match:
-            return match.group(1).strip()
+            return self._clean_learning_topic(match.group(1))
         if "深度学习" in (text or ""):
             return "深度学习"
         return "学习计划"
+
+    def _clean_learning_topic(self, value: str) -> str:
+        topic = (value or "").strip(" 的了吧吗呢啊？?！!，,。")
+        for suffix in ("了", "吧", "吗", "呢", "啊", "相关内容", "资料", "课程"):
+            if topic.endswith(suffix) and len(topic) > len(suffix):
+                topic = topic[: -len(suffix)]
+        return topic.strip(" 的了吧吗呢啊？?！!，,。") or "学习计划"
 
     def _mentions_push_intent(self, lowered: str) -> bool:
         return any(marker in lowered for marker in PUSH_MARKERS + DAILY_MARKERS)
 
     def _is_affirmation(self, lowered: str) -> bool:
-        return any(marker in lowered for marker in AFFIRM_MARKERS)
+        text = re.sub(r"[\s，,。.!！?？、]+", "", lowered or "")
+        if not text:
+            return False
+        if text in AFFIRM_EXACT_MARKERS:
+            return True
+        if len(text) <= 12 and any(marker in text for marker in AFFIRM_MARKERS):
+            return True
+        return any(phrase in text for phrase in AFFIRM_PHRASES)
+
+    def _is_explicit_push_authorization(self, lowered: str) -> bool:
+        text = lowered or ""
+        has_push_action = any(marker in text for marker in PUSH_MARKERS + ("订阅", "subscribe"))
+        has_schedule_or_enable = any(marker in text for marker in DAILY_MARKERS + ("开启", "启用", "定时", "定期", "每天", "每日"))
+        return has_push_action and has_schedule_or_enable
 
     def _is_decline(self, lowered: str) -> bool:
         return any(marker in lowered for marker in DECLINE_MARKERS)

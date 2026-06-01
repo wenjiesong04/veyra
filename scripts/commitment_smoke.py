@@ -17,13 +17,16 @@ if str(ROOT) not in sys.path:
 _TEST_RUNTIME = TemporaryDirectory(prefix="veyra-commitment-")
 TEST_STATE_ROOT = Path(_TEST_RUNTIME.name) / "state"
 TEST_AGENCY_ROOT = Path(_TEST_RUNTIME.name) / "agency"
+os.environ["VEYRA_STATE_DIR"] = str(TEST_STATE_ROOT)
 os.environ["VEYRA_STATE_ROOT"] = str(TEST_STATE_ROOT)
+os.environ["VEYRA_AGENCY_DIR"] = str(TEST_AGENCY_ROOT)
 os.environ["VEYRA_AGENCY_ROOT"] = str(TEST_AGENCY_ROOT)
 TEST_AGENCY_ROOT.mkdir(parents=True, exist_ok=True)
 (TEST_AGENCY_ROOT / "goals.json").write_text("{}", encoding="utf-8")
 (TEST_AGENCY_ROOT / "intention_queue.json").write_text("[]", encoding="utf-8")
 
 from main import app  # noqa: E402
+from core.world_state import WorldStateStore  # noqa: E402
 
 
 client = TestClient(app)
@@ -36,6 +39,53 @@ def expect(condition: bool, label: str, detail=None) -> None:
 
 
 def main() -> int:
+    store = WorldStateStore(TEST_STATE_ROOT)
+
+    learning_turn = client.post(
+        "/events/message",
+        json={
+            "text": "现在我要开始学习深度学习了，你能不能帮我？",
+            "channel": "self-test",
+            "user_id": "cmt-user",
+            "session_id": "cmt-learn",
+        },
+    )
+    expect(learning_turn.status_code == 200, "learning goal message", learning_turn.text)
+    learning_body = learning_turn.json()
+    learning_artifact = (learning_body.get("artifacts") or {}).get("commitment") or {}
+    expect(learning_artifact.get("status") == "goal_recorded", "learning goal recorded", learning_artifact)
+    expect("学习目标" in str(learning_body.get("response") or "") and "同意开启" in str(learning_body.get("response") or ""), "learning response includes plan and opt-in", learning_body.get("response"))
+
+    goals = store.read_json("user_goals.json").get("goals", [])
+    learning_goal = next((goal for goal in goals if isinstance(goal, dict) and goal.get("topic") == "深度学习"), None)
+    expect(bool(learning_goal), "user_goals stores learning topic", goals)
+    expect((learning_goal.get("permissions") or {}).get("proactive_push") == "pending_confirmation", "learning push requires confirmation", learning_goal)
+    pending_digest = learning_artifact.get("commitment") if isinstance(learning_artifact.get("commitment"), dict) else {}
+    expect(pending_digest.get("status") == "pending_confirmation", "learning digest is pending before consent", pending_digest)
+
+    learn_session = pending_digest.get("session_id") or "self-test:cmt-user:cmt-learn"
+    confirm_learning = client.post(
+        "/events/message",
+        json={
+            "text": "好的",
+            "channel": "self-test",
+            "user_id": "cmt-user",
+            "session_id": "cmt-learn",
+        },
+    )
+    expect(confirm_learning.status_code == 200, "confirm learning digest", confirm_learning.text)
+    expect(
+        (confirm_learning.json().get("artifacts") or {}).get("commitment", {}).get("status") == "confirmed",
+        "learning confirmation activates commitment",
+        confirm_learning.json().get("artifacts"),
+    )
+    learning_list = client.get("/commitments", params={"session_id": learn_session, "status": "active"})
+    expect(learning_list.status_code == 200 and learning_list.json().get("count", 0) >= 1, "active learning commitment exists", learning_list.json())
+    learn_id = learning_list.json()["commitments"][0]["commitment_id"]
+    goals = store.read_json("user_goals.json").get("goals", [])
+    learning_goal = next((goal for goal in goals if isinstance(goal, dict) and goal.get("topic") == "深度学习"), {})
+    expect((learning_goal.get("permissions") or {}).get("proactive_push") == "granted", "confirmed learning updates goal permissions", learning_goal)
+
     weather = client.post(
         "/events/message",
         json={
@@ -49,9 +99,11 @@ def main() -> int:
     body = weather.json()
     expect(body.get("route") == "probe", "weather routes to probe", body)
     expect("推送" in str(body.get("response") or ""), "weather response offers subscription", body.get("response"))
+    weather_offer = (body.get("artifacts") or {}).get("commitment", {}).get("commitment", {})
+    expect((weather_offer.get("payload") or {}).get("location") == "北京", "weather commitment extracts clean location", weather_offer)
 
     mapped_session = (
-        (body.get("artifacts") or {}).get("commitment", {}).get("commitment", {}).get("session_id")
+        weather_offer.get("session_id")
         or "self-test:cmt-user:cmt-weather"
     )
     confirm = client.post(
@@ -74,26 +126,7 @@ def main() -> int:
 
     commitment_id = listed.json()["commitments"][0]["commitment_id"]
 
-    learning = client.post(
-        "/commitments",
-        json={
-            "kind": "learning_digest",
-            "title": "学习辅导：深度学习",
-            "user_id": "cmt-user",
-            "channel": "self-test",
-            "session_id": "self-test:cmt-user:cmt-learn",
-            "status": "active",
-            "schedule": {"kind": "interval", "interval_seconds": 60, "timezone": "Asia/Shanghai"},
-            "payload": {"topic": "深度学习", "phase": "入门"},
-        },
-    )
-    expect(learning.status_code == 200, "create learning commitment", learning.text)
-    learn_id = learning.json()["commitment"]["commitment_id"]
-
     past = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
-    from core.world_state import WorldStateStore
-
-    store = WorldStateStore(TEST_STATE_ROOT)
     state = store.read_json("user_commitments.json")
     for item in state.get("commitments", []):
         if item.get("commitment_id") in {commitment_id, learn_id}:

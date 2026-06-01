@@ -44,6 +44,7 @@ def main() -> None:
 
         store.write_json("local_world.json", {"current_project": "/tmp/demo", "probes": {}})
         expect((root / "local" / "local_world.json").exists(), "new writes use layout paths")
+        expect(store.relative_path_for("user_goals.json") == "user/user_goals.json", "user goals path mapping")
         expect(store.relative_path_for("task_state.json") == "runtime/task_state.json", "runtime path mapping")
 
         saved_env = {key: os.environ.get(key) for key in ("VEYRA_STATE_DIR", "VEYRA_STATE_ROOT", "VEYRA_AGENCY_DIR", "VEYRA_AGENCY_ROOT", "VEYRA_ENV")}

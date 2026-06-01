@@ -112,6 +112,13 @@ STATE_DEFINITIONS: list[dict[str, Any]] = [
         "freshness": "event_scoped",
     },
     {
+        "id": "user_goals",
+        "file": "state/user/user_goals.json",
+        "owner": "GoalCore",
+        "purpose": "Long-running user goals, learning plans, permissions, and progress state.",
+        "freshness": "event_scoped",
+    },
+    {
         "id": "local_world",
         "file": "state/local/local_world.json",
         "owner": "WorldState.LocalWorld",

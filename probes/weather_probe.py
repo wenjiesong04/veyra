@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import json
 import re
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import urlopen
 
+from probes.http_utils import fetch_json
 from probes.schema import probe_payload
 
 
@@ -82,28 +82,35 @@ class WeatherProbe:
             return ""
         patterns = [
             r"(?:在|于)\s*([^\s，,。.?！!]{2,24}?)(?:的)?(?:天气|气温)",
-            r"(?:今天|现在|当前)?\s*([^\s，,。.?！!]{2,24}?)(?:的)?(?:天气|气温)",
+            r"([^\s，,。.?！!]{2,24}?)(?:今天|现在|当前|明天|今日)?(?:的)?(?:天气|气温)",
             r"(?:weather in|weather for)\s+([A-Za-z][A-Za-z\s.-]{1,40})",
         ]
         for pattern in patterns:
             match = re.search(pattern, cleaned, flags=re.IGNORECASE)
             if match:
-                location = match.group(1).strip(" 的？?！!，,")
-                for prefix in ("今天", "现在", "当前"):
-                    if location.startswith(prefix) and len(location) > len(prefix):
-                        location = location[len(prefix) :]
-                return location
+                location = self._clean_location(match.group(1))
+                if location:
+                    return location
         for token in ("北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "西安", "南京", "重庆", "天津", "苏州"):
             if token in cleaned:
                 return token
         return ""
 
+    def _clean_location(self, value: str) -> str:
+        location = (value or "").strip(" 的？?！!，,。")
+        for prefix in ("今天", "现在", "当前", "明天", "今日"):
+            if location.startswith(prefix) and len(location) > len(prefix):
+                location = location[len(prefix) :]
+        for suffix in ("今天", "现在", "当前", "明天", "今日", "的"):
+            if location.endswith(suffix) and len(location) > len(suffix):
+                location = location[: -len(suffix)]
+        return location.strip(" 的？?！!，,。")
+
     def _geocode(self, location: str) -> dict:
         url = f"https://geocoding-api.open-meteo.com/v1/search?name={quote(location)}&count=1&language=zh"
         try:
-            with urlopen(url, timeout=5) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            body = fetch_json(url, timeout=5)
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
             return {"status": "error", "summary": f"Geocoding failed: {exc}"}
         results = body.get("results") if isinstance(body.get("results"), list) else []
         if not results:
@@ -123,9 +130,8 @@ class WeatherProbe:
             f"latitude={latitude}&longitude={longitude}&current=temperature_2m,weather_code&timezone={quote(timezone)}"
         )
         try:
-            with urlopen(url, timeout=5) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            body = fetch_json(url, timeout=5)
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
             return {"status": "error", "summary": f"Forecast failed: {exc}"}
         current = body.get("current") if isinstance(body.get("current"), dict) else {}
         code = current.get("weather_code")
