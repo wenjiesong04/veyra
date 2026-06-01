@@ -29,7 +29,7 @@ from interface.event_schema import VeyraTaskPacket
 DEFAULT_OPENCLAW_PROTOCOL_MIN = 3
 DEFAULT_OPENCLAW_PROTOCOL_MAX = 4
 OPENCLAW_REQUIRED_METHODS = ("chat.send",)
-OPENCLAW_OPTIONAL_METHODS = ("health", "status", "tools.catalog", "skills.status", "agent.wait", "chat.history")
+OPENCLAW_OPTIONAL_METHODS = ("health", "status", "tools.catalog", "skills.status", "agent.wait", "chat.history", "memory.summary", "memory.patch")
 
 
 class OpenClawGatewayError(RuntimeError):
@@ -162,15 +162,35 @@ class OpenClawAdapter(AgentAdapter):
             )
 
     def fetch_memory_summary(self, session_id: str) -> dict[str, Any]:
+        if not self.gateway_url:
+            return {"session_id": session_id, "summary": "", "runtime": "openclaw", "status": "not_configured"}
+        try:
+            response = self._gateway_request("memory.summary", {"sessionId": session_id, "sessionKey": self.session_key})
+        except OpenClawGatewayError as exc:
+            return {
+                "session_id": session_id,
+                "summary": "",
+                "runtime": "openclaw",
+                "status": exc.status,
+                "error": exc.message,
+            }
+        summary = response.get("summary") or response.get("text") or response.get("memory") or ""
         return {
             "session_id": session_id,
-            "summary": "",
+            "summary": summary,
             "runtime": "openclaw",
-            "status": "local_memory_bridge",
+            "status": str(response.get("status") or ("success" if summary else "empty")),
+            "raw": self._redact_payload(response),
         }
 
-    def write_memory_patch(self, memory_patch: dict[str, Any]) -> None:
-        return None
+    def write_memory_patch(self, memory_patch: dict[str, Any]) -> dict[str, Any]:
+        if not self.gateway_url:
+            return {"status": "not_configured", "runtime": "openclaw"}
+        try:
+            response = self._gateway_request("memory.patch", {"sessionKey": self.session_key, "patch": memory_patch})
+        except OpenClawGatewayError as exc:
+            return {"status": exc.status, "runtime": "openclaw", "error": exc.message}
+        return {"status": str(response.get("status") or "submitted"), "runtime": "openclaw", "raw": self._redact_payload(response)}
 
     def fetch_task_status(self, task_id: str) -> ExecutionResult:
         if not self.gateway_url:
