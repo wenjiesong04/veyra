@@ -22,6 +22,12 @@ def fetch_json(url: str, *, timeout: float = 5.0, headers: dict[str, str] | None
         return json.loads(response.read().decode("utf-8"))
 
 
+def fetch_text(url: str, *, timeout: float = 5.0, headers: dict[str, str] | None = None, max_bytes: int = 500_000) -> str:
+    request = Request(url, headers=headers or {})
+    with urlopen(request, timeout=timeout, context=ssl_context()) as response:
+        return response.read(max_bytes).decode("utf-8", errors="replace")
+
+
 def _ca_bundle_path() -> str:
     candidates = [
         os.getenv("REQUESTS_CA_BUNDLE", ""),

@@ -142,7 +142,7 @@ class WorldStateStore:
             "user_goals.json": {"goals": [], "updated_at": None},
             "user_commitments.json": {"commitments": [], "updated_at": None},
             "local_world.json": {"current_project": str(Path.cwd()), "probes": {}, "last_probe_at": None, "updated_at": utc_now_iso()},
-            "external_world.json": {"watchlist": [], "summaries": []},
+            "external_world.json": {"watchlist": [], "summaries": [], "knowledge_items": [], "push_candidates": []},
             "executor_state.json": {"selected_agent": "openclaw", "status": "unknown"},
             "risk_state.json": {"current_risk": "R0", "signals": [], "levels": risk_catalog()},
             "belief_state.json": {
