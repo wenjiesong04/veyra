@@ -136,13 +136,10 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _copy_config(source_root: Path, state_store: WorldStateStore) -> None:
+    source_store = WorldStateStore(source_root)
     for filename in ["agent_config.json", "user_world.json"]:
-        source = source_root / filename
-        if not source.exists():
-            continue
-        try:
-            payload = json.loads(source.read_text(encoding="utf-8") or "{}")
-        except json.JSONDecodeError:
+        payload = source_store.read_json(filename)
+        if not payload:
             continue
         state_store.write_json(filename, payload)
 

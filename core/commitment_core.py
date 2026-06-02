@@ -207,9 +207,9 @@ class CommitmentCore:
         lowered = (user_text or "").lower()
         result: dict[str, Any] = {"status": "idle", "actions": []}
         intent = self.intent_planner.plan(user_text=user_text, event=event)
-        intent_record = self.intent_planner.record_intent(intent)
 
         if intent.intent_type in {"cancel_commitment", "pause_commitment", "resume_commitment"}:
+            intent_record = self.intent_planner.record_intent(intent)
             control = self.template_registry.apply(
                 intent=intent,
                 core=self,
@@ -242,6 +242,10 @@ class CommitmentCore:
                     "actions": ["cancelled_pending"],
                     "response_override": f"已取消：{cancelled.get('title') or cancelled.get('kind')}",
                 }
+
+        if self._intent_is_answer_only(intent):
+            return {}
+        intent_record = self.intent_planner.record_intent(intent)
 
         templated = self.template_registry.apply(
             intent=intent,
@@ -284,7 +288,10 @@ class CommitmentCore:
             result = {"status": "offered", "commitment": offer, "followup_offer": self._confirmation_prompt(offer), "actions": ["offered_subscription"]}
         if result.get("status") != "idle":
             result["intent"] = intent_record
-        return result
+        return result if result.get("status") != "idle" else {}
+
+    def _intent_is_answer_only(self, intent: ProactiveIntent) -> bool:
+        return str(intent.proposed_next_action or "") == "answer_only"
 
     def apply_control_intent(self, intent: ProactiveIntent, *, action: str) -> dict[str, Any]:
         statuses = {"cancel": ["active", "pending_confirmation"], "pause": ["active"], "resume": ["paused"]}.get(action, [])

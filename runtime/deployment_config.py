@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from core.model_client import redact_sensitive
+from core.model_client import _env_value, redact_sensitive
 from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
 
@@ -81,14 +81,15 @@ class DeploymentConfigValidator:
         model = str(core_model.get("model") or "")
         api_key_env = str(core_model.get("api_key_env") or "")
         api_key = str(core_model.get("api_key") or "")
+        api_key_env_set = bool(api_key_env and _env_value(api_key_env, ""))
         return [
             self._check("core_model_base_url", "pass" if self._valid_http_like(base_url) else "fail", "Core model base_url checked.", {"configured": bool(base_url)}),
             self._check("core_model_name", "pass" if bool(model) else "fail", "Core model name checked.", {"configured": bool(model)}),
             self._check(
                 "core_model_secret_source",
-                "pass" if api_key or (api_key_env and os.getenv(api_key_env)) else "warn",
+                "pass" if api_key or api_key_env_set else "warn",
                 "Core model API key source checked.",
-                {"api_key_env": api_key_env, "api_key_env_set": bool(api_key_env and os.getenv(api_key_env)), "inline_api_key_set": bool(api_key)},
+                {"api_key_env": api_key_env, "api_key_env_set": api_key_env_set, "inline_api_key_set": bool(api_key)},
             ),
             self._check("core_model_inline_secret", "warn" if api_key else "pass", "Inline API keys are discouraged for deployment.", {"inline_api_key_set": bool(api_key)}),
         ]

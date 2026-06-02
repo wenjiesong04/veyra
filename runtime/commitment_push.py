@@ -197,7 +197,8 @@ class CommitmentPushRuntime:
                 title_text = str(candidate.get("title") or topic)
                 url = str(candidate.get("url") or "")
                 snippet = str(candidate.get("snippet") or "")
-                message = f"【学习资料·{topic}】{title_text}\n{snippet[:220]}\n链接：{url}\n如需调整计划或推送频率，直接告诉我即可。"
+                link_line = f"\n链接：{url}" if url else ""
+                message = f"【学习资料·{topic}】{title_text}\n{snippet[:220]}{link_line}\n如需调整计划或推送频率，直接告诉我即可。"
                 return message, {"kind": "external_candidate", "candidate_id": candidate.get("candidate_id")}
             tips = [
                 "回顾上一轮笔记并列出 3 个不懂的概念",
@@ -213,7 +214,8 @@ class CommitmentPushRuntime:
                 title_text = str(candidate.get("title") or topic)
                 url = str(candidate.get("url") or "")
                 snippet = str(candidate.get("snippet") or "")
-                message = f"【外部追踪·{topic}】{title_text}\n{snippet[:220]}\n链接：{url}\n如需暂停、取消或调整范围，直接告诉我即可。"
+                link_line = f"\n链接：{url}" if url else ""
+                message = f"【外部追踪·{topic}】{title_text}\n{snippet[:220]}{link_line}\n如需暂停、取消或调整范围，直接告诉我即可。"
                 return message, {"kind": "external_candidate", "candidate_id": candidate.get("candidate_id")}
             return f"【外部追踪·{topic}】当前没有新的高价值更新。我会继续按授权观察；如需暂停或取消，直接告诉我即可。", None
         if kind == "local_probe_monitor":

@@ -15,6 +15,12 @@ from core.world_state import WorldStateStore
 
 
 SENSITIVE_KEY_MARKERS = ("api_key", "apikey", "token", "secret", "password", "private_key", "authorization")
+LOCAL_ENV_FALLBACK_FILES = (
+    "OPENCLAW_ENV_FILE",
+    "~/.openclaw/.env",
+    "~/.openclaw/service-env/ai.openclaw.gateway.env",
+)
+_LOCAL_ENV_CACHE: dict[str, str] | None = None
 
 
 @dataclass(slots=True)
@@ -410,5 +416,61 @@ def _pick_config_value(
     if selected_agent.get(agent_key) not in {None, ""}:
         return selected_agent.get(agent_key)
     if env_key:
-        return os.getenv(env_key, default)
+        return _env_value(env_key, default)
     return default
+
+
+def _env_value(env_key: str, default: Any = "") -> Any:
+    if not env_key:
+        return default
+    value = os.getenv(env_key)
+    if value not in {None, ""}:
+        return value
+    local = _local_env_values().get(env_key)
+    if local not in {None, ""}:
+        return local
+    return default
+
+
+def _local_env_values() -> dict[str, str]:
+    global _LOCAL_ENV_CACHE
+    if _LOCAL_ENV_CACHE is not None:
+        return _LOCAL_ENV_CACHE
+    values: dict[str, str] = {}
+    for raw_path in LOCAL_ENV_FALLBACK_FILES:
+        if raw_path.isupper():
+            configured = os.getenv(raw_path, "")
+            if not configured:
+                continue
+            path = Path(configured).expanduser()
+        else:
+            path = Path(raw_path).expanduser()
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                key, value = _parse_env_line(line)
+                if key:
+                    values.setdefault(key, value)
+        except OSError:
+            continue
+    _LOCAL_ENV_CACHE = values
+    return values
+
+
+def _parse_env_line(line: str) -> tuple[str, str]:
+    text = line.strip()
+    if not text or text.startswith("#"):
+        return "", ""
+    if text.startswith("export "):
+        text = text[7:].strip()
+    if "=" not in text:
+        return "", ""
+    key, value = text.split("=", 1)
+    key = key.strip()
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+        return "", ""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    return key, value

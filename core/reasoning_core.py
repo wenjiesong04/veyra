@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 from core.definitions import RiskLevel, normalize_risk
-from core.model_client import CoreModelClient, redact_sensitive
+from core.model_client import CoreModelClient, _env_value, redact_sensitive
 from core.turn_context_builder import TurnContextBuilder
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent
@@ -385,8 +385,10 @@ class CoreReasoning:
         public = redact_sensitive(config)
         core_model = public.get("core_model") if isinstance(public.get("core_model"), dict) else {}
         if core_model:
-            core_model["api_key_set"] = bool(core_model.get("api_key"))
-            core_model["api_key"] = "<redacted>" if core_model.get("api_key") else ""
+            original = config.get("core_model") if isinstance(config.get("core_model"), dict) else {}
+            api_key_env = str(original.get("api_key_env") or "VEYRA_CORE_MODEL_API_KEY")
+            core_model["api_key_set"] = bool(original.get("api_key") or _env_value(api_key_env, ""))
+            core_model["api_key"] = "<redacted>" if original.get("api_key") else ""
         return public
 
     def _trace(self, purpose: str, result: dict[str, Any], request_summary: dict[str, Any]) -> None:

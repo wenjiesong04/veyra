@@ -23,8 +23,8 @@ class ContractOpenClawAdapter(OpenClawAdapter):
         super().__init__(base_url="ws://127.0.0.1:18789", api_key="contract-test")
         self.calls: list[dict[str, Any]] = []
 
-    def _gateway_request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        self.calls.append({"method": method, "params": params})
+    def _gateway_request(self, method: str, params: dict[str, Any], *, scopes: list[str] | None = None) -> dict[str, Any]:
+        self.calls.append({"method": method, "params": params, "scopes": scopes or []})
         if method == "memory.summary":
             return {"status": "success", "summary": "OpenClaw remembers the user's learning plan."}
         if method == "memory.patch":
@@ -49,6 +49,8 @@ def main() -> int:
     expect([call["method"] for call in adapter.calls] == ["memory.summary", "memory.patch"], "OpenClaw memory methods are called in contract order", adapter.calls)
     expect(adapter.calls[0]["params"] == {"sessionId": "session-1", "sessionKey": adapter.session_key}, "memory.summary params match gateway contract", adapter.calls[0])
     expect(adapter.calls[1]["params"]["patch"]["session_id"] == "session-1", "memory.patch includes normalized patch", adapter.calls[1])
+    expect("operator.admin" in adapter.calls[0]["scopes"], "memory summary requests memory admin scope", adapter.calls[0])
+    expect("operator.admin" in adapter.calls[1]["scopes"], "memory patch requests memory admin scope", adapter.calls[1])
     memory_capable = adapter._compatibility_summary({"features": {"methods": ["chat.send", "memory.summary", "memory.patch"]}})
     memory_missing = adapter._compatibility_summary({"features": {"methods": ["chat.send"]}})
     expect(memory_capable["optional_methods"]["memory.summary"], "gateway memory.summary capability is detected", memory_capable)

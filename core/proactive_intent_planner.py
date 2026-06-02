@@ -189,9 +189,9 @@ class ProactiveIntentPlanner:
             user_text=text,
             intent_type="unknown",
             topic=topic,
-            desired_outcome="unclear proactive request",
-            proposed_next_action="ask_confirmation",
-            external_context_needed=["intent_target", "cadence", "source"],
+            desired_outcome="no proactive action requested",
+            proposed_next_action="answer_only",
+            requires_user_authorization=False,
             confidence=0.25,
         )
 

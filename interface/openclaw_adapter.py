@@ -66,6 +66,7 @@ class OpenClawAdapter(AgentAdapter):
             configured_wait = self._float_env("OPENCLAW_TASK_WAIT_TIMEOUT", 75.0)
         self.task_wait_timeout = max(15.0, min(float(configured_wait), 300.0))
         self.scopes = self._scopes(os.getenv("OPENCLAW_SCOPES", "operator.read,operator.write"))
+        self.memory_scopes = self._scopes(os.getenv("OPENCLAW_MEMORY_SCOPES", ",".join([*self.scopes, "operator.admin"])))
         self.device_store = Path(os.getenv("OPENCLAW_DEVICE_STORE", "state/local/openclaw_device.json"))
         self.protocol_min = protocol_min if protocol_min is not None else self._int_env("OPENCLAW_PROTOCOL_MIN", DEFAULT_OPENCLAW_PROTOCOL_MIN)
         configured_max = protocol_max if protocol_max is not None else self._int_env("OPENCLAW_PROTOCOL_MAX", DEFAULT_OPENCLAW_PROTOCOL_MAX)
@@ -165,7 +166,7 @@ class OpenClawAdapter(AgentAdapter):
         if not self.gateway_url:
             return {"session_id": session_id, "summary": "", "runtime": "openclaw", "status": "not_configured"}
         try:
-            response = self._gateway_request("memory.summary", {"sessionId": session_id, "sessionKey": self.session_key})
+            response = self._gateway_request("memory.summary", {"sessionId": session_id, "sessionKey": self.session_key}, scopes=self.memory_scopes)
         except OpenClawGatewayError as exc:
             return {
                 "session_id": session_id,
@@ -187,7 +188,7 @@ class OpenClawAdapter(AgentAdapter):
         if not self.gateway_url:
             return {"status": "not_configured", "runtime": "openclaw"}
         try:
-            response = self._gateway_request("memory.patch", {"sessionKey": self.session_key, "patch": memory_patch})
+            response = self._gateway_request("memory.patch", {"sessionKey": self.session_key, "patch": memory_patch}, scopes=self.memory_scopes)
         except OpenClawGatewayError as exc:
             return {"status": exc.status, "runtime": "openclaw", "error": exc.message}
         return {"status": str(response.get("status") or "submitted"), "runtime": "openclaw", "raw": self._redact_payload(response)}
@@ -311,10 +312,10 @@ class OpenClawAdapter(AgentAdapter):
             "skills": self._skills_summary(skills),
         })
 
-    def _gateway_request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    def _gateway_request(self, method: str, params: dict[str, Any], *, scopes: list[str] | None = None) -> dict[str, Any]:
         events: list[dict[str, Any]] = []
         with self._open_socket() as ws:
-            self._connect(ws, events)
+            self._connect(ws, events, scopes=scopes)
             return self._request_on_socket(ws, method, params, events)
 
     def _open_socket(self) -> Any:
@@ -326,8 +327,8 @@ class OpenClawAdapter(AgentAdapter):
             reason = str(exc)
             raise OpenClawGatewayError(self._classify_text(reason), reason) from exc
 
-    def _connect(self, ws: Any, events: list[dict[str, Any]]) -> dict[str, Any]:
-        request_id = self._send_request(ws, "connect", self._connect_params(self._initial_nonce(ws, events)))
+    def _connect(self, ws: Any, events: list[dict[str, Any]], *, scopes: list[str] | None = None) -> dict[str, Any]:
+        request_id = self._send_request(ws, "connect", self._connect_params(self._initial_nonce(ws, events), scopes=scopes))
         deadline = time.monotonic() + self.timeout
         while True:
             raw = self._recv(ws, deadline)
@@ -340,7 +341,7 @@ class OpenClawAdapter(AgentAdapter):
                     payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
                     nonce = str(payload.get("nonce") or "")
                     if nonce:
-                        request_id = self._send_request(ws, "connect", self._connect_params(nonce))
+                        request_id = self._send_request(ws, "connect", self._connect_params(nonce, scopes=scopes))
                 continue
             if message.get("type") != "res" or message.get("id") != request_id:
                 continue
@@ -352,13 +353,13 @@ class OpenClawAdapter(AgentAdapter):
             error = message.get("error") if isinstance(message.get("error"), dict) else {}
             raise self._gateway_error(error, "connect")
 
-    def _connect_params(self, nonce: str) -> dict[str, Any]:
+    def _connect_params(self, nonce: str, *, scopes: list[str] | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {
             "minProtocol": self.protocol_min,
             "maxProtocol": self.protocol_max,
             "client": self._connect_client(),
             "role": "operator",
-            "scopes": self.scopes,
+            "scopes": scopes or self.scopes,
             "caps": ["tool-events"],
             "userAgent": "Veyra/OpenClawAdapter",
             "locale": "zh-CN",
@@ -367,7 +368,7 @@ class OpenClawAdapter(AgentAdapter):
         auth = self._auth_payload(device_identity)
         if auth:
             params["auth"] = auth
-        device = self._device_payload(device_identity, nonce)
+        device = self._device_payload(device_identity, nonce, scopes=scopes)
         if device:
             params["device"] = device
         return params
@@ -796,12 +797,13 @@ class OpenClawAdapter(AgentAdapter):
             "token": token,
         }
 
-    def _device_payload(self, device_identity: dict[str, Any] | None, nonce: str) -> dict[str, Any] | None:
+    def _device_payload(self, device_identity: dict[str, Any] | None, nonce: str, *, scopes: list[str] | None = None) -> dict[str, Any] | None:
         if not device_identity or Ed25519PrivateKey is None or not nonce:
             return None
         client = self._connect_client()
         signed_at = int(time.time() * 1000)
         token = self.api_key or str(device_identity.get("token") or "")
+        requested_scopes = scopes or self.scopes
         message = "|".join(
             [
                 "v2",
@@ -809,7 +811,7 @@ class OpenClawAdapter(AgentAdapter):
                 client["id"],
                 client["mode"],
                 "operator",
-                ",".join(self.scopes),
+                ",".join(requested_scopes),
                 str(signed_at),
                 token,
                 nonce,

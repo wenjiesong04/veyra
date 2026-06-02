@@ -214,9 +214,9 @@ class ExternalWorldRefresh:
             if refresh.get("kind") not in {"learning_search", "external_search"}:
                 continue
             for result in refresh.get("results", []) if isinstance(refresh.get("results"), list) else []:
-                if not isinstance(result, dict) or not result.get("url"):
+                if not isinstance(result, dict) or not (result.get("url") or result.get("title")):
                     continue
-                item_id = self._stable_id("knowledge", str(result.get("url")))
+                item_id = self._stable_id("knowledge", str(result.get("url") or f"{refresh.get('topic')}:{result.get('source')}:{result.get('title')}"))
                 by_key[item_id] = {
                     "item_id": item_id,
                     "goal_id": refresh.get("goal_id"),
@@ -237,9 +237,9 @@ class ExternalWorldRefresh:
             if refresh.get("kind") not in {"learning_search", "external_search"} or not refresh.get("commitment_id"):
                 continue
             for result in refresh.get("results", []) if isinstance(refresh.get("results"), list) else []:
-                if not isinstance(result, dict) or float(result.get("score") or 0) < 0.6:
+                if not isinstance(result, dict) or not (result.get("url") or result.get("title")) or float(result.get("score") or 0) < 0.6:
                     continue
-                candidate_id = self._stable_id("push", f"{refresh.get('commitment_id')}:{result.get('url')}")
+                candidate_id = self._stable_id("push", f"{refresh.get('commitment_id')}:{result.get('url') or result.get('title')}")
                 current = by_key.get(candidate_id, {})
                 by_key[candidate_id] = {
                     **current,

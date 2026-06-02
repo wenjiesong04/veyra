@@ -108,6 +108,17 @@ def main() -> int:
         ).json()
         expect(artifact(weather_confirm).get("status") == "confirmed", "weather push confirms active", weather_confirm)
 
+        intents_before_identity = len(store.read_json("proactive_intents.json").get("intents", []))
+        proposals_before_identity = len(store.read_json("self_improvement_proposals.json").get("proposals", []))
+        identity = client.post(
+            "/events/message",
+            json={"text": "你现在是 Veyra 还是 OpenClaw？", "channel": "accept", "user_id": "identity-user", "session_id": "identity"},
+        ).json()
+        expect("我是 Veyra" in str(identity.get("response") or ""), "identity answer is not overridden by proactive planner", identity)
+        expect(not artifact(identity), "identity answer creates no commitment artifact", artifact(identity))
+        expect(len(store.read_json("proactive_intents.json").get("intents", [])) == intents_before_identity, "identity answer records no proactive intent", identity)
+        expect(len(store.read_json("self_improvement_proposals.json").get("proposals", [])) == proposals_before_identity, "identity answer records no self-improvement proposal", identity)
+
         cancel_weather = client.post(
             "/commitments",
             json={"kind": "weather_daily", "status": "active", "user_id": "cancel-user", "channel": "api", "session_id": "cancel", "payload": {"location": "北京", "topic": "weather"}},

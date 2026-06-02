@@ -167,19 +167,38 @@ class ChannelAdapter:
         inbound_feishu = inbound.get("feishu") if isinstance(inbound.get("feishu"), dict) else {}
         receive_id = str(metadata.get("receive_id") or "")
         receive_id_type = str(metadata.get("receive_id_type") or "")
+        source = "explicit_metadata" if receive_id else ""
         if not receive_id and config.get("reply_to_session", True):
             receive_id = str(feishu.get("chat_id") or inbound_feishu.get("chat_id") or "")
             if receive_id:
                 receive_id_type = "chat_id"
+                source = "inbound_session"
+        if not receive_id and config.get("reply_to_session", True):
+            session_target = self._feishu_target_from_session_id(session_id)
+            if session_target.get("receive_id"):
+                receive_id = str(session_target["receive_id"])
+                receive_id_type = str(session_target.get("receive_id_type") or "chat_id")
+                source = "session_id"
         if not receive_id:
             receive_id = self._secret(config, "default_receive_id", "FEISHU_DEFAULT_RECEIVE_ID")
             receive_id_type = receive_id_type or str(config.get("default_receive_id_type") or "chat_id")
+            if receive_id:
+                source = "configured_default"
         return {
             "receive_id": receive_id,
             "receive_id_type": receive_id_type or "chat_id",
-            "source": "inbound_session" if (feishu.get("chat_id") or inbound_feishu.get("chat_id")) else "configured_default",
+            "source": source or "unresolved",
             "session_id": session_id,
         }
+
+    def _feishu_target_from_session_id(self, session_id: str) -> dict[str, Any]:
+        parts = [part.strip() for part in str(session_id or "").split(":") if part.strip()]
+        if len(parts) < 3 or parts[0] != "feishu":
+            return {}
+        for candidate in reversed(parts[2:]):
+            if candidate.startswith("oc_"):
+                return {"receive_id": candidate, "receive_id_type": "chat_id"}
+        return {}
 
     def _secret(self, config: dict[str, Any], key: str, fallback_env: str) -> str:
         env_name = str(config.get(f"{key}_env") or fallback_env)
