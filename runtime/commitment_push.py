@@ -7,6 +7,7 @@ from core.commitment_core import CommitmentCore
 from core.definitions import RiskLevel
 from core.foresight_engine import ForesightEngine
 from core.guardian_controller import GuardianController
+from core.proactive_authorization import AuthorizationPolicy
 from core.world_state import WorldStateStore
 from interface.channel_adapter import ChannelAdapter
 from interface.event_schema import Decision, Route, utc_now_iso
@@ -33,6 +34,7 @@ class CommitmentPushRuntime:
         self.guardian = guardian or GuardianController()
         self.foresight = foresight or ForesightEngine()
         self.weather_probe = WeatherProbe()
+        self.authorization = AuthorizationPolicy(state_store)
 
     def run_due(self, *, limit: int = 10, reason: str = "scheduled") -> dict[str, Any]:
         due = self.commitment_core.due_commitments(limit=limit)
@@ -67,6 +69,11 @@ class CommitmentPushRuntime:
     def _push_one(self, commitment: dict[str, Any], *, reason: str) -> dict[str, Any]:
         commitment_id = str(commitment.get("commitment_id"))
         fresh = self.commitment_core.get_commitment(commitment_id) or commitment
+        authorized, auth_reason = self.authorization.allows_commitment(fresh, behavior="push_delivery")
+        if not authorized:
+            result = {"commitment_id": commitment_id, "status": "skipped", "reason": f"authorization:{auth_reason}"}
+            self._audit_push_attempt(commitment_id, result, reason=reason)
+            return result
         pushable, skip_reason = self.commitment_core.pushable_reason(fresh)
         if not pushable:
             result = {"commitment_id": commitment_id, "status": "skipped", "reason": skip_reason}

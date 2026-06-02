@@ -10,11 +10,13 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from core.definitions import RiskLevel
+from core.proactive_authorization import AuthorizationPolicy
 from core.proactive_intent import ProactiveIntent, WatchlistDraft
 from core.proactive_intent_planner import ProactiveIntentPlanner
 from core.proactive_templates import ProactiveTemplateRegistry, watchlist_id_for
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent, utc_now_iso
+from memory_bridge.local_memory_bridge import LocalMemoryBridge
 
 
 AFFIRM_EXACT_MARKERS = ("好的", "好", "可以", "行", "同意", "确认", "没问题", "ok", "yes", "sure", "开启", "启用")
@@ -41,6 +43,8 @@ class CommitmentCore:
         self.state_store = state_store
         self.intent_planner = ProactiveIntentPlanner(state_store)
         self.template_registry = ProactiveTemplateRegistry()
+        self.authorization = AuthorizationPolicy(state_store)
+        self.memory_bridge = LocalMemoryBridge(state_store)
 
     def list_commitments(
         self,
@@ -105,6 +109,7 @@ class CommitmentCore:
         self._sync_agency_goal(item)
         self._sync_goal_permission_from_commitment(item)
         self.set_watchlists_for_commitment(item)
+        self.authorization.record_commitment(item)
         return item
 
     def confirm_commitment(self, commitment_id: str) -> dict[str, Any] | None:
@@ -427,6 +432,19 @@ class CommitmentCore:
                 },
             },
         )
+        if updated:
+            self.memory_bridge.write_patch(
+                {
+                    "session_id": intent.session_id,
+                    "memory_type": "proactive_authorization",
+                    "topic": intent.topic or "proactive_commitments",
+                    "summary": f"User requested {action} for {len(updated)} proactive commitment(s).",
+                    "freshness": "fresh",
+                    "trust": "user_explicit_request",
+                    "confidence": 0.95,
+                },
+                provider="local",
+            )
 
     def append_followup_to_response(self, response: str, turn_result: dict[str, Any]) -> str:
         override = str(turn_result.get("response_override") or "").strip()
@@ -765,6 +783,7 @@ class CommitmentCore:
         self._sync_user_world(updated)
         self._sync_goal_permission_from_commitment(updated)
         self.set_watchlists_for_commitment(updated)
+        self.authorization.record_commitment(updated)
         return updated
 
     def _read_state(self) -> dict[str, Any]:
