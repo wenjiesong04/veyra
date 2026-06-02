@@ -17,6 +17,7 @@ from core.proactive_templates import ProactiveTemplateRegistry, watchlist_id_for
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent, utc_now_iso
 from memory_bridge.local_memory_bridge import LocalMemoryBridge
+from runtime.self_improvement import SelfImprovementProposalRegistry
 
 
 AFFIRM_EXACT_MARKERS = ("好的", "好", "可以", "行", "同意", "确认", "没问题", "ok", "yes", "sure", "开启", "启用")
@@ -45,6 +46,7 @@ class CommitmentCore:
         self.template_registry = ProactiveTemplateRegistry()
         self.authorization = AuthorizationPolicy(state_store)
         self.memory_bridge = LocalMemoryBridge(state_store)
+        self.self_improvement = SelfImprovementProposalRegistry(state_store)
 
     def list_commitments(
         self,
@@ -252,6 +254,17 @@ class CommitmentCore:
         if templated:
             templated["intent"] = intent_record
             return templated
+
+        if intent.intent_type == "unknown":
+            proposal = self.self_improvement.propose_from_intent(intent, reason="unknown_proactive_intent")
+            return {
+                "status": "intent_draft",
+                "actions": ["recorded_intent_draft", "created_self_improvement_proposal"],
+                "intent": intent_record,
+                "capability_gap": proposal.get("gap_description"),
+                "self_improvement_proposal": proposal,
+                "response_override": "我先把这个需求记录为主动意图草案，但还不能安全确定信息源、频率或模板；不会创建 active 推送。已生成一条需要人工审查的能力改进建议。",
+            }
 
         extracted = self._extract_from_user_text(user_text, event=event)
         if extracted:

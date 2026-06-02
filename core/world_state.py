@@ -56,6 +56,7 @@ STATE_FILE_LAYOUT: dict[str, str] = {
     "risk_state.json": f"{STATE_RUNTIME}/risk_state.json",
     "active_loop_state.json": f"{STATE_RUNTIME}/active_loop_state.json",
     "runtime_cron_state.json": f"{STATE_RUNTIME}/runtime_cron_state.json",
+    "self_improvement_proposals.json": f"{STATE_RUNTIME}/self_improvement_proposals.json",
     "rollback_state.json": f"{STATE_RUNTIME}/rollback_state.json",
     "replay_runtime_state.json": f"{STATE_RUNTIME}/replay_runtime_state.json",
     "ops_soak_state.json": f"{STATE_RUNTIME}/ops_soak_state.json",
@@ -90,6 +91,7 @@ STATE_METADATA: dict[str, dict[str, Any]] = {
     "ops_soak_state.json": {"source": "ops_soak_runner", "ttl_seconds": 3600, "confidence": 0.7},
     "active_loop_state.json": {"source": "active_runtime_loop", "ttl_seconds": 600, "confidence": 0.78},
     "runtime_cron_state.json": {"source": "runtime_cron", "ttl_seconds": 3600, "confidence": 0.78},
+    "self_improvement_proposals.json": {"source": "self_improvement_registry", "ttl_seconds": 86400, "confidence": 0.72},
     "feishu_ws_state.json": {"source": "feishu_ws_runner", "ttl_seconds": 600, "confidence": 0.65},
     "ops_runtime_matrix.json": {"source": "runtime_matrix", "ttl_seconds": 1800, "confidence": 0.74},
     "ops_config.json": {"source": "ops_config", "ttl_seconds": 86400, "confidence": 0.8},
@@ -272,6 +274,7 @@ class WorldStateStore:
                     }
                 },
             },
+            "self_improvement_proposals.json": {"proposals": [], "updated_at": None},
             "feishu_ws_state.json": {"status": "stopped", "last_event_at": None},
             "ops_runtime_matrix.json": {"status": "not_run", "runtimes": []},
             "ops_config.json": {
@@ -408,6 +411,7 @@ class WorldStateStore:
             "ops_runtime_matrix": self.read_json("ops_runtime_matrix.json"),
             "active_loop_state": self.read_json("active_loop_state.json"),
             "runtime_cron_state": self.read_json("runtime_cron_state.json"),
+            "self_improvement_proposals": self.read_json("self_improvement_proposals.json"),
             "feishu_ws_state": self.read_json("feishu_ws_state.json"),
             "ops_config": self.read_json("ops_config.json"),
         }
