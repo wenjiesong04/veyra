@@ -10,6 +10,9 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from core.definitions import RiskLevel
+from core.proactive_intent import ProactiveIntent, WatchlistDraft
+from core.proactive_intent_planner import ProactiveIntentPlanner
+from core.proactive_templates import ProactiveTemplateRegistry, watchlist_id_for
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent, utc_now_iso
 
@@ -36,6 +39,8 @@ class CommitmentCore:
 
     def __init__(self, state_store: WorldStateStore) -> None:
         self.state_store = state_store
+        self.intent_planner = ProactiveIntentPlanner(state_store)
+        self.template_registry = ProactiveTemplateRegistry()
 
     def list_commitments(
         self,
@@ -99,6 +104,7 @@ class CommitmentCore:
         self._sync_user_world(item)
         self._sync_agency_goal(item)
         self._sync_goal_permission_from_commitment(item)
+        self.set_watchlists_for_commitment(item)
         return item
 
     def confirm_commitment(self, commitment_id: str) -> dict[str, Any] | None:
@@ -193,21 +199,54 @@ class CommitmentCore:
 
         lowered = (user_text or "").lower()
         result: dict[str, Any] = {"status": "idle", "actions": []}
+        intent = self.intent_planner.plan(user_text=user_text, event=event)
+        intent_record = self.intent_planner.record_intent(intent)
+
+        if intent.intent_type in {"cancel_commitment", "pause_commitment", "resume_commitment"}:
+            control = self.template_registry.apply(
+                intent=intent,
+                core=self,
+                event=event,
+                user_text=user_text,
+                assistant_response=assistant_response,
+                route=route,
+            )
+            if control:
+                control["intent"] = intent_record
+                return control
 
         pending = self._pending_for_session(event.source.session_id)
         if pending and self._is_affirmation(lowered):
             confirmed = self.confirm_commitment(str(pending.get("commitment_id")))
             if confirmed:
-                result = {"status": "confirmed", "commitment": confirmed, "actions": ["confirmed_pending"]}
+                result = {
+                    "status": "confirmed",
+                    "commitment": confirmed,
+                    "actions": ["confirmed_pending"],
+                    "response_override": f"已开启：{confirmed.get('title') or confirmed.get('kind')}",
+                }
                 return result
         if pending and self._is_decline(lowered):
             cancelled = self.cancel_commitment(str(pending.get("commitment_id")))
             if cancelled:
-                return {"status": "declined", "commitment": cancelled, "actions": ["cancelled_pending"]}
+                return {
+                    "status": "declined",
+                    "commitment": cancelled,
+                    "actions": ["cancelled_pending"],
+                    "response_override": f"已取消：{cancelled.get('title') or cancelled.get('kind')}",
+                }
 
-        learning_goal = self._maybe_record_learning_goal(user_text=user_text, event=event)
-        if learning_goal:
-            return learning_goal
+        templated = self.template_registry.apply(
+            intent=intent,
+            core=self,
+            event=event,
+            user_text=user_text,
+            assistant_response=assistant_response,
+            route=route,
+        )
+        if templated:
+            templated["intent"] = intent_record
+            return templated
 
         extracted = self._extract_from_user_text(user_text, event=event)
         if extracted:
@@ -225,7 +264,169 @@ class CommitmentCore:
         )
         if offer:
             result = {"status": "offered", "commitment": offer, "followup_offer": self._confirmation_prompt(offer), "actions": ["offered_subscription"]}
+        if result.get("status") != "idle":
+            result["intent"] = intent_record
         return result
+
+    def apply_control_intent(self, intent: ProactiveIntent, *, action: str) -> dict[str, Any]:
+        statuses = {"cancel": ["active", "pending_confirmation"], "pause": ["active"], "resume": ["paused"]}.get(action, [])
+        matches = self.match_commitments(intent, statuses=statuses)
+        if not matches:
+            return {
+                "status": "not_found",
+                "actions": [f"{action}_matching_commitments"],
+                "response_override": "没有找到正在进行的相关推送。",
+                "matched_commitments": [],
+                "template": "cancel_pause_resume",
+            }
+        updated: list[dict[str, Any]] = []
+        for item in matches:
+            commitment_id = str(item.get("commitment_id") or "")
+            if action == "cancel":
+                changed = self.cancel_commitment(commitment_id)
+            elif action == "pause":
+                changed = self.pause_commitment(commitment_id)
+            elif action == "resume":
+                changed = self.confirm_commitment(commitment_id)
+            else:
+                changed = None
+            if changed:
+                updated.append(changed)
+        self._audit_commitment_control(intent, action=action, matches=matches, updated=updated)
+        action_word = {"cancel": "停止", "pause": "暂停", "resume": "恢复"}.get(action, action)
+        status_word = {"cancel": "cancelled", "pause": "paused", "resume": "resumed"}.get(action, action)
+        return {
+            "status": status_word,
+            "actions": [f"{action}_matching_commitments"],
+            "matched_commitments": matches,
+            "updated_commitments": updated,
+            "response_override": f"已{action_word} {len(updated)} 个匹配的主动任务。",
+            "template": "cancel_pause_resume",
+        }
+
+    def match_commitments(self, intent: ProactiveIntent, *, statuses: list[str]) -> list[dict[str, Any]]:
+        topic = str(intent.topic or "").lower()
+        scope = str((intent.entities or {}).get("scope") or "matching")
+        items = [
+            item
+            for item in self.list_commitments(user_id=intent.user_id)
+            if isinstance(item, dict) and item.get("status") in statuses
+        ]
+        if scope == "all" or not topic:
+            return items
+        matched: list[dict[str, Any]] = []
+        for item in items:
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            haystack = " ".join(
+                str(part or "").lower()
+                for part in (
+                    item.get("kind"),
+                    item.get("title"),
+                    payload.get("topic"),
+                    payload.get("location"),
+                    payload.get("note"),
+                    payload.get("query"),
+                )
+            )
+            if topic in haystack or haystack in topic:
+                matched.append(item)
+        return matched
+
+    def record_watchlist_draft(
+        self,
+        draft: WatchlistDraft,
+        *,
+        commitment: dict[str, Any] | None = None,
+        goal: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        external = self.state_store.read_json("external_world.json")
+        watchlist = external.setdefault("watchlist", [])
+        if not isinstance(watchlist, list):
+            watchlist = []
+        payload = draft.to_dict()
+        watchlist_id = watchlist_id_for(str(payload.get("topic") or ""), str(payload.get("query") or ""))
+        item = {
+            "watchlist_id": watchlist_id,
+            "target": f"external:{watchlist_id}",
+            "kind": "external_search",
+            "enabled": payload.get("status") == "active",
+            "status": payload.get("status") or "pending_confirmation",
+            "topic": payload.get("topic"),
+            "query": payload.get("query"),
+            "sources": payload.get("sources") if isinstance(payload.get("sources"), list) else [],
+            "refresh_policy": payload.get("refresh_policy") if isinstance(payload.get("refresh_policy"), dict) else {},
+            "ranking_policy": payload.get("ranking_policy") if isinstance(payload.get("ranking_policy"), dict) else {},
+            "dedupe_policy": payload.get("dedupe_policy") if isinstance(payload.get("dedupe_policy"), dict) else {},
+            "ttl": payload.get("ttl"),
+            "source_intent_id": payload.get("source_intent_id"),
+            "commitment_id": (commitment or {}).get("commitment_id"),
+            "goal_id": (goal or {}).get("goal_id"),
+            "created_at": utc_now_iso(),
+            "updated_at": utc_now_iso(),
+        }
+        existing = [entry for entry in watchlist if isinstance(entry, dict) and entry.get("watchlist_id") == watchlist_id]
+        if existing:
+            existing[-1].update({key: value for key, value in item.items() if value not in (None, "", [])})
+            item = existing[-1]
+        else:
+            watchlist.append(item)
+        external["watchlist"] = watchlist[-100:]
+        self.state_store.write_json("external_world.json", external)
+        return item
+
+    def set_watchlists_for_commitment(self, commitment: dict[str, Any]) -> None:
+        payload = commitment.get("payload") if isinstance(commitment.get("payload"), dict) else {}
+        watchlist_id = str(payload.get("watchlist_id") or "")
+        if not watchlist_id:
+            return
+        external = self.state_store.read_json("external_world.json")
+        watchlist = external.get("watchlist") if isinstance(external.get("watchlist"), list) else []
+        changed = False
+        for item in watchlist:
+            if not isinstance(item, dict) or item.get("watchlist_id") != watchlist_id:
+                continue
+            status = str(commitment.get("status") or "")
+            item["commitment_id"] = commitment.get("commitment_id")
+            if status == "active":
+                item["status"] = "active"
+                item["enabled"] = True
+            elif status in {"cancelled", "paused"}:
+                item["status"] = status
+                item["enabled"] = False
+            else:
+                item["status"] = "pending_confirmation"
+                item["enabled"] = False
+            item["updated_at"] = utc_now_iso()
+            changed = True
+        if changed:
+            external["watchlist"] = watchlist[-100:]
+            self.state_store.write_json("external_world.json", external)
+
+    def external_tracking_query(self, intent: ProactiveIntent) -> str:
+        topic = str(intent.topic or "updates")
+        sources = " ".join(intent.information_sources or [])
+        if "github" in sources.lower() or "release" in (intent.raw_text or "").lower():
+            return f"{topic} GitHub release latest updates"
+        if any(marker in intent.raw_text for marker in ("论文", "paper")):
+            return f"{topic} latest paper arxiv"
+        if any(marker in intent.raw_text for marker in ("房源", "短租", "租房")):
+            return f"{topic} latest listings"
+        return f"{topic} latest important updates"
+
+    def _audit_commitment_control(self, intent: ProactiveIntent, *, action: str, matches: list[dict[str, Any]], updated: list[dict[str, Any]]) -> None:
+        self.state_store.append_jsonl(
+            "action_record.jsonl",
+            {
+                "route": "commitment_control",
+                "status": action,
+                "artifacts": {
+                    "intent": intent.to_dict(),
+                    "matched_count": len(matches),
+                    "updated_count": len(updated),
+                    "commitment_ids": [item.get("commitment_id") for item in updated],
+                },
+            },
+        )
 
     def append_followup_to_response(self, response: str, turn_result: dict[str, Any]) -> str:
         override = str(turn_result.get("response_override") or "").strip()
@@ -563,6 +764,7 @@ class CommitmentCore:
         self._write_state(state)
         self._sync_user_world(updated)
         self._sync_goal_permission_from_commitment(updated)
+        self.set_watchlists_for_commitment(updated)
         return updated
 
     def _read_state(self) -> dict[str, Any]:

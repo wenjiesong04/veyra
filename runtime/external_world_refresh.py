@@ -43,6 +43,9 @@ class ExternalWorldRefresh:
             if item.get("kind") == "learning_search":
                 refreshed.append(self._refresh_learning_search(item))
                 continue
+            if item.get("kind") == "external_search":
+                refreshed.append(self._refresh_external_search(item))
+                continue
             probe_result = self._probe_target(target)
             state_patch = self.perception.interpret_probe_result(probe_result)
             assist = self.reasoning.external_world_assist(
@@ -136,6 +139,28 @@ class ExternalWorldRefresh:
             "watch_recommendation": "keep",
         }
 
+    def _refresh_external_search(self, item: dict[str, Any]) -> dict[str, Any]:
+        topic = str(item.get("topic") or item.get("target") or "外部主题")
+        query = str(item.get("query") or f"{topic} latest important updates")
+        search_result = self.search_probe.run(query, max_results=6)
+        results = search_result.get("details", {}).get("results") if isinstance(search_result.get("details"), dict) else []
+        scored = self._score_search_results(results if isinstance(results, list) else [], topic=topic)
+        useful = [entry for entry in scored if float(entry.get("score") or 0) >= 0.45]
+        return {
+            "target": item.get("target"),
+            "kind": "external_search",
+            "watchlist_id": item.get("watchlist_id"),
+            "commitment_id": item.get("commitment_id"),
+            "topic": topic,
+            "query": query,
+            "status": search_result.get("status"),
+            "summary": self._external_search_summary(topic, useful, search_result),
+            "observed_at": search_result.get("observed_at") or search_result.get("timestamp") or utc_now_iso(),
+            "results": useful[:5],
+            "probe": redact_sensitive(search_result, max_string=1000),
+            "watch_recommendation": "keep",
+        }
+
     def _learning_query(self, topic: str) -> str:
         return f"{topic} latest tutorial course paper 2026"
 
@@ -177,10 +202,16 @@ class ExternalWorldRefresh:
             return f"Found {len(useful)} useful external item(s) for {topic}; top item: {top.get('title')}"
         return str(search_result.get("summary") or f"No useful external item found for {topic}.")
 
+    def _external_search_summary(self, topic: str, useful: list[dict[str, Any]], search_result: dict[str, Any]) -> str:
+        if useful:
+            top = useful[0]
+            return f"Found {len(useful)} useful external update(s) for {topic}; top item: {top.get('title')}"
+        return str(search_result.get("summary") or f"No useful external update found for {topic}.")
+
     def _merge_knowledge_items(self, existing: list[Any], refreshed: list[dict[str, Any]]) -> list[dict[str, Any]]:
         by_key: dict[str, dict[str, Any]] = {str(item.get("item_id")): item for item in existing if isinstance(item, dict) and item.get("item_id")}
         for refresh in refreshed:
-            if refresh.get("kind") != "learning_search":
+            if refresh.get("kind") not in {"learning_search", "external_search"}:
                 continue
             for result in refresh.get("results", []) if isinstance(refresh.get("results"), list) else []:
                 if not isinstance(result, dict) or not result.get("url"):
@@ -203,7 +234,7 @@ class ExternalWorldRefresh:
     def _merge_push_candidates(self, existing: list[Any], refreshed: list[dict[str, Any]]) -> list[dict[str, Any]]:
         by_key: dict[str, dict[str, Any]] = {str(item.get("candidate_id")): item for item in existing if isinstance(item, dict) and item.get("candidate_id")}
         for refresh in refreshed:
-            if refresh.get("kind") != "learning_search" or not refresh.get("commitment_id"):
+            if refresh.get("kind") not in {"learning_search", "external_search"} or not refresh.get("commitment_id"):
                 continue
             for result in refresh.get("results", []) if isinstance(refresh.get("results"), list) else []:
                 if not isinstance(result, dict) or float(result.get("score") or 0) < 0.6:

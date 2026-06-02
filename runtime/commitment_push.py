@@ -199,6 +199,26 @@ class CommitmentPushRuntime:
             ]
             tip = tips[int(commitment.get("run_count") or 0) % len(tips)]
             return f"【学习辅导·{topic}】当前阶段：{phase}。今日建议：{tip}。如需调整计划或推送频率，直接告诉我即可。", None
+        if kind == "external_digest":
+            topic = str(payload.get("topic") or title)
+            candidate = self._next_push_candidate(str(commitment.get("commitment_id") or ""))
+            if candidate:
+                title_text = str(candidate.get("title") or topic)
+                url = str(candidate.get("url") or "")
+                snippet = str(candidate.get("snippet") or "")
+                message = f"【外部追踪·{topic}】{title_text}\n{snippet[:220]}\n链接：{url}\n如需暂停、取消或调整范围，直接告诉我即可。"
+                return message, {"kind": "external_candidate", "candidate_id": candidate.get("candidate_id")}
+            return f"【外部追踪·{topic}】当前没有新的高价值更新。我会继续按授权观察；如需暂停或取消，直接告诉我即可。", None
+        if kind == "local_probe_monitor":
+            topic = str(payload.get("topic") or title)
+            local = self.state_store.read_json("local_world.json")
+            probes = local.get("probes") if isinstance(local.get("probes"), dict) else {}
+            status = "unknown"
+            if probes:
+                latest = list(probes.values())[-1]
+                if isinstance(latest, dict):
+                    status = str(latest.get("status") or latest.get("summary") or "observed")
+            return f"【本地监控·{topic}】最近状态：{status}。我只使用已授权的安全 probe 结果，不执行危险命令。", None
         note = str(payload.get("note") or title)
         return f"【定时提醒】{note}", None
 
