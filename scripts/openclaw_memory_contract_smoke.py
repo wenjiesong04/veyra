@@ -49,6 +49,12 @@ def main() -> int:
     expect([call["method"] for call in adapter.calls] == ["memory.summary", "memory.patch"], "OpenClaw memory methods are called in contract order", adapter.calls)
     expect(adapter.calls[0]["params"] == {"sessionId": "session-1", "sessionKey": adapter.session_key}, "memory.summary params match gateway contract", adapter.calls[0])
     expect(adapter.calls[1]["params"]["patch"]["session_id"] == "session-1", "memory.patch includes normalized patch", adapter.calls[1])
+    memory_capable = adapter._compatibility_summary({"features": {"methods": ["chat.send", "memory.summary", "memory.patch"]}})
+    memory_missing = adapter._compatibility_summary({"features": {"methods": ["chat.send"]}})
+    expect(memory_capable["optional_methods"]["memory.summary"], "gateway memory.summary capability is detected", memory_capable)
+    expect(memory_capable["optional_methods"]["memory.patch"], "gateway memory.patch capability is detected", memory_capable)
+    expect(not memory_missing["optional_methods"]["memory.summary"], "missing gateway memory.summary is explicit", memory_missing)
+    expect(not memory_missing["optional_methods"]["memory.patch"], "missing gateway memory.patch is explicit", memory_missing)
 
     print("OpenClaw memory contract smoke passed")
     return 0

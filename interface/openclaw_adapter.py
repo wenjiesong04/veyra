@@ -284,6 +284,7 @@ class OpenClawAdapter(AgentAdapter):
             skills = self._compat_request(ws, hello, "skills.status", {}, events)
         compatibility = self._compatibility_summary(hello)
         compatible = all(compatibility["required_methods"].values())
+        optional_methods = compatibility.get("optional_methods") if isinstance(compatibility.get("optional_methods"), dict) else {}
         # Raw gateway payloads can include host paths, device tokens, and plugin details.
         # Veyra exposes only a stable summary contract to state endpoints and audit logs.
         return self._redact_payload({
@@ -297,8 +298,8 @@ class OpenClawAdapter(AgentAdapter):
             "features": {
                 "structured_task_packet": True,
                 "rendered_prompt_fallback": True,
-                "memory_summary": True,
-                "memory_patch": True,
+                "memory_summary": bool(optional_methods.get("memory.summary")),
+                "memory_patch": bool(optional_methods.get("memory.patch")),
                 "task_status": True,
                 "task_poll": "agent.wait+chat.history",
                 "stop_task": True,
