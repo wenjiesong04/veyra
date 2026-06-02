@@ -168,7 +168,14 @@ class WorldStateStore:
                     "api": {"enabled": True, "delivery": "local_outbox"},
                     "cli": {"enabled": True, "delivery": "local_outbox"},
                     "console": {"enabled": True, "delivery": "local_outbox"},
-                    "webhook": {"enabled": True, "delivery": "local_outbox"},
+                    "webhook": {
+                        "enabled": True,
+                        "delivery": "local_outbox",
+                        "webhook_url": "",
+                        "webhook_url_env": "VEYRA_CHANNEL_WEBHOOK_URL",
+                        "timeout": 15,
+                        "trust_env": False,
+                    },
                     "feishu": {
                         "enabled": False,
                         "delivery": "feishu",

@@ -246,6 +246,9 @@ class ChannelConfigRequest(BaseModel):
     enabled: bool | None = None
     delivery: str | None = None
     base_url: str | None = None
+    webhook_url: str | None = None
+    webhook_url_env: str | None = None
+    trust_env: bool | None = None
     app_id: str | None = None
     app_id_env: str | None = None
     app_secret: str | None = None
@@ -512,8 +515,8 @@ async def channel_config(channel: str):
 @app.post("/channels/{channel}/config")
 async def configure_channel(channel: str, request: ChannelConfigRequest):
     patch = request.model_dump(exclude_none=True)
-    if "delivery" in patch and patch["delivery"] not in {"local_outbox", "feishu"}:
-        raise HTTPException(status_code=422, detail="delivery must be local_outbox or feishu")
+    if "delivery" in patch and patch["delivery"] not in {"local_outbox", "feishu", "webhook"}:
+        raise HTTPException(status_code=422, detail="delivery must be local_outbox, feishu, or webhook")
     if "default_receive_id_type" in patch and patch["default_receive_id_type"] not in {"open_id", "user_id", "union_id", "email", "chat_id"}:
         raise HTTPException(status_code=422, detail="unsupported Feishu receive_id_type")
     if "connection_mode" in patch and patch["connection_mode"] not in {"callback", "websocket"}:

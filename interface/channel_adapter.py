@@ -36,6 +36,8 @@ class ChannelAdapter:
             item.update({"status": "not_configured", "delivery_status": "not_configured", "reason": f"{self.channel} channel is disabled."})
         elif item["delivery"] == "feishu" or self.channel == "feishu":
             item.update(self._send_feishu(session_id=session_id, message=message, metadata=metadata, config=config))
+        elif item["delivery"] == "webhook":
+            item.update(self._send_webhook(session_id=session_id, message=message, metadata=metadata, config=config))
         if self.state_store:
             state = self.state_store.read_json("channel_state.json")
             outbox = state.setdefault("outbox", [])
@@ -97,6 +99,44 @@ class ChannelAdapter:
             "provider_response": self._compact_provider_response(body),
         }
 
+    def _send_webhook(self, *, session_id: str, message: str, metadata: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+        webhook_url = self._secret(config, "webhook_url", "VEYRA_CHANNEL_WEBHOOK_URL")
+        if not webhook_url:
+            return {"status": "not_configured", "delivery_status": "not_configured", "reason": "Webhook URL is not configured."}
+        timeout = float(config.get("timeout") or 15)
+        trust_env = bool(config.get("trust_env"))
+        payload = {
+            "channel": self.channel,
+            "session_id": session_id,
+            "message": message,
+            "metadata": metadata,
+            "created_at": utc_now_iso(),
+        }
+        try:
+            with httpx.Client(timeout=timeout, trust_env=trust_env) as client:
+                response = client.post(webhook_url, json=payload)
+            try:
+                body: Any = response.json()
+            except ValueError:
+                body = {"text": response.text[:500]}
+        except Exception as exc:
+            return {"status": "error", "delivery_status": "request_failed", "reason": str(exc), "error_type": type(exc).__name__}
+        if response.status_code >= 400:
+            return {
+                "status": "error",
+                "delivery_status": "http_error",
+                "http_status": response.status_code,
+                "provider_response": self._compact_webhook_response(body),
+            }
+        return {
+            "status": "sent",
+            "delivery_status": "provider_sent",
+            "provider": "webhook",
+            "http_status": response.status_code,
+            "external_message_id": self._webhook_message_id(body),
+            "provider_response": self._compact_webhook_response(body),
+        }
+
     def _feishu_token(self, config: dict[str, Any]) -> dict[str, Any]:
         direct_token = self._secret(config, "tenant_access_token", "FEISHU_TENANT_ACCESS_TOKEN")
         if direct_token:
@@ -156,6 +196,21 @@ class ChannelAdapter:
             "msg": body.get("msg"),
             "message_id": data.get("message_id"),
         }
+
+    def _compact_webhook_response(self, body: Any) -> dict[str, Any]:
+        if not isinstance(body, dict):
+            return {"raw_type": type(body).__name__}
+        compact: dict[str, Any] = {}
+        for key in ("status", "id", "message_id", "text", "error"):
+            if key in body:
+                value = body.get(key)
+                compact[key] = value[:500] if isinstance(value, str) else value
+        return compact or {"keys": sorted(str(key) for key in body.keys())[:8]}
+
+    def _webhook_message_id(self, body: Any) -> str:
+        if not isinstance(body, dict):
+            return ""
+        return str(body.get("message_id") or body.get("id") or "")
 
     def _format_feishu_text(self, message: str) -> str:
         lines = str(message or "").splitlines()

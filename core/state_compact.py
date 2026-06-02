@@ -132,6 +132,8 @@ def compact_channel_outbox_item(item: dict[str, Any]) -> dict[str, Any]:
         "status": item.get("status"),
         "delivery": item.get("delivery"),
         "delivery_status": item.get("delivery_status"),
+        "provider": item.get("provider"),
+        "external_message_id": item.get("external_message_id"),
         "created_at": item.get("created_at"),
     }
     if metadata:
