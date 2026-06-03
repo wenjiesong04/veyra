@@ -204,6 +204,9 @@ class CommitmentCore:
         if status in {"blocked", "duplicate"}:
             return {"status": "skipped", "reason": status}
 
+        if self._is_learning_memory_question(user_text):
+            return {}
+
         lowered = (user_text or "").lower()
         result: dict[str, Any] = {"status": "idle", "actions": []}
         intent = self.intent_planner.plan(user_text=user_text, event=event)
@@ -224,7 +227,7 @@ class CommitmentCore:
 
         pending = self._pending_for_session(event.source.session_id)
         if pending and self._is_affirmation(lowered):
-            confirmed = self.confirm_commitment(str(pending.get("commitment_id")))
+            confirmed = self._confirm_pending_commitment(pending, user_text=user_text)
             if confirmed:
                 result = {
                     "status": "confirmed",
@@ -294,7 +297,7 @@ class CommitmentCore:
         return str(intent.proposed_next_action or "") == "answer_only"
 
     def apply_control_intent(self, intent: ProactiveIntent, *, action: str) -> dict[str, Any]:
-        statuses = {"cancel": ["active", "pending_confirmation"], "pause": ["active"], "resume": ["paused"]}.get(action, [])
+        statuses = {"cancel": ["active", "pending_confirmation"], "pause": ["active", "pending_confirmation"], "resume": ["paused"]}.get(action, [])
         matches = self.match_commitments(intent, statuses=statuses)
         if not matches:
             return {
@@ -550,6 +553,18 @@ class CommitmentCore:
                 permissions["proactive_push"] = "granted"
             self._replace_user_goal(goal)
         self._sync_learning_goal_to_user_world(goal, digest)
+        memory_write = self.memory_bridge.write_patch(
+            {
+                "session_id": event.source.session_id,
+                "memory_type": "learning_goal",
+                "topic": topic,
+                "summary": f"User is learning {topic}; current phase is getting_started.",
+                "freshness": "fresh",
+                "trust": "user_explicit_request",
+                "confidence": 0.94,
+            },
+            provider="selected",
+        )
         actions = ["recorded_learning_goal"]
         if digest:
             actions.append("offered_learning_digest" if digest.get("status") == "pending_confirmation" else "activated_learning_digest")
@@ -558,6 +573,7 @@ class CommitmentCore:
             "goal": goal,
             "commitment": digest,
             "actions": actions,
+            "memory_write": memory_write,
             "response_override": self._learning_goal_response(goal, digest),
         }
 
@@ -729,6 +745,10 @@ class CommitmentCore:
             return True
         return bool(re.search(r"(?:我要|我想|想|准备|开始|打算).{0,8}(?:学习|学)", text or ""))
 
+    def _is_learning_memory_question(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        return ("记得" in text or "remember" in lowered) and any(marker in text for marker in ("在学什么", "学习什么", "学什么", "学习目标"))
+
     def _extract_from_user_text(self, text: str, *, event: VeyraEvent) -> dict[str, Any] | None:
         lowered = (text or "").lower()
         if not self._mentions_push_intent(lowered) and not any(marker in lowered for marker in LEARNING_MARKERS):
@@ -779,6 +799,29 @@ class CommitmentCore:
     def _pending_for_session(self, session_id: str) -> dict[str, Any] | None:
         pending = self.list_commitments(session_id=session_id, status="pending_confirmation")
         return pending[-1] if pending else None
+
+    def _confirm_pending_commitment(self, pending: dict[str, Any], *, user_text: str) -> dict[str, Any] | None:
+        patch: dict[str, Any] = {
+            "status": "active",
+            "confirmed_at": utc_now_iso(),
+        }
+        schedule = self._confirmation_schedule(user_text=user_text, pending=pending)
+        if schedule:
+            patch["schedule"] = schedule
+        return self._patch_commitment(str(pending.get("commitment_id")), patch, recompute_next_run=True)
+
+    def _confirmation_schedule(self, *, user_text: str, pending: dict[str, Any]) -> dict[str, Any] | None:
+        text = user_text or ""
+        lowered = text.lower()
+        if any(marker in lowered for marker in ("每天", "每日", "daily", "every morning", "each day")):
+            return self._default_daily_schedule(text)
+        if any(marker in text for marker in ("早上", "早晨")) or "morning" in lowered:
+            return self._default_daily_schedule(text)
+        if re.search(r"\d{1,2}[:：]\d{2}", text):
+            return self._default_daily_schedule(text)
+        if pending.get("kind") == "learning_digest" and any(marker in lowered for marker in PUSH_MARKERS):
+            return self._default_learning_schedule(text)
+        return None
 
     def _patch_commitment(self, commitment_id: str, patch: dict[str, Any], *, recompute_next_run: bool = False) -> dict[str, Any] | None:
         state = self._read_state()
@@ -889,6 +932,8 @@ class CommitmentCore:
         return self._normalize_schedule({"kind": "daily", "time_local": time_local, "timezone": "Asia/Shanghai"})
 
     def _default_learning_schedule(self, text: str) -> dict[str, Any]:
+        if any(marker in (text or "") for marker in ("早上", "早晨")) or "morning" in (text or "").lower():
+            return self._normalize_schedule({"kind": "daily", "time_local": "08:00", "timezone": "Asia/Shanghai"})
         if any(marker in (text or "").lower() for marker in ("每天", "每日", "daily")):
             return self._normalize_schedule({"kind": "daily", "time_local": "09:00", "timezone": "Asia/Shanghai"})
         return self._normalize_schedule({"kind": "interval", "interval_seconds": 86400, "timezone": "Asia/Shanghai"})

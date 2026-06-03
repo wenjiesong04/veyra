@@ -83,6 +83,7 @@ state_store = WorldStateStore()
 runtime_entity = RuntimeEntity(state_store=state_store)
 commitment_core = CommitmentCore(state_store)
 awareness_loop = AwarenessLoop(state_store=state_store, runtime_entity=runtime_entity, commitment_core=commitment_core)
+commitment_core.memory_bridge = awareness_loop.memory_bridge
 commitment_push = CommitmentPushRuntime(
     state_store=state_store,
     commitment_core=commitment_core,
@@ -147,6 +148,9 @@ ops_monitor = OpsMonitor(
     agent_status_resolver=lambda: awareness_loop.agent_registry.selected().connection_status(),
     retention_policy=retention_policy,
     safety_validation=safety_validation,
+    model_status_resolver=lambda: awareness_loop.core_reasoning.status(),
+    feishu_status_resolver=lambda: feishu_ws_runner.status(),
+    active_loop_status_resolver=lambda: active_loop.status(),
 )
 alert_dispatcher = AlertDispatcher(state_store, ops_monitor)
 deployment_validator = DeploymentConfigValidator(state_store)
@@ -200,6 +204,38 @@ agent_orchestrator = AgentOrchestrator(
 
 @app.on_event("startup")
 async def startup_integrations() -> None:
+    try:
+        runtime_entity.set_status(runtime_entity.lifecycle.status)
+    except Exception as exc:
+        state_store.append_jsonl("action_record.jsonl", {"route": "runtime_startup_heartbeat", "status": "error", "artifacts": {"error": str(exc), "error_type": type(exc).__name__}})
+    try:
+        retention_summary = retention_policy.summary()
+        if any(item.get("status") == "over_limit" for item in retention_summary.get("files", []) if isinstance(item, dict)):
+            retention_policy.enforce()
+    except Exception as exc:
+        state_store.append_jsonl("action_record.jsonl", {"route": "runtime_startup_retention", "status": "error", "artifacts": {"error": str(exc), "error_type": type(exc).__name__}})
+    try:
+        active_loop_config = state_store.read_json("ops_config.json").get("active_loop", {})
+        if not isinstance(active_loop_config, dict):
+            active_loop_config = {}
+        env_autostart = _env_bool("VEYRA_ACTIVE_LOOP_AUTOSTART")
+        autostart = env_autostart if env_autostart is not None else bool(active_loop_config.get("autostart", False))
+        if autostart:
+            active_loop.start(interval_seconds=float(active_loop_config.get("interval_seconds") or 300.0))
+            retention_summary = retention_policy.summary()
+            if any(item.get("status") == "over_limit" for item in retention_summary.get("files", []) if isinstance(item, dict)):
+                retention_policy.enforce()
+    except Exception as exc:
+        state_store.write_json(
+            "active_loop_state.json",
+            {
+                **state_store.read_json("active_loop_state.json"),
+                "status": "error",
+                "last_error": str(exc),
+                "error_type": type(exc).__name__,
+                "updated_at": utc_now_iso(),
+            },
+        )
     if _env_bool("VEYRA_FEISHU_WS_AUTOSTART") is False:
         return
     try:
@@ -501,6 +537,7 @@ app.include_router(
             {
                 "safety_validation": lambda: safety_validation,
                 "retention_policy": lambda: retention_policy,
+                "review_queue": lambda: review_queue,
                 "ops_monitor": lambda: ops_monitor,
                 "alert_dispatcher": lambda: alert_dispatcher,
                 "deployment_readiness": lambda: _deployment_readiness,

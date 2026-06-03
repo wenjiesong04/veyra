@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 from typing import Any
@@ -102,6 +103,8 @@ class WorldStateStore:
     def __init__(self, root: str | Path = "state") -> None:
         selected_root = self._selected_root(root)
         self.root = Path(selected_root)
+        self.action_record_auto_retention_limit = self._action_record_retention_limit()
+        self._action_record_retention_active = False
         self.root.mkdir(parents=True, exist_ok=True)
         self._migrate_legacy_layout()
         self._ensure_defaults()
@@ -116,6 +119,13 @@ class WorldStateStore:
         if env in {"dev", "prod", "test"}:
             return Path("state") / env
         return "state"
+
+    def _action_record_retention_limit(self) -> int:
+        raw = os.getenv("VEYRA_ACTION_RECORD_RETENTION_LIMIT", "10000").strip()
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 10000
 
     def path_for(self, name: str) -> Path:
         relative = STATE_FILE_LAYOUT.get(name, name)
@@ -292,6 +302,11 @@ class WorldStateStore:
                     "browser_allowed_hosts": ["localhost", "127.0.0.1", "::1"],
                     "api_allowed_hosts": ["localhost", "127.0.0.1", "::1"],
                 },
+                "active_loop": {
+                    "autostart": True,
+                    "interval_seconds": 300.0,
+                    "health_required": True,
+                },
             },
         }
         defaults = {name: self._with_state_metadata(name, payload) for name, payload in defaults.items()}
@@ -362,6 +377,54 @@ class WorldStateStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        if name == "action_record.jsonl":
+            self._enforce_action_record_retention_after_append(trigger=payload)
+
+    def _enforce_action_record_retention_after_append(self, *, trigger: dict[str, Any]) -> None:
+        if self._action_record_retention_active:
+            return
+        limit = max(0, int(self.action_record_auto_retention_limit or 0))
+        if limit <= 0:
+            return
+        path = self.path_for("action_record.jsonl")
+        lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+        if len(lines) <= limit:
+            return
+
+        self._action_record_retention_active = True
+        try:
+            retained_capacity = max(limit - 1, 0)
+            archive_lines = lines[: len(lines) - retained_capacity]
+            retained_lines = lines[len(archive_lines) :]
+            archive_payload = "\n".join(archive_lines)
+            archive_bytes = (archive_payload + ("\n" if archive_payload else "")).encode("utf-8")
+            archive_root = self.root / "archive" / "retention"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            archive_name = f"action_record-{utc_now_iso().replace(':', '').replace('.', '')}-{uuid4().hex[:8]}.jsonl"
+            archive_path = archive_root / archive_name
+            archive_path.write_bytes(archive_bytes)
+
+            audit = compact_action_record(
+                {
+                    "timestamp": utc_now_iso(),
+                    "route": "ops_retention_auto_enforce",
+                    "status": "success",
+                    "artifacts": {
+                        "file": "action_record.jsonl",
+                        "entries": len(lines),
+                        "limit": limit,
+                        "pruned_entries": len(archive_lines),
+                        "retained_entries": len(retained_lines) + 1,
+                        "archive_path": str(archive_path.relative_to(self.root)),
+                        "archive_sha256": hashlib.sha256(archive_bytes).hexdigest(),
+                        "trigger_route": trigger.get("route"),
+                    },
+                }
+            )
+            final_lines = retained_lines + [json.dumps(audit, ensure_ascii=False)]
+            path.write_text("\n".join(final_lines[-limit:]) + "\n", encoding="utf-8")
+        finally:
+            self._action_record_retention_active = False
 
     def read_jsonl(self, name: str, limit: int = 100) -> list[dict[str, Any]]:
         path = self.path_for(name)

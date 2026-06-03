@@ -19,11 +19,17 @@ class OpsMonitor:
         agent_status_resolver: Callable[[], dict[str, Any]],
         retention_policy: RetentionPolicy,
         safety_validation: SafetyValidation,
+        model_status_resolver: Callable[[], dict[str, Any]] | None = None,
+        feishu_status_resolver: Callable[[], dict[str, Any]] | None = None,
+        active_loop_status_resolver: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.state_store = state_store
         self.agent_status_resolver = agent_status_resolver
         self.retention_policy = retention_policy
         self.safety_validation = safety_validation
+        self.model_status_resolver = model_status_resolver
+        self.feishu_status_resolver = feishu_status_resolver
+        self.active_loop_status_resolver = active_loop_status_resolver
 
     def health(self) -> dict[str, Any]:
         alerts = self.alerts()["items"]
@@ -42,7 +48,11 @@ class OpsMonitor:
         items: list[dict[str, Any]] = []
         items.extend(self._safety_alerts())
         items.extend(self._retention_alerts())
+        items.extend(self._model_alerts())
         items.extend(self._agent_alerts())
+        items.extend(self._feishu_alerts())
+        items.extend(self._active_loop_alerts())
+        items.extend(self._push_alerts())
         items.extend(self._task_alerts())
         items.extend(self._review_alerts())
         items.extend(self._belief_alerts())
@@ -55,6 +65,10 @@ class OpsMonitor:
             self._check("safety_red_team", not any(item.get("component") == "safety" and item.get("severity") == "critical" for item in health["alerts"])),
             self._check("retention_within_limits", not any(item.get("component") == "retention" and item.get("severity") == "warning" for item in health["alerts"])),
             self._check("agent_runtime_known", not any(item.get("component") == "agent" and item.get("severity") == "critical" for item in health["alerts"])),
+            self._check("core_model_available", not any(item.get("component") == "model" and item.get("severity") == "critical" for item in health["alerts"])),
+            self._check("feishu_available", not any(item.get("component") == "feishu" and item.get("severity") == "critical" for item in health["alerts"])),
+            self._check("active_loop_available", not any(item.get("component") == "active_loop" and item.get("severity") == "critical" for item in health["alerts"])),
+            self._check("push_runtime_available", not any(item.get("component") == "push" and item.get("severity") == "critical" for item in health["alerts"])),
             self._check("no_stale_heartbeat", not any(item.get("component") == "heartbeat" and item.get("severity") == "critical" for item in health["alerts"])),
             self._check("no_belief_conflict", not any(item.get("component") == "belief" and item.get("severity") == "critical" for item in health["alerts"])),
         ]
@@ -104,16 +118,173 @@ class OpsMonitor:
             return [{"component": "agent", "severity": "critical", "code": "agent_status_error", "message": str(exc), "details": {}}]
         raw_status = str(status.get("status") or "unknown")
         connected = bool(status.get("connected"))
+        alerts: list[dict[str, Any]] = []
+        features = status.get("capabilities", {}).get("features") if isinstance(status.get("capabilities"), dict) else {}
+        if connected and isinstance(features, dict) and (features.get("memory_summary") is False or features.get("memory_patch") is False):
+            alerts.append(
+                {
+                    "component": "memory",
+                    "severity": "info",
+                    "code": "openclaw_workspace_memory_fallback",
+                    "message": "OpenClaw memory RPC is unavailable; workspace memory fallback is enabled.",
+                    "details": {"features": {"memory_summary": features.get("memory_summary"), "memory_patch": features.get("memory_patch")}},
+                }
+            )
         if connected or raw_status in {"available", "ok", "success"}:
-            return []
+            return alerts
         severity = "warning" if raw_status in {"adapter_unconfigured", "unconfigured", "unknown"} else "critical"
-        return [
+        alerts.append(
             {
                 "component": "agent",
                 "severity": severity,
                 "code": "agent_runtime_not_connected",
                 "message": f"Selected Agent runtime is {raw_status}.",
                 "details": status,
+            }
+        )
+        return alerts
+
+    def _model_alerts(self) -> list[dict[str, Any]]:
+        if self.model_status_resolver is None:
+            return []
+        try:
+            status = self.model_status_resolver()
+        except Exception as exc:
+            return [{"component": "model", "severity": "critical", "code": "core_model_status_error", "message": str(exc), "details": {}}]
+        if not status.get("enabled"):
+            return [
+                {
+                    "component": "model",
+                    "severity": "info",
+                    "code": "core_model_disabled",
+                    "message": "Core model is disabled; deterministic governance rules remain active.",
+                    "details": {"status": status.get("status"), "missing": status.get("missing")},
+                }
+            ]
+        if not status.get("configured"):
+            return [
+                {
+                    "component": "model",
+                    "severity": "critical",
+                    "code": "core_model_not_configured",
+                    "message": "Core model is enabled but not fully configured.",
+                    "details": {"status": status.get("status"), "missing": status.get("missing"), "api_key_set": status.get("api_key_set")},
+                }
+            ]
+        return []
+
+    def _feishu_alerts(self) -> list[dict[str, Any]]:
+        if self.feishu_status_resolver is None:
+            return []
+        try:
+            status = self.feishu_status_resolver()
+        except Exception as exc:
+            return [{"component": "feishu", "severity": "critical", "code": "feishu_status_error", "message": str(exc), "details": {}}]
+        config = status.get("channel_config") if isinstance(status.get("channel_config"), dict) else {}
+        if not config.get("enabled"):
+            return []
+        raw_status = str(status.get("status") or "unknown")
+        if raw_status in {"running", "already_running"} and status.get("thread_alive"):
+            if status.get("last_event_after_start") is False:
+                return [
+                    {
+                        "component": "feishu",
+                        "severity": "info",
+                        "code": "feishu_no_current_run_event",
+                        "message": "Feishu websocket is running but has not received an inbound event in this process.",
+                        "details": {
+                            "status": raw_status,
+                            "thread_alive": status.get("thread_alive"),
+                            "last_event_at": status.get("last_event_at"),
+                            "started_at": status.get("started_at"),
+                        },
+                    }
+                ]
+            return []
+        if raw_status in {"not_configured", "stopped"}:
+            severity = "warning"
+        else:
+            severity = "critical"
+        return [
+            {
+                "component": "feishu",
+                "severity": severity,
+                "code": "feishu_not_ready",
+                "message": f"Feishu websocket is {raw_status}.",
+                "details": {
+                    "status": raw_status,
+                    "configured": status.get("configured"),
+                    "thread_alive": status.get("thread_alive"),
+                    "diagnostics": status.get("diagnostics"),
+                },
+            }
+        ]
+
+    def _active_loop_alerts(self) -> list[dict[str, Any]]:
+        config = self.state_store.read_json("ops_config.json").get("active_loop", {})
+        if not isinstance(config, dict):
+            config = {}
+        required = bool(config.get("health_required", True))
+        if self.active_loop_status_resolver is None:
+            return []
+        try:
+            status = self.active_loop_status_resolver()
+        except Exception as exc:
+            return [{"component": "active_loop", "severity": "critical", "code": "active_loop_status_error", "message": str(exc), "details": {}}]
+        raw_status = str(status.get("status") or "stopped")
+        alive = bool(status.get("thread_alive"))
+        if raw_status in {"running", "already_running"} and alive:
+            return []
+        if not required:
+            return [
+                {
+                    "component": "active_loop",
+                    "severity": "info",
+                    "code": "active_loop_not_required",
+                    "message": "Active loop is not required by current ops config.",
+                    "details": {"status": raw_status, "thread_alive": alive},
+                }
+            ]
+        severity = "critical" if raw_status in {"stale", "stopped", "error"} else "warning"
+        return [
+            {
+                "component": "active_loop",
+                "severity": severity,
+                "code": "active_loop_not_running",
+                "message": f"Active runtime loop is {raw_status}.",
+                "details": {"status": raw_status, "thread_alive": alive, "enabled": status.get("enabled")},
+            }
+        ]
+
+    def _push_alerts(self) -> list[dict[str, Any]]:
+        if self.active_loop_status_resolver is None:
+            return []
+        try:
+            status = self.active_loop_status_resolver()
+        except Exception:
+            return []
+        last_tick = status.get("last_tick") if isinstance(status.get("last_tick"), dict) else {}
+        steps = last_tick.get("steps") if isinstance(last_tick.get("steps"), list) else []
+        push_step = next((step for step in steps if isinstance(step, dict) and step.get("name") == "commitment_push"), None)
+        if not push_step:
+            return []
+        result_status = str(push_step.get("result_status") or push_step.get("status") or "")
+        if result_status in {"", "idle", "success", "ok", "not_configured"}:
+            return []
+        severity = "critical" if result_status in {"error", "timeout"} else "warning"
+        result = push_step.get("result") if isinstance(push_step.get("result"), dict) else {}
+        return [
+            {
+                "component": "push",
+                "severity": severity,
+                "code": "commitment_push_degraded",
+                "message": f"Commitment push runtime reported {result_status} in the latest active-loop tick.",
+                "details": {
+                    "result_status": result_status,
+                    "duration_ms": push_step.get("duration_ms"),
+                    "processed_count": result.get("processed_count"),
+                    "due_count": result.get("due_count"),
+                },
             }
         ]
 
@@ -138,13 +309,14 @@ class OpsMonitor:
         pending = [item for item in items if isinstance(item, dict) and item.get("status") == "pending"] if isinstance(items, list) else []
         if not pending:
             return []
+        diagnostics = [self._review_diagnostic_item(item) for item in pending[-10:]]
         return [
             {
                 "component": "review",
                 "severity": "warning",
                 "code": "pending_reviews",
                 "message": f"{len(pending)} action review item(s) are pending.",
-                "details": {"count": len(pending), "items": pending[-10:]},
+                "details": {"count": len(pending), "items": diagnostics},
             }
         ]
 
@@ -167,7 +339,7 @@ class OpsMonitor:
             alerts.append(
                 {
                     "component": "belief",
-                    "severity": "warning",
+                    "severity": "info",
                     "code": "stale_beliefs",
                     "message": f"{stale} belief claim(s) are stale.",
                     "details": summary,
@@ -193,7 +365,10 @@ class OpsMonitor:
         return []
 
     def _components(self, alerts: list[dict[str, Any]]) -> dict[str, str]:
-        components = {name: "ok" for name in ["safety", "retention", "agent", "tasks", "review", "belief", "heartbeat"]}
+        components = {
+            name: "ok"
+            for name in ["safety", "retention", "model", "agent", "feishu", "active_loop", "push", "tasks", "review", "belief", "heartbeat", "memory"]
+        }
         for alert in alerts:
             component = str(alert.get("component") or "unknown")
             severity = str(alert.get("severity") or "info")
@@ -201,6 +376,8 @@ class OpsMonitor:
                 components[component] = "critical"
             elif severity == "warning" and components.get(component) != "critical":
                 components[component] = "warning"
+            elif severity == "info" and components.get(component) == "ok":
+                components[component] = "info"
         return components
 
     def _alert_summary(self, alerts: list[dict[str, Any]]) -> dict[str, int]:
@@ -222,3 +399,20 @@ class OpsMonitor:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return (datetime.now(timezone.utc) - parsed).total_seconds()
+
+    def _review_diagnostic_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        created_at = str(item.get("created_at") or "")
+        task_text = str(item.get("task_text") or "")
+        proposal = item.get("proposal") if isinstance(item.get("proposal"), dict) else {}
+        review_type = str(proposal.get("type") or "action_review")
+        if "openclaw" in task_text.lower() and ("重启" in task_text or "restart" in task_text.lower()):
+            review_type = "service_restart_request"
+        return {
+            "review_id": item.get("review_id"),
+            "type": review_type,
+            "source": f"event:{item.get('event_id')}" if item.get("event_id") else "guardian_review_queue",
+            "created_at": created_at,
+            "age_seconds": self._age_seconds(created_at),
+            "risk": item.get("risk_level"),
+            "task_text": task_text[:240],
+        }

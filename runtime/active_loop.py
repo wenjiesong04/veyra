@@ -119,6 +119,7 @@ class ActiveRuntimeLoop:
         }
         self._append_tick(tick)
         self.state_store.append_jsonl("action_record.jsonl", {"route": "active_loop_tick", "status": status, "artifacts": tick})
+        self._retention_after_tick_audit()
         return tick
 
     def _run_forever(self, loop_id: str, interval_seconds: float, stop_event: threading.Event) -> None:
@@ -168,6 +169,14 @@ class ActiveRuntimeLoop:
             "over_limit_before": len(over_limit),
             "files": enforced.get("files", []),
         }
+
+    def _retention_after_tick_audit(self) -> None:
+        try:
+            summary = self.retention_policy.summary()
+            if any(item.get("status") == "over_limit" for item in summary.get("files", []) if isinstance(item, dict)):
+                self.retention_policy.enforce()
+        except Exception:
+            return
 
     def _commitment_push_tick(self) -> dict[str, Any]:
         if self.commitment_push is None:

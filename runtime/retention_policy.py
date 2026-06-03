@@ -27,6 +27,8 @@ class RetentionPolicy:
     def __init__(self, state_store: WorldStateStore, limits: dict[str, int] | None = None) -> None:
         self.state_store = state_store
         self.limits = {**self.DEFAULT_LIMITS, **(limits or {})}
+        if hasattr(self.state_store, "action_record_auto_retention_limit"):
+            self.state_store.action_record_auto_retention_limit = self.limits.get("action_record.jsonl", 10000)
 
     def summary(self, limits: dict[str, int] | None = None) -> dict[str, Any]:
         files = []

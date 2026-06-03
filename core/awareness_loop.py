@@ -649,6 +649,11 @@ class AwarenessLoop:
             return "我是 Veyra。OpenClaw 是我可以在需要执行复杂任务时治理和调用的 Agent Runtime，不是当前对话身份。"
         if decision.intent == "preference" or "memory:preference" in decision.signals:
             return "记住了。之后我会尽量更直接，除非问题本身需要先说明风险、证据或执行边界。"
+        if self._is_learning_memory_question(text):
+            topic = self._current_learning_topic(event.source.user_id)
+            if topic:
+                return f"记得。你现在在学习「{topic}」。我会把它作为当前学习目标来组织后续建议。"
+            return "我现在没有找到明确的学习目标记录；你可以直接告诉我要学习的主题，我会记录到 Veyra memory。"
         answer_assist = self.core_reasoning.answer_assist(text=text, attention_focus=attention_focus, decision=decision.to_dict(), event=event)
         draft = str(answer_assist.get("draft_response") or answer_assist.get("response") or "").strip()
         if not draft:
@@ -765,6 +770,36 @@ class AwarenessLoop:
         if decision.intent in {"information", "unknown"}:
             return f"针对「{snippet}」，我这轮拿不到稳定的认知模型输出。为避免误导，我先不编结论；你可以让我改走探针取证，或把问题拆成可验证的小点继续。"
         return "我这轮无法给出稳定直答。为避免误导，我先不输出未经验证的结论；请补充上下文或改为可验证路径。"
+
+    def _is_learning_memory_question(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        return ("记得" in text or "remember" in lowered) and any(marker in text for marker in ("在学什么", "学习什么", "学什么", "学习目标"))
+
+    def _current_learning_topic(self, user_id: str) -> str:
+        goals_state = self.state_store.read_json("user_goals.json")
+        goals = goals_state.get("goals") if isinstance(goals_state.get("goals"), list) else []
+        for goal in reversed(goals):
+            if not isinstance(goal, dict):
+                continue
+            if goal.get("kind") == "learning" and goal.get("status") == "active" and str(goal.get("user_id") or "") == user_id:
+                topic = str(goal.get("topic") or "").strip()
+                if topic:
+                    return topic
+        user_world = self.state_store.read_json("user_world.json")
+        topic = str(user_world.get("learning_topic") or "").strip()
+        if topic:
+            return topic
+        memory_state = self.state_store.read_json("agent_memory.json")
+        items = memory_state.get("items") if isinstance(memory_state.get("items"), list) else []
+        for item in reversed(items):
+            if not isinstance(item, dict):
+                continue
+            patch = item.get("patch") if isinstance(item.get("patch"), dict) else {}
+            if patch.get("memory_type") == "learning_goal":
+                topic = str(patch.get("topic") or item.get("topic") or "").strip()
+                if topic:
+                    return topic
+        return ""
 
     def _process_commitment_turn(self, event: VeyraEvent, result: LoopResult) -> dict[str, Any] | None:
         if self.commitment_core is None:

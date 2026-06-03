@@ -50,6 +50,10 @@ class RetentionEnforceRequest(BaseModel):
     limit_overrides: dict[str, int] | None = None
 
 
+class ReviewQueueActionRequest(BaseModel):
+    reason: str = "runtime hygiene"
+
+
 def build_ops_runtime_router(deps: dict[str, Any]) -> APIRouter:
     router = APIRouter()
 
@@ -65,6 +69,20 @@ def build_ops_runtime_router(deps: dict[str, Any]) -> APIRouter:
     async def ops_retention_enforce(request: RetentionEnforceRequest | None = None) -> dict[str, Any]:
         payload = request or RetentionEnforceRequest()
         return deps["retention_policy"].enforce(dry_run=payload.dry_run, limits=payload.limit_overrides)
+
+    @router.get("/ops/reviews/diagnostic")
+    async def ops_reviews_diagnostic(stale_after_days: int = 7) -> dict[str, Any]:
+        return deps["review_queue"].diagnostic(stale_after_days=stale_after_days)
+
+    @router.post("/ops/reviews/{review_id}/resolve")
+    async def ops_review_resolve(review_id: str, request: ReviewQueueActionRequest | None = None) -> dict[str, Any]:
+        payload = request or ReviewQueueActionRequest()
+        return deps["review_queue"].mark_resolved(review_id, payload.reason)
+
+    @router.post("/ops/reviews/{review_id}/archive")
+    async def ops_review_archive(review_id: str, request: ReviewQueueActionRequest | None = None) -> dict[str, Any]:
+        payload = request or ReviewQueueActionRequest()
+        return deps["review_queue"].archive(review_id, payload.reason)
 
     @router.get("/ops/health")
     async def ops_health() -> dict[str, Any]:
