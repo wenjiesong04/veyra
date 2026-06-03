@@ -408,7 +408,20 @@ class OpenClawAdapter(AgentAdapter):
             return False
 
     def connection_status(self) -> dict[str, Any]:
-        capabilities = self.fetch_capabilities()
+        try:
+            capabilities = self.fetch_capabilities()
+        except Exception as exc:
+            capabilities = normalize_capabilities(
+                {
+                    "runtime": "openclaw",
+                    "status": "unavailable",
+                    "connected": False,
+                    "error": str(exc),
+                    "protocol": "openclaw_gateway_ws",
+                },
+                runtime="openclaw",
+                base_url=self.gateway_url,
+            )
         status = str(capabilities.get("status", "unknown"))
         connected = status in {"available", "ok", "success"}
         configured = bool(self.gateway_url)

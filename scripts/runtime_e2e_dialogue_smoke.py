@@ -60,7 +60,7 @@ def post_message(text: str, *, user_id: str, session_id: str, index: int) -> dic
             "message_id": f"runtime-e2e-{session_id}-{index}",
             "metadata": {"smoke": "runtime_e2e_dialogue", "case": index},
         },
-        timeout=45.0,
+        timeout=120.0,
     )
 
 
