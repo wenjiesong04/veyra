@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from core.awareness_loop import AwarenessLoop
 from core.model_client import redact_sensitive
+from core.state_compact import compact_channel_inbox_item
 from core.world_state import WorldStateStore
 from interface.auth import AuthPolicy
 from interface.channel_adapter import ChannelAdapter
@@ -87,16 +88,18 @@ class IntakeGateway:
             return {"status": "duplicate", "message_id": dedupe_id, "channel": channel_id, "session_id": mapped_session, "previous": seen[dedupe_id]}
 
         event = self.normalizer.user_message(text=text, channel=channel_id, user_id=user_id, session_id=mapped_session, metadata=metadata or {})
-        inbox_item = {
-            "message_id": dedupe_id,
-            "event_id": event.event_id,
-            "channel": channel_id,
-            "user_id": user_id,
-            "session_id": mapped_session,
-            "text": text,
-            "metadata": metadata or {},
-            "received_at": utc_now_iso(),
-        }
+        inbox_item = compact_channel_inbox_item(
+            {
+                "message_id": dedupe_id,
+                "event_id": event.event_id,
+                "channel": channel_id,
+                "user_id": user_id,
+                "session_id": mapped_session,
+                "text": text,
+                "metadata": metadata or {},
+                "received_at": utc_now_iso(),
+            }
+        )
         self._record_inbox(state, inbox_item)
         result = self.awareness_loop.handle_event(event)
         adapter = ChannelAdapter(self.state_store, channel=channel_id)
@@ -115,7 +118,7 @@ class IntakeGateway:
         seen = state.setdefault("seen_message_ids", {})
         if isinstance(seen, dict):
             seen[dedupe_id] = {"event_id": event.event_id, "session_id": mapped_session, "processed_at": utc_now_iso(), "status": result.status}
-            state["seen_message_ids"] = dict(list(seen.items())[-1000:])
+            state["seen_message_ids"] = dict(list(seen.items())[-300:])
         sessions = state.setdefault("sessions", {})
         if isinstance(sessions, dict):
             sessions[mapped_session] = {"channel": channel_id, "user_id": user_id, "last_event_id": event.event_id, "updated_at": utc_now_iso()}
@@ -195,7 +198,7 @@ class IntakeGateway:
             inbox = []
             state["inbox"] = inbox
         inbox.append(item)
-        state["inbox"] = inbox[-500:]
+        state["inbox"] = [compact_channel_inbox_item(entry) for entry in inbox[-200:]]
         self._write_channel_state(state)
 
     def _record_intake_trace(

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import uuid4
 
+from core.state_compact import compact_foresight, compact_guardian_decision, compact_review_item
 from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
 
@@ -20,20 +21,22 @@ class ReviewQueue:
         guardian_decision: dict[str, Any],
         proposal: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        review = {
-            "review_id": f"rev_{uuid4().hex[:12]}",
-            "event_id": event_id,
-            "task_text": task_text,
-            "risk_level": risk_level,
-            "status": "pending",
-            "foresight": foresight,
-            "guardian_decision": guardian_decision,
-            "proposal": proposal,
-            "execution_result": None,
-            "created_at": utc_now_iso(),
-            "decided_at": None,
-            "decision_reason": None,
-        }
+        review = compact_review_item(
+            {
+                "review_id": f"rev_{uuid4().hex[:12]}",
+                "event_id": event_id,
+                "task_text": task_text,
+                "risk_level": risk_level,
+                "status": "pending",
+                "foresight": compact_foresight(foresight),
+                "guardian_decision": compact_guardian_decision(guardian_decision),
+                "proposal": proposal,
+                "execution_result": None,
+                "created_at": utc_now_iso(),
+                "decided_at": None,
+                "decision_reason": None,
+            }
+        )
         state = self.state_store.read_json("review_queue.json") or {"items": []}
         items = state.setdefault("items", [])
         items.append(review)

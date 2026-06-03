@@ -198,6 +198,25 @@ agent_orchestrator = AgentOrchestrator(
 )
 
 
+@app.on_event("startup")
+async def startup_integrations() -> None:
+    if _env_bool("VEYRA_FEISHU_WS_AUTOSTART") is False:
+        return
+    try:
+        feishu_ws_runner.autostart_if_configured()
+    except Exception as exc:
+        state_store.write_json(
+            "feishu_ws_state.json",
+            {
+                "status": "error",
+                "last_error": str(exc),
+                "error_type": type(exc).__name__,
+                "started_at": None,
+                "last_event_at": None,
+            },
+        )
+
+
 class MessageRequest(BaseModel):
     text: str
     channel: str = "webhook"
@@ -407,9 +426,16 @@ def _deployment_readiness() -> dict[str, Any]:
 
 
 class _DynamicDeps(dict[str, Any]):
-    def __getitem__(self, key: str) -> Any:
-        value = super().__getitem__(key)
+    def _resolve(self, value: Any) -> Any:
         return value() if callable(value) else value
+
+    def __getitem__(self, key: str) -> Any:
+        return self._resolve(super().__getitem__(key))
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key not in self:
+            return default
+        return self._resolve(super().__getitem__(key))
 
 
 app.include_router(

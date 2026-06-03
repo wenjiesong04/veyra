@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from core.definitions import RiskLevel
+from core.state_compact import compact_persona_binding
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent, utc_now_iso
 
@@ -77,24 +78,25 @@ class PersonaEngine:
         if not self.state_store:
             return {"status": "skipped", "reason": "no state_store"}
         state = self.state_store.read_json("persona_state.json") or {"active_modes": [], "history": []}
-        binding = {
-            "event_id": event.event_id,
-            "channel": event.source.channel,
-            "session_id": event.source.session_id,
-            "active_modes": persona_patch.get("mode", []),
-            "route": persona_patch.get("route"),
-            "target_agent": persona_patch.get("target_agent"),
-            "risk_level": persona_patch.get("risk_level"),
-            "response_style": persona_patch.get("response_style"),
-            "token_budget": persona_patch.get("token_budget"),
-            "updated_at": utc_now_iso(),
-        }
+        binding = compact_persona_binding(
+            {
+                "event_id": event.event_id,
+                "channel": event.source.channel,
+                "session_id": event.source.session_id,
+                "active_modes": persona_patch.get("mode", []),
+                "route": persona_patch.get("route"),
+                "target_agent": persona_patch.get("target_agent"),
+                "risk_level": persona_patch.get("risk_level"),
+                "response_style": persona_patch.get("response_style"),
+                "updated_at": utc_now_iso(),
+            }
+        )
         history = state.setdefault("history", [])
         if not isinstance(history, list):
             history = []
             state["history"] = history
         history.append(binding)
-        state["history"] = history[-100:]
+        state["history"] = history[-50:]
         state["active_modes"] = persona_patch.get("mode", [])
         state["last_binding"] = binding
         state["updated_at"] = utc_now_iso()

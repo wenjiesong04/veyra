@@ -651,6 +651,11 @@ class AwarenessLoop:
             return "记住了。之后我会尽量更直接，除非问题本身需要先说明风险、证据或执行边界。"
         answer_assist = self.core_reasoning.answer_assist(text=text, attention_focus=attention_focus, decision=decision.to_dict(), event=event)
         draft = str(answer_assist.get("draft_response") or answer_assist.get("response") or "").strip()
+        if not draft:
+            model_assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
+            draft = str(model_assist.get("draft_response") or "").strip()
+            if draft and answer_assist.get("status") != "model_assisted":
+                answer_assist = {**answer_assist, "status": "model_assisted", "draft_response": draft}
         if answer_assist.get("status") == "model_assisted" and draft and self._direct_draft_is_usable(text=text, decision=decision, draft=draft, answer_assist=answer_assist):
             decision.model_assist = {**decision.model_assist, "answer_assist": answer_assist}
             return draft

@@ -304,13 +304,13 @@ class DecisionCore:
         if candidate_route == Route.AGENT and not self._agent_allowed_by_policy(text, base, assist):
             candidate_route = Route.DIRECT_ANSWER
             policy_signals.append("policy:agent_route_rejected")
-        if risk == RiskLevel.R5:
+        if risk == RiskLevel.R5 or candidate_route == Route.BLOCK:
             route = Route.BLOCK
+            risk = self._max_risk(risk, RiskLevel.R5)
+            if candidate_route == Route.BLOCK:
+                policy_signals.append("policy:model_block_honored")
         elif risk in {RiskLevel.R3, RiskLevel.R4}:
             route = Route.HUMAN_REVIEW
-        elif candidate_route == Route.BLOCK:
-            route = Route.HUMAN_REVIEW
-            risk = self._max_risk(risk, RiskLevel.R3)
         elif candidate_route == Route.HUMAN_REVIEW:
             route = Route.HUMAN_REVIEW
             risk = self._max_risk(risk, RiskLevel.R3)
@@ -555,7 +555,8 @@ class DecisionCore:
         normalized = self._canonical_probe_name(selected)
         if normalized:
             return normalized
-        return self._canonical_probe_name(default or "")
+        fallback = self._canonical_probe_name(default or "")
+        return fallback or str(default or "").strip()
 
     def _agent_allowed_by_policy(self, text: str, base: Decision, assist: dict[str, Any]) -> bool:
         lowered = text.lower()
@@ -592,9 +593,10 @@ class DecisionCore:
             "openclaw_probe": "openclaw",
             "hermes_probe": "hermes",
             "mcp_probe": "mcp",
+            "weather": "weather_probe",
         }
         canonical = aliases.get(token, token)
-        allowed = {"time", "system", "git", "port", "process", "file", "log", "network", "web", "openclaw", "hermes", "mcp"}
+        allowed = {"time", "system", "git", "port", "process", "file", "log", "network", "web", "openclaw", "hermes", "mcp", "weather_probe"}
         return canonical if canonical in allowed else ""
 
     def _preserve_rule_route(self, base: Decision, candidate: Route) -> tuple[Route, str]:

@@ -7,6 +7,7 @@ from typing import Callable, Any
 
 from interface.event_schema import Decision, Route
 from core.agency_core import AgencyCore
+from core.state_compact import compact_foresight, compact_guardian_decision
 from core.definitions import RiskLevel
 from core.foresight_engine import ForesightEngine
 from core.guardian_controller import GuardianController
@@ -145,6 +146,10 @@ class ProactiveChecks:
             status = "suggested"
         updated = self.agency.update_intention(
             str(intention.get("intention_id")),
-            {"status": status, "guardian_decision": guardian, "foresight": foresight},
+            {
+                "status": status,
+                "guardian_decision": compact_guardian_decision(guardian),
+                "foresight": compact_foresight(foresight),
+            },
         )
         return updated or intention

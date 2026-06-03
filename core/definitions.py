@@ -132,6 +132,14 @@ FORBIDDEN_ACTION_PATTERNS: tuple[str, ...] = (
     r"\b(?:cat|type|less|more)\s+\.env\b.*(?:send|upload|post|外发)",
     r"\.env\s*外发",
     r"绕过权限",
+    r"钓鱼邮件?",
+    r"phishing",
+    r"恶意邮件",
+    r"木马",
+    r"勒索软件",
+    r"绕过.*检测",
+    r"窃取.*密码",
+    r"盗取.*账号",
 )
 
 HIGH_RISK_PATTERNS: tuple[str, ...] = (

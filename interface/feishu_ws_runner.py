@@ -19,15 +19,29 @@ class FeishuWsRunner:
         self.state_store = state_store
         self.adapter = adapter
         self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
 
     def status(self) -> dict[str, Any]:
         state = self._read_state()
         alive = bool(self._thread and self._thread.is_alive())
         config = self._config()
+        started_at = str(state.get("started_at") or "")
+        last_event_at = str(state.get("last_event_at") or "")
+        status = str(state.get("status") or "stopped")
+        last_event_after_start = bool(last_event_at and (not started_at or last_event_at >= started_at))
+        diagnostics: list[str] = []
+        if status in {"running", "starting"} and not alive:
+            status = "stale"
+            diagnostics.append("Feishu websocket state is running but the worker thread is not alive.")
+        if alive and started_at and not last_event_after_start:
+            diagnostics.append("No Feishu events have been received since this websocket runner started.")
         return {
             **state,
+            "status": status,
             "thread_alive": alive,
             "configured": bool(self._secret(config, "app_id", "FEISHU_APP_ID") and self._secret(config, "app_secret", "FEISHU_APP_SECRET")),
+            "last_event_after_start": last_event_after_start,
+            "diagnostics": diagnostics,
             "channel_config": redact_sensitive(config),
         }
 
@@ -62,19 +76,36 @@ class FeishuWsRunner:
         return {"status": "success", "path": str(config_path), "config": redact_sensitive(current)}
 
     def start(self) -> dict[str, Any]:
-        if self._thread and self._thread.is_alive():
-            return {**self.status(), "status": "already_running"}
-        config = self._config()
-        app_id = self._secret(config, "app_id", "FEISHU_APP_ID")
-        app_secret = self._secret(config, "app_secret", "FEISHU_APP_SECRET")
-        if not app_id or not app_secret:
-            return {"status": "not_configured", "reason": "Feishu app_id/app_secret is required for websocket mode."}
-        state = self._read_state()
-        state.update({"status": "starting", "started_at": utc_now_iso(), "last_error": None})
-        self._write_state(state)
-        self._thread = threading.Thread(target=self._run, args=(app_id, app_secret, config), daemon=True, name="veyra-feishu-ws")
-        self._thread.start()
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return {**self.status(), "status": "already_running"}
+            config = self._config()
+            app_id = self._secret(config, "app_id", "FEISHU_APP_ID")
+            app_secret = self._secret(config, "app_secret", "FEISHU_APP_SECRET")
+            if not app_id or not app_secret:
+                return {"status": "not_configured", "reason": "Feishu app_id/app_secret is required for websocket mode."}
+            previous = self._read_state()
+            state = {
+                "status": "starting",
+                "started_at": utc_now_iso(),
+                "last_event_at": None,
+                "last_result": None,
+                "previous_last_event_at": previous.get("last_event_at"),
+                "previous_last_result": redact_sensitive(previous.get("last_result"), max_string=1800),
+                "last_error": None,
+            }
+            self._write_state(state)
+            self._thread = threading.Thread(target=self._run, args=(app_id, app_secret, config), daemon=True, name="veyra-feishu-ws")
+            self._thread.start()
         return self.status()
+
+    def autostart_if_configured(self) -> dict[str, Any]:
+        config = self._config()
+        if not config.get("enabled"):
+            return {"status": "skipped", "reason": "Feishu channel is disabled."}
+        if str(config.get("connection_mode") or "callback") != "websocket":
+            return {"status": "skipped", "reason": "Feishu channel is not in websocket mode."}
+        return self.start()
 
     def _run(self, app_id: str, app_secret: str, config: dict[str, Any]) -> None:
         try:
