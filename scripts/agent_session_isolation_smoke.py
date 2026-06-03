@@ -185,7 +185,7 @@ def run() -> None:
         )
 
         # A different dialogue session must not collide with this one.
-        loop.handle_event(make_event("帮我找一下某主播最新视频", session_id="feishu:ou_other:oc_chat2", idx=200))
+        loop.handle_event(make_event("检查 hermes runtime 在本地的连接状态", session_id="feishu:ou_other:oc_chat2", idx=200))
         other = fake.sent[4]
         expect(
             other.agent_execution_session_id not in session_ids,
