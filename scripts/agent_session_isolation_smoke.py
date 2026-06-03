@@ -125,10 +125,11 @@ def run() -> None:
         loop, fake = build_loop(tmp)
         dialogue_session = "feishu:ou_test:oc_chat"
 
+        # Use non-YouTube agent tasks here: L1 compact lookup intercepts YouTube title queries before AGENT.
         queries = [
-            "帮我找一下柴静在 YouTube 最新一期视频标题",
-            "什么 PyTorch，我说的是柴静在 YouTube 最新一期视频标题",
-            "帮我找一下王志安在 YouTube 最新一期视频标题",
+            "检查 veyra 仓库 git 工作区有哪些未提交变更",
+            "什么 PyTorch，我说的是检查 openclaw gateway 连接状态",
+            "总结 awareness_loop 在本项目里的职责",
         ]
         for idx, text in enumerate(queries):
             loop.handle_event(make_event(text, session_id=dialogue_session, idx=idx))
@@ -153,16 +154,20 @@ def run() -> None:
             [pkt.agent_session_policy for pkt in fake.sent],
         )
 
-        # Context scope: the third (王志安) packet must be clean.
-        wzz = fake.sent[2]
-        serialized = __import__("json").dumps(wzz.context_patch, ensure_ascii=False, sort_keys=True)
-        expect("agent_memory_summary" not in wzz.context_patch, "workspace fallback memory omitted from packet")
+        # Context scope: the third agent packet must be clean (no workspace fallback / gateway_error dumps).
+        third = fake.sent[2]
+        serialized = __import__("json").dumps(third.context_patch, ensure_ascii=False, sort_keys=True)
+        expect("agent_memory_summary" not in third.context_patch, "workspace fallback memory omitted from packet")
         expect("gateway_error" not in serialized, "gateway_error not present in agent context")
         expect("memory_roundtrip" not in serialized, "memory_roundtrip not present in agent context")
         expect("深度学习" not in serialized, "unrelated learning-goal markdown not present in agent context")
-        scope = wzz.context_patch.get("context_scope") or {}
+        scope = third.context_patch.get("context_scope") or {}
         expect(bool(scope), "context_scope report attached", scope)
         expect("agent_memory_summary" in scope.get("omitted_sections", []), "fallback omission recorded in scope", scope)
+
+        # L1 YouTube lookup must not dispatch a heavy agent packet.
+        loop.handle_event(make_event("帮我找一下王志安在 YouTube 最新一期视频标题", session_id=dialogue_session, idx=300))
+        expect(len(fake.sent) == 3, "YouTube title lookup uses L1 compact path, not agent", len(fake.sent))
 
         # Explicit continuation should reuse the previous agent session.
         loop.handle_event(make_event("基于刚才的结果，给我视频链接", session_id=dialogue_session, idx=99))
