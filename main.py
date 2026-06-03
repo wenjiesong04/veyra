@@ -217,6 +217,11 @@ async def startup_integrations() -> None:
         )
 
 
+@app.get("/health")
+async def health() -> dict[str, Any]:
+    return ops_monitor.health()
+
+
 class MessageRequest(BaseModel):
     text: str
     channel: str = "webhook"
