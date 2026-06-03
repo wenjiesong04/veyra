@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
@@ -20,6 +21,7 @@ class SearchProbe:
     def __init__(self, fetcher: Callable[[str], str] | None = None, cli_runner: Callable[[list[str], float], str] | None = None) -> None:
         self.fetcher = fetcher
         self.cli_runner = cli_runner
+        self._cache: dict[str, dict[str, Any]] = {}
 
     def run(self, query: str, *, max_results: int = 5) -> dict[str, Any]:
         query = " ".join((query or "").split())
@@ -33,14 +35,26 @@ class SearchProbe:
                 ttl_seconds=600,
                 details={"configured": True},
             )
+        cache_key = self._cache_key(query, max_results=max_results)
+        cached = self._cached(cache_key)
+        if cached:
+            return cached
+        openclaw_attempt: dict[str, Any] | None = None
         if self.fetcher is None and self._openclaw_search_enabled():
             openclaw_result = self._run_openclaw_search(query, max_results=max_results)
             provider = os.getenv("VEYRA_SEARCH_PROVIDER", "auto").strip().lower()
             if openclaw_result.get("status") == "ok" or provider in {"openclaw", "openclaw_cli"}:
+                self._store_cache(cache_key, openclaw_result)
                 return openclaw_result
+            openclaw_attempt = {
+                "status": openclaw_result.get("status"),
+                "summary": openclaw_result.get("summary"),
+                "provider": "openclaw_cli",
+            }
         url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+        http_timeout = self._float_env("VEYRA_SEARCH_HTTP_TIMEOUT", 8.0)
         try:
-            body = self.fetcher(url) if self.fetcher else fetch_text(url, timeout=8, headers={"User-Agent": "Veyra-SearchProbe/0.1"})
+            body = self.fetcher(url) if self.fetcher else fetch_text(url, timeout=http_timeout, headers={"User-Agent": "Veyra-SearchProbe/0.1"})
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
             return probe_payload(
                 probe="search_probe",
@@ -49,19 +63,19 @@ class SearchProbe:
                 summary=f"Search unavailable for {query}: {exc}",
                 confidence=0.35,
                 ttl_seconds=300,
-                details={"query": query, "source_url": url, "error": str(exc)},
+                details={"query": query, "source_url": url, "error": str(exc), "timeout_seconds": http_timeout, "openclaw_attempt": openclaw_attempt},
             )
         results = self._parse_results(body, limit=max_results)
         status = "ok" if results else "empty"
         summary = f"Search returned {len(results)} result(s) for {query}." if results else f"Search returned no parseable results for {query}."
-        return probe_payload(
+        payload = probe_payload(
             probe="search_probe",
             target=query,
             status=status,
             summary=summary,
             confidence=0.7 if results else 0.45,
             ttl_seconds=1800,
-            details={"query": query, "source_url": url, "results": results},
+            details={"query": query, "source_url": url, "results": results, "timeout_seconds": http_timeout, "openclaw_attempt": openclaw_attempt},
             claims=[
                 {
                     "key": f"search:{query}",
@@ -72,6 +86,8 @@ class SearchProbe:
                 }
             ],
         )
+        self._store_cache(cache_key, payload)
+        return payload
 
     def _openclaw_search_enabled(self) -> bool:
         provider = os.getenv("VEYRA_SEARCH_PROVIDER", "auto").strip().lower()
@@ -258,3 +274,38 @@ class SearchProbe:
             return float(os.getenv(name, str(default)))
         except ValueError:
             return default
+
+    def _cache_key(self, query: str, *, max_results: int) -> str:
+        provider = os.getenv("VEYRA_SEARCH_PROVIDER", "auto").strip().lower()
+        return f"{provider}|{max(1, min(int(max_results), 10))}|{query.lower()}"
+
+    def _cached(self, cache_key: str) -> dict[str, Any] | None:
+        ttl = max(0.0, self._float_env("VEYRA_SEARCH_CACHE_SECONDS", 600.0))
+        if ttl <= 0:
+            return None
+        item = self._cache.get(cache_key)
+        if not item:
+            return None
+        if time.time() - float(item.get("cached_at") or 0.0) > ttl:
+            self._cache.pop(cache_key, None)
+            return None
+        payload = self._copy_payload(item.get("payload"))
+        if isinstance(payload.get("details"), dict):
+            payload["details"] = {**payload["details"], "cache_hit": True, "cache_age_seconds": round(time.time() - float(item.get("cached_at") or 0.0), 3)}
+        return payload
+
+    def _store_cache(self, cache_key: str, payload: dict[str, Any]) -> None:
+        if str(payload.get("status") or "") not in {"ok", "empty"}:
+            return
+        self._cache[cache_key] = {"cached_at": time.time(), "payload": self._copy_payload(payload)}
+        if len(self._cache) > 80:
+            oldest = sorted(self._cache.items(), key=lambda item: float(item[1].get("cached_at") or 0.0))[:20]
+            for key, _value in oldest:
+                self._cache.pop(key, None)
+
+    def _copy_payload(self, payload: Any) -> dict[str, Any]:
+        try:
+            copied = json.loads(json.dumps(payload, ensure_ascii=False))
+        except (TypeError, ValueError):
+            copied = payload
+        return copied if isinstance(copied, dict) else {}

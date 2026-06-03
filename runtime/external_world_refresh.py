@@ -33,39 +33,52 @@ class ExternalWorldRefresh:
         skipped: list[dict[str, Any]] = []
         for raw_item in watchlist[:limit]:
             item = self._normalize_watch_item(raw_item)
-            if not item.get("enabled", True):
-                skipped.append({"target": item.get("target"), "reason": "disabled"})
-                continue
             target = str(item.get("target") or "").strip()
-            if not target:
-                skipped.append({"target": "", "reason": "missing_target"})
-                continue
-            if item.get("kind") == "learning_search":
-                refreshed.append(self._refresh_learning_search(item))
-                continue
-            if item.get("kind") == "external_search":
-                refreshed.append(self._refresh_external_search(item))
-                continue
-            probe_result = self._probe_target(target)
-            state_patch = self.perception.interpret_probe_result(probe_result)
-            assist = self.reasoning.external_world_assist(
-                target=target,
-                probe_result=probe_result,
-                current_goal=str(self.state_store.read_json("user_world.json").get("current_goal") or ""),
-            )
-            refreshed.append(
-                {
-                    "target": target,
-                    "kind": item.get("kind") or self._kind_for_target(target),
-                    "status": probe_result.get("status"),
-                    "summary": self._summary_for(target, probe_result, assist),
-                    "observed_at": probe_result.get("observed_at") or probe_result.get("timestamp") or utc_now_iso(),
-                    "watch_recommendation": self._watch_recommendation(assist),
-                    "probe": redact_sensitive(probe_result, max_string=1200),
-                    "state_patch": state_patch,
-                    "model_assist": self._compact_assist(assist),
-                }
-            )
+            try:
+                if not item.get("enabled", True):
+                    skipped.append({"target": item.get("target"), "reason": "disabled"})
+                    continue
+                if not target:
+                    skipped.append({"target": "", "reason": "missing_target"})
+                    continue
+                if item.get("kind") == "learning_search":
+                    refreshed.append(self._refresh_learning_search(item))
+                    continue
+                if item.get("kind") == "external_search":
+                    refreshed.append(self._refresh_external_search(item))
+                    continue
+                probe_result = self._probe_target(target)
+                state_patch = self.perception.interpret_probe_result(probe_result)
+                assist = self.reasoning.external_world_assist(
+                    target=target,
+                    probe_result=probe_result,
+                    current_goal=str(self.state_store.read_json("user_world.json").get("current_goal") or ""),
+                )
+                refreshed.append(
+                    {
+                        "target": target,
+                        "kind": item.get("kind") or self._kind_for_target(target),
+                        "status": probe_result.get("status"),
+                        "summary": self._summary_for(target, probe_result, assist),
+                        "observed_at": probe_result.get("observed_at") or probe_result.get("timestamp") or utc_now_iso(),
+                        "watch_recommendation": self._watch_recommendation(assist),
+                        "probe": redact_sensitive(probe_result, max_string=1200),
+                        "state_patch": state_patch,
+                        "model_assist": self._compact_assist(assist),
+                    }
+                )
+            except Exception as exc:
+                refreshed.append(
+                    {
+                        "target": target,
+                        "kind": item.get("kind") or self._kind_for_target(target),
+                        "status": "error",
+                        "summary": f"External watch refresh failed without blocking active loop: {type(exc).__name__}: {str(exc)[:240]}",
+                        "observed_at": utc_now_iso(),
+                        "watch_recommendation": "keep",
+                        "error_type": type(exc).__name__,
+                    }
+                )
         external["summaries"] = (external.get("summaries", []) if isinstance(external.get("summaries"), list) else []) + refreshed
         external["summaries"] = external["summaries"][-100:]
         external["knowledge_items"] = self._merge_knowledge_items(
@@ -120,9 +133,9 @@ class ExternalWorldRefresh:
     def _refresh_learning_search(self, item: dict[str, Any]) -> dict[str, Any]:
         topic = str(item.get("topic") or item.get("target") or "学习主题")
         query = str(item.get("query") or self._learning_query(topic))
-        search_result = self.search_probe.run(query, max_results=6)
+        search_result = self._safe_search(query, max_results=6)
         results = search_result.get("details", {}).get("results") if isinstance(search_result.get("details"), dict) else []
-        scored = self._score_search_results(results if isinstance(results, list) else [], topic=topic)
+        scored = self._score_search_results(results if isinstance(results, list) else [], topic=topic, ttl_seconds=int(search_result.get("ttl_seconds") or 1800))
         useful = [entry for entry in scored if float(entry.get("score") or 0) >= 0.45]
         return {
             "target": item.get("target"),
@@ -142,9 +155,9 @@ class ExternalWorldRefresh:
     def _refresh_external_search(self, item: dict[str, Any]) -> dict[str, Any]:
         topic = str(item.get("topic") or item.get("target") or "外部主题")
         query = str(item.get("query") or f"{topic} latest important updates")
-        search_result = self.search_probe.run(query, max_results=6)
+        search_result = self._safe_search(query, max_results=6)
         results = search_result.get("details", {}).get("results") if isinstance(search_result.get("details"), dict) else []
-        scored = self._score_search_results(results if isinstance(results, list) else [], topic=topic)
+        scored = self._score_search_results(results if isinstance(results, list) else [], topic=topic, ttl_seconds=int(search_result.get("ttl_seconds") or 1800))
         useful = [entry for entry in scored if float(entry.get("score") or 0) >= 0.45]
         return {
             "target": item.get("target"),
@@ -164,10 +177,28 @@ class ExternalWorldRefresh:
     def _learning_query(self, topic: str) -> str:
         return f"{topic} latest tutorial course paper 2026"
 
-    def _score_search_results(self, results: list[Any], *, topic: str) -> list[dict[str, Any]]:
+    def _safe_search(self, query: str, *, max_results: int) -> dict[str, Any]:
+        try:
+            return self.search_probe.run(query, max_results=max_results)
+        except Exception as exc:
+            return {
+                "probe": "search_probe",
+                "source": "search_probe",
+                "target": query,
+                "status": "unavailable",
+                "summary": f"Search failed without blocking active loop for {query}: {type(exc).__name__}: {str(exc)[:240]}",
+                "confidence": 0.2,
+                "ttl_seconds": 300,
+                "observed_at": utc_now_iso(),
+                "details": {"query": query, "error": str(exc), "error_type": type(exc).__name__, "results": []},
+            }
+
+    def _score_search_results(self, results: list[Any], *, topic: str, ttl_seconds: int = 1800) -> list[dict[str, Any]]:
         scored: list[dict[str, Any]] = []
         topic_lower = topic.lower()
         trusted_hosts = ("arxiv.org", "deeplearning.ai", "pytorch.org", "tensorflow.org", "paperswithcode.com", "openreview.net", "github.com")
+        retrieved_at = utc_now_iso()
+        ttl = max(60, min(int(ttl_seconds or 1800), 86400))
         for raw in results:
             if not isinstance(raw, dict):
                 continue
@@ -175,6 +206,7 @@ class ExternalWorldRefresh:
             url = str(raw.get("url") or "")
             snippet = str(raw.get("snippet") or "")
             host = str(raw.get("source") or self._host(url))
+            source = host or str(raw.get("source") or "unknown")
             haystack = f"{title} {snippet}".lower()
             score = 0.2
             if topic_lower and topic_lower in haystack:
@@ -185,13 +217,21 @@ class ExternalWorldRefresh:
                 score += 0.18
             if any(marker in haystack for marker in ("tutorial", "course", "paper", "guide", "入门", "课程", "论文")):
                 score += 0.12
+            score = round(min(score, 1.0), 3)
+            summary = self._result_summary(title=title, snippet=snippet)
+            dedupe_key = self._dedupe_key(url=url, title=title, source=source, snippet=snippet)
             scored.append(
                 {
                     "title": title[:240],
                     "url": url,
                     "snippet": snippet[:500],
-                    "source": host,
-                    "score": round(min(score, 1.0), 3),
+                    "summary": summary,
+                    "source": source,
+                    "retrieved_at": retrieved_at,
+                    "ttl": ttl,
+                    "dedupe_key": dedupe_key,
+                    "quality_score": score,
+                    "score": score,
                 }
             )
         return sorted(scored, key=lambda item: float(item.get("score") or 0), reverse=True)
@@ -216,15 +256,21 @@ class ExternalWorldRefresh:
             for result in refresh.get("results", []) if isinstance(refresh.get("results"), list) else []:
                 if not isinstance(result, dict) or not (result.get("url") or result.get("title")):
                     continue
-                item_id = self._stable_id("knowledge", str(result.get("url") or f"{refresh.get('topic')}:{result.get('source')}:{result.get('title')}"))
+                dedupe_key = str(result.get("dedupe_key") or result.get("url") or f"{refresh.get('topic')}:{result.get('source')}:{result.get('title')}")
+                item_id = self._stable_id("knowledge", dedupe_key)
                 by_key[item_id] = {
                     "item_id": item_id,
+                    "dedupe_key": dedupe_key,
                     "goal_id": refresh.get("goal_id"),
                     "topic": refresh.get("topic"),
                     "title": result.get("title"),
                     "url": result.get("url"),
                     "source": result.get("source"),
                     "snippet": result.get("snippet"),
+                    "summary": result.get("summary"),
+                    "retrieved_at": result.get("retrieved_at") or refresh.get("observed_at") or utc_now_iso(),
+                    "ttl": result.get("ttl"),
+                    "quality_score": result.get("quality_score") or result.get("score"),
                     "score": result.get("score"),
                     "status": "fresh",
                     "observed_at": refresh.get("observed_at") or utc_now_iso(),
@@ -239,17 +285,24 @@ class ExternalWorldRefresh:
             for result in refresh.get("results", []) if isinstance(refresh.get("results"), list) else []:
                 if not isinstance(result, dict) or not (result.get("url") or result.get("title")) or float(result.get("score") or 0) < 0.6:
                     continue
-                candidate_id = self._stable_id("push", f"{refresh.get('commitment_id')}:{result.get('url') or result.get('title')}")
+                dedupe_key = str(result.get("dedupe_key") or result.get("url") or result.get("title") or "")
+                candidate_id = self._stable_id("push", f"{refresh.get('commitment_id')}:{dedupe_key}")
                 current = by_key.get(candidate_id, {})
                 by_key[candidate_id] = {
                     **current,
                     "candidate_id": candidate_id,
+                    "dedupe_key": dedupe_key,
                     "commitment_id": refresh.get("commitment_id"),
                     "goal_id": refresh.get("goal_id"),
                     "topic": refresh.get("topic"),
                     "title": result.get("title"),
                     "url": result.get("url"),
                     "snippet": result.get("snippet"),
+                    "summary": result.get("summary"),
+                    "source": result.get("source"),
+                    "retrieved_at": result.get("retrieved_at") or refresh.get("observed_at") or utc_now_iso(),
+                    "ttl": result.get("ttl"),
+                    "quality_score": result.get("quality_score") or result.get("score"),
                     "score": result.get("score"),
                     "status": current.get("status") or "new",
                     "created_at": current.get("created_at") or utc_now_iso(),
@@ -297,3 +350,17 @@ class ExternalWorldRefresh:
 
     def _host(self, url: str) -> str:
         return urlparse(url).netloc.lower()
+
+    def _dedupe_key(self, *, url: str, title: str, source: str, snippet: str) -> str:
+        normalized_url = (url or "").strip().lower().rstrip("/")
+        if normalized_url:
+            return normalized_url
+        seed = "|".join([source.strip().lower(), " ".join(title.split()).lower(), " ".join(snippet.split()).lower()[:220]])
+        return self._stable_id("search", seed)
+
+    def _result_summary(self, *, title: str, snippet: str) -> str:
+        title = " ".join(str(title or "").split())
+        snippet = " ".join(str(snippet or "").split())
+        if title and snippet:
+            return f"{title}: {snippet[:360]}"
+        return (title or snippet)[:400]
