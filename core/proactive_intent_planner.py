@@ -26,6 +26,7 @@ class ProactiveIntentPlanner:
     """Model-assisted planner for generic proactive user needs."""
 
     CONTROL_TYPES = {"cancel_commitment", "pause_commitment", "resume_commitment"}
+    AUTH_REQUIRED_TYPES = {"goal_start", "track_external_topic", "daily_digest", "monitor_local_state", "project_assistance", "learning_plan"}
 
     def __init__(self, state_store: WorldStateStore, client: CoreModelClient | None = None) -> None:
         self.state_store = state_store
@@ -99,6 +100,7 @@ class ProactiveIntentPlanner:
         intent = self._intent_from_payload(result, user_text=user_text, event=event, source="model")
         if intent.intent_type in self.CONTROL_TYPES:
             intent.proposed_next_action = self._control_next_action(intent.intent_type)
+        intent = self._guard_model_intent(intent, user_text=user_text, event=event)
         if intent.requires_user_authorization and intent.proposed_next_action not in {
             "ask_confirmation",
             "create_commitment_draft",
@@ -110,6 +112,54 @@ class ProactiveIntentPlanner:
         }:
             intent.proposed_next_action = "ask_confirmation"
         return intent
+
+    def _guard_model_intent(self, intent: ProactiveIntent, *, user_text: str, event: VeyraEvent) -> ProactiveIntent:
+        fallback = self._fallback_plan(user_text=user_text, event=event)
+        if self._should_use_template_guardrail(intent, fallback):
+            fallback.intent_id = intent.intent_id
+            fallback.source = "model"
+            fallback.confidence = max(intent.confidence, fallback.confidence)
+            fallback.entities = {
+                **fallback.entities,
+                "model_guardrail": "known_template_correction",
+                "model_intent_type": intent.intent_type,
+                "model_topic": intent.topic,
+            }
+            intent = fallback
+        elif intent.intent_type == fallback.intent_type and fallback.confidence >= 0.6:
+            if not intent.topic and fallback.topic:
+                intent.topic = fallback.topic
+            if not intent.cadence and fallback.cadence:
+                intent.cadence = fallback.cadence
+            if not intent.information_sources and fallback.information_sources:
+                intent.information_sources = fallback.information_sources
+            if not intent.local_context_needed and fallback.local_context_needed:
+                intent.local_context_needed = fallback.local_context_needed
+            if not intent.external_context_needed and fallback.external_context_needed:
+                intent.external_context_needed = fallback.external_context_needed
+            intent.entities = {**fallback.entities, **intent.entities}
+
+        if self._model_intent_requires_authorization(intent):
+            intent.requires_user_authorization = True
+            intent.authorization_status = "pending_confirmation"
+        return intent
+
+    def _should_use_template_guardrail(self, intent: ProactiveIntent, fallback: ProactiveIntent) -> bool:
+        if fallback.intent_type == "unknown" or fallback.confidence < 0.6:
+            return False
+        if intent.intent_type == "unknown":
+            return True
+        guarded_types = {"daily_digest", "monitor_local_state", "reminder"}
+        return fallback.intent_type in guarded_types and intent.intent_type != fallback.intent_type
+
+    def _model_intent_requires_authorization(self, intent: ProactiveIntent) -> bool:
+        if intent.intent_type in self.AUTH_REQUIRED_TYPES:
+            return True
+        if intent.memory_write_needed:
+            return True
+        if intent.information_sources or intent.external_context_needed or intent.local_context_needed:
+            return True
+        return False
 
     def _fallback_plan(self, *, user_text: str, event: VeyraEvent) -> ProactiveIntent:
         text = user_text or ""
@@ -388,7 +438,7 @@ class ProactiveIntentPlanner:
 
     def _is_local_monitor(self, text: str) -> bool:
         lowered = text.lower()
-        return any(marker in text for marker in ("服务器状态", "服务是不是还在跑", "服务状态", "端口", "本地服务")) or any(
+        return any(marker in text for marker in ("服务器状态", "服务是不是还在跑", "服务是否还在运行", "服务还在运行", "服务状态", "端口", "本地服务")) or any(
             marker in lowered for marker in ("server status", "localhost", "openclaw gateway", "veyra service")
         )
 
