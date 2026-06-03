@@ -444,8 +444,8 @@ class ProactiveIntentPlanner:
 
     def _is_external_tracking(self, text: str) -> bool:
         lowered = text.lower()
-        return any(marker in text for marker in ("关注", "跟踪", "留意", "最新消息", "新论文", "房源", "招聘", "新版本", "重要更新", "持续关注")) or any(
-            marker in lowered for marker in ("release", "github", "gsoc", "kotlin", "pytorch")
+        return any(marker in text for marker in ("关注", "跟踪", "留意", "持续关注", "订阅")) or any(
+            marker in lowered for marker in ("watch", "track", "monitor", "subscribe")
         )
 
     def _topic(self, text: str) -> str:

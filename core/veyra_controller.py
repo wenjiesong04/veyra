@@ -39,6 +39,29 @@ class VeyraController:
         if normalized.route == Route.BLOCK:
             return normalized, ControllerPlan(Route.BLOCK, "ready", delegation_trace.get("reason", "guardian block route selected"), missing)
         if missing:
+            agent_capabilities = self._available_agent_capabilities_for_missing(normalized, missing)
+            if agent_capabilities:
+                adjusted = replace(
+                    normalized,
+                    route=Route.AGENT,
+                    reason=f"selected Agent Runtime can satisfy missing capability: {', '.join(agent_capabilities)}",
+                    capability="selected_agent_runtime",
+                    needs_agent=True,
+                    needs_probe=False,
+                    needs_user_confirmation=False,
+                    required_capabilities=list(dict.fromkeys(["selected_agent_runtime", *agent_capabilities])),
+                    signals=list(dict.fromkeys(normalized.signals + ["controller:agent_capability_fallback"])),
+                    constraints=list(
+                        dict.fromkeys(
+                            normalized.constraints
+                            + [
+                                "selected Agent Runtime must return evidence for external facts",
+                                "do not fabricate unavailable capability results",
+                            ]
+                        )
+                    ),
+                )
+                return adjusted, ControllerPlan(Route.AGENT, "rerouted", adjusted.reason, missing)
             if self._should_agent_fallback(normalized):
                 adjusted = replace(
                     normalized,
@@ -96,6 +119,21 @@ class VeyraController:
             )
             return adjusted, ControllerPlan(Route.AGENT, "rerouted", "execution requires agent runtime", [])
         return normalized, ControllerPlan(normalized.route, "ready", str(delegation_trace.get("reason") or "route is executable"), [])
+
+    def _available_agent_capabilities_for_missing(self, decision: Decision, missing: list[dict[str, Any]]) -> list[str]:
+        if decision.risk_level.value not in {"R0", "R1"}:
+            return []
+        agent_capabilities: list[str] = []
+        for item in missing:
+            capability = str(item.get("capability") or item.get("capability_id") or "")
+            if not capability:
+                continue
+            match = self.capabilities.agent_capability_for(capability)
+            if isinstance(match, dict) and match.get("available"):
+                token = str(match.get("capability") or "")
+                if token:
+                    agent_capabilities.append(token)
+        return list(dict.fromkeys(agent_capabilities))
 
     def _should_agent_fallback(self, decision: Decision) -> bool:
         if decision.risk_level.value not in {"R0", "R1"}:

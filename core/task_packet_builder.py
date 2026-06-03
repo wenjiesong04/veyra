@@ -3,6 +3,7 @@ from __future__ import annotations
 from uuid import uuid4
 from typing import Any
 
+from core.agent_session_router import default_agent_execution_session_id
 from core.definitions import RiskLevel
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent, VeyraTaskPacket
@@ -22,11 +23,14 @@ class TaskPacketBuilder:
         policy_patch: dict[str, object],
         required_capabilities: list[str] | None = None,
         memory_policy: str = "forget",
+        agent_execution_session_id: str | None = None,
+        agent_session_policy: str = "ephemeral_per_task",
     ) -> VeyraTaskPacket:
         task_id = f"task_{uuid4().hex[:12]}"
         patched_policy = dict(policy_patch)
         patched_policy["tool_proxy_contract"] = agent_tool_proxy_contract(task_id)
         risk_level = str(patched_policy.get("risk_level") or "R0")
+        execution_session = str(agent_execution_session_id or "").strip() or default_agent_execution_session_id(task_id)
         return VeyraTaskPacket(
             task_id=task_id,
             target_agent=target_agent,
@@ -40,6 +44,8 @@ class TaskPacketBuilder:
             verification_policy=self._verification_policy(risk_level, required_capabilities or [], context_patch),
             rollback_requirement=self._rollback_requirement(risk_level, patched_policy),
             memory_policy=memory_policy,
+            agent_execution_session_id=execution_session,
+            agent_session_policy=agent_session_policy,
         )
 
     def _verification_policy(self, risk_level: str, capabilities: list[str], context_patch: dict[str, Any]) -> dict[str, Any]:

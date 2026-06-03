@@ -28,6 +28,8 @@ DAILY_MARKERS = ("每天", "每日", "每天早上", "每天早晨", "定时", "
 WEATHER_MARKERS = ("天气", "气温", "weather", "下雨", "晴天")
 LEARNING_MARKERS = ("学习", "深度学习", "机器学习", "入门", "教程", "课程", "复习", "learn", "study")
 PUSH_MARKERS = ("推送", "提醒", "通知", "告诉我", "发给我", "push", "notify", "remind")
+TRACKING_REQUEST_MARKERS = ("关注", "跟踪", "留意", "持续关注", "订阅")
+TRACKING_REQUEST_MARKERS_EN = ("watch", "track", "monitor", "subscribe")
 
 
 class CommitmentCore:
@@ -209,21 +211,22 @@ class CommitmentCore:
 
         lowered = (user_text or "").lower()
         result: dict[str, Any] = {"status": "idle", "actions": []}
-        intent = self.intent_planner.plan(user_text=user_text, event=event)
 
-        if intent.intent_type in {"cancel_commitment", "pause_commitment", "resume_commitment"}:
-            intent_record = self.intent_planner.record_intent(intent)
-            control = self.template_registry.apply(
-                intent=intent,
-                core=self,
-                event=event,
-                user_text=user_text,
-                assistant_response=assistant_response,
-                route=route,
-            )
-            if control:
-                control["intent"] = intent_record
-                return control
+        if self._is_commitment_control_request(user_text, lowered):
+            intent = self.intent_planner.plan(user_text=user_text, event=event)
+            if intent.intent_type in {"cancel_commitment", "pause_commitment", "resume_commitment"}:
+                intent_record = self.intent_planner.record_intent(intent)
+                control = self.template_registry.apply(
+                    intent=intent,
+                    core=self,
+                    event=event,
+                    user_text=user_text,
+                    assistant_response=assistant_response,
+                    route=route,
+                )
+                if control:
+                    control["intent"] = intent_record
+                    return control
 
         pending = self._pending_for_session(event.source.session_id)
         if pending and self._is_affirmation(lowered):
@@ -233,7 +236,7 @@ class CommitmentCore:
                     "status": "confirmed",
                     "commitment": confirmed,
                     "actions": ["confirmed_pending"],
-                    "response_override": f"已开启：{confirmed.get('title') or confirmed.get('kind')}",
+                    "primary_response_override": f"已开启：{confirmed.get('title') or confirmed.get('kind')}",
                 }
                 return result
         if pending and self._is_decline(lowered):
@@ -243,9 +246,20 @@ class CommitmentCore:
                     "status": "declined",
                     "commitment": cancelled,
                     "actions": ["cancelled_pending"],
-                    "response_override": f"已取消：{cancelled.get('title') or cancelled.get('kind')}",
+                    "primary_response_override": f"已取消：{cancelled.get('title') or cancelled.get('kind')}",
                 }
 
+        # Bare confirmations without a pending offer must not create or confirm commitments.
+        if self._is_affirmation(lowered) and not pending:
+            return {}
+
+        if self._looks_like_plain_information_query(user_text, lowered):
+            return {}
+
+        if not self._looks_like_proactive_request(user_text, lowered):
+            return {}
+
+        intent = self.intent_planner.plan(user_text=user_text, event=event)
         if self._intent_is_answer_only(intent):
             return {}
         intent_record = self.intent_planner.record_intent(intent)
@@ -270,7 +284,7 @@ class CommitmentCore:
                 "intent": intent_record,
                 "capability_gap": proposal.get("gap_description"),
                 "self_improvement_proposal": proposal,
-                "response_override": "我先把这个需求记录为主动意图草案，但还不能安全确定信息源、频率或模板；不会创建 active 推送。已生成一条需要人工审查的能力改进建议。",
+                "followup_messages": ["我先把这个需求记录为主动意图草案，但还不能安全确定信息源、频率或模板；不会创建 active 推送。已生成一条需要人工审查的能力改进建议。"],
             }
 
         extracted = self._extract_from_user_text(user_text, event=event)
@@ -303,7 +317,7 @@ class CommitmentCore:
             return {
                 "status": "not_found",
                 "actions": [f"{action}_matching_commitments"],
-                "response_override": "没有找到正在进行的相关推送。",
+                "primary_response_override": "没有找到正在进行的相关推送。",
                 "matched_commitments": [],
                 "template": "cancel_pause_resume",
             }
@@ -328,7 +342,7 @@ class CommitmentCore:
             "actions": [f"{action}_matching_commitments"],
             "matched_commitments": matches,
             "updated_commitments": updated,
-            "response_override": f"已{action_word} {len(updated)} 个匹配的主动任务。",
+            "primary_response_override": f"已{action_word} {len(updated)} 个匹配的主动任务。",
             "template": "cancel_pause_resume",
         }
 
@@ -470,15 +484,27 @@ class CommitmentCore:
             )
 
     def append_followup_to_response(self, response: str, turn_result: dict[str, Any]) -> str:
-        override = str(turn_result.get("response_override") or "").strip()
-        if override:
-            return override
-        followup = str(turn_result.get("followup_offer") or "").strip()
-        if not followup:
+        messages = self.followup_messages_for_turn(turn_result)
+        if not messages:
             return response
-        if followup in response:
+        additions = [message for message in messages if message and message not in response]
+        if not additions:
             return response
-        return f"{response.rstrip()}\n\n{followup}"
+        return f"{response.rstrip()}\n\n" + "\n\n".join(additions)
+
+    def followup_messages_for_turn(self, turn_result: dict[str, Any]) -> list[str]:
+        messages: list[str] = []
+        for key in ("primary_response_override", "response_override", "followup_offer"):
+            message = str(turn_result.get(key) or "").strip()
+            if message and message not in messages:
+                messages.append(message)
+        explicit = turn_result.get("followup_messages")
+        if isinstance(explicit, list):
+            for item in explicit:
+                message = str(item or "").strip()
+                if message and message not in messages:
+                    messages.append(message)
+        return messages
 
     def _maybe_offer_subscription(
         self,
@@ -491,7 +517,9 @@ class CommitmentCore:
         lowered = (user_text or "").lower()
         if not any(marker in lowered for marker in WEATHER_MARKERS):
             return None
-        if not self._mentions_push_intent(lowered) and route not in {"probe", "direct_answer"}:
+        if not self._mentions_push_intent(lowered):
+            return None
+        if route not in {"probe", "direct_answer"}:
             return None
         existing = [
             item
@@ -574,7 +602,7 @@ class CommitmentCore:
             "commitment": digest,
             "actions": actions,
             "memory_write": memory_write,
-            "response_override": self._learning_goal_response(goal, digest),
+            "followup_messages": [self._learning_goal_response(goal, digest)],
         }
 
     def _ensure_learning_digest_offer(self, *, goal: dict[str, Any], event: VeyraEvent, user_text: str) -> dict[str, Any] | None:
@@ -991,6 +1019,7 @@ class CommitmentCore:
 
     def _extract_location(self, text: str) -> str:
         patterns = [
+            r"(?:推送|通知|告诉我|提醒我)\s*([^\s，,。.?！!]{2,16}?)(?:的)?(?:天气|气温)",
             r"(?:在|于)\s*([^\s，,。.?！!]{2,16}?)(?:的)?(?:天气|气温)",
             r"([^\s，,。.?！!]{2,16}?)(?:今天|现在|当前|明天|今日)?(?:的)?(?:天气|气温)",
         ]
@@ -1032,6 +1061,72 @@ class CommitmentCore:
 
     def _mentions_push_intent(self, lowered: str) -> bool:
         return any(marker in lowered for marker in PUSH_MARKERS + DAILY_MARKERS)
+
+    def _looks_like_plain_information_query(self, text: str, lowered: str) -> bool:
+        """One-shot factual lookups should not spawn proactive commitments."""
+        if self._mentions_push_intent(lowered):
+            return False
+        if any(marker in (text or "") for marker in TRACKING_REQUEST_MARKERS):
+            return False
+        if any(marker in lowered for marker in TRACKING_REQUEST_MARKERS_EN):
+            return False
+        lookup_markers = (
+            "帮我找",
+            "查一下",
+            "查询",
+            "是什么",
+            "标题",
+            "最新一期",
+            "最新视频",
+            "最新版本",
+            "youtube",
+            "bilibili",
+            "github release",
+            "release note",
+        )
+        if any(marker in lowered for marker in lookup_markers):
+            return True
+        if any(marker in (text or "") for marker in ("最新", "最近", "当前")) and any(
+            marker in lowered for marker in ("新闻", "版本", "视频", "标题", "天气怎么样", "气温")
+        ):
+            return True
+        return False
+
+    def _looks_like_proactive_request(self, text: str, lowered: str) -> bool:
+        if self._is_commitment_control_request(text, lowered):
+            return True
+        if self._mentions_push_intent(lowered):
+            return True
+        if any(marker in lowered for marker in LEARNING_MARKERS) and self._looks_like_learning_goal_request(text):
+            return True
+        if any(marker in (text or "") for marker in TRACKING_REQUEST_MARKERS):
+            return True
+        return any(marker in lowered for marker in TRACKING_REQUEST_MARKERS_EN)
+
+    def _is_commitment_control_request(self, text: str, lowered: str) -> bool:
+        if any(marker in lowered for marker in ("pause", "resume", "stop", "cancel")):
+            return True
+        return any(
+            marker in (text or "")
+            for marker in (
+                "停止",
+                "停掉",
+                "取消",
+                "以后都停止",
+                "取消所有",
+                "停止所有",
+                "暂停",
+                "先暂停",
+                "最近先暂停",
+                "暂时停",
+                "先停一下",
+                "恢复",
+                "继续给我推",
+                "继续推",
+                "重新开启",
+                "恢复推送",
+            )
+        )
 
     def _is_affirmation(self, lowered: str) -> bool:
         text = re.sub(r"[\s，,。.!！?？、]+", "", lowered or "")

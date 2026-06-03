@@ -92,11 +92,30 @@ class LoopResult:
     response: str
     risk_level: RiskLevel
     artifacts: dict[str, Any] = field(default_factory=dict)
+    followup_messages: list[str] = field(default_factory=list)
+
+    @property
+    def primary_response(self) -> str:
+        return self.response
+
+    @primary_response.setter
+    def primary_response(self, value: str) -> None:
+        self.response = value
+
+    def ordered_messages(self) -> list[dict[str, Any]]:
+        messages = [{"message_type": "primary", "index": 0, "message": self.response}]
+        for index, message in enumerate(self.followup_messages, start=1):
+            text = str(message or "").strip()
+            if text:
+                messages.append({"message_type": "followup", "index": index, "message": text})
+        return messages
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["route"] = self.route.value
         data["risk_level"] = self.risk_level.value
+        data["primary_response"] = self.response
+        data["messages"] = self.ordered_messages()
         return data
 
 
@@ -114,6 +133,11 @@ class VeyraTaskPacket:
     verification_policy: dict[str, Any] = field(default_factory=dict)
     rollback_requirement: dict[str, Any] = field(default_factory=dict)
     memory_policy: str = "forget"
+    # Agent execution session is isolated per task by default so independent user
+    # requests never share one polluted agent conversation window. session_id stays
+    # the Veyra-side dialogue/user session and must NOT be used as the agent runtime key.
+    agent_execution_session_id: str = ""
+    agent_session_policy: str = "ephemeral_per_task"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

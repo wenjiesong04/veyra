@@ -68,6 +68,10 @@ def artifact(body: dict[str, Any]) -> dict[str, Any]:
     return (body.get("artifacts") or {}).get("commitment") or {}
 
 
+def message_text(body: dict[str, Any]) -> str:
+    return "\n".join([str(body.get("response") or ""), *[str(item) for item in body.get("followup_messages", []) if item]])
+
+
 def commitments(store: WorldStateStore, user_id: str, *, status: str | None = None) -> list[dict[str, Any]]:
     state = store.read_json("user_commitments.json")
     items = state.get("commitments") if isinstance(state.get("commitments"), list) else []
@@ -110,7 +114,7 @@ def main() -> int:
     learning = post_message("现在我要开始学习深度学习了，你能帮我吗？", user_id=user_id, session_id=session_id, index=1)
     learning_artifact = artifact(learning)
     expect(learning_artifact.get("status") == "goal_recorded", "learning request records a goal", learning_artifact)
-    expect("深度学习" in str(learning.get("response") or "") and "启动" in str(learning.get("response") or ""), "learning response gives a start plan", learning.get("response"))
+    expect("深度学习" in message_text(learning) and "启动" in message_text(learning), "learning response gives a start plan", learning)
     pending_digest = learning_artifact.get("commitment") if isinstance(learning_artifact.get("commitment"), dict) else {}
     expect(pending_digest.get("kind") == "learning_digest" and pending_digest.get("status") == "pending_confirmation", "learning digest is pending before consent", pending_digest)
     expect((learning_artifact.get("watchlist_draft") or {}).get("status") == "pending_confirmation", "learning watchlist draft is pending", learning_artifact)
@@ -130,7 +134,7 @@ def main() -> int:
     pytorch_pending = find_commitment(store, user_id, kind="external_digest", topic="PyTorch", status="pending_confirmation")
     expect((track_artifact.get("intent") or {}).get("intent_type") == "track_external_topic", "PyTorch request is track_external_topic", track_artifact)
     expect((track_artifact.get("watchlist_draft") or {}).get("status") == "pending_confirmation" and pytorch_pending, "PyTorch watchlist and commitment draft are created", track_artifact)
-    expect("回复" in str(track.get("response") or "") and "好的" in str(track.get("response") or ""), "PyTorch tracking asks for push authorization", track.get("response"))
+    expect("回复" in message_text(track) and "好的" in message_text(track), "PyTorch tracking asks for push authorization", track)
 
     ids_before_pause = {str(item.get("commitment_id")) for item in commitments(store, user_id)}
     pause = post_message("最近先暂停 PyTorch 更新提醒", user_id=user_id, session_id=session_id, index=4)

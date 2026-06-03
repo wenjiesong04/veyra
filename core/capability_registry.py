@@ -84,8 +84,8 @@ GENERIC_TO_AGENT_CAPABILITY: dict[str, str] = {
 }
 
 AGENT_CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
-    "web_search": ("web_search", "search", "browser.search", "tools.web_search"),
-    "web_fetch": ("web_fetch", "fetch", "browser.fetch", "tools.web_fetch"),
+    "web_search": ("web_search", "search", "browser.search", "tools.web_search", "web"),
+    "web_fetch": ("web_fetch", "fetch", "browser.fetch", "tools.web_fetch", "web"),
     "browser": ("browser", "browser_automation", "tools.browser"),
     "vision": ("vision", "image", "image_understanding", "multimodal", "media"),
     "code_edit": ("code_edit", "edit", "patch", "workspace_edit"),
@@ -141,13 +141,13 @@ class CapabilityRegistry:
         )
         capabilities["web_search"] = Capability(
             capability_id="web_search",
-            available=False,
+            available=True,
             kind="probe",
             route="probe",
-            executor="none",
-            description="General web search over arbitrary current facts.",
-            status="not_implemented",
-            reason="Only direct URL fetch is implemented as web_url_probe.",
+            executor="search_probe",
+            description="General web search via SearchProbe (DuckDuckGo HTML / optional OpenClaw CLI).",
+            status="available",
+            reason="",
             updated_at=now,
         )
         capabilities["weather_probe"] = Capability(

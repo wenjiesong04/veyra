@@ -58,6 +58,10 @@ def expect(condition: bool, label: str, detail: object = None) -> None:
     print(f"ok - {label}")
 
 
+def message_text(body: dict[str, Any]) -> str:
+    return "\n".join([str(body.get("response") or ""), *[str(item) for item in body.get("followup_messages", []) if item]])
+
+
 def past_iso() -> str:
     return (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
 
@@ -128,9 +132,9 @@ def main() -> int:
 
         weather = client.post(
             "/events/message",
-            json={"text": "今天北京天气怎么样", "channel": "acceptance", "user_id": "closed-loop-user", "session_id": "weather"},
+            json={"text": "每天早上帮我推送北京天气", "channel": "acceptance", "user_id": "closed-loop-user", "session_id": "weather"},
         )
-        expect(weather.status_code == 200 and "推送" in weather.json().get("response", ""), "weather answer offers subscription", weather.text)
+        expect(weather.status_code == 200 and "推送" in message_text(weather.json()), "weather answer offers subscription", weather.text)
         weather_offer = (weather.json().get("artifacts") or {}).get("commitment", {}).get("commitment", {})
         expect((weather_offer.get("payload") or {}).get("location") == "北京", "weather offer records clean location", weather_offer)
         weather_confirm = client.post(

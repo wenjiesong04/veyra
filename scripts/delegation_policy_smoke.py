@@ -11,11 +11,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.awareness_loop import AwarenessLoop  # noqa: E402
+from core.capability_registry import CapabilityRegistry  # noqa: E402
+from core.commitment_core import CommitmentCore  # noqa: E402
+from core.definitions import RiskLevel  # noqa: E402
+from core.result_interpreter import ResultInterpreter  # noqa: E402
 from core.runtime_entity import RuntimeEntity  # noqa: E402
+from core.veyra_controller import VeyraController  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
 from interface.agent_adapter import AgentAdapter, ExecutionResult  # noqa: E402
 from interface.event_normalizer import EventNormalizer  # noqa: E402
-from interface.event_schema import VeyraTaskPacket  # noqa: E402
+from interface.event_schema import utc_now_iso  # noqa: E402
+from interface.event_schema import Decision, Route, VeyraTaskPacket  # noqa: E402
 
 
 @dataclass
@@ -45,12 +51,55 @@ def expect(condition: bool, label: str, detail: Any = None) -> None:
 
 def main() -> int:
     print("Veyra DelegationPolicy smoke")
+    with TemporaryDirectory(prefix="veyra-capability-registry-") as tmp:
+        state = WorldStateStore(Path(tmp) / "state")
+        executor = state.read_json("executor_state.json")
+        executor["capability_snapshot"] = {
+            "runtime": "openclaw",
+            "updated_at": utc_now_iso(),
+            "ttl_seconds": 300,
+            "source": "agent_adapter.fetch_capabilities",
+            "tools": [{"groups": ["fs", "runtime", "web", "memory", "media"]}],
+        }
+        state.write_json("executor_state.json", executor)
+        registry = CapabilityRegistry(state)
+        expect(registry.agent_available_for("web_search"), "OpenClaw web tool group advertises web_search")
+        expect(registry.agent_available_for("web_url_probe"), "OpenClaw web tool group advertises web_fetch")
+        delegated, plan = VeyraController(registry).prepare(
+            Decision(
+                route=Route.PROBE,
+                risk_level=RiskLevel.R1,
+                reason="latest external fact needs web search",
+                intent="information",
+                selected_probe="youtube_search",
+                freshness_required=True,
+                needs_probe=True,
+                reasoning_mode="evidence",
+                required_capabilities=["web_search", "openclaw.web_search"],
+            )
+        )
+        expect(delegated.route == Route.AGENT, "missing native web_search falls back to OpenClaw", delegated.to_dict())
+        expect("openclaw.web_search" in delegated.required_capabilities, "fallback keeps agent web_search capability", delegated.to_dict())
+        expect(plan.status == "rerouted", "fallback controller plan is rerouted", plan.to_dict())
+        interpreted = ResultInterpreter().interpret_execution(
+            ExecutionResult(
+                task_id="task_reasoning_leak",
+                executor="openclaw",
+                status="success",
+                result='用户说系统可能把柴静误解成 PyTorch。我需要重新搜索。让我直接给出答案。根据我之前的搜索结果，柴静在 YouTube 最新一期视频的标题是：**《柴静专访赖恩典》**。抱歉之前的混淆，这是柴静在 YouTube 最新一期视频的标题： **《柴静专访赖恩典》**。',
+            ),
+            {"status": "verified_success"},
+        )
+        expect("我需要" not in interpreted["summary"] and "用户说" not in interpreted["summary"], "agent summary strips internal preamble", interpreted)
+        expect("标题是" in interpreted["summary"] and "柴静专访赖恩典" in interpreted["summary"], "agent summary keeps final answer", interpreted)
+
     with TemporaryDirectory(prefix="veyra-delegation-") as tmp:
         state = WorldStateStore(Path(tmp) / "state")
         config = state.read_json("agent_config.json")
         config["agents"]["openclaw"]["capabilities"] = ["vision", "web_search", "code_edit", "file", "shell", "memory"]
         state.write_json("agent_config.json", config)
-        loop = AwarenessLoop(state, RuntimeEntity(state))
+        commitment_core = CommitmentCore(state)
+        loop = AwarenessLoop(state, RuntimeEntity(state), commitment_core=commitment_core)
         spy = SpyAgent()
         selected = loop.agent_registry.selected_name()
         loop.agent_registry._adapters[selected] = spy
@@ -81,6 +130,7 @@ def main() -> int:
         expect(latest["route"] == "agent", "latest external info uses Agent web capability", latest)
         expect("openclaw.web_search" in spy.packets[-1]["required_capabilities"], "latest packet carries web_search capability", spy.packets[-1])
         expect("raw spy" not in latest["response"], "agent raw result is synthesized", latest["response"])
+        expect(not (latest.get("artifacts") or {}).get("commitment"), "latest search is not overridden by proactive commitment", latest.get("artifacts"))
 
         code = loop.handle_event(normalizer.user_message("帮我修改项目代码实现 xxx 功能", "smoke", "u", "code")).to_dict()
         packet = spy.packets[-1]
@@ -96,7 +146,8 @@ def main() -> int:
         expect(identity["route"] == "direct_answer", "identity stays direct", identity)
         expect("Veyra" in identity["response"] and "OpenClaw" in identity["response"], "identity answer explains governance boundary", identity["response"])
         traces = state.read_jsonl("decision_trace.jsonl", limit=20)
-        expect(bool(traces) and all("route" in trace and "memory_policy" in trace for trace in traces), "decision traces recorded", traces)
+        runtime_traces = [trace for trace in traces if isinstance(trace, dict) and trace.get("trace_id")]
+        expect(bool(runtime_traces) and all("route" in trace and "memory_policy" in trace for trace in runtime_traces), "decision traces recorded", traces)
     return 0
 
 

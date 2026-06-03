@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from interface.agent_adapter import ExecutionResult
@@ -67,11 +68,42 @@ class ResultInterpreter:
 
     def _compact_text(self, value: str, limit: int = 900) -> str:
         text = " ".join(str(value or "").split())
+        text = self._strip_internal_preamble(text)
         if not text:
             return ""
         if len(text) <= limit:
             return text
         return text[: limit - 3] + "..."
+
+    def _strip_internal_preamble(self, text: str) -> str:
+        if not text:
+            return ""
+        preamble_markers = ("用户", "用户说", "我需要", "我应该", "让我直接", "之前的搜索结果", "重新搜索", "系统可能")
+        answer_markers = (
+            "抱歉之前的混淆，",
+            "抱歉之前的混淆。",
+            "根据我之前的搜索结果：",
+            "根据我之前的搜索结果，",
+            "根据之前的搜索结果：",
+            "根据搜索结果：",
+            "最终答案：",
+            "答案是：",
+            "答案：",
+            "结论：",
+        )
+        if not any(marker in text[:520] for marker in preamble_markers):
+            return text
+        title_matches = re.findall(r"标题(?:是|为)?[：:]?\s*(?:(?:>)|(?:\*)|(?:-)|\s)*((?:\*\*)?《[^》]{2,160}》(?:\*\*)?)", text)
+        if title_matches:
+            return f"标题是：{title_matches[-1].strip()}"
+        for marker in answer_markers:
+            index = text.rfind(marker)
+            if index > 0:
+                return text[index + len(marker) :].strip()
+        match = re.search(r"((?:\*\*)?[^。]{0,80}(?:标题|答案)(?:是|为|：)[^\n]{8,})", text)
+        if match and match.start() > 0:
+            return match.group(1).strip()
+        return text
 
 
 def compact_json(value: Any, *, limit: int = 900) -> str:

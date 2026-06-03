@@ -231,6 +231,11 @@ def main() -> int:
             verdict = verifier.verify_execution_result(ExecutionResult(task_id=f"t_{status}", executor="fake", status=status, result="queued"))
             expect(verdict["status"] == "partially_success", f"verifier {status}", verdict)
             expect(verdict["next_action"] == "poll_runtime_or_probe_result", f"verifier {status} next action", verdict)
+        failed_placeholder = verifier.verify_execution_result(
+            ExecutionResult(task_id="agent_failed_placeholder", executor="openclaw", status="success", result="[assistant turn failed before producing content]")
+        )
+        expect(failed_placeholder["status"] == "verified_failed", "verifier rejects agent failure placeholder", failed_placeholder)
+        expect(failed_placeholder["verdict"] == "execution_result_contains_failure_marker", "verifier failure placeholder verdict", failed_placeholder)
 
         bypass = verifier.verify_execution_result(
             ExecutionResult(task_id="tool_bypass", executor="fake", status="success", result="restarted", tool_calls=["sudo restart openclaw"])

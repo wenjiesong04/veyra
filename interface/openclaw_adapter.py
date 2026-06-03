@@ -95,8 +95,12 @@ class OpenClawAdapter(AgentAdapter):
         if not self.gateway_url:
             return self._unconfigured_result(task_packet)
         prompt = self.render_prompt(task_packet)
+        # Isolate each task in its own agent conversation window. The Veyra dialogue/user
+        # session id (e.g. feishu:ou_xxx:oc_xxx) must never be the OpenClaw sessionKey, and
+        # the fixed "main" key must not be shared across independent tasks.
+        session_key = str(getattr(task_packet, "agent_execution_session_id", "") or "").strip() or self.session_key
         try:
-            raw = self._send_chat(prompt)
+            raw = self._send_chat(prompt, session_key=session_key)
         except OpenClawGatewayError as exc:
             return ExecutionResult(
                 task_id=task_packet.task_id,
@@ -426,8 +430,9 @@ class OpenClawAdapter(AgentAdapter):
             "capabilities": capabilities,
         }
 
-    def _send_chat(self, message: str) -> dict[str, Any]:
+    def _send_chat(self, message: str, *, session_key: str | None = None) -> dict[str, Any]:
         events: list[dict[str, Any]] = []
+        active_session_key = str(session_key or "").strip() or self.session_key
         with self._open_socket() as ws:
             hello = self._connect(ws, events)
             idempotency_key = f"veyra-{uuid4().hex}"
@@ -435,7 +440,7 @@ class OpenClawAdapter(AgentAdapter):
                 ws,
                 "chat.send",
                 {
-                    "sessionKey": self.session_key,
+                    "sessionKey": active_session_key,
                     "message": message,
                     "idempotencyKey": idempotency_key,
                 },

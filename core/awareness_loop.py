@@ -9,8 +9,12 @@ from typing import Any
 from awareness.attention_core import AttentionCore
 from awareness.belief_core import BeliefCore
 from awareness.uncertainty_core import UncertaintyCore
+from core.agent_session_router import AgentSessionRouter
 from core.capability_registry import CapabilityRegistry
 from core.context_patch_builder import ContextPatchBuilder
+from core.compact_external_lookup import CompactExternalLookup
+from core.context_scope import ContextScopeFilter
+from core.execution_tier import TIER_L1_COMPACT_EXTERNAL, classify_execution_tier
 from core.definitions import GuardianDecision, LifecycleStatus, RiskLevel
 from core.decision_core import DecisionCore
 from core.foresight_engine import ForesightEngine
@@ -44,6 +48,7 @@ from probes.port_probe import PortProbe
 from probes.process_probe import ProcessProbe
 from probes.system_probe import SystemProbe
 from probes.time_probe import TimeProbe
+from probes.search_probe import SearchProbe
 from probes.weather_probe import WeatherProbe
 from probes.web_probe import WebProbe
 from rollback_audit.execution_trace import ExecutionTrace
@@ -77,7 +82,10 @@ class AwarenessLoop:
         self.guardian = GuardianController()
         self.persona_engine = PersonaEngine(state_store)
         self.context_builder = ContextPatchBuilder(state_store)
+        self.context_scope = ContextScopeFilter()
         self.task_packet_builder = TaskPacketBuilder(state_store)
+        self.agent_session_router = AgentSessionRouter(state_store)
+        self.compact_external_lookup = CompactExternalLookup()
         self.verifier = Verifier()
         self.result_interpreter = ResultInterpreter()
         self.response_synthesizer = ResponseSynthesizer()
@@ -110,6 +118,7 @@ class AwarenessLoop:
             "log": LogProbe(),
             "network": NetworkProbe(),
             "web": WebProbe(),
+            "search_probe": SearchProbe(),
             "openclaw": OpenClawProbe(),
             "hermes": HermesProbe(),
             "mcp": McpProbe(),
@@ -223,6 +232,32 @@ class AwarenessLoop:
             return self._finalize_event(event, result, started_at, route_trace, context_observability)
 
         self.runtime_entity.set_status(LifecycleStatus.ACTING.value)
+        execution_tier = classify_execution_tier(text, decision)
+        if isinstance(decision.model_assist, dict):
+            decision.model_assist["execution_tier"] = execution_tier
+        else:
+            decision.model_assist = {"execution_tier": execution_tier}
+        if execution_tier == TIER_L1_COMPACT_EXTERNAL:
+            compact = self.compact_external_lookup.run(text)
+            if compact.get("status") == "ok":
+                route_trace.append({"phase": "compact_external_lookup", "status": "ok", "provider": compact.get("provider")})
+                result = LoopResult(
+                    event_id=event.event_id,
+                    route=Route.PROBE,
+                    status="compact_lookup_success",
+                    response=str(compact.get("response") or ""),
+                    risk_level=decision.risk_level,
+                    artifacts={
+                        "decision": decision.to_dict(),
+                        "controller": controller_plan.to_dict(),
+                        "persona": persona_patch,
+                        "execution_tier": execution_tier,
+                        "compact_lookup": compact,
+                    },
+                )
+                return self._finalize_event(event, result, started_at, route_trace, context_observability)
+            route_trace.append({"phase": "compact_external_lookup", "status": "fallback", "reason": compact.get("reason")})
+
         if decision.route == Route.DIRECT_ANSWER:
             result = LoopResult(
                 event_id=event.event_id,
@@ -270,6 +305,22 @@ class AwarenessLoop:
             agent_memory_summary = self.agent_adapter.fetch_memory_summary(event.source.session_id)
             if agent_memory_summary.get("summary"):
                 context_patch["agent_memory_summary"] = agent_memory_summary
+            scoped = self.context_scope.apply(context_patch, user_goal=text)
+            context_patch = scoped["context_patch"]
+            if scoped.get("omitted_audit"):
+                self.state_store.append_jsonl(
+                    "context_scope_audit.jsonl",
+                    {
+                        "event_id": event.event_id,
+                        "session_id": event.source.session_id,
+                        "scope": scoped.get("scope"),
+                        "omitted": scoped.get("omitted_audit"),
+                    },
+                )
+            session_plan = self.agent_session_router.resolve(
+                dialogue_session_id=event.source.session_id,
+                text=text,
+            )
             packet = self.task_packet_builder.build(
                 event=event,
                 target_agent=selected_agent,
@@ -278,6 +329,14 @@ class AwarenessLoop:
                 context_patch=context_patch,
                 required_capabilities=decision.required_capabilities,
                 memory_policy=decision.memory_policy,
+                agent_execution_session_id=session_plan.get("reuse_session_id"),
+                agent_session_policy=str(session_plan.get("policy") or "ephemeral_per_task"),
+            )
+            self.agent_session_router.record(
+                dialogue_session_id=event.source.session_id,
+                agent_execution_session_id=packet.agent_execution_session_id,
+                task_id=packet.task_id,
+                user_goal=packet.user_goal,
             )
             execution = self.agent_adapter.send_task(packet)
             execution = self._poll_if_needed(execution)
@@ -317,6 +376,13 @@ class AwarenessLoop:
                 "controller": controller_plan.to_dict(),
                 "guardian": guardian_decision,
                 "persona": persona_patch,
+                "agent_session": {
+                    "agent_execution_session_id": packet.agent_execution_session_id,
+                    "agent_session_policy": packet.agent_session_policy,
+                    "dialogue_session_id": event.source.session_id,
+                    **session_plan.get("trace", {}),
+                },
+                "context_scope": scoped.get("scope"),
             }
             artifacts["execution_trace"] = self.execution_trace.record(
                 {
@@ -407,7 +473,16 @@ class AwarenessLoop:
         commitment_turn = self._process_commitment_turn(event, result)
         if commitment_turn:
             result.artifacts["commitment"] = commitment_turn
-            result.response = self._apply_commitment_followup(result.response, commitment_turn)
+            # Commitment/proactive must never replace the primary answer to the user's question.
+            # Subscription confirmations and control outcomes are delivered as followups only.
+            primary_override = str(commitment_turn.get("primary_response_override") or "").strip()
+            if primary_override:
+                result.artifacts["commitment_primary_deferred_to_followup"] = primary_override
+            followups = self._commitment_followup_messages(commitment_turn)
+            if followups:
+                existing = list(result.followup_messages or [])
+                result.followup_messages = existing + [message for message in followups if message not in existing]
+                result.artifacts["followup_messages"] = result.followup_messages
             route_trace.append({"phase": "commitment", "status": commitment_turn.get("status"), "actions": commitment_turn.get("actions", [])})
         trace = self.runtime_trace.record(
             event=event,
@@ -813,10 +888,10 @@ class AwarenessLoop:
             status=result.status,
         )
 
-    def _apply_commitment_followup(self, response: str, commitment_turn: dict[str, Any]) -> str:
+    def _commitment_followup_messages(self, commitment_turn: dict[str, Any]) -> list[str]:
         if self.commitment_core is None:
-            return response
-        return self.commitment_core.append_followup_to_response(response, commitment_turn)
+            return []
+        return self.commitment_core.followup_messages_for_turn(commitment_turn)
 
     def _update(self, event: VeyraEvent, result: LoopResult) -> None:
         risk_level = result.risk_level.value if hasattr(result.risk_level, "value") else str(result.risk_level)

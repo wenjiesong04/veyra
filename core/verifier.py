@@ -7,6 +7,14 @@ from interface.agent_adapter import ExecutionResult
 from tool_proxy.agent_tool_contract import AgentToolCompliance
 
 
+EXECUTION_FAILURE_MARKERS = (
+    "assistant turn failed before producing content",
+    "failed before producing content",
+    "model turn failed",
+    "no assistant content",
+)
+
+
 class Verifier:
     def __init__(self) -> None:
         self.agent_tool_compliance = AgentToolCompliance()
@@ -40,6 +48,17 @@ class Verifier:
         has_evidence = has_result or changed_files or has_tool_calls or has_raw
         tool_proxy_compliance = self.agent_tool_compliance.review_execution(execution_result)
         evidence["tool_proxy_compliance"] = tool_proxy_compliance
+
+        if status == "success" and self._has_failure_marker(execution_result):
+            return {
+                "status": "verified_failed",
+                "verdict": "execution_result_contains_failure_marker",
+                "confidence": 0.84,
+                "evidence": evidence,
+                "next_action": "retry_agent_or_inspect_runtime",
+                "needs_rollback": bool(changed_files),
+                "needs_memory_patch": False,
+            }
 
         if tool_proxy_compliance["status"] == "blocked":
             return {
@@ -148,6 +167,17 @@ class Verifier:
             "tool_calls": execution_result.tool_calls,
             "raw_keys": sorted(execution_result.raw.keys()) if isinstance(execution_result.raw, dict) else [],
         }
+
+    def _has_failure_marker(self, execution_result: ExecutionResult) -> bool:
+        text = str(execution_result.result or "").strip().lower()
+        if any(marker in text for marker in EXECUTION_FAILURE_MARKERS):
+            return True
+        raw = execution_result.raw if isinstance(execution_result.raw, dict) else {}
+        for key in ("error", "failure", "message", "result", "summary"):
+            value = raw.get(key)
+            if isinstance(value, str) and any(marker in value.strip().lower() for marker in EXECUTION_FAILURE_MARKERS):
+                return True
+        return False
 
     def _raw_has_snapshot(self, raw: dict[str, Any]) -> bool:
         if not isinstance(raw, dict):

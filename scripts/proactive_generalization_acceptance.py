@@ -24,6 +24,10 @@ def artifact(body: dict[str, Any]) -> dict[str, Any]:
     return (body.get("artifacts") or {}).get("commitment") or {}
 
 
+def message_text(body: dict[str, Any]) -> str:
+    return "\n".join([str(body.get("response") or ""), *[str(item) for item in body.get("followup_messages", []) if item]])
+
+
 def commitment_statuses(store: Any, ids: set[str]) -> dict[str, str]:
     state = store.read_json("user_commitments.json")
     items = state.get("commitments") if isinstance(state.get("commitments"), list) else []
@@ -68,7 +72,7 @@ def main() -> int:
         external_artifact = artifact(external)
         expect((external_artifact.get("intent") or {}).get("intent_type") == "track_external_topic", "external tracking intent typed", external_artifact)
         expect((external_artifact.get("watchlist_draft") or {}).get("status") == "pending_confirmation", "external watchlist draft pending", external_artifact)
-        expect("回复「好的」" in str(external.get("response") or ""), "external tracking asks for authorization", external.get("response"))
+        expect("回复「好的」" in message_text(external), "external tracking asks for authorization", external)
 
         monitor = client.post(
             "/events/message",
@@ -97,10 +101,10 @@ def main() -> int:
 
         weather = client.post(
             "/events/message",
-            json={"text": "今天伦敦天气怎么样？", "channel": "accept", "user_id": "weather-user", "session_id": "weather"},
+            json={"text": "每天早上帮我推送伦敦天气", "channel": "accept", "user_id": "weather-user", "session_id": "weather"},
         ).json()
         weather_artifact = artifact(weather)
-        expect("推送" in str(weather.get("response") or ""), "weather answer offers daily push", weather)
+        expect("推送" in message_text(weather), "explicit weather request offers daily push", weather)
         expect((weather_artifact.get("commitment") or {}).get("status") == "pending_confirmation", "weather push pending", weather_artifact)
         weather_confirm = client.post(
             "/events/message",

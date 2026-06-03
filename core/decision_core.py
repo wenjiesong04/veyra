@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from core.capability_registry import CapabilityRegistry
+from core.model_driven_decision_core import ModelDrivenDecisionCore
 from core.definitions import RiskLevel, classify_text_risk
 from core.memory_policy_runtime import normalize_memory_policy
 from core.reasoning_core import CoreReasoning, safe_model_risk
@@ -77,7 +78,7 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "latest_external_fact",
-        "probe": None,
+        "probe": "search_probe",
         "capability": "web_search",
         "markers": ("最新", "新闻", "latest", "recent", "today's", "今天的"),
     },
@@ -95,10 +96,12 @@ class DecisionCore:
         self.state_store = state_store
         self.reasoning = reasoning or (CoreReasoning(state_store) if state_store else None)
         self.capabilities = CapabilityRegistry(state_store) if state_store else None
+        self.model_driven = ModelDrivenDecisionCore()
 
     def decide(self, text: str, attention_focus: list[str], event: VeyraEvent | None = None) -> Decision:
         base = self._rule_decide(text, attention_focus, event=event)
-        return self._apply_model_assist(text, attention_focus, base, event=event)
+        decision = self._apply_model_assist(text, attention_focus, base, event=event)
+        return self.model_driven.enrich(text, decision, event=event)
 
     def _rule_decide(self, text: str, attention_focus: list[str], event: VeyraEvent | None = None) -> Decision:
         lowered = text.lower()

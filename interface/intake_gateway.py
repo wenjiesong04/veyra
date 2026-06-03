@@ -103,17 +103,39 @@ class IntakeGateway:
         self._record_inbox(state, inbox_item)
         result = self.awareness_loop.handle_event(event)
         adapter = ChannelAdapter(self.state_store, channel=channel_id)
-        outbox = adapter.send(
-            mapped_session,
-            result.response,
-            metadata={
+        deliveries: list[dict[str, Any]] = []
+        messages = result.ordered_messages()
+        for item in messages:
+            message_type = str(item.get("message_type") or "primary")
+            message_index = int(item.get("index") or 0)
+            message_text = str(item.get("message") or "").strip()
+            if not message_text:
+                continue
+            delivery_metadata = {
                 "event_id": event.event_id,
                 "message_id": dedupe_id,
                 "route": result.route.value,
                 "status": result.status,
+                "message_type": message_type,
+                "message_index": message_index,
+                "message_count": len(messages),
                 "inbound": metadata or {},
-            },
-        )
+            }
+            try:
+                delivery = adapter.send(mapped_session, message_text, metadata=delivery_metadata)
+            except Exception as exc:
+                delivery = {
+                    "channel": channel_id,
+                    "session_id": mapped_session,
+                    "message": message_text,
+                    "metadata": delivery_metadata,
+                    "status": "error",
+                    "delivery_status": "send_failed",
+                    "reason": str(exc),
+                    "error_type": type(exc).__name__,
+                }
+            deliveries.append(delivery)
+        outbox = deliveries[0] if deliveries else {}
         state = self._channel_state()
         seen = state.setdefault("seen_message_ids", {})
         if isinstance(seen, dict):
@@ -131,6 +153,7 @@ class IntakeGateway:
             "event": event.to_dict(),
             "loop_result": result.to_dict(),
             "outbox": outbox,
+            "outbox_messages": deliveries,
         }
 
     def channel_status(self) -> dict[str, Any]:

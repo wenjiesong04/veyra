@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.awareness_loop import AwarenessLoop  # noqa: E402
+from core.commitment_core import CommitmentCore  # noqa: E402
 from core.decision_core import DecisionCore  # noqa: E402
 from core.definitions import RiskLevel  # noqa: E402
 from core.runtime_entity import RuntimeEntity  # noqa: E402
@@ -234,6 +235,107 @@ def main() -> int:
                 "conversation_tail_keeps_inbound_and_outbound",
                 "inbound" in directions and "outbound" in directions,
                 f"directions={sorted(directions)}",
+            )
+        )
+
+        commitment_core = CommitmentCore(state_store)
+        ordinary_search_text = "帮我找一下柴静在 YouTube 最新一期视频的标题是什么"
+        cases.append(
+            _result(
+                "ordinary_help_search_is_not_proactive_request",
+                not commitment_core._looks_like_proactive_request(ordinary_search_text, ordinary_search_text.lower()),
+                "plain help/search request should stay in Core answer or evidence route",
+            )
+        )
+        ordinary_search_event = normalizer.user_message(
+            text=ordinary_search_text,
+            channel="smoke",
+            user_id="dialogue-regression",
+            session_id="dialogue-regression-session",
+        )
+        ordinary_turn = commitment_core.process_turn(
+            event=ordinary_search_event,
+            user_text=str(ordinary_search_event.payload.get("text") or ""),
+            assistant_response="需要可验证外部证据。",
+            route="agent",
+            status="success",
+        )
+        cases.append(
+            _result(
+                "ordinary_latest_search_does_not_create_proactive_draft",
+                ordinary_turn == {},
+                f"commitment_turn={ordinary_turn}",
+            )
+        )
+
+        topic_correction_event = normalizer.user_message(
+            text="什么 PyTorch，我说的是柴静在 YouTube 最新一期视频标题",
+            channel="smoke",
+            user_id="dialogue-regression",
+            session_id="dialogue-regression-session",
+        )
+        topic_correction_turn = commitment_core.process_turn(
+            event=topic_correction_event,
+            user_text=str(topic_correction_event.payload.get("text") or ""),
+            assistant_response="我会按柴静 YouTube 最新视频继续处理。",
+            route="agent",
+            status="success",
+        )
+        cases.append(
+            _result(
+                "topic_correction_with_pytorch_word_does_not_create_tracking",
+                topic_correction_turn == {},
+                f"commitment_turn={topic_correction_turn}",
+            )
+        )
+
+        pending = commitment_core.create_commitment(
+            {
+                "kind": "external_digest",
+                "status": "pending_confirmation",
+                "title": "外部追踪：PyTorch",
+                "user_id": "dialogue-regression",
+                "channel": "smoke",
+                "session_id": "dialogue-regression-session",
+                "payload": {"topic": "PyTorch"},
+            }
+        )
+        followup_event = normalizer.user_message(
+            text="找到了吗",
+            channel="smoke",
+            user_id="dialogue-regression",
+            session_id="dialogue-regression-session",
+        )
+        followup_turn = commitment_core.process_turn(
+            event=followup_event,
+            user_text=str(followup_event.payload.get("text") or ""),
+            assistant_response="还没有可验证结果。",
+            route="direct_answer",
+            status="success",
+        )
+        still_pending = commitment_core.get_commitment(str(pending.get("commitment_id") or ""))
+        cases.append(
+            _result(
+                "followup_question_does_not_confirm_pending_commitment",
+                followup_turn == {} and (still_pending or {}).get("status") == "pending_confirmation",
+                f"commitment_turn={followup_turn}, pending={still_pending}",
+            )
+        )
+
+        loop.commitment_core = commitment_core
+        confirm_event = normalizer.user_message(
+            text="好的",
+            channel="smoke",
+            user_id="dialogue-regression",
+            session_id="dialogue-regression-session",
+        )
+        confirm_result = loop.handle_event(confirm_event).to_dict()
+        followups = confirm_result.get("followup_messages") or []
+        cases.append(
+            _result(
+                "commitment_confirmation_uses_followup_not_primary_override",
+                any("已开启" in str(item) for item in followups),
+                f"response={confirm_result.get('response')}, followups={followups}",
             )
         )
 

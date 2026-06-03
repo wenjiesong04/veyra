@@ -38,6 +38,10 @@ def expect(condition: bool, label: str, detail=None) -> None:
     print(f"ok - {label}")
 
 
+def message_text(body: dict) -> str:
+    return "\n".join([str(body.get("response") or ""), *[str(item) for item in body.get("followup_messages", []) if item]])
+
+
 def main() -> int:
     store = WorldStateStore(TEST_STATE_ROOT)
 
@@ -54,7 +58,7 @@ def main() -> int:
     learning_body = learning_turn.json()
     learning_artifact = (learning_body.get("artifacts") or {}).get("commitment") or {}
     expect(learning_artifact.get("status") == "goal_recorded", "learning goal recorded", learning_artifact)
-    expect("学习目标" in str(learning_body.get("response") or "") and "同意开启" in str(learning_body.get("response") or ""), "learning response includes plan and opt-in", learning_body.get("response"))
+    expect("学习目标" in message_text(learning_body) and "同意开启" in message_text(learning_body), "learning response includes plan and opt-in", learning_body)
 
     goals = store.read_json("user_goals.json").get("goals", [])
     learning_goal = next((goal for goal in goals if isinstance(goal, dict) and goal.get("topic") == "深度学习"), None)
@@ -89,7 +93,7 @@ def main() -> int:
     weather = client.post(
         "/events/message",
         json={
-            "text": "今天北京天气怎么样",
+            "text": "每天早上帮我推送北京天气",
             "channel": "self-test",
             "user_id": "cmt-user",
             "session_id": "cmt-weather",
@@ -98,8 +102,17 @@ def main() -> int:
     expect(weather.status_code == 200, "weather message", weather.text)
     body = weather.json()
     expect(body.get("route") == "probe", "weather routes to probe", body)
-    expect("推送" in str(body.get("response") or ""), "weather response offers subscription", body.get("response"))
+    expect("推送" in message_text(body), "explicit weather request offers subscription", body)
+    expect("推送" not in str(body.get("response") or "") and any("推送" in str(item) for item in body.get("followup_messages", [])), "weather followup does not override primary", body)
+    weather_outbox = [
+        item
+        for item in store.read_json("channel_state.json").get("outbox", [])
+        if isinstance(item, dict) and item.get("session_id") == "self-test:cmt-user:cmt-weather"
+    ][-2:]
+    message_types = [(item.get("metadata") or {}).get("message_type") for item in weather_outbox]
+    expect(message_types == ["primary", "followup"], "weather turn sends primary then followup", weather_outbox)
     weather_offer = (body.get("artifacts") or {}).get("commitment", {}).get("commitment", {})
+    expect("response_override" not in ((body.get("artifacts") or {}).get("commitment") or {}), "commitment artifact has no response_override", body.get("artifacts"))
     expect((weather_offer.get("payload") or {}).get("location") == "北京", "weather commitment extracts clean location", weather_offer)
 
     mapped_session = (
