@@ -51,7 +51,14 @@ class CompactExternalLookup:
     def _success_from_search(self, target: dict[str, Any], search: dict[str, Any], creator: str) -> dict[str, Any]:
         details = search.get("details") if isinstance(search.get("details"), dict) else {}
         results = details.get("results") if isinstance(details.get("results"), list) else []
-        top = results[0] if results and isinstance(results[0], dict) else {}
+        top = self._verified_search_result(results, creator)
+        if not top:
+            return {
+                "status": "failed",
+                "reason": "search_result_not_verified_for_youtube_latest",
+                "compact_task": target,
+                "probe_result": search,
+            }
         title = str(top.get("title") or "").strip()
         url = str(top.get("url") or "").strip()
         source = str(top.get("source") or "web_search")
@@ -63,6 +70,29 @@ class CompactExternalLookup:
             "probe_result": search,
             "response": response,
         }
+
+    def _verified_search_result(self, results: list[Any], creator: str) -> dict[str, Any] | None:
+        creator = str(creator or "").strip().lower()
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip()
+            url = str(item.get("url") or "").strip()
+            source = str(item.get("source") or "").strip().lower()
+            haystack = " ".join(
+                str(part or "").lower()
+                for part in (title, url, source, item.get("snippet"))
+            )
+            if not title or title.lower() in {"here", "click here", "duckduckgo"}:
+                continue
+            if source in {"duckduckgo.com", "www.duckduckgo.com"} or url.rstrip("/") == "https://duckduckgo.com":
+                continue
+            if "youtube.com" not in haystack and "youtu.be" not in haystack:
+                continue
+            if creator and creator not in haystack:
+                continue
+            return item
+        return None
 
     def _format_response(self, *, creator: str, title: str, source: str, published: str, url: str) -> str:
         lines = [f"{creator} 在 YouTube 的最新视频标题是：{title or '（未能解析标题）'}"]

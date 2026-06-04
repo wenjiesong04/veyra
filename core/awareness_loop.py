@@ -14,7 +14,7 @@ from core.capability_registry import CapabilityRegistry
 from core.context_patch_builder import ContextPatchBuilder
 from core.compact_external_lookup import CompactExternalLookup
 from core.context_scope import ContextScopeFilter
-from core.execution_tier import TIER_L1_COMPACT_EXTERNAL, classify_execution_tier
+from core.execution_tier import TIER_L1_COMPACT_EXTERNAL, TIER_L5_PROACTIVE, classify_execution_tier
 from core.definitions import GuardianDecision, LifecycleStatus, RiskLevel
 from core.decision_core import DecisionCore
 from core.foresight_engine import ForesightEngine
@@ -257,6 +257,24 @@ class AwarenessLoop:
                 )
                 return self._finalize_event(event, result, started_at, route_trace, context_observability)
             route_trace.append({"phase": "compact_external_lookup", "status": "fallback", "reason": compact.get("reason")})
+            result = LoopResult(
+                event_id=event.event_id,
+                route=Route.PROBE,
+                status="compact_lookup_failed",
+                response=(
+                    "这类最新 YouTube 标题需要可验证的官方频道/RSS 或可信搜索结果。"
+                    "我这轮没有拿到可靠证据，因此不会把未验证搜索结果当答案，也不会把简单查询升级成重型 Agent 任务。"
+                ),
+                risk_level=decision.risk_level,
+                artifacts={
+                    "decision": decision.to_dict(),
+                    "controller": controller_plan.to_dict(),
+                    "persona": persona_patch,
+                    "execution_tier": execution_tier,
+                    "compact_lookup": compact,
+                },
+            )
+            return self._finalize_event(event, result, started_at, route_trace, context_observability)
 
         if decision.route == Route.DIRECT_ANSWER:
             result = LoopResult(
@@ -476,9 +494,14 @@ class AwarenessLoop:
             # Commitment/proactive must never replace the primary answer to the user's question.
             # Subscription confirmations and control outcomes are delivered as followups only.
             primary_override = str(commitment_turn.get("primary_response_override") or "").strip()
-            if primary_override:
+            if primary_override and self._result_execution_tier(result) == TIER_L5_PROACTIVE:
+                result.primary_response = primary_override
+                result.artifacts["commitment_primary_applied"] = primary_override
+            elif primary_override:
                 result.artifacts["commitment_primary_deferred_to_followup"] = primary_override
             followups = self._commitment_followup_messages(commitment_turn)
+            if primary_override and self._result_execution_tier(result) == TIER_L5_PROACTIVE:
+                followups = [message for message in followups if message != primary_override]
             if followups:
                 existing = list(result.followup_messages or [])
                 result.followup_messages = existing + [message for message in followups if message not in existing]
@@ -498,6 +521,15 @@ class AwarenessLoop:
         }
         self._update(event, result)
         return result
+
+    def _result_execution_tier(self, result: LoopResult) -> str:
+        direct_tier = str(result.artifacts.get("execution_tier") or "").strip()
+        if direct_tier:
+            return direct_tier
+        decision = result.artifacts.get("decision") if isinstance(result.artifacts.get("decision"), dict) else {}
+        assist = decision.get("model_assist") if isinstance(decision.get("model_assist"), dict) else {}
+        plan = assist.get("decision_plan") if isinstance(assist.get("decision_plan"), dict) else {}
+        return str(plan.get("execution_tier") or assist.get("execution_tier") or "").strip()
 
     def _confirmation_proposal(self, text: str, decision: Decision) -> dict[str, object] | None:
         if decision.route != Route.ROLLBACK:

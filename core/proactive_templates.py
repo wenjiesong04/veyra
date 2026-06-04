@@ -232,6 +232,7 @@ class ReminderTemplate(ProactiveIntentTemplate):
                 source_intent_id=intent.intent_id,
                 payload=commitment.get("payload") if isinstance(commitment.get("payload"), dict) else {},
             ).to_dict(),
+            "primary_response_override": f"已记录提醒：{topic}。",
             "followup_messages": [f"已记录提醒：{topic}。"],
             "actions": ["created_reminder"],
             "template": self.name,

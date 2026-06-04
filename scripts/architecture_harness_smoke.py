@@ -16,7 +16,8 @@ from core.awareness_loop import AwarenessLoop  # noqa: E402
 from core.commitment_core import CommitmentCore  # noqa: E402
 from core.compact_external_lookup import CompactExternalLookup  # noqa: E402
 from core.decision_core import DecisionCore  # noqa: E402
-from core.execution_tier import TIER_L1_COMPACT_EXTERNAL, classify_execution_tier  # noqa: E402
+from core.execution_tier import TIER_L1_COMPACT_EXTERNAL, classify_execution_tier, compact_lookup_target  # noqa: E402
+from core.proactive_intent_planner import ProactiveIntentPlanner  # noqa: E402
 from core.provider_repair import repair_provider_error  # noqa: E402
 from core.runtime_entity import RuntimeEntity  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
@@ -36,6 +37,9 @@ def main() -> None:
         text = "帮我找一下王志安在 YouTube 最新一期视频的标题是什么"
         decision = Decision(route=Route.AGENT, risk_level=RiskLevel.R0, reason="test", needs_agent=True)
         expect(classify_execution_tier(text, decision) == TIER_L1_COMPACT_EXTERNAL, "youtube lookup classified as L1")
+        expect((compact_lookup_target(text) or {}).get("target", {}).get("creator") == "王志安", "youtube lookup extracts clean creator", compact_lookup_target(text))
+        correction = "什么 PyTorch，我说的是柴静在 YouTube 最新一期视频标题"
+        expect((compact_lookup_target(correction) or {}).get("target", {}).get("creator") == "柴静", "correction lookup extracts corrected creator", compact_lookup_target(correction))
 
         fake_ok = {
             "status": "ok",
@@ -56,6 +60,17 @@ def main() -> None:
         plan = (result.artifacts.get("decision") or {}).get("model_assist", {}).get("decision_plan", {})
         expect(plan.get("execution_tier") == TIER_L1_COMPACT_EXTERNAL, "decision_plan records L1 tier", plan)
 
+        lookup = CompactExternalLookup()
+        bad_search = lookup._success_from_search(
+            compact_lookup_target(text) or {},
+            {
+                "status": "ok",
+                "details": {"results": [{"title": "here", "url": "https://duckduckgo.com/", "source": "duckduckgo.com"}]},
+            },
+            "王志安",
+        )
+        expect(bad_search.get("status") == "failed", "compact lookup rejects unverified search result", bad_search)
+
         bare_ok = commitment.process_turn(
             event=VeyraEvent(
                 type=EventType.USER_MESSAGE,
@@ -68,6 +83,8 @@ def main() -> None:
             status="success",
         )
         expect(bare_ok == {}, "bare 好的 without pending does not create commitment", bare_ok)
+        planner = ProactiveIntentPlanner(store)
+        expect(planner._reminder_topic("以后王志安更新视频提醒我") == "王志安", "reminder topic extracts subject before 提醒我")
 
         calls: list[dict[str, Any]] = []
 

@@ -53,18 +53,42 @@ def _looks_like_compact_external_video_lookup(text: str, lowered: str) -> bool:
 
 def _extract_creator(text: str) -> str | None:
     patterns = (
-        r"(?:帮我找(?:一下)?|查(?:一下|询)?|看看)?\s*([^\s，,。.!！?？]{2,12})\s*(?:在\s*)?(?:YouTube|youtube|油管)",
-        r"(?:YouTube|youtube|油管)\s*(?:上)?\s*([^\s，,。.!！?？]{2,12})",
-        r"([^\s，,。.!！?？]{2,12})\s*(?:的)?\s*(?:最新(?:一期)?视频|最新视频|视频标题)",
+        r"(?:帮我找(?:一下)?|查(?:一下|询)?|看看)?\s*([^\s，,。.!！?？]{2,24}?)(?:在\s*)?(?:YouTube|youtube|油管)",
+        r"(?:YouTube|youtube|油管)\s*(?:上)?\s*([^\s，,。.!！?？]{2,24})",
+        r"([^\s，,。.!！?？]{2,24}?)\s*(?:的)?\s*(?:最新(?:一期)?视频|最新视频|视频标题)",
     )
     for pattern in patterns:
         match = re.search(pattern, text or "", flags=re.IGNORECASE)
         if match:
-            creator = match.group(1).strip(" 的了吧吗呢啊？?！!，,。")
+            creator = _clean_creator(match.group(1))
             noise = {"什么", "不是", "我说", "帮我", "查一下", "查询", "标题", "最新", "视频", "一期"}
             if creator and creator not in noise and len(creator) >= 2:
                 return creator
     return None
+
+
+def _clean_creator(value: str) -> str:
+    creator = (value or "").strip(" 的了吧吗呢啊？?！!，,。")
+    for prefix in (
+        "我说的是",
+        "我说的",
+        "说的是",
+        "不是",
+        "什么",
+        "帮我找一下",
+        "帮我找",
+        "找一下",
+        "查一下",
+        "查询",
+        "看看",
+    ):
+        if creator.startswith(prefix) and len(creator) > len(prefix):
+            creator = creator[len(prefix) :].strip(" 的了吧吗呢啊？?！!，,。")
+            break
+    for suffix in ("在", "的", "YouTube", "youtube", "油管"):
+        if creator.endswith(suffix) and len(creator) > len(suffix):
+            creator = creator[: -len(suffix)].strip(" 的了吧吗呢啊？?！!，,。")
+    return creator
 
 
 def compact_lookup_target(text: str) -> dict[str, Any] | None:

@@ -489,6 +489,11 @@ class ProactiveIntentPlanner:
         return topic.strip(" 的了吧吗呢啊？?！!，,。")[:180]
 
     def _reminder_topic(self, text: str) -> str:
+        prefix_match = re.search(r"(?:以后|今后|下次)?\s*([^，,。！？!?]{2,60}?)(?:更新(?:视频)?|发布(?:新视频|新内容)?|有新(?:视频|内容)?)?提醒我", text or "")
+        if prefix_match:
+            topic = self._clean_topic(prefix_match.group(1))
+            if topic:
+                return topic
         match = re.search(r"提醒我([^，,。！？!?]{2,60})", text or "")
         return self._clean_topic(match.group(1)) if match else self._topic(text) or "提醒"
 
