@@ -14,8 +14,10 @@ TIER_L4_GUARDED_ACTION = "L4_guarded_action"
 TIER_L5_PROACTIVE = "L5_proactive_commitment"
 
 PUSH_INTENT_MARKERS = ("提醒", "订阅", "关注", "跟踪", "留意", "推送", "notify", "remind", "subscribe", "watch", "track", "monitor")
-VIDEO_LOOKUP_MARKERS = ("youtube", "youtu.be", "视频", "最新一期", "最新视频", "视频标题", "频道")
+VIDEO_LOOKUP_MARKERS = ("youtube", "youtu.be", "视频", "最新一期", "最新视频", "视频标题", "频道", "油管", "bilibili", "哔哩哔哩", "b站")
 LATEST_MARKERS = ("最新", "最近", "当前", "latest", "recent")
+# Lookup verbs signal a one-shot external retrieval request (not a subscription).
+LOOKUP_VERB_MARKERS = ("帮我找", "帮我搜", "帮我查", "找一下", "搜一下", "查一下", "搜索", "查询", "看看", "找找", "find", "search", "look up")
 
 
 def classify_execution_tier(text: str, decision: Decision) -> str:
@@ -41,10 +43,19 @@ def _wants_proactive_commitment(text: str, lowered: str) -> bool:
     return any(marker in (text or "") for marker in PUSH_INTENT_MARKERS) or any(marker in lowered for marker in PUSH_INTENT_MARKERS)
 
 
+def _has_lookup_verb(text: str, lowered: str) -> bool:
+    return any(marker in (text or "") for marker in LOOKUP_VERB_MARKERS) or any(
+        marker in lowered for marker in LOOKUP_VERB_MARKERS
+    )
+
+
 def _looks_like_compact_external_video_lookup(text: str, lowered: str) -> bool:
     if not any(marker in lowered for marker in VIDEO_LOOKUP_MARKERS):
         return False
-    if not any(marker in (text or "") for marker in LATEST_MARKERS) and "标题" not in text:
+    # Trigger when the user is doing a one-shot lookup: either an explicit lookup verb
+    # ("帮我找…的视频"), or a latest/title phrasing ("…最新一期视频标题").
+    has_latest_or_title = any(marker in (text or "") for marker in LATEST_MARKERS) or "标题" in text
+    if not has_latest_or_title and not _has_lookup_verb(text, lowered):
         return False
     if _wants_proactive_commitment(text, lowered):
         return False
@@ -53,15 +64,17 @@ def _looks_like_compact_external_video_lookup(text: str, lowered: str) -> bool:
 
 def _extract_creator(text: str) -> str | None:
     patterns = (
-        r"(?:帮我找(?:一下)?|查(?:一下|询)?|看看)?\s*([^\s，,。.!！?？]{2,24}?)(?:在\s*)?(?:YouTube|youtube|油管)",
-        r"(?:YouTube|youtube|油管)\s*(?:上)?\s*([^\s，,。.!！?？]{2,24})",
+        r"(?:帮我找(?:一下)?|查(?:一下|询)?|看看)?\s*([^\s，,。.!！?？]{2,24}?)(?:在\s*)?(?:YouTube|youtube|油管|B站|b站|bilibili|哔哩哔哩)",
+        r"(?:YouTube|youtube|油管|B站|b站|bilibili|哔哩哔哩)\s*(?:上)?\s*(?:的)?\s*([^\s，,。.!！?？]{2,24})",
+        # "…的最新视频/视频标题" and the looser "…的视频"
         r"([^\s，,。.!！?？]{2,24}?)\s*(?:的)?\s*(?:最新(?:一期)?视频|最新视频|视频标题)",
+        r"([^\s，,。.!！?？]{2,24}?)\s*的\s*视频",
     )
+    noise = {"什么", "不是", "我说", "帮我", "查一下", "查询", "标题", "最新", "视频", "一期", "户", "这个", "那个", "一下"}
     for pattern in patterns:
         match = re.search(pattern, text or "", flags=re.IGNORECASE)
         if match:
             creator = _clean_creator(match.group(1))
-            noise = {"什么", "不是", "我说", "帮我", "查一下", "查询", "标题", "最新", "视频", "一期"}
             if creator and creator not in noise and len(creator) >= 2:
                 return creator
     return None

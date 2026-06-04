@@ -43,6 +43,7 @@ class Capability:
 
 PROBE_CAPABILITIES: dict[str, str] = {
     "time": "time_probe",
+    "time_probe": "time_probe",
     "system": "system_probe",
     "git": "git_probe",
     "port": "port_probe",

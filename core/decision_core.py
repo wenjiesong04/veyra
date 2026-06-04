@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from core.capability_registry import CapabilityRegistry
+from core.cognition_pipeline import CognitionPipeline, use_model_first_pipeline
 from core.model_driven_decision_core import ModelDrivenDecisionCore
 from core.definitions import RiskLevel, classify_text_risk
 from core.memory_policy_runtime import normalize_memory_policy
@@ -98,10 +99,107 @@ class DecisionCore:
         self.capabilities = CapabilityRegistry(state_store) if state_store else None
         self.model_driven = ModelDrivenDecisionCore()
 
-    def decide(self, text: str, attention_focus: list[str], event: VeyraEvent | None = None) -> Decision:
+    def decide(
+        self,
+        text: str,
+        attention_focus: list[str],
+        event: VeyraEvent | None = None,
+        *,
+        turn_context: dict[str, Any] | None = None,
+    ) -> Decision:
+        locked = self._governance_locked_decision(text, attention_focus, event=event)
+        if locked:
+            return self.model_driven.enrich(text, locked, event=event)
+        if use_model_first_pipeline(self.reasoning):
+            pipeline = CognitionPipeline(self.reasoning, self.state_store, self.capabilities)
+            pipeline_decision = pipeline.run(
+                text=text,
+                attention_focus=attention_focus,
+                event=event,
+                turn_context=turn_context,
+            )
+            if pipeline_decision is not None:
+                return self.model_driven.enrich(text, pipeline_decision, event=event)
         base = self._rule_decide(text, attention_focus, event=event)
         decision = self._apply_model_assist(text, attention_focus, base, event=event)
         return self.model_driven.enrich(text, decision, event=event)
+
+    def _governance_locked_decision(self, text: str, attention_focus: list[str], event: VeyraEvent | None = None) -> Decision | None:
+        """Deterministic locks that must never be overridden by model routing."""
+        lowered = text.lower()
+        risk = self._risk_for_text(lowered)
+        intent, intent_signals = self._intent_for_text(lowered)
+        complexity, complexity_signals = self._complexity_for_text(lowered, attention_focus)
+        signals = intent_signals + complexity_signals + self._risk_signals(risk)
+        priority = self._priority_intent_decision(lowered=lowered, risk=risk, complexity=complexity, signals=signals)
+        if priority:
+            return priority
+        preference = self._preference_decision(lowered=lowered, risk=risk, complexity=complexity, signals=signals)
+        if preference:
+            return preference
+        attachment_gap = self._attachment_capability_gap(event)
+        if attachment_gap:
+            return self._decision(
+                route=Route.ASK_USER,
+                risk=RiskLevel.R1,
+                reason=str(attachment_gap.get("reason")),
+                intent=intent if intent != "unknown" else "information",
+                complexity=complexity,
+                capability="ask_user",
+                signals=signals + ["freshness:attachment_content", "capability:vision"],
+                freshness_required=True,
+                memory_policy="forget",
+                reasoning_mode="evidence",
+                required_capabilities=["vision"],
+                capability_request=attachment_gap,
+                constraints=["do not infer unreadable attachment content"],
+            )
+        if self._is_rollback_request(lowered):
+            return self._decision(
+                route=Route.ROLLBACK,
+                risk=RiskLevel.R4,
+                reason="snapshot rollback requires guarded confirmation",
+                intent="action",
+                complexity="moderate",
+                capability="rollback_audit",
+                signals=signals + ["route:rollback"],
+                requires_confirmation=True,
+                needs_user_confirmation=True,
+                memory_policy="short_term",
+                reasoning_mode="execution",
+                required_capabilities=["rollback_audit"],
+                constraints=["restore only an existing snapshot", "record rollback trace", "verify restored checksum"],
+            )
+        if risk == RiskLevel.R5:
+            return self._decision(
+                route=Route.BLOCK,
+                risk=risk,
+                reason="destructive or forbidden action detected",
+                intent=intent,
+                complexity=complexity,
+                capability="guardian",
+                signals=signals,
+                reasoning_mode="execution" if intent in {"action", "implementation"} else "direct",
+                required_capabilities=["guardian"],
+                constraints=["block unsafe action", "require safer alternative"],
+            )
+        if risk in {RiskLevel.R3, RiskLevel.R4}:
+            return self._decision(
+                route=Route.HUMAN_REVIEW,
+                risk=risk,
+                reason="medium/high risk action requires review",
+                intent=intent,
+                complexity=complexity,
+                capability="human_review",
+                signals=signals,
+                requires_confirmation=True,
+                needs_user_confirmation=True,
+                memory_policy="short_term",
+                reasoning_mode="execution",
+                required_capabilities=["human_review"],
+                constraints=["explain impact", "check rollback path", "wait for explicit approval"],
+            )
+        return None
 
     def _rule_decide(self, text: str, attention_focus: list[str], event: VeyraEvent | None = None) -> Decision:
         lowered = text.lower()

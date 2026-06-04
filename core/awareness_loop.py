@@ -109,6 +109,7 @@ class AwarenessLoop:
         self.skill_runtime = SkillRuntime(state_store)
         self.probes = {
             "time": TimeProbe(),
+            "time_probe": TimeProbe(),
             "weather_probe": WeatherProbe(),
             "system": SystemProbe(),
             "git": GitProbe(),
@@ -161,7 +162,12 @@ class AwarenessLoop:
                 "drift_score": context_observability.get("context_drift", {}).get("drift_score"),
             }
         )
-        decision = self.decision_core.decide(text=text, attention_focus=attention_focus, event=event)
+        decision = self.decision_core.decide(
+            text=text,
+            attention_focus=attention_focus,
+            event=event,
+            turn_context=turn_context,
+        )
         route_trace.append(
             {
                 "phase": "core_cognition",
@@ -233,11 +239,13 @@ class AwarenessLoop:
 
         self.runtime_entity.set_status(LifecycleStatus.ACTING.value)
         execution_tier = classify_execution_tier(text, decision)
+        model_assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
+        model_first = model_assist.get("pipeline") in {"model_first", "awareness_model_first"}
         if isinstance(decision.model_assist, dict):
             decision.model_assist["execution_tier"] = execution_tier
         else:
             decision.model_assist = {"execution_tier": execution_tier}
-        if execution_tier == TIER_L1_COMPACT_EXTERNAL:
+        if execution_tier == TIER_L1_COMPACT_EXTERNAL and not model_first:
             compact = self.compact_external_lookup.run(text)
             if compact.get("status") == "ok":
                 route_trace.append({"phase": "compact_external_lookup", "status": "ok", "provider": compact.get("provider")})
@@ -696,7 +704,7 @@ class AwarenessLoop:
                 risk_level=RiskLevel.R1,
                 artifacts={"decision": decision.to_dict(), "next_action": "use a supported probe"},
             )
-        raw = probe.run(text)
+        raw = self._invoke_probe(probe_name=probe_name, probe=probe, text=text, decision=decision)
         state_patch = self.perception.interpret_probe_result(raw)
         belief_state = self.belief.refresh()
         verified = self.verifier.verify_probe_result(raw)
@@ -739,6 +747,36 @@ class AwarenessLoop:
                 "uncertainty": self.uncertainty.uncertainty_summary(belief_state.get("claims", [])),
             },
         )
+
+    def _invoke_probe(self, *, probe_name: str, probe: Any, text: str, decision: Decision) -> dict[str, Any]:
+        model_assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
+        params = model_assist.get("probe_params") if isinstance(model_assist.get("probe_params"), dict) else {}
+        if probe_name == "weather_probe":
+            location = str(params.get("location") or params.get("place") or params.get("city") or "").strip()
+            return probe.run(text, location=location or None)
+        if probe_name == "search_probe":
+            query = str(params.get("query") or params.get("search_query") or text).strip()
+            max_results = params.get("max_results")
+            try:
+                limit = int(max_results) if max_results is not None else 5
+            except (TypeError, ValueError):
+                limit = 5
+            return probe.run(query, max_results=max(1, min(limit, 10)))
+        if probe_name == "web":
+            url = str(params.get("url") or "").strip()
+            if url and hasattr(probe, "run"):
+                try:
+                    return probe.run(url)
+                except TypeError:
+                    pass
+        if probe_name == "port":
+            port = params.get("port")
+            if port is not None and hasattr(probe, "run"):
+                try:
+                    return probe.run(port=int(port))
+                except TypeError:
+                    pass
+        return probe.run(text)
 
     def _probe_response(self, *, probe_name: str, raw: dict[str, object], verified: dict[str, object], answer_assist: dict[str, object]) -> str:
         draft = str(answer_assist.get("draft_response") or answer_assist.get("response") or "").strip()

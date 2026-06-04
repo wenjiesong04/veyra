@@ -12,8 +12,8 @@ from probes.schema import probe_payload
 class WeatherProbe:
     """Read-only current weather via Open-Meteo (no API key)."""
 
-    def run(self, text: str = "") -> dict:
-        location = self._extract_location(text)
+    def run(self, text: str = "", *, location: str | None = None) -> dict:
+        location = (location or "").strip() or self._extract_location(text)
         if not location:
             return probe_payload(
                 probe="weather_probe",
@@ -108,7 +108,16 @@ class WeatherProbe:
         return location.strip(" 的？?！!，,。")
 
     def _geocode(self, location: str) -> dict:
-        url = f"https://geocoding-api.open-meteo.com/v1/search?name={quote(location)}&count=1&language=zh"
+        last_error: dict[str, Any] = {"status": "error", "summary": f"No geocoding result for {location}."}
+        for candidate in self._location_candidates(location):
+            result = self._geocode_one(candidate)
+            if result.get("status") == "ok":
+                return result
+            last_error = result
+        return last_error
+
+    def _geocode_one(self, location: str) -> dict:
+        url = f"https://geocoding-api.open-meteo.com/v1/search?name={quote(location)}&count=3&language=zh"
         try:
             body = fetch_json(url, timeout=5)
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
@@ -123,7 +132,38 @@ class WeatherProbe:
             "latitude": item.get("latitude"),
             "longitude": item.get("longitude"),
             "timezone": item.get("timezone"),
+            "admin1": item.get("admin1"),
+            "country": item.get("country"),
         }
+
+    def _location_candidates(self, location: str) -> list[str]:
+        loc = (location or "").strip()
+        if not loc:
+            return []
+        candidates: list[str] = [loc]
+        if "市" in loc:
+            city, rest = loc.split("市", 1)
+            rest = rest.strip(" 的")
+            if rest:
+                candidates.extend([rest, f"{city}市", city])
+        # 贵阳花溪区 → 花溪区, 贵阳, 贵阳市花溪区
+        for suffix in ("区", "县"):
+            if loc.endswith(suffix) and len(loc) >= 5:
+                district_len = 3 if loc.endswith("区") else 2
+                district = loc[-district_len:]
+                prefix = loc[:-district_len].strip(" 市")
+                if district.endswith(suffix) and len(prefix) >= 2:
+                    candidates.extend([district, prefix, f"{prefix}市{district}"])
+        if re.search(r"[\u4e00-\u9fff]", loc):
+            candidates.extend([f"{loc}, China", "Huaxi, Guiyang, China", "Guiyang, China"])
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in candidates:
+            key = item.strip()
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(key)
+        return deduped
 
     def _current_weather(self, latitude: float, longitude: float, timezone: str) -> dict:
         url = (
