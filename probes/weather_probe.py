@@ -141,6 +141,14 @@ class WeatherProbe:
         if not loc:
             return []
         candidates: list[str] = [loc]
+        without_province = re.sub(r"^[\u4e00-\u9fff]{2,8}(?:省|自治区|特别行政区)", "", loc)
+        if without_province and without_province != loc:
+            candidates.append(without_province)
+        city_district = re.search(r"([\u4e00-\u9fff]{2,8}市)([\u4e00-\u9fff]{2,8}[区县])", without_province or loc)
+        if city_district:
+            city = city_district.group(1)
+            district = city_district.group(2)
+            candidates.extend([f"{city}{district}", district, city, city.rstrip("市")])
         if "市" in loc:
             city, rest = loc.split("市", 1)
             rest = rest.strip(" 的")

@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import time
+from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
@@ -94,12 +95,13 @@ class SearchProbe:
         if provider in {"public", "duckduckgo", "ddg"}:
             return False
         if provider in {"openclaw", "openclaw_cli", "auto"}:
-            return bool(self.cli_runner or shutil.which("openclaw"))
+            return bool(self.cli_runner or self._openclaw_executable())
         return False
 
     def _run_openclaw_search(self, query: str, *, max_results: int) -> dict[str, Any]:
         timeout = self._float_env("VEYRA_OPENCLAW_SEARCH_TIMEOUT", 60.0)
-        command = ["openclaw", "infer", "web", "search", "--query", query, "--limit", str(max(1, min(int(max_results), 10))), "--json"]
+        executable = self._openclaw_executable() or "openclaw"
+        command = [executable, "infer", "web", "search", "--query", query, "--limit", str(max(1, min(int(max_results), 10))), "--json"]
         try:
             body = self.cli_runner(command, timeout) if self.cli_runner else self._run_cli(command, timeout)
         except (OSError, subprocess.SubprocessError, TimeoutError, ValueError) as exc:
@@ -135,7 +137,16 @@ class SearchProbe:
         )
 
     def _run_cli(self, command: list[str], timeout: float) -> str:
-        completed = subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
+        env = os.environ.copy()
+        path_parts = [
+            str(Path(command[0]).expanduser().parent) if command and "/" in command[0] else "",
+            str(Path.home() / ".npm-global" / "bin"),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            env.get("PATH", ""),
+        ]
+        env["PATH"] = os.pathsep.join(part for part in path_parts if part)
+        completed = subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout, env=env)
         return completed.stdout
 
     def _parse_openclaw_results(self, body: str, *, limit: int, query: str = "") -> list[dict[str, Any]]:
@@ -187,18 +198,31 @@ class SearchProbe:
         snippet = str(item.get("snippet") or item.get("summary") or item.get("content") or item.get("text") or "").strip()
         if not url or not url.startswith(("http://", "https://")):
             return None
-        return {"title": title or url, "url": url, "snippet": snippet[:700], "source": self._host(url)}
+        published_at = str(item.get("published_at") or item.get("publishedAt") or item.get("date") or "").strip()
+        if self._is_search_placeholder(title=title, url=url, snippet=snippet):
+            return None
+        return {"title": title or url, "url": url, "snippet": snippet[:700], "source": self._host(url), "published_at": published_at}
 
     def _openclaw_summary_result(self, payload: Any, *, query: str) -> dict[str, Any] | None:
         content = self._find_text_field(payload, keys={"content", "summary", "text"})
         if not content:
             return None
+        content = self._clean_openclaw_content(content)
         source = "openclaw_cli"
         provider = self._find_text_field(payload, keys={"provider"})
         if provider:
             source = f"openclaw_cli:{provider[:40]}"
         title = self._first_heading(content) or f"OpenClaw web search summary: {query}"
         return {"title": title[:240], "url": "", "snippet": content[:900], "source": source}
+
+    def _clean_openclaw_content(self, text: str) -> str:
+        lines: list[str] = []
+        for line in str(text or "").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("<<<") or stripped.startswith("---") or stripped.lower() == "source: web search":
+                continue
+            lines.append(line)
+        return "\n".join(lines).strip()
 
     def _find_text_field(self, value: Any, *, keys: set[str]) -> str:
         if isinstance(value, dict):
@@ -217,11 +241,16 @@ class SearchProbe:
         return ""
 
     def _first_heading(self, text: str) -> str:
+        fallback = ""
         for line in str(text or "").splitlines():
             cleaned = self._clean_html(line).strip(" #-*\t")
-            if len(cleaned) >= 8:
+            if not cleaned or cleaned.startswith("<<<") or cleaned.lower() == "source: web search":
+                continue
+            if line.strip().startswith("#") and len(cleaned) >= 4:
                 return cleaned
-        return ""
+            if not fallback and len(cleaned) >= 8:
+                fallback = cleaned
+        return fallback
 
     def _parse_results(self, body: str, *, limit: int) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
@@ -232,6 +261,8 @@ class SearchProbe:
             if not title or not url:
                 continue
             snippet = self._snippet_after(body, match.end())
+            if self._is_search_placeholder(title=title, url=url, snippet=snippet):
+                continue
             results.append({"title": title, "url": url, "snippet": snippet, "source": self._host(url)})
             if len(results) >= limit:
                 return results
@@ -242,7 +273,7 @@ class SearchProbe:
         for match in fallback.finditer(body or ""):
             title = self._clean_html(match.group("title"))
             url = self._clean_url(match.group("href"))
-            if title and url and not any(item["url"] == url for item in results):
+            if title and url and not self._is_search_placeholder(title=title, url=url, snippet="") and not any(item["url"] == url for item in results):
                 results.append({"title": title, "url": url, "snippet": "", "source": self._host(url)})
             if len(results) >= limit:
                 break
@@ -268,6 +299,35 @@ class SearchProbe:
 
     def _host(self, url: str) -> str:
         return urlparse(url).netloc.lower()
+
+    def _is_search_placeholder(self, *, title: str, url: str, snippet: str) -> bool:
+        host = self._host(url)
+        normalized_title = (title or "").strip().lower()
+        normalized_url = (url or "").rstrip("/")
+        if host in {"duckduckgo.com", "www.duckduckgo.com"}:
+            if normalized_url in {"https://duckduckgo.com", "http://duckduckgo.com"}:
+                return True
+            if normalized_title in {"here", "duckduckgo", "duckduckgo search", "html"} and not (snippet or "").strip():
+                return True
+        return False
+
+    def _openclaw_executable(self) -> str:
+        found = shutil.which("openclaw")
+        if found:
+            return found
+        candidates = (
+            Path.home() / ".npm-global" / "bin" / "openclaw",
+            Path.home() / ".local" / "bin" / "openclaw",
+            Path("/opt/homebrew/bin/openclaw"),
+            Path("/usr/local/bin/openclaw"),
+        )
+        for candidate in candidates:
+            try:
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    return str(candidate)
+            except OSError:
+                continue
+        return ""
 
     def _float_env(self, name: str, default: float) -> float:
         try:

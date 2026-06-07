@@ -35,7 +35,7 @@ from interface.agent_contract import NON_TERMINAL_STATUSES
 from interface.agent_adapter import ExecutionResult
 from interface.channel_adapter import ChannelAdapter
 from interface.agent_registry import AgentRegistry
-from interface.event_schema import Decision, LoopResult, Route, VeyraEvent
+from interface.event_schema import Decision, LoopResult, Route, VeyraEvent, utc_now_iso
 from memory_bridge.local_memory_bridge import LocalMemoryBridge
 from probes.git_probe import GitProbe
 from probes.hermes_probe import HermesProbe
@@ -142,6 +142,9 @@ class AwarenessLoop:
 
         attention_focus = self.attention.focus_for_text(text)
         self.belief.update_from_event(event)
+        followup_result = self._conversation_followup_result(event, str(text or ""), attention_focus)
+        if followup_result:
+            return self._finalize_event(event, followup_result, started_at, route_trace, context_observability)
         belief_state = self.belief.refresh()
         turn_context = self.core_reasoning.turn_context.build(
             user_message=text,
@@ -245,7 +248,7 @@ class AwarenessLoop:
             decision.model_assist["execution_tier"] = execution_tier
         else:
             decision.model_assist = {"execution_tier": execution_tier}
-        if execution_tier == TIER_L1_COMPACT_EXTERNAL and not model_first:
+        if execution_tier == TIER_L1_COMPACT_EXTERNAL and (not model_first or decision.route == Route.DIRECT_ANSWER):
             compact = self.compact_external_lookup.run(text)
             if compact.get("status") == "ok":
                 route_trace.append({"phase": "compact_external_lookup", "status": "ok", "provider": compact.get("provider")})
@@ -261,10 +264,29 @@ class AwarenessLoop:
                         "persona": persona_patch,
                         "execution_tier": execution_tier,
                         "compact_lookup": compact,
+                        **({"probe_result": compact.get("probe_result")} if isinstance(compact.get("probe_result"), dict) else {}),
                     },
                 )
                 return self._finalize_event(event, result, started_at, route_trace, context_observability)
             route_trace.append({"phase": "compact_external_lookup", "status": "fallback", "reason": compact.get("reason")})
+            compact_probe_result = self._compact_search_probe_result(compact)
+            if compact_probe_result:
+                result = LoopResult(
+                    event_id=event.event_id,
+                    route=Route.PROBE,
+                    status="compact_lookup_search_results",
+                    response=self._search_user_response(compact_probe_result),
+                    risk_level=decision.risk_level,
+                    artifacts={
+                        "decision": decision.to_dict(),
+                        "controller": controller_plan.to_dict(),
+                        "persona": persona_patch,
+                        "execution_tier": execution_tier,
+                        "compact_lookup": compact,
+                        "probe_result": compact_probe_result,
+                    },
+                )
+                return self._finalize_event(event, result, started_at, route_trace, context_observability)
             result = LoopResult(
                 event_id=event.event_id,
                 route=Route.PROBE,
@@ -463,6 +485,7 @@ class AwarenessLoop:
 
         result.artifacts.setdefault("persona", persona_patch)
         result.artifacts.setdefault("controller", controller_plan.to_dict())
+        result.artifacts.setdefault("execution_tier", execution_tier)
         if result.artifacts.get("memory_write"):
             result.artifacts["memory_policy_execution"] = {"status": "written", "policy": decision.memory_policy, "write": result.artifacts.get("memory_write")}
         else:
@@ -499,22 +522,31 @@ class AwarenessLoop:
         commitment_turn = self._process_commitment_turn(event, result)
         if commitment_turn:
             result.artifacts["commitment"] = commitment_turn
-            # Commitment/proactive must never replace the primary answer to the user's question.
-            # Subscription confirmations and control outcomes are delivered as followups only.
+            # Commitment-only turns should render the commitment control outcome as primary;
+            # incidental subscription offers remain followups.
             primary_override = str(commitment_turn.get("primary_response_override") or "").strip()
-            if primary_override and self._result_execution_tier(result) == TIER_L5_PROACTIVE:
+            commitment_status = str(commitment_turn.get("status") or "").strip()
+            followups = self._commitment_followup_messages(commitment_turn)
+            if primary_override and (
+                self._result_execution_tier(result) == TIER_L5_PROACTIVE
+                or commitment_status in {"created", "confirmed", "declined", "already_exists"}
+            ):
                 result.primary_response = primary_override
                 result.artifacts["commitment_primary_applied"] = primary_override
+                followups = [message for message in followups if message != primary_override]
+            elif commitment_status == "needs_parameters" and followups:
+                result.primary_response = followups[0]
+                result.artifacts["commitment_primary_applied"] = followups[0]
+                followups = followups[1:]
             elif primary_override:
                 result.artifacts["commitment_primary_deferred_to_followup"] = primary_override
-            followups = self._commitment_followup_messages(commitment_turn)
-            if primary_override and self._result_execution_tier(result) == TIER_L5_PROACTIVE:
-                followups = [message for message in followups if message != primary_override]
             if followups:
                 existing = list(result.followup_messages or [])
                 result.followup_messages = existing + [message for message in followups if message not in existing]
                 result.artifacts["followup_messages"] = result.followup_messages
             route_trace.append({"phase": "commitment", "status": commitment_turn.get("status"), "actions": commitment_turn.get("actions", [])})
+        self._persist_conversation_slots(event, result)
+        self._render_final_user_messages(event, result)
         trace = self.runtime_trace.record(
             event=event,
             result=result,
@@ -704,7 +736,7 @@ class AwarenessLoop:
                 risk_level=RiskLevel.R1,
                 artifacts={"decision": decision.to_dict(), "next_action": "use a supported probe"},
             )
-        raw = self._invoke_probe(probe_name=probe_name, probe=probe, text=text, decision=decision)
+        raw = self._invoke_probe(probe_name=probe_name, probe=probe, text=text, decision=decision, event=event)
         state_patch = self.perception.interpret_probe_result(raw)
         belief_state = self.belief.refresh()
         verified = self.verifier.verify_probe_result(raw)
@@ -748,14 +780,17 @@ class AwarenessLoop:
             },
         )
 
-    def _invoke_probe(self, *, probe_name: str, probe: Any, text: str, decision: Decision) -> dict[str, Any]:
+    def _invoke_probe(self, *, probe_name: str, probe: Any, text: str, decision: Decision, event: VeyraEvent) -> dict[str, Any]:
         model_assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
         params = model_assist.get("probe_params") if isinstance(model_assist.get("probe_params"), dict) else {}
         if probe_name == "weather_probe":
             location = str(params.get("location") or params.get("place") or params.get("city") or "").strip()
+            if not location:
+                slots = self._conversation_slots_for_event(event)
+                location = self._resolve_weather_location_for_turn(text, slots)
             return probe.run(text, location=location or None)
         if probe_name == "search_probe":
-            query = str(params.get("query") or params.get("search_query") or text).strip()
+            query = str(params.get("query") or params.get("search_query") or "").strip() or self._search_query_from_text(text)
             max_results = params.get("max_results")
             try:
                 limit = int(max_results) if max_results is not None else 5
@@ -782,6 +817,21 @@ class AwarenessLoop:
         draft = str(answer_assist.get("draft_response") or answer_assist.get("response") or "").strip()
         if answer_assist.get("status") == "model_assisted" and draft and self._probe_draft_is_usable(probe_name=probe_name, raw=raw, draft=draft):
             return draft
+        if probe_name == "search_probe":
+            details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
+            results = details.get("results") if isinstance(details.get("results"), list) else []
+            generic_titles = {"here", "result", "search result", "source: web search", "openclaw web search summary"}
+            titles = [
+                str(item.get("title") or "").strip()
+                for item in results[:3]
+                if isinstance(item, dict)
+                and item.get("title")
+                and str(item.get("title") or "").strip().lower() not in generic_titles
+            ]
+            if titles:
+                return f"我拿到了 {len(results)} 条搜索结果，靠前结果包括：" + "；".join(titles)
+            if results:
+                return "我拿到了搜索结果，但结果标题信息不够清晰，不能可靠确认最新视频标题。"
         return str(raw.get("summary") or verified.get("message") or "Probe completed.")
 
     def _probe_needs_answer_model(self, probe_name: str, raw: dict[str, object]) -> bool:
@@ -794,6 +844,8 @@ class AwarenessLoop:
             return "我是 Veyra。OpenClaw 是我可以在需要执行复杂任务时治理和调用的 Agent Runtime，不是当前对话身份。"
         if decision.intent == "preference" or "memory:preference" in decision.signals:
             return "记住了。之后我会尽量更直接，除非问题本身需要先说明风险、证据或执行边界。"
+        if self._is_proactive_weather_request(text):
+            return "可以，你要我每天几点发哪个城市/地区的天气？"
         if self._is_learning_memory_question(text):
             topic = self._current_learning_topic(event.source.user_id)
             if topic:
@@ -880,12 +932,17 @@ class AwarenessLoop:
             return False
         lowered_question = text.lower()
         lowered_draft = draft.lower()
+        if not decision.needs_probe and any(
+            marker in draft for marker in ("正在检查", "正在获取", "我会先检查", "我将检查", "正在搜索", "正在为您搜索", "我来搜索", "请稍等")
+        ):
+            return False
         if decision.intent in {"information", "unknown"} and any(marker in lowered_question for marker in ("为什么", "是什么", "解释", "说明", "how", "what", "why")):
             if len(draft) < 24:
                 return False
-        if "openclaw" in lowered_draft and "openclaw" not in lowered_question and decision.intent != "identity":
+        meta_context = any(marker in lowered_question for marker in ("架构", "认知", "prompt", "提示词", "智障", "architecture", "cognition"))
+        if "openclaw" in lowered_draft and "openclaw" not in lowered_question and decision.intent != "identity" and not meta_context:
             return False
-        if "hermes" in lowered_draft and "hermes" not in lowered_question and decision.intent != "identity":
+        if "hermes" in lowered_draft and "hermes" not in lowered_question and decision.intent != "identity" and not meta_context:
             return False
         return True
 
@@ -907,6 +964,12 @@ class AwarenessLoop:
     def _direct_answer_degraded(self, *, text: str, decision: Decision, answer_assist: dict[str, object]) -> str:
         compact = " ".join(text.split())
         snippet = compact[:48] + ("..." if len(compact) > 48 else "")
+        if self._is_meta_cognition_question(text):
+            return (
+                "问题主要不在架构名词，而在认知链路被压成了机械路由：先急着选 direct/probe/agent，"
+                "再套回答模板，导致它没有先判断用户真实目标、当前状态是否新鲜、缺什么证据、该不该让 Agent 做更深分析。"
+                "应该把入口改成 situation assessment，再决定证据、Agent 提案或直答。"
+            )
         gaps = answer_assist.get("context_gaps") if isinstance(answer_assist.get("context_gaps"), list) else []
         if gaps:
             gap_text = "；".join(str(item) for item in gaps[:2] if item)
@@ -915,6 +978,19 @@ class AwarenessLoop:
         if decision.intent in {"information", "unknown"}:
             return f"针对「{snippet}」，我这轮拿不到稳定的认知模型输出。为避免误导，我先不编结论；你可以让我改走探针取证，或把问题拆成可验证的小点继续。"
         return "我这轮无法给出稳定直答。为避免误导，我先不输出未经验证的结论；请补充上下文或改为可验证路径。"
+
+    def _is_meta_cognition_question(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        return any(marker in text for marker in ("架构", "认知", "prompt", "提示词", "智障")) or any(
+            marker in lowered for marker in ("architecture", "cognition", "prompt")
+        )
+
+    def _is_proactive_weather_request(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        wants_recurring = any(marker in text for marker in ("每天", "每日", "定时", "定期")) or any(
+            marker in lowered for marker in ("daily", "every morning", "each day")
+        )
+        return wants_recurring and ("天气" in text or "weather" in lowered)
 
     def _is_learning_memory_question(self, text: str) -> bool:
         lowered = (text or "").lower()
@@ -962,6 +1038,383 @@ class AwarenessLoop:
         if self.commitment_core is None:
             return []
         return self.commitment_core.followup_messages_for_turn(commitment_turn)
+
+    def _conversation_followup_result(self, event: VeyraEvent, text: str, attention_focus: list[str]) -> LoopResult | None:
+        slots = self._conversation_slots_for_event(event)
+        last_tool = slots.get("last_tool_result") if isinstance(slots.get("last_tool_result"), dict) else {}
+        if last_tool.get("type") == "search":
+            response = self._answer_search_followup(text, last_tool)
+            if response:
+                return LoopResult(
+                    event_id=event.event_id,
+                    route=Route.DIRECT_ANSWER,
+                    status="success",
+                    response=response,
+                    risk_level=RiskLevel.R0,
+                    artifacts={"conversation_followup": {"type": "search_result_reference"}, "attention": attention_focus},
+                )
+        if self._looks_like_weather_followup(text, slots):
+            location = self._resolve_weather_location_for_turn(text, slots)
+            raw = self.probes["weather_probe"].run(text, location=location or None)
+            state_patch = self.perception.interpret_probe_result(raw)
+            verified = self.verifier.verify_probe_result(raw)
+            trace = self.execution_trace.record(
+                {
+                    "event_id": event.event_id,
+                    "route": Route.PROBE.value,
+                    "task_id": event.event_id,
+                    "executor": "probe:weather_probe",
+                    "status": verified["status"],
+                    "execution_result": raw,
+                    "verification": verified,
+                    "conversation_followup": True,
+                }
+            )
+            return LoopResult(
+                event_id=event.event_id,
+                route=Route.PROBE,
+                status=verified["status"],
+                response=self._weather_user_response(raw),
+                risk_level=RiskLevel.R1,
+                artifacts={
+                    "conversation_followup": {"type": "weather_location_reference", "resolved_location": location},
+                    "probe_result": raw,
+                    "state_patch": state_patch,
+                    "verification": verified,
+                    "execution_trace": trace,
+                },
+            )
+        return None
+
+    def _compact_search_probe_result(self, compact: dict[str, Any]) -> dict[str, Any]:
+        candidates = [
+            compact.get("probe_result") if isinstance(compact.get("probe_result"), dict) else {},
+            compact.get("search") if isinstance(compact.get("search"), dict) else {},
+        ]
+        for item in candidates:
+            if item.get("probe") != "search_probe":
+                continue
+            details = item.get("details") if isinstance(item.get("details"), dict) else {}
+            results = details.get("results") if isinstance(details.get("results"), list) else []
+            if results:
+                return item
+        return {}
+
+    def _conversation_slots_for_event(self, event: VeyraEvent) -> dict[str, Any]:
+        state = self.state_store.read_json("task_state.json")
+        slots_by_session = state.get("conversation_slots") if isinstance(state.get("conversation_slots"), dict) else {}
+        slots = slots_by_session.get(event.source.session_id) if isinstance(slots_by_session, dict) else {}
+        return dict(slots) if isinstance(slots, dict) else {}
+
+    def _persist_conversation_slots(self, event: VeyraEvent, result: LoopResult) -> None:
+        state = self.state_store.read_json("task_state.json")
+        slots_by_session = state.get("conversation_slots") if isinstance(state.get("conversation_slots"), dict) else {}
+        if not isinstance(slots_by_session, dict):
+            slots_by_session = {}
+        slots = dict(slots_by_session.get(event.source.session_id) or {})
+        text = str(event.payload.get("text") or "")
+        slots["last_intent"] = self._intent_from_result(result)
+        slots["last_topic"] = self._topic_from_turn(text, result, slots)
+        tool_result = self._structured_tool_result(result)
+        if tool_result:
+            slots["last_tool_result"] = tool_result
+            if tool_result.get("type") == "weather":
+                location = str(tool_result.get("requested_location") or tool_result.get("location") or "").strip()
+                if location:
+                    slots["last_location"] = location
+                slots["last_topic"] = "weather"
+            elif tool_result.get("type") == "search":
+                query = str(tool_result.get("query") or "").strip()
+                if query:
+                    slots["last_search_query"] = query
+                    slots["last_topic"] = query
+        elif self._looks_like_location_text(text):
+            resolved_location = self._resolve_weather_location_for_turn(text, slots)
+            if resolved_location:
+                slots["last_location"] = resolved_location
+        slots["updated_at"] = utc_now_iso()
+        slots_by_session[event.source.session_id] = slots
+        if len(slots_by_session) > 200:
+            slots_by_session = dict(list(slots_by_session.items())[-200:])
+        state["conversation_slots"] = slots_by_session
+        self.state_store.write_json("task_state.json", state)
+        result.artifacts["conversation_slots"] = self._compact_conversation_slots(slots)
+
+    def _structured_tool_result(self, result: LoopResult) -> dict[str, Any]:
+        raw = result.artifacts.get("probe_result") if isinstance(result.artifacts.get("probe_result"), dict) else {}
+        probe_name = str(raw.get("probe") or "")
+        if probe_name == "search_probe":
+            details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
+            results = details.get("results") if isinstance(details.get("results"), list) else []
+            return {
+                "type": "search",
+                "status": str(raw.get("status") or ""),
+                "query": str(details.get("query") or raw.get("target") or "").strip(),
+                "summary": str(raw.get("summary") or "").strip(),
+                "observed_at": str(raw.get("observed_at") or raw.get("timestamp") or utc_now_iso()),
+                "results": [self._normalize_search_result(item) for item in results[:5] if isinstance(item, dict)],
+            }
+        if probe_name == "weather_probe":
+            details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
+            current = details.get("current") if isinstance(details.get("current"), dict) else {}
+            return {
+                "type": "weather",
+                "status": str(raw.get("status") or ""),
+                "requested_location": str(raw.get("target") or details.get("location_query") or "").strip(),
+                "location": str(details.get("location") or raw.get("target") or "").strip(),
+                "summary": str(raw.get("summary") or "").strip(),
+                "weather_description": str(details.get("weather_description") or current.get("weather_description") or "").strip(),
+                "temperature_2m": current.get("temperature_2m"),
+                "current": current,
+                "observed_at": str(raw.get("observed_at") or raw.get("timestamp") or utc_now_iso()),
+            }
+        return {}
+
+    def _normalize_search_result(self, item: dict[str, Any]) -> dict[str, Any]:
+        url = str(item.get("url") or item.get("link") or "").strip()
+        snippet = str(item.get("snippet") or item.get("summary") or "").strip()
+        title = self._clean_search_title(str(item.get("title") or item.get("name") or "").strip(), snippet=snippet, url=url)
+        return {
+            "title": title,
+            "url": url,
+            "source": str(item.get("source") or self._host_from_url(url) or "").strip(),
+            "snippet": snippet[:900],
+            "published_at": str(item.get("published_at") or item.get("date") or "").strip(),
+        }
+
+    def _clean_search_title(self, title: str, *, snippet: str = "", url: str = "") -> str:
+        generic = {"", "here", "result", "search result", "source: web search", "openclaw web search summary"}
+        cleaned = title.strip()
+        if cleaned.lower() not in generic:
+            return cleaned[:240]
+        for line in str(snippet or "").splitlines():
+            candidate = line.strip(" #*-\t")
+            if not candidate or candidate.startswith("<<<") or candidate.startswith("---") or candidate.lower() == "source: web search":
+                continue
+            if len(candidate) >= 4:
+                return candidate[:240]
+        return url or "未命名搜索结果"
+
+    def _host_from_url(self, url: str) -> str:
+        match = re.match(r"https?://([^/]+)", url or "")
+        return match.group(1).lower() if match else ""
+
+    def _intent_from_result(self, result: LoopResult) -> str:
+        decision = result.artifacts.get("decision") if isinstance(result.artifacts.get("decision"), dict) else {}
+        intent = str(decision.get("intent") or "").strip()
+        raw = result.artifacts.get("probe_result") if isinstance(result.artifacts.get("probe_result"), dict) else {}
+        if raw.get("probe") == "weather_probe":
+            return "weather"
+        if raw.get("probe") == "search_probe":
+            return "search"
+        return intent or result.route.value
+
+    def _topic_from_turn(self, text: str, result: LoopResult, slots: dict[str, Any]) -> str:
+        raw = result.artifacts.get("probe_result") if isinstance(result.artifacts.get("probe_result"), dict) else {}
+        details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
+        if raw.get("probe") == "search_probe":
+            return str(details.get("query") or raw.get("target") or "").strip()
+        if raw.get("probe") == "weather_probe":
+            return "weather"
+        return str(slots.get("last_topic") or "").strip() if self._is_short_followup(text) else ""
+
+    def _compact_conversation_slots(self, slots: dict[str, Any]) -> dict[str, Any]:
+        tool = slots.get("last_tool_result") if isinstance(slots.get("last_tool_result"), dict) else {}
+        compact_tool = {"type": tool.get("type"), "status": tool.get("status")}
+        if tool.get("type") == "search":
+            compact_tool["query"] = tool.get("query")
+            compact_tool["result_count"] = len(tool.get("results") if isinstance(tool.get("results"), list) else [])
+        if tool.get("type") == "weather":
+            compact_tool["location"] = tool.get("location")
+            compact_tool["requested_location"] = tool.get("requested_location")
+        return {
+            "last_location": slots.get("last_location"),
+            "last_topic": slots.get("last_topic"),
+            "last_search_query": slots.get("last_search_query"),
+            "last_intent": slots.get("last_intent"),
+            "last_tool_result": compact_tool,
+            "updated_at": slots.get("updated_at"),
+        }
+
+    def _render_final_user_messages(self, event: VeyraEvent, result: LoopResult) -> None:
+        result.response = self._render_user_message(event, result, str(result.response or ""))
+        rendered_followups = []
+        seen_messages = {str(result.response or "").strip()} if str(result.response or "").strip() else set()
+        for message in result.followup_messages or []:
+            rendered = self._render_user_message(event, result, str(message or ""))
+            if rendered and rendered not in seen_messages:
+                rendered_followups.append(rendered)
+                seen_messages.add(rendered)
+        result.followup_messages = rendered_followups
+
+    def _render_user_message(self, event: VeyraEvent, result: LoopResult, message: str) -> str:
+        text = str(message or "").strip()
+        raw = result.artifacts.get("probe_result") if isinstance(result.artifacts.get("probe_result"), dict) else {}
+        if raw.get("probe") == "weather_probe":
+            return self._weather_user_response(raw)
+        if raw.get("probe") == "search_probe":
+            return self._search_user_response(raw)
+        forbidden = (
+            "No geocoding result",
+            "Weather probe needs a city",
+            "Search returned",
+            "traceback",
+            "raw exception",
+            "internal probe error",
+        )
+        lowered = text.lower()
+        if any(marker.lower() in lowered for marker in forbidden):
+            slots = self._conversation_slots_for_event(event)
+            last_tool = slots.get("last_tool_result") if isinstance(slots.get("last_tool_result"), dict) else {}
+            if last_tool.get("type") == "search":
+                return self._answer_search_followup("结果呢", last_tool) or "我拿到了搜索结果，但还需要你指定想看标题、链接还是摘要。"
+            if last_tool.get("type") == "weather":
+                location = str(last_tool.get("requested_location") or last_tool.get("location") or "").strip()
+                if location:
+                    return f"我暂时没能精确查到「{location}」的天气；你可以补充上级城市，或让我按上次地点继续查。"
+            return "这轮内部工具没有返回可直接展示的结果。我不会把工具错误原样发给你；请补充地点、关键词或让我重新查一次。"
+        return text
+
+    def _weather_user_response(self, raw: dict[str, Any]) -> str:
+        details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
+        status = str(raw.get("status") or "")
+        requested = str(raw.get("target") or details.get("location_query") or "").strip()
+        resolved = str(details.get("location") or "").strip()
+        current = details.get("current") if isinstance(details.get("current"), dict) else {}
+        description = str(details.get("weather_description") or current.get("weather_description") or "").strip()
+        temp = current.get("temperature_2m")
+        if status == "ok":
+            body = f"{resolved or requested}: {description}" if description else str(raw.get("summary") or "")
+            if temp is not None:
+                body = f"{resolved or requested}: {description}, {temp}°C"
+            if requested and resolved and requested != resolved:
+                return f"我没能精确到「{requested}」的区县级天气，先按「{resolved}」给你：{description}{f'，{temp}°C' if temp is not None else ''}。"
+            return body
+        if status == "missing_target":
+            return "你想查哪个城市或地区的天气？请直接发地点，例如“贵阳花溪区天气”。"
+        if requested:
+            return f"我暂时没查到「{requested}」的天气。如果这是区县或街道，请补充上级城市，我再按完整地点查。"
+        return "我暂时没拿到可用天气结果。请补充城市或地区后我再查。"
+
+    def _search_user_response(self, raw: dict[str, Any]) -> str:
+        details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
+        query = str(details.get("query") or raw.get("target") or "").strip()
+        results = details.get("results") if isinstance(details.get("results"), list) else []
+        normalized = [self._normalize_search_result(item) for item in results[:3] if isinstance(item, dict)]
+        if not normalized:
+            return f"我没有拿到「{query or '这个查询'}」的可展示搜索结果。你可以换个关键词或补充平台。"
+        lines = [f"我找到 {len(results)} 条结果，先给你靠前的："]
+        for index, item in enumerate(normalized, start=1):
+            title = item.get("title") or "未命名搜索结果"
+            url = item.get("url") or ""
+            snippet = item.get("snippet") or ""
+            line = f"{index}. {title}"
+            if url:
+                line += f"\n链接：{url}"
+            if snippet:
+                line += f"\n摘要：{snippet[:180]}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _answer_search_followup(self, text: str, tool: dict[str, Any]) -> str:
+        cleaned = (text or "").strip()
+        results = tool.get("results") if isinstance(tool.get("results"), list) else []
+        results = [item for item in results if isinstance(item, dict)]
+        if not results:
+            return ""
+        wants_title = any(marker in cleaned for marker in ("标题", "名字", "叫什么", "题目"))
+        wants_link = any(marker in cleaned for marker in ("链接", "地址", "网址", "url", "URL"))
+        wants_first = any(marker in cleaned for marker in ("第一个", "第一条", "首个", "第1个", "第1条"))
+        wants_result = any(marker in cleaned for marker in ("结果", "内容", "是什么", "呢"))
+        if not any((wants_title, wants_link, wants_first, wants_result)):
+            return ""
+        if wants_first:
+            item = results[0]
+            lines = [f"第一个结果是：{item.get('title') or '未命名搜索结果'}"]
+            if item.get("url"):
+                lines.append(f"链接：{item.get('url')}")
+            if item.get("snippet"):
+                lines.append(f"摘要：{str(item.get('snippet'))[:220]}")
+            return "\n".join(lines)
+        if wants_link:
+            links = [str(item.get("url") or "").strip() for item in results[:3] if str(item.get("url") or "").strip()]
+            return "链接是：\n" + "\n".join(links) if links else "上一轮搜索结果没有提供可用链接。"
+        if wants_title:
+            titles = [str(item.get("title") or "").strip() for item in results[:3] if str(item.get("title") or "").strip()]
+            return "标题是：\n" + "\n".join(f"{index}. {title}" for index, title in enumerate(titles, start=1)) if titles else "上一轮搜索结果没有提供清晰标题。"
+        lines = ["上一轮搜索结果里，靠前结果是："]
+        for index, item in enumerate(results[:3], start=1):
+            title = item.get("title") or "未命名搜索结果"
+            snippet = str(item.get("snippet") or "")[:160]
+            lines.append(f"{index}. {title}" + (f"\n摘要：{snippet}" if snippet else ""))
+        return "\n".join(lines)
+
+    def _search_query_from_text(self, text: str) -> str:
+        query = " ".join(str(text or "").split())
+        query = re.sub(r"^(帮我|麻烦你|请你)?(找一下|搜索一下|搜一下|查一下|查询|找|搜索|搜)\s*", "", query)
+        query = query.replace("的最新", " 最新").replace("的视频", " 视频").replace("视频", " 视频")
+        query = re.sub(r"\s+", " ", query).strip(" ，,。！？!?")
+        return query or str(text or "").strip()
+
+    def _looks_like_weather_followup(self, text: str, slots: dict[str, Any]) -> bool:
+        if not slots:
+            return False
+        if self._looks_like_search_result_reference(text):
+            return False
+        last_tool = slots.get("last_tool_result") if isinstance(slots.get("last_tool_result"), dict) else {}
+        if slots.get("last_intent") != "weather" and last_tool.get("type") != "weather":
+            return False
+        return self._looks_like_location_text(text) or self._is_short_followup(text)
+
+    def _looks_like_search_result_reference(self, text: str) -> bool:
+        cleaned = re.sub(r"[\s，,。！？!?、]+", "", text or "")
+        return cleaned in {"结果呢", "链接呢", "标题是什么", "第一个是什么"} or any(marker in cleaned for marker in ("标题", "链接", "网址", "结果", "第一个"))
+
+    def _looks_like_location_text(self, text: str) -> bool:
+        location = self._clean_location_fragment(text)
+        if not location or len(location) > 16:
+            return False
+        return bool(re.search(r"[\u4e00-\u9fff]", location)) and (
+            location.endswith(("区", "县", "市", "镇", "乡", "州", "省")) or len(location) <= 6
+        )
+
+    def _is_short_followup(self, text: str) -> bool:
+        cleaned = re.sub(r"[\s，,。！？!?、]+", "", text or "")
+        return 0 < len(cleaned) <= 10 and (cleaned.endswith("呢") or cleaned in {"结果呢", "链接呢", "标题是什么", "第一个是什么"})
+
+    def _resolve_weather_location_for_turn(self, text: str, slots: dict[str, Any]) -> str:
+        direct = self.probes["weather_probe"]._extract_location(text) if hasattr(self.probes.get("weather_probe"), "_extract_location") else ""
+        fragment = direct or self._clean_location_fragment(text)
+        previous = str(slots.get("last_location") or "").strip()
+        if not fragment:
+            return previous
+        if previous:
+            return self._combine_location(previous, fragment)
+        return fragment
+
+    def _clean_location_fragment(self, text: str) -> str:
+        value = str(text or "").strip(" 的？?！!，,。 、")
+        for token in ("现在", "当前", "今天", "今日", "天气", "气温", "怎么样", "如何", "呢", "的"):
+            value = value.replace(token, "")
+        return value.strip(" 的？?！!，,。 、")
+
+    def _combine_location(self, previous: str, fragment: str) -> str:
+        previous = previous.strip()
+        fragment = fragment.strip()
+        if not previous:
+            return fragment
+        if not fragment or fragment in previous:
+            return previous
+        if previous in fragment:
+            return fragment
+        parent = previous
+        if "市" in parent:
+            parent = parent.split("市", 1)[0] + "市"
+        else:
+            parent = re.sub(r"(区|县|镇|乡)$", "", parent)
+        if fragment.endswith(("区", "县", "镇", "乡")):
+            return f"{parent}{fragment}"
+        return fragment
 
     def _update(self, event: VeyraEvent, result: LoopResult) -> None:
         risk_level = result.risk_level.value if hasattr(result.risk_level, "value") else str(result.risk_level)

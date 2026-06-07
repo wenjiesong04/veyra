@@ -37,6 +37,12 @@ class CommitmentPushRuntime:
         self.authorization = AuthorizationPolicy(state_store)
 
     def run_due(self, *, limit: int = 10, reason: str = "scheduled") -> dict[str, Any]:
+        healed = self.commitment_core.heal_invalid_commitments()
+        invalid_notifications = [
+            self._notify_invalid_commitment_once(item, reason=reason)
+            for item in healed.get("invalid_commitments", [])
+            if isinstance(item, dict) and not item.get("invalid_notified_at")
+        ]
         due = self.commitment_core.due_commitments(limit=limit)
         processed: list[dict[str, Any]] = []
         for commitment in due:
@@ -59,6 +65,8 @@ class CommitmentPushRuntime:
             "delivered_count": len(delivered),
             "queued_count": len(queued),
             "processed": processed,
+            "invalid_healing": healed,
+            "invalid_notifications": invalid_notifications,
         }
         self.state_store.append_jsonl(
             "action_record.jsonl",
@@ -184,10 +192,14 @@ class CommitmentPushRuntime:
         title = str(commitment.get("title") or "提醒")
         if kind == "weather_daily":
             location = str(payload.get("location") or "北京")
+            validation = self.commitment_core._validate_weather_daily_payload(payload, commitment.get("schedule") if isinstance(commitment.get("schedule"), dict) else {}, require_explicit_time=False)
+            if not validation.get("valid"):
+                self.commitment_core._mark_invalid_commitment(str(commitment.get("commitment_id") or ""), str(validation.get("reason") or "invalid_weather_commitment"))
+                return "", {"kind": "invalid_weather_commitment", "status": "paused", "reason": validation.get("reason")}
             raw = self.weather_probe.run(f"{location}天气")
             summary = str(raw.get("summary") or "暂时无法获取天气。")
             if str(raw.get("status") or "") in {"missing_target", "unavailable", "error", "http_error"}:
-                summary = f"暂时无法获取{location}天气（{raw.get('status')}）"
+                summary = f"暂时没查到{location}的天气。我会下次继续尝试；你也可以告诉我更完整的城市/地区。"
             return f"【每日天气】{summary}", raw
         if kind == "learning_digest":
             topic = str(payload.get("topic") or "学习")
@@ -240,6 +252,35 @@ class CommitmentPushRuntime:
                 "artifacts": {"commitment_id": commitment_id, "reason": reason, "result": result},
             },
         )
+
+    def _notify_invalid_commitment_once(self, commitment: dict[str, Any], *, reason: str) -> dict[str, Any]:
+        commitment_id = str(commitment.get("commitment_id") or "")
+        payload = commitment.get("payload") if isinstance(commitment.get("payload"), dict) else {}
+        location = str(payload.get("location") or "未确认地点")
+        message = f"之前的每日天气任务地点「{location}」不完整或无效，我已先暂停它。你可以告诉我“每天几点发哪个城市/地区天气”，我再重新创建。"
+        channel = str(commitment.get("channel") or "api")
+        session_id = str(commitment.get("session_id") or "local-session")
+        delivery = ChannelAdapter(self.state_store, channel=channel).send(
+            session_id,
+            message,
+            metadata={
+                "route": "commitment_invalid_repair_notice",
+                "commitment_id": commitment_id,
+                "kind": commitment.get("kind"),
+                "push_reason": reason,
+                "risk_level": RiskLevel.R0.value,
+                "pushed_at": utc_now_iso(),
+            },
+        )
+        self.commitment_core.mark_invalid_notified(commitment_id)
+        result = {
+            "commitment_id": commitment_id,
+            "status": "notified",
+            "delivery_status": delivery.get("delivery_status") or delivery.get("status"),
+            "message_preview": message[:240],
+        }
+        self._audit_push_attempt(commitment_id, result, reason=f"{reason}:invalid_repair_notice")
+        return result
 
     def _delivery_status(self, delivery: dict[str, Any]) -> str:
         status_values = {str(delivery.get("status") or ""), str(delivery.get("delivery_status") or "")}

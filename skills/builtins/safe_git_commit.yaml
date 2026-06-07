@@ -1,3 +1,4 @@
 name: safe_git_commit
 risk_level: R2
 description: Commit staged changes after diff review.
+guidance: Use only after reviewing staged diff and user intent; require confirmation when commit content, authorship, or branch state is ambiguous.

@@ -1,3 +1,4 @@
 name: summarize_logs
 risk_level: R1
 description: Summarize a bounded log tail.
+guidance: Use when recent logs are needed as evidence; keep the read bounded, cite observed errors, and avoid treating old log lines as current state.

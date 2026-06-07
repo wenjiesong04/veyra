@@ -11,25 +11,35 @@ from interface.event_schema import VeyraEvent
 
 
 CORE_DECISION_SYSTEM = (
-    "You are Veyra Core's internal cognition layer, not an external agent runtime. "
+    "You are Veyra Core's awareness decision judge, not an external agent runtime. "
     "Return strict JSON only. Veyra is an Awareness-driven Cognition and Governance Runtime. "
-    "Your job is understanding, reasoning, and structured decision output; you do not execute tools. "
-    "Use the minimal turn context and available_capabilities. Do not claim a capability that is unavailable. "
-    "Do not answer from stale claims. If fresh local, external, time, status, latest, runtime, or attachment "
-    "evidence is required, set freshness_required=true and choose probe when an evidence capability exists, "
-    "or ask_user when it does not. Use agent only for implementation, multi-step execution, complex debugging, "
-    "browser automation, code modification, or long tool chains. Ordinary chat and explanations should stay "
-    "direct_answer with a natural draft_response. You cannot approve execution, lower risk, bypass Guardian, "
-    "or ignore allowed_routes."
+    "Your job is situation assessment, reasoning, and structured decision output; you do not execute tools. "
+    "First assess what the user really needs, what current state is known, what state may be stale, "
+    "what evidence gap remains, and what would change the answer. Then choose a route. "
+    "Use the minimal turn context and available_capabilities. Do not claim unavailable capabilities and do not "
+    "answer from stale claims. direct_answer is allowed only when no fresh local/runtime/external/file/attachment "
+    "evidence is needed, risk is low, and confidence is high enough to be useful. "
+    "If the user asks about now/latest/status/running/logs/files/attachments/results/completion, require evidence "
+    "unless the turn context supplies fresh evidence. Choose probe when a concrete read-only observation can close "
+    "the gap; choose ask_user only when the missing input is user preference, permission, or unavailable context. "
+    "Use agent when the task benefits from deeper reasoning, multi-step synthesis, external search, workspace/code/"
+    "browser/debugging operations, or when Veyra's direct confidence is insufficient while policy allows delegation. "
+    "Agent is governed by Veyra and returns a proposal or bounded result; it is not final authority. "
+    "You cannot approve execution, lower risk, bypass Guardian, or ignore allowed_routes."
 )
 
 CORE_ANSWER_SYSTEM = (
-    "You are Veyra Core's answer composer. Reply naturally in the user's language, using the supplied "
-    "turn context. Do not recite architecture slogans unless the user asks about architecture. "
-    "If the user asks about current time/date/status/latest facts and no evidence is supplied, say what "
-    "fresh observation is needed instead of guessing. If an image/attachment is referenced but only an "
-    "attachment placeholder is available, say that Veyra has not received readable image content and ask "
-    "for OCR/description or enabled vision intake. Return strict JSON only."
+    "You are Veyra Core's user reply composer. Reply naturally in the user's language, using the supplied "
+    "decision, evidence, memory, and turn context. Return strict JSON only, but draft_response must be final "
+    "text that can be sent to the user. Do not leak internal JSON, route labels, policy patches, or task packet "
+    "details unless the user asks for internals. Start with the useful conclusion, then give the reason or next "
+    "step when needed. Do not recite architecture slogans unless the user asks about architecture. "
+    "For volatile facts, use only supplied fresh evidence; if evidence is missing or stale, say exactly what is "
+    "missing and do not pretend to know. If an agent proposal is supplied, translate it into a human-readable "
+    "answer while preserving Veyra policy, risk, confirmation, and verification boundaries. "
+    "If the user is frustrated or confused, acknowledge the issue briefly and then give an actionable conclusion. "
+    "If an image/attachment is referenced but only an attachment placeholder is available, say that Veyra has not "
+    "received readable image content and ask for OCR/description or enabled vision intake."
 )
 
 
@@ -93,6 +103,20 @@ class CoreReasoning:
             "turn_context": turn_context,
             "allowed_routes": ["direct_answer", "probe", "skill", "agent", "ask_user", "human_review", "block"],
             "required_json_fields": {
+                "situation_assessment": {
+                    "user_goal": "explicit user goal",
+                    "what_user_really_needs": "practical need behind the request",
+                    "known_state": "list",
+                    "missing_state": "list",
+                    "freshness_need": "none|local|runtime|external|file|attachment|memory",
+                    "risk": "R0-R5",
+                    "confidence": "0.0-1.0",
+                },
+                "route_decision": {
+                    "route": "direct_answer|probe|skill|agent|ask_user|human_review|block",
+                    "why_this_route": "short rationale",
+                    "why_not_other_routes": "list",
+                },
                 "intent": "conversation|information|action|implementation|unknown",
                 "complexity": "simple|moderate|complex",
                 "risk_level": "R0-R5",
@@ -112,6 +136,11 @@ class CoreReasoning:
                 },
                 "draft_response": "natural reply when direct_answer or ask_user is appropriate",
                 "context_gaps": "list of missing context/evidence",
+                "reply_strategy": {
+                    "tone": "natural|direct|technical|supportive",
+                    "must_include": "list",
+                    "must_avoid": "list",
+                },
                 "reason": "short rationale",
             },
         }
@@ -140,7 +169,8 @@ class CoreReasoning:
             "required_json_fields": {
                 "draft_response": "final user-facing reply",
                 "confidence": "0.0-1.0",
-                "memory_policy": "forget|short_term|long_term",
+                "used_sources": "list of evidence, memory, or decision inputs used",
+                "memory_policy": "none|read|write_candidate|forget|short_term|long_term",
                 "needs_observation": "boolean",
                 "context_gaps": "list",
             },
@@ -181,7 +211,9 @@ class CoreReasoning:
             purpose="probe_answer",
             system=(
                 CORE_ANSWER_SYSTEM
-                + " Use only supplied probe evidence for volatile facts. Mention uncertainty when evidence is missing or stale."
+                + " Use only supplied probe evidence for volatile facts. If probe evidence is insufficient, do not fill gaps "
+                "from memory or model guesses. Give the conclusion first, then evidence and uncertainty. Avoid machine phrasing "
+                "like 'according to probe_result' unless the user asked for technical details."
             ),
             user=json.dumps(payload, ensure_ascii=False),
         )
@@ -202,14 +234,18 @@ class CoreReasoning:
             "probe_result": redact_sensitive(probe_result, max_string=1800),
             "task": (
                 "Interpret the probe result into concise operational meaning. "
-                "Return claims only when they are directly grounded in the probe evidence."
+                "Return claims only when they are directly grounded in the probe evidence. "
+                "Every claim must include observed_at when available, ttl_seconds, source, confidence, and claim_type "
+                "fact|fault|capability_limit. For failed probes, output an anomaly instead of pretending no result exists. "
+                "Do not cache failed observations as durable facts."
             ),
         }
         result = self.client.complete_json(
             purpose="perception",
             system=(
                 "You are Veyra Core's perception interpreter. Return strict JSON with optional "
-                "summary, anomaly {kind,next_action}, and claims [{key, claim, confidence, ttl_seconds}]. "
+                "summary, anomaly {kind,next_action}, and claims [{key, claim, observed_at, ttl_seconds, source, "
+                "confidence, claim_type}]. Distinguish fact claims, fault claims, and capability-limit claims. "
                 "Do not invent facts beyond the probe evidence."
             ),
             user=json.dumps(payload, ensure_ascii=False),

@@ -1,3 +1,4 @@
 name: diagnose_openclaw
 risk_level: R1
 description: Read-only OpenClaw runtime diagnosis.
+guidance: Use for OpenClaw status questions that need fresh runtime evidence; distinguish configured, process-running, gateway-reachable, and healthy task execution.

@@ -52,6 +52,8 @@ PROBE_CAPABILITIES: dict[str, str] = {
     "log": "log_probe",
     "network": "network_probe",
     "web": "web_url_probe",
+    "search_probe": "web_search",
+    "weather_probe": "weather_probe",
     "openclaw": "openclaw_probe",
     "hermes": "hermes_probe",
     "mcp": "mcp_probe",

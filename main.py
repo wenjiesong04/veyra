@@ -215,6 +215,12 @@ async def startup_integrations() -> None:
     except Exception as exc:
         state_store.append_jsonl("action_record.jsonl", {"route": "runtime_startup_retention", "status": "error", "artifacts": {"error": str(exc), "error_type": type(exc).__name__}})
     try:
+        healing = commitment_core.heal_invalid_commitments()
+        if healing.get("invalid_count"):
+            state_store.append_jsonl("action_record.jsonl", {"route": "runtime_startup_commitment_healing", "status": "success", "artifacts": healing})
+    except Exception as exc:
+        state_store.append_jsonl("action_record.jsonl", {"route": "runtime_startup_commitment_healing", "status": "error", "artifacts": {"error": str(exc), "error_type": type(exc).__name__}})
+    try:
         active_loop_config = state_store.read_json("ops_config.json").get("active_loop", {})
         if not isinstance(active_loop_config, dict):
             active_loop_config = {}

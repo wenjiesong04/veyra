@@ -18,6 +18,8 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
         "probe": "weather_probe",
         "capability": "weather_probe",
         "markers": ("天气", "weather", "temperature", "气温"),
+        "requires_volatile_marker": True,
+        "anti_markers": ("每天", "每日", "定时", "定期", "daily", "every morning", "each day"),
     },
     {
         "name": "volatile_time",
@@ -85,7 +87,7 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
     },
 )
 
-VOLATILE_MARKERS = ("现在", "当前", "状态", "最新", "today", "now", "current", "status", "latest")
+VOLATILE_MARKERS = ("现在", "当前", "今天", "最近", "状态", "最新", "today", "now", "current", "status", "latest")
 IDENTITY_MARKERS = ("你是谁", "你是", "你现在是", "身份", "who are you", "are you")
 GOVERNANCE_ENTITIES = ("veyra", "openclaw", "hermes", "runtime", "agent")
 PREFERENCE_SCOPE_MARKERS = ("以后", "今后", "下次", "记住", "默认", "总是", "一直", "from now on", "remember", "always", "prefer")
@@ -387,9 +389,19 @@ class DecisionCore:
         if assist.get("status") != "model_assisted":
             return base
 
-        model_risk = safe_model_risk(assist.get("risk_level"), base.risk_level)
+        route_decision = assist.get("route_decision") if isinstance(assist.get("route_decision"), dict) else {}
+        risk_payload = assist.get("risk") if isinstance(assist.get("risk"), dict) else {}
+        reply_strategy = assist.get("reply_strategy") if isinstance(assist.get("reply_strategy"), dict) else {}
+        capability_request_payload = assist.get("capability_request") if isinstance(assist.get("capability_request"), dict) else {}
+        model_risk = safe_model_risk(risk_payload.get("level") or assist.get("risk_level"), base.risk_level)
         risk = self._max_risk(base.risk_level, model_risk)
-        candidate_route = self._route_from_model(assist.get("recommended_route") or assist.get("route"), base.route)
+        candidate_route = self._route_from_model(
+            assist.get("recommended_route")
+            or assist.get("route")
+            or route_decision.get("route")
+            or capability_request_payload.get("target_route"),
+            base.route,
+        )
         policy_signals: list[str] = []
         candidate_route, preserved_signal = self._preserve_rule_route(base, candidate_route)
         if preserved_signal:
@@ -432,13 +444,16 @@ class DecisionCore:
         reason = str(assist.get("reason") or assist.get("rationale") or "model-assisted core reasoning")
         signals = self._dedupe(base.signals + self._string_list(assist.get("signals")) + policy_signals + ["model:decision"])
         constraints = self._dedupe(base.constraints + self._string_list(assist.get("constraints")) + ["guardian remains final execution boundary"])
-        capability_request = assist.get("capability_request") if isinstance(assist.get("capability_request"), dict) else {}
+        capability_request = capability_request_payload
         required_capabilities = self._dedupe(
             base.required_capabilities
             + self._string_list(assist.get("required_capabilities"))
             + self._capabilities_from_route(route, selected_probe)
         )
-        memory_policy = normalize_memory_policy(assist.get("memory_policy"), default=base.memory_policy)
+        memory_policy = normalize_memory_policy(
+            self._memory_policy_alias(assist.get("memory_policy") or reply_strategy.get("memory_policy")),
+            default=base.memory_policy,
+        )
         freshness_required = bool(assist.get("freshness_required", base.freshness_required))
         needs_probe = bool(assist.get("needs_probe", route == Route.PROBE or base.needs_probe))
         needs_agent = bool(assist.get("needs_agent", route == Route.AGENT or base.needs_agent))
@@ -462,7 +477,10 @@ class DecisionCore:
             "needs_observation": bool(assist.get("needs_observation")),
             "required_capabilities": required_capabilities,
             "capability_request": capability_request,
-            "draft_response": str(assist.get("draft_response") or assist.get("response") or "")[:2000],
+            "draft_response": str(reply_strategy.get("draft_response") or assist.get("draft_response") or assist.get("response") or "")[:2000],
+            "situation_assessment": assist.get("situation_assessment") if isinstance(assist.get("situation_assessment"), dict) else {},
+            "route_decision": route_decision,
+            "reply_strategy": reply_strategy,
         }
         return self._decision(
             route=route,
@@ -642,6 +660,15 @@ class DecisionCore:
     def _route_from_model(self, value: Any, default: Route) -> Route:
         if not value:
             return default
+        alias = {
+            "agent_reasoning": Route.AGENT,
+            "agent_proposal": Route.AGENT,
+            "core": Route.DIRECT_ANSWER,
+            "user": Route.ASK_USER,
+            "guardian": Route.HUMAN_REVIEW,
+        }.get(str(value).strip().lower())
+        if alias:
+            return alias
         try:
             route = Route(str(value))
         except ValueError:
@@ -652,7 +679,14 @@ class DecisionCore:
 
     def _selected_probe_from_model(self, assist: dict[str, Any], default: str | None) -> str:
         capability_request = assist.get("capability_request") if isinstance(assist.get("capability_request"), dict) else {}
-        selected = str(assist.get("selected_probe") or assist.get("probe") or capability_request.get("probe") or "")
+        selected = str(
+            assist.get("selected_probe")
+            or assist.get("probe")
+            or capability_request.get("probe")
+            or capability_request.get("executor")
+            or capability_request.get("capability_id")
+            or ""
+        )
         normalized = self._canonical_probe_name(selected)
         if normalized:
             return normalized
@@ -661,19 +695,52 @@ class DecisionCore:
 
     def _agent_allowed_by_policy(self, text: str, base: Decision, assist: dict[str, Any]) -> bool:
         lowered = text.lower()
-        route_markers = ["修改", "实现", "开发", "重构", "修复", "调试", "多文件", "代码", "部署", "接入", "agent", "openclaw", "hermes"]
+        route_markers = [
+            "修改",
+            "实现",
+            "开发",
+            "重构",
+            "修复",
+            "调试",
+            "多文件",
+            "代码",
+            "部署",
+            "接入",
+            "深入分析",
+            "综合判断",
+            "复杂判断",
+            "agent",
+            "openclaw",
+            "hermes",
+        ]
         assist_intent = str(assist.get("intent") or "").lower()
         assist_complexity = str(assist.get("complexity") or base.complexity).lower()
+        route_decision = assist.get("route_decision") if isinstance(assist.get("route_decision"), dict) else {}
+        answer_source = str(route_decision.get("answer_source") or assist.get("answer_source") or "").lower()
         if base.route == Route.AGENT or "agent_required" in base.signals:
             return True
         if any(marker in lowered for marker in route_markers):
             return True
+        if answer_source in {"agent", "agent_proposal"}:
+            return assist_complexity in {"moderate", "complex"} or assist_intent in {"information", "action", "implementation", "execution"}
         return assist_intent in {"action", "implementation", "execution"} and assist_complexity in {"moderate", "complex"}
+
+    def _memory_policy_alias(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return {"none": "forget", "read": "short_term", "write_candidate": "long_term"}.get(value, value)
+        return value
 
     def _selected_skill_from_model(self, assist: dict[str, Any], default: str | None) -> str:
         allowed = {"diagnose_openclaw", "check_port", "summarize_logs", "safe_git_commit"}
         capability_request = assist.get("capability_request") if isinstance(assist.get("capability_request"), dict) else {}
-        selected = str(assist.get("selected_skill") or assist.get("skill") or capability_request.get("skill") or default or "")
+        selected = str(
+            assist.get("selected_skill")
+            or assist.get("skill")
+            or capability_request.get("skill")
+            or capability_request.get("executor")
+            or default
+            or ""
+        )
         return selected if selected in allowed else (default or "")
 
     def _canonical_probe_name(self, value: str) -> str:
@@ -697,7 +764,7 @@ class DecisionCore:
             "weather": "weather_probe",
         }
         canonical = aliases.get(token, token)
-        allowed = {"time", "system", "git", "port", "process", "file", "log", "network", "web", "openclaw", "hermes", "mcp", "weather_probe"}
+        allowed = {"time", "system", "git", "port", "process", "file", "log", "network", "web", "openclaw", "hermes", "mcp", "weather_probe", "search_probe"}
         return canonical if canonical in allowed else ""
 
     def _preserve_rule_route(self, base: Decision, candidate: Route) -> tuple[Route, str]:

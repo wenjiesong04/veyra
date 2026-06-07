@@ -1,3 +1,4 @@
 name: check_port
 risk_level: R1
 description: Read-only port availability check.
+guidance: Use when a concrete port or service endpoint needs fresh reachability evidence; report observed host, port, status, and uncertainty without changing runtime state.

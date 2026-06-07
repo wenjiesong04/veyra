@@ -23,6 +23,10 @@ class CompactExternalLookup:
         if str(rss.get("status")) == "ok":
             return self._success_from_rss(target, rss)
         search = self.search.run(search_query_for_creator(creator), max_results=5)
+        if str(search.get("status")) != "ok":
+            broader_search = self.search.run(f"{creator} 视频", max_results=5)
+            if str(broader_search.get("status")) == "ok":
+                search = broader_search
         if str(search.get("status")) == "ok":
             return self._success_from_search(target, search, creator)
         return {

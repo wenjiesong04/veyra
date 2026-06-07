@@ -30,6 +30,20 @@ LEARNING_MARKERS = ("学习", "深度学习", "机器学习", "入门", "教程"
 PUSH_MARKERS = ("推送", "提醒", "通知", "告诉我", "发给我", "push", "notify", "remind")
 TRACKING_REQUEST_MARKERS = ("关注", "跟踪", "留意", "持续关注", "订阅")
 TRACKING_REQUEST_MARKERS_EN = ("watch", "track", "monitor", "subscribe")
+INVALID_WEATHER_LOCATION_MARKERS = (
+    "以后",
+    "能每天",
+    "每天发",
+    "发天气",
+    "天气信息",
+    "可以",
+    "能不能",
+    "给我",
+    "帮我",
+    "吗",
+    "？",
+    "?",
+)
 
 
 class CommitmentCore:
@@ -78,6 +92,14 @@ class CommitmentCore:
     def create_commitment(self, payload: dict[str, Any]) -> dict[str, Any]:
         kind = str(payload.get("kind") or "generic_reminder").strip()
         schedule = self._normalize_schedule(payload.get("schedule") if isinstance(payload.get("schedule"), dict) else {})
+        inner_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+        validation: dict[str, Any] = {"valid": True}
+        if kind == "weather_daily":
+            location = self._normalize_weather_location(str(inner_payload.get("location") or ""))
+            if location:
+                inner_payload = {**inner_payload, "location": location}
+            validation = self._validate_weather_daily_payload(inner_payload, schedule, require_explicit_time=False)
+            payload = {**payload, "payload": inner_payload}
         now = utc_now_iso()
         item = {
             "commitment_id": f"cmt_{uuid4().hex[:12]}",
@@ -89,7 +111,7 @@ class CommitmentCore:
             "session_id": str(payload.get("session_id") or "local-session"),
             "risk_level": str(payload.get("risk_level") or RiskLevel.R0.value),
             "schedule": schedule,
-            "payload": payload.get("payload") if isinstance(payload.get("payload"), dict) else {},
+            "payload": inner_payload,
             "source_event_id": payload.get("source_event_id"),
             "created_at": now,
             "updated_at": now,
@@ -99,6 +121,11 @@ class CommitmentCore:
             "run_count": 0,
             "push_history": [],
         }
+        if not validation.get("valid"):
+            item["status"] = "paused"
+            item["invalid"] = True
+            item["invalid_reason"] = str(validation.get("reason") or "invalid_weather_commitment")
+            item["invalid_detected_at"] = now
         if item["status"] == "active" and not item["confirmed_at"]:
             item["confirmed_at"] = now
         state = self._read_state()
@@ -133,6 +160,7 @@ class CommitmentCore:
         return self._patch_commitment(commitment_id, {"status": "cancelled"})
 
     def due_commitments(self, *, limit: int = 20, now: datetime | None = None) -> list[dict[str, Any]]:
+        self.heal_invalid_commitments()
         now = now or datetime.now(timezone.utc)
         due: list[dict[str, Any]] = []
         for item in self.list_commitments(status="active"):
@@ -259,6 +287,33 @@ class CommitmentCore:
         if not self._looks_like_proactive_request(user_text, lowered):
             return {}
 
+        if self._is_weather_commitment_request(user_text, lowered):
+            candidate = self._weather_commitment_candidate(user_text, event=event)
+            validation = self._validate_weather_daily_payload(
+                candidate.get("payload") if isinstance(candidate.get("payload"), dict) else {},
+                candidate.get("schedule") if isinstance(candidate.get("schedule"), dict) else {},
+                require_explicit_time=True,
+                source_text=user_text,
+            )
+            if not validation.get("valid"):
+                return self._weather_parameters_needed(validation)
+            if self._is_explicit_push_authorization(lowered):
+                existing = self._existing_weather_commitment(event, str((candidate.get("payload") or {}).get("location") or ""))
+                if existing:
+                    return {
+                        "status": "already_exists",
+                        "commitment": existing,
+                        "actions": ["weather_commitment_already_exists"],
+                        "primary_response_override": f"已经有这个每日天气任务：{existing.get('title') or existing.get('kind')}",
+                    }
+                created = self.create_commitment(candidate)
+                return {
+                    "status": "created",
+                    "commitment": created,
+                    "actions": ["created_from_user"],
+                    "primary_response_override": f"已开启：{created.get('title') or '每日天气'}",
+                }
+
         intent = self.intent_planner.plan(user_text=user_text, event=event)
         if self._intent_is_answer_only(intent):
             return {}
@@ -289,6 +344,15 @@ class CommitmentCore:
 
         extracted = self._extract_from_user_text(user_text, event=event)
         if extracted:
+            if extracted.get("kind") == "weather_daily":
+                validation = self._validate_weather_daily_payload(
+                    extracted.get("payload") if isinstance(extracted.get("payload"), dict) else {},
+                    extracted.get("schedule") if isinstance(extracted.get("schedule"), dict) else {},
+                    require_explicit_time=True,
+                    source_text=user_text,
+                )
+                if not validation.get("valid"):
+                    return self._weather_parameters_needed(validation)
             created = self.create_commitment(extracted)
             result = {"status": "created", "commitment": created, "actions": ["created_from_user"]}
             if created.get("status") == "pending_confirmation":
@@ -532,6 +596,14 @@ class CommitmentCore:
             self.state_store.read_json("user_world.json").get("preferences", {}).get("default_location") or ""
         )
         schedule = self._default_daily_schedule(user_text)
+        validation = self._validate_weather_daily_payload(
+            {"location": location, "topic": "weather"},
+            schedule,
+            require_explicit_time=True,
+            source_text=user_text,
+        )
+        if not validation.get("valid"):
+            return None
         return self.create_commitment(
             {
                 "kind": "weather_daily",
@@ -777,6 +849,180 @@ class CommitmentCore:
         lowered = (text or "").lower()
         return ("记得" in text or "remember" in lowered) and any(marker in text for marker in ("在学什么", "学习什么", "学什么", "学习目标"))
 
+    def heal_invalid_commitments(self) -> dict[str, Any]:
+        state = self._read_state()
+        commitments = state.get("commitments") if isinstance(state.get("commitments"), list) else []
+        checked = 0
+        invalid_items: list[dict[str, Any]] = []
+        newly_invalid: list[dict[str, Any]] = []
+        changed = False
+        now = utc_now_iso()
+        for item in commitments:
+            if not isinstance(item, dict) or item.get("kind") != "weather_daily":
+                continue
+            if item.get("status") not in {"active", "pending_confirmation"}:
+                continue
+            checked += 1
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            schedule = item.get("schedule") if isinstance(item.get("schedule"), dict) else {}
+            validation = self._validate_weather_daily_payload(payload, schedule, require_explicit_time=False)
+            if validation.get("valid"):
+                continue
+            reason = str(validation.get("reason") or "invalid_weather_commitment")
+            was_invalid = bool(item.get("invalid"))
+            item["status"] = "paused"
+            item["invalid"] = True
+            item["invalid_reason"] = reason
+            item["invalid_detected_at"] = item.get("invalid_detected_at") or now
+            item["updated_at"] = now
+            item["next_run_at"] = None
+            invalid_items.append(item)
+            if not was_invalid:
+                newly_invalid.append(item)
+            changed = True
+        if changed:
+            state["commitments"] = commitments
+            state["updated_at"] = now
+            self._write_state(state)
+            for item in invalid_items:
+                self.set_watchlists_for_commitment(item)
+        return {
+            "status": "success",
+            "checked": checked,
+            "invalid_count": len(invalid_items),
+            "newly_invalid_count": len(newly_invalid),
+            "invalid_commitments": invalid_items,
+            "newly_invalid_commitments": newly_invalid,
+        }
+
+    def mark_invalid_notified(self, commitment_id: str) -> dict[str, Any] | None:
+        return self._patch_commitment(commitment_id, {"invalid_notified_at": utc_now_iso()}, recompute_next_run=False)
+
+    def _mark_invalid_commitment(self, commitment_id: str, reason: str) -> dict[str, Any] | None:
+        return self._patch_commitment(
+            commitment_id,
+            {
+                "status": "paused",
+                "invalid": True,
+                "invalid_reason": reason,
+                "invalid_detected_at": utc_now_iso(),
+                "next_run_at": None,
+            },
+            recompute_next_run=False,
+        )
+
+    def _is_weather_commitment_request(self, text: str, lowered: str) -> bool:
+        return any(marker in lowered for marker in WEATHER_MARKERS) and any(marker in lowered for marker in DAILY_MARKERS + PUSH_MARKERS)
+
+    def _weather_commitment_candidate(self, text: str, *, event: VeyraEvent) -> dict[str, Any]:
+        location = self._normalize_weather_location(self._extract_location(text))
+        return {
+            "kind": "weather_daily",
+            "status": "active" if self._is_explicit_push_authorization((text or "").lower()) else "pending_confirmation",
+            "title": f"每日天气（{location or '待确认地点'}）",
+            "user_id": event.source.user_id,
+            "channel": event.source.channel,
+            "session_id": event.source.session_id,
+            "source_event_id": event.event_id,
+            "schedule": self._default_daily_schedule(text),
+            "payload": {"location": location, "topic": "weather"},
+        }
+
+    def _existing_weather_commitment(self, event: VeyraEvent, location: str) -> dict[str, Any] | None:
+        normalized = self._normalize_weather_location(location)
+        for item in self.list_commitments(user_id=event.source.user_id, session_id=event.source.session_id):
+            if item.get("kind") != "weather_daily" or item.get("status") not in {"active", "pending_confirmation"}:
+                continue
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            if self._normalize_weather_location(str(payload.get("location") or "")) == normalized:
+                return item
+        return None
+
+    def _validate_weather_daily_payload(
+        self,
+        payload: dict[str, Any],
+        schedule: dict[str, Any],
+        *,
+        require_explicit_time: bool,
+        source_text: str = "",
+    ) -> dict[str, Any]:
+        location = self._normalize_weather_location(str(payload.get("location") or ""))
+        if not location:
+            return {"valid": False, "reason": "missing_location", "field": "location"}
+        if self._invalid_weather_location(location):
+            return {"valid": False, "reason": "invalid_location", "field": "location", "location": location}
+        time_local = str(schedule.get("time_local") or "").strip()
+        if not re.match(r"^(?:[01]\d|2[0-3]):[0-5]\d$", time_local):
+            return {"valid": False, "reason": "missing_schedule_time", "field": "schedule_time"}
+        if require_explicit_time and not self._has_explicit_schedule_time(source_text):
+            return {"valid": False, "reason": "missing_schedule_time", "field": "schedule_time"}
+        return {"valid": True, "location": location, "schedule_time": time_local}
+
+    def _weather_parameters_needed(self, validation: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "status": "needs_parameters",
+            "actions": ["asked_for_weather_commitment_parameters"],
+            "validation": validation,
+            "followup_messages": ["可以，你要我每天几点发哪个城市/地区的天气？"],
+        }
+
+    def _normalize_weather_location(self, location: str) -> str:
+        value = self._clean_location(location)
+        value = re.sub(r"^[\u4e00-\u9fff]{2,8}(?:省|自治区|特别行政区)", "", value)
+        value = value.strip(" 的？?！!，,。")
+        if not value:
+            return ""
+        if "市" not in value and value.endswith(("区", "县")) and len(value) >= 5:
+            district_len = 3 if value.endswith("区") else 2
+            district = value[-district_len:]
+            parent = value[:-district_len].strip()
+            if len(parent) >= 2:
+                return f"{parent}市{district}"
+        return value
+
+    def _invalid_weather_location(self, location: str) -> bool:
+        value = (location or "").strip()
+        if not value or value in {"默认地点", "待确认地点", "天气"}:
+            return True
+        if len(value) > 18:
+            return True
+        if any(marker in value for marker in INVALID_WEATHER_LOCATION_MARKERS):
+            return True
+        if not re.search(r"[\u4e00-\u9fffA-Za-z]", value):
+            return True
+        return False
+
+    def _has_explicit_schedule_time(self, text: str) -> bool:
+        value = text or ""
+        if re.search(r"\d{1,2}[:：]\d{2}", value):
+            return True
+        if self._chinese_hour(value) is not None:
+            return True
+        return any(marker in value for marker in ("每天早上", "每天早晨", "早上", "早晨", "上午", "中午", "晚上"))
+
+    def _chinese_hour(self, text: str) -> int | None:
+        match = re.search(r"([一二两三四五六七八九十]|十[一二]?|二十[一二三]?|[0-2]?\d)点", text or "")
+        if not match:
+            return None
+        raw = match.group(1)
+        if raw.isdigit():
+            hour = int(raw)
+        else:
+            mapping = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+            if raw.startswith("二十"):
+                tail = raw[2:]
+                hour = 20 + (mapping.get(tail, 0) if tail else 0)
+            elif raw.startswith("十") and len(raw) > 1:
+                hour = 10 + mapping.get(raw[1:], 0)
+            else:
+                hour = mapping.get(raw, 0)
+        if "下午" in (text or "") or "晚上" in (text or ""):
+            if 1 <= hour <= 11:
+                hour += 12
+        if 0 <= hour <= 23:
+            return hour
+        return None
+
     def _extract_from_user_text(self, text: str, *, event: VeyraEvent) -> dict[str, Any] | None:
         lowered = (text or "").lower()
         if not self._mentions_push_intent(lowered) and not any(marker in lowered for marker in LEARNING_MARKERS):
@@ -784,6 +1030,7 @@ class CommitmentCore:
 
         if any(marker in lowered for marker in WEATHER_MARKERS) and any(marker in lowered for marker in DAILY_MARKERS + PUSH_MARKERS):
             location = self._extract_location(text)
+            schedule = self._default_daily_schedule(text)
             return {
                 "kind": "weather_daily",
                 "status": "active" if self._is_explicit_push_authorization(lowered) else "pending_confirmation",
@@ -792,8 +1039,8 @@ class CommitmentCore:
                 "channel": event.source.channel,
                 "session_id": event.source.session_id,
                 "source_event_id": event.event_id,
-                "schedule": self._default_daily_schedule(text),
-                "payload": {"location": location, "topic": "weather"},
+                "schedule": schedule,
+                "payload": {"location": self._normalize_weather_location(location), "topic": "weather"},
             }
 
         if any(marker in lowered for marker in LEARNING_MARKERS):
@@ -836,6 +1083,13 @@ class CommitmentCore:
         schedule = self._confirmation_schedule(user_text=user_text, pending=pending)
         if schedule:
             patch["schedule"] = schedule
+        if pending.get("kind") == "weather_daily":
+            payload = pending.get("payload") if isinstance(pending.get("payload"), dict) else {}
+            candidate_schedule = patch.get("schedule") if isinstance(patch.get("schedule"), dict) else pending.get("schedule") if isinstance(pending.get("schedule"), dict) else {}
+            validation = self._validate_weather_daily_payload(payload, candidate_schedule, require_explicit_time=False)
+            if not validation.get("valid"):
+                self._mark_invalid_commitment(str(pending.get("commitment_id")), str(validation.get("reason") or "invalid_weather_commitment"))
+                return None
         return self._patch_commitment(str(pending.get("commitment_id")), patch, recompute_next_run=True)
 
     def _confirmation_schedule(self, *, user_text: str, pending: dict[str, Any]) -> dict[str, Any] | None:
@@ -955,6 +1209,9 @@ class CommitmentCore:
     def _default_daily_schedule(self, text: str) -> dict[str, Any]:
         match = re.search(r"(\d{1,2})[:：](\d{2})", text or "")
         time_local = f"{int(match.group(1)):02d}:{match.group(2)}" if match else "08:00"
+        chinese_hour = self._chinese_hour(text)
+        if chinese_hour is not None and not match:
+            time_local = f"{chinese_hour:02d}:00"
         if "早上" in (text or "") or "早晨" in (text or "") or "morning" in (text or "").lower():
             time_local = "08:00" if time_local == "08:00" and not match else time_local
         return self._normalize_schedule({"kind": "daily", "time_local": time_local, "timezone": "Asia/Shanghai"})
@@ -1019,14 +1276,14 @@ class CommitmentCore:
 
     def _extract_location(self, text: str) -> str:
         patterns = [
-            r"(?:推送|通知|告诉我|提醒我)\s*([^\s，,。.?！!]{2,16}?)(?:的)?(?:天气|气温)",
-            r"(?:在|于)\s*([^\s，,。.?！!]{2,16}?)(?:的)?(?:天气|气温)",
-            r"([^\s，,。.?！!]{2,16}?)(?:今天|现在|当前|明天|今日)?(?:的)?(?:天气|气温)",
+            r"(?:发|发送|推送|通知|告诉我|提醒我)\s*([^\s，,。.?！!]{2,24}?)(?:的)?(?:天气|气温)",
+            r"(?:在|于)\s*([^\s，,。.?！!]{2,24}?)(?:的)?(?:天气|气温)",
+            r"([^\s，,。.?！!]{2,24}?)(?:今天|现在|当前|明天|今日)?(?:的)?(?:天气|气温)",
         ]
         for pattern in patterns:
             match = re.search(pattern, text or "")
             if match:
-                location = self._clean_location(match.group(1))
+                location = self._normalize_weather_location(self._clean_location(match.group(1)))
                 if location:
                     return location
         for token in ("北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "西安", "南京", "重庆"):
@@ -1036,10 +1293,12 @@ class CommitmentCore:
 
     def _clean_location(self, value: str) -> str:
         location = (value or "").strip(" 的？?！!，,。")
-        for prefix in ("今天", "现在", "当前", "明天", "今日"):
+        for prefix in ("今天", "现在", "当前", "明天", "今日", "每天", "每日", "早上", "早晨", "上午", "晚上"):
             if location.startswith(prefix) and len(location) > len(prefix):
                 location = location[len(prefix) :]
-        for suffix in ("今天", "现在", "当前", "明天", "今日", "的"):
+        location = re.sub(r"^(?:[一二两三四五六七八九十0-9]{1,3}点(?:钟)?|[0-2]?\d[:：]\d{2})", "", location)
+        location = re.sub(r"^发", "", location)
+        for suffix in ("今天", "现在", "当前", "明天", "今日", "天气信息", "天气", "气温", "的"):
             if location.endswith(suffix) and len(location) > len(suffix):
                 location = location[: -len(suffix)]
         return location.strip(" 的？?！!，,。")
@@ -1140,7 +1399,7 @@ class CommitmentCore:
 
     def _is_explicit_push_authorization(self, lowered: str) -> bool:
         text = lowered or ""
-        has_push_action = any(marker in text for marker in PUSH_MARKERS + ("订阅", "subscribe"))
+        has_push_action = any(marker in text for marker in PUSH_MARKERS + ("订阅", "subscribe")) or ("发" in text and "天气" in text)
         has_schedule_or_enable = any(marker in text for marker in DAILY_MARKERS + ("开启", "启用", "定时", "定期", "每天", "每日"))
         return has_push_action and has_schedule_or_enable
 

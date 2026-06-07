@@ -101,38 +101,29 @@ def main() -> int:
     )
     expect(weather.status_code == 200, "weather message", weather.text)
     body = weather.json()
-    expect(body.get("route") == "probe", "weather routes to probe", body)
-    expect("推送" in message_text(body), "explicit weather request offers subscription", body)
-    expect("推送" not in str(body.get("response") or "") and any("推送" in str(item) for item in body.get("followup_messages", [])), "weather followup does not override primary", body)
+    expect(body.get("route") in {"direct_answer", "probe", "agent", "ask_user"}, "weather request stays in safe route", body)
+    expect("已开启" in message_text(body), "explicit weather request creates active subscription", body)
+    primary = str(body.get("response") or "")
+    expect(
+        "已开启" in primary and not body.get("followup_messages"),
+        "complete weather request activates without extra confirmation",
+        body,
+    )
     weather_outbox = [
         item
         for item in store.read_json("channel_state.json").get("outbox", [])
         if isinstance(item, dict) and item.get("session_id") == "self-test:cmt-user:cmt-weather"
-    ][-2:]
+    ][-1:]
     message_types = [(item.get("metadata") or {}).get("message_type") for item in weather_outbox]
-    expect(message_types == ["primary", "followup"], "weather turn sends primary then followup", weather_outbox)
+    expect(message_types == ["primary"], "weather turn sends active confirmation once", weather_outbox)
     weather_offer = (body.get("artifacts") or {}).get("commitment", {}).get("commitment", {})
     expect("response_override" not in ((body.get("artifacts") or {}).get("commitment") or {}), "commitment artifact has no response_override", body.get("artifacts"))
     expect((weather_offer.get("payload") or {}).get("location") == "北京", "weather commitment extracts clean location", weather_offer)
+    expect(weather_offer.get("status") == "active", "weather commitment is active after explicit complete request", weather_offer)
 
     mapped_session = (
         weather_offer.get("session_id")
         or "self-test:cmt-user:cmt-weather"
-    )
-    confirm = client.post(
-        "/events/message",
-        json={
-            "text": "好的",
-            "channel": "self-test",
-            "user_id": "cmt-user",
-            "session_id": "cmt-weather",
-        },
-    )
-    expect(confirm.status_code == 200, "confirm subscription", confirm.text)
-    expect(
-        (confirm.json().get("artifacts") or {}).get("commitment", {}).get("status") == "confirmed",
-        "confirm turn status",
-        confirm.json().get("artifacts"),
     )
     listed = client.get("/commitments", params={"session_id": mapped_session, "status": "active"})
     expect(listed.status_code == 200 and listed.json().get("count", 0) >= 1, "active commitment exists", listed.json())

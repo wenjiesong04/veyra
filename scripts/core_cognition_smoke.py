@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.awareness_loop import AwarenessLoop  # noqa: E402
+from core.commitment_core import CommitmentCore  # noqa: E402
 from core.model_client import redact_sensitive  # noqa: E402
 from core.runtime_entity import RuntimeEntity  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
@@ -103,6 +104,31 @@ SMOKE_CASES: list[dict[str, Any]] = [
         "metadata": {"message_type": "image", "feishu": {"message_type": "image", "image_key": "debug_image"}},
         "expectation": "Image attachment + no vision capability => ask_user/agent; do not claim image content.",
     },
+    {
+        "id": "latest_video_title",
+        "message": "柴静最新视频标题是什么？",
+        "expectation": "Latest/current external fact must not direct_answer without evidence; use search/probe/agent or ask for evidence.",
+    },
+    {
+        "id": "openclaw_running_status",
+        "message": "现在 OpenClaw 是不是还在运行？",
+        "expectation": "Runtime status needs fresh local/runtime evidence; stale awareness is not enough.",
+    },
+    {
+        "id": "frustrated_architecture_meta",
+        "message": "这个架构为什么还是像智障？",
+        "expectation": "Acknowledge the issue and analyze cognition/prompt causes without architecture slogans.",
+    },
+    {
+        "id": "code_capability_agent",
+        "message": "帮我改代码实现这个能力",
+        "expectation": "Code capability implementation routes to governed Agent task packet with verification and rollback policy.",
+    },
+    {
+        "id": "daily_weather_authorization",
+        "message": "每天早上给我天气",
+        "expectation": "Incomplete daily weather request asks for city/time parameters and does not create a commitment.",
+    },
 ]
 
 
@@ -146,7 +172,9 @@ def _copy_config(source_root: Path, state_store: WorldStateStore) -> None:
 
 def _run_cases(*, state_store: WorldStateStore, cases: list[dict[str, Any]], live_agent: bool, isolated: bool) -> dict[str, Any]:
     runtime = RuntimeEntity(state_store=state_store)
-    loop = AwarenessLoop(state_store=state_store, runtime_entity=runtime)
+    commitment_core = CommitmentCore(state_store)
+    loop = AwarenessLoop(state_store=state_store, runtime_entity=runtime, commitment_core=commitment_core)
+    commitment_core.memory_bridge = loop.memory_bridge
     normalizer = EventNormalizer()
     debug_agent: DebugAgentAdapter | None = None
     if not live_agent:
@@ -224,6 +252,7 @@ def _record_case(
     task_packet = artifacts.get("task_packet") if isinstance(artifacts.get("task_packet"), dict) else {}
     controller = artifacts.get("controller") if isinstance(artifacts.get("controller"), dict) else {}
     memory_execution = artifacts.get("memory_policy_execution") if isinstance(artifacts.get("memory_policy_execution"), dict) else {}
+    commitment = artifacts.get("commitment") if isinstance(artifacts.get("commitment"), dict) else {}
     turn_context_summary = _summarize_turn_context(turn_context)
 
     return {
@@ -257,6 +286,7 @@ def _record_case(
         "probe_used": probe_result.get("probe") or None,
         "memory_policy": decision.get("memory_policy"),
         "memory_policy_execution": memory_execution,
+        "commitment": _summarize_commitment(commitment),
         "task_packet_summary": _summarize_task_packet(task_packet),
         "final_response": str(result.get("response") or ""),
         "final_response_summary": _summarize_text(str(result.get("response") or "")),
@@ -367,6 +397,20 @@ def _summarize_task_packet(task_packet: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _summarize_commitment(commitment: dict[str, Any]) -> dict[str, Any]:
+    if not commitment:
+        return {}
+    item = commitment.get("commitment") if isinstance(commitment.get("commitment"), dict) else {}
+    return {
+        "status": commitment.get("status"),
+        "actions": commitment.get("actions", []),
+        "followup_offer_present": bool(str(commitment.get("followup_offer") or "").strip()),
+        "commitment_status": item.get("status"),
+        "kind": item.get("kind"),
+        "confirmed": bool(item.get("confirmed_at")),
+    }
+
+
 def _executed_action(result: dict[str, Any], probe_result: dict[str, Any], task_packet: dict[str, Any]) -> str:
     route = str(result.get("route") or "")
     if task_packet:
@@ -466,6 +510,48 @@ def _expectation_failures(record: dict[str, Any]) -> list[str]:
         attachments = (record.get("turn_context_summary") or {}).get("attachments") or {}
         if not attachments.get("available"):
             failures.append("turn context did not preserve image attachment metadata")
+    elif case_id == "latest_video_title":
+        if route == "direct_answer":
+            failures.append("latest video title was directly answered without evidence")
+        if route not in {"probe", "agent", "ask_user"}:
+            failures.append(f"expected probe/agent/ask_user for latest external fact, got {route}")
+        if not (record["probe_used"] or record["agent_used"] or route == "ask_user"):
+            failures.append("latest external fact did not request evidence")
+    elif case_id == "openclaw_running_status":
+        if route == "direct_answer":
+            failures.append("OpenClaw runtime status was directly answered")
+        if route not in {"probe", "agent", "ask_user"}:
+            failures.append(f"expected probe/agent/ask_user for runtime status, got {route}")
+        if route == "probe" and record["probe_used"] not in {"openclaw", "openclaw_probe"}:
+            failures.append(f"expected openclaw probe, got {record['probe_used']}")
+    elif case_id == "frustrated_architecture_meta":
+        if route not in {"direct_answer", "agent"}:
+            failures.append(f"expected direct_answer or agent for meta architecture critique, got {route}")
+        if "Veyra 是" in response and "架构" not in response:
+            failures.append("response looks like identity slogan instead of architecture critique")
+        if len(response.strip()) < 20:
+            failures.append("architecture critique response is too thin")
+    elif case_id == "code_capability_agent":
+        if route != "agent":
+            failures.append(f"expected agent route, got {route}")
+        task_summary = record.get("task_packet_summary") or {}
+        for field in ["has_context_patch", "has_policy_patch", "has_persona_patch"]:
+            if not task_summary.get(field):
+                failures.append(f"task packet missing {field}")
+    elif case_id == "daily_weather_authorization":
+        commitment = record.get("commitment") or {}
+        if route == "block":
+            failures.append("daily weather authorization should not be blocked")
+        if not commitment:
+            failures.append("daily weather request did not return commitment parameter handling metadata")
+        if commitment.get("status") != "needs_parameters":
+            failures.append(f"expected needs_parameters, got {commitment.get('status')}")
+        if commitment.get("commitment_status") or commitment.get("kind") or commitment.get("confirmed"):
+            failures.append("incomplete daily weather request created a commitment")
+        if "几点" not in response or "城市/地区" not in response:
+            failures.append("daily weather request did not ask for city/time parameters")
+        if "将为您提供" in response or "已开启" in response:
+            failures.append("daily weather primary response implies activation before confirmation")
     return failures
 
 

@@ -90,6 +90,28 @@ def cache_smoke() -> None:
     expect((second.get("details") or {}).get("cache_hit") is True, "cache hit is explicit", second)
 
 
+def placeholder_filter_smoke() -> None:
+    def fetcher(_url: str) -> str:
+        return """
+        <html>
+          <a href="https://duckduckgo.com/">here</a>
+        </html>
+        """
+
+    old_provider = os.environ.get("VEYRA_SEARCH_PROVIDER")
+    os.environ["VEYRA_SEARCH_PROVIDER"] = "public"
+    try:
+        result = SearchProbe(fetcher=fetcher).run("卢成风 视频", max_results=3)
+    finally:
+        if old_provider is None:
+            os.environ.pop("VEYRA_SEARCH_PROVIDER", None)
+        else:
+            os.environ["VEYRA_SEARCH_PROVIDER"] = old_provider
+    results = (result.get("details") or {}).get("results") if isinstance(result.get("details"), dict) else []
+    expect(result.get("status") == "empty", "duckduckgo placeholder is not a search result", result)
+    expect(results == [], "placeholder result list is empty", result)
+
+
 def quality_and_dedupe_smoke() -> None:
     with TemporaryDirectory(prefix="veyra-external-search-quality-") as tmp:
         store = WorldStateStore(Path(tmp) / "state")
@@ -158,6 +180,7 @@ def failure_smoke() -> None:
 
 def main() -> int:
     cache_smoke()
+    placeholder_filter_smoke()
     quality_and_dedupe_smoke()
     failure_smoke()
     print("external search quality smoke passed")

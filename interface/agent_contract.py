@@ -6,7 +6,7 @@ from typing import Any
 from interface.agent_compatibility import compatibility_policy_summary, evaluate_agent_compatibility
 
 
-AGENT_CONTRACT_VERSION = "veyra.agent_adapter.v1"
+AGENT_CONTRACT_VERSION = "veyra.agent_adapter.v2"
 
 TERMINAL_STATUSES = {"success", "failed", "error", "adapter_unconfigured", "timeout", "blocked"}
 NON_TERMINAL_STATUSES = {"submitted", "running", "pending"}
@@ -73,10 +73,40 @@ def render_prompt_payload(payload: dict[str, Any]) -> str:
     return "\n".join(
         [
             f"Veyra Agent Contract: {AGENT_CONTRACT_VERSION}",
+            "You are an Agent Runtime operating under Veyra governance.",
+            "You are not the final authority. Veyra owns policy, memory, confirmation, verification, and delivery.",
+            "Your job is to analyze the user goal and provided awareness/context, then return a proposal or bounded low-risk result.",
+            "You may reason deeply, synthesize context, inspect provided workspace/context when allowed, propose actions, and perform only actions explicitly allowed by capability_request and policy_patch.",
+            "You must not bypass Veyra, assume user approval for risky actions, claim unavailable capabilities, invent runtime state, or treat stale awareness as current fact.",
             f"Task ID: {payload.get('task_id', '')}",
             f"Session ID: {payload.get('session_id', '')}",
             f"User Goal: {payload.get('user_goal') or payload.get('user_message', '')}",
             f"Required Capabilities: {json.dumps(payload.get('required_capabilities', []), ensure_ascii=False)}",
+            "Expected Structured JSON Response:",
+            json.dumps(
+                {
+                    "agent_understanding": "",
+                    "answer_or_plan": "",
+                    "evidence_used": [],
+                    "evidence_needed": [],
+                    "proposed_actions": [
+                        {
+                            "action": "",
+                            "risk_level": "",
+                            "requires_confirmation": True,
+                            "reversible": True,
+                            "reason": "",
+                        }
+                    ],
+                    "verification_steps": [],
+                    "rollback_notes": "",
+                    "memory_recommendation": "none|read|write_candidate",
+                    "confidence": 0.0,
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
             "Context Patch:",
             json.dumps(payload.get("context_patch", {}), ensure_ascii=False, indent=2, sort_keys=True),
             "Persona Patch:",

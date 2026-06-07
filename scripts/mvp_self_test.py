@@ -80,7 +80,7 @@ def main() -> int:
     expect(phases.get("P5") == "completed", "P5 architecture status", phases)
 
     contract = get_json("/agent/contract")
-    expect(contract.get("contract_version") == "veyra.agent_adapter.v1", "agent adapter contract", contract)
+    expect(contract.get("contract_version") == "veyra.agent_adapter.v2", "agent adapter contract", contract)
     expect(
         contract.get("compatibility", {}).get("policy_version") == "veyra.agent_compatibility.v1",
         "agent compatibility policy",
@@ -90,7 +90,7 @@ def main() -> int:
         {
             "runtime": "custom",
             "status": "available",
-            "contract_version": "veyra.agent_adapter.v2",
+            "contract_version": "veyra.agent_adapter.v3",
             "features": {"rendered_prompt_fallback": True},
         },
         runtime="custom",

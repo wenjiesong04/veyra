@@ -65,6 +65,10 @@ class TurnContextBuilder:
                 },
                 "short_memory": {
                     "conversation_tail": self._conversation_tail(event, limit=6),
+                    "conversation_slots": self._conversation_slots(
+                        state.get("task_state", {}),
+                        session_id=event.source.session_id if event else None,
+                    ),
                     "user": self._user_world_summary(state.get("user_world", {})),
                     "task": self._task_summary(
                         state.get("task_state", {}),
@@ -206,6 +210,31 @@ class TurnContextBuilder:
             )
         tail.sort(key=lambda item: str(item.get("received_at") or ""))
         return tail[-limit:]
+
+    def _conversation_slots(self, task_state: dict[str, Any], session_id: str | None) -> dict[str, Any]:
+        if not session_id or not isinstance(task_state, dict):
+            return {}
+        slots_by_session = task_state.get("conversation_slots") if isinstance(task_state.get("conversation_slots"), dict) else {}
+        slots = slots_by_session.get(session_id) if isinstance(slots_by_session, dict) else {}
+        if not isinstance(slots, dict):
+            return {}
+        tool = slots.get("last_tool_result") if isinstance(slots.get("last_tool_result"), dict) else {}
+        compact_tool: dict[str, Any] = {
+            "type": tool.get("type"),
+            "status": tool.get("status"),
+        }
+        if tool.get("type") == "search":
+            results = tool.get("results") if isinstance(tool.get("results"), list) else []
+            compact_tool.update({"query": tool.get("query"), "result_count": len(results)})
+        elif tool.get("type") == "weather":
+            compact_tool.update({"location": tool.get("location"), "requested_location": tool.get("requested_location")})
+        return {
+            "last_location": self._clip(slots.get("last_location"), 80),
+            "last_topic": self._clip(slots.get("last_topic"), 120),
+            "last_search_query": self._clip(slots.get("last_search_query"), 120),
+            "last_intent": self._clip(slots.get("last_intent"), 40),
+            "last_tool_result": compact_tool,
+        }
 
     def _attachment_summary(self, metadata: Any) -> dict[str, Any]:
         if not isinstance(metadata, dict):

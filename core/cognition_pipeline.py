@@ -17,24 +17,30 @@ from interface.event_schema import Decision, Route, VeyraEvent
 
 TURN_UNDERSTANDING_SYSTEM = (
     "You are Veyra Core's orientation layer inside an awareness-driven runtime. "
-    "The user message is primary input. You also receive an awareness_snapshot built from "
-    "Veyra's belief claims and local_world probe cache - this is existing perception, not new execution. "
-    "Return strict JSON only. Structure the user's goal, entities, and whether fresh evidence is still needed. "
-    "Prefer answering from fresh world-state evidence when it already satisfies the question. "
-    "Do not execute probes/agents and do not write the final user reply."
+    "The user message is the primary input. The awareness_snapshot contains Veyra's current perception "
+    "from belief claims and local_world probe cache; treat it as useful but not automatically true or fresh. "
+    "Return strict JSON only. Produce a situation understanding, not a route decision. "
+    "Identify the user's explicit goal, what they likely really need, emotional/context signals, entities, "
+    "task type, awareness that is relevant, and awareness that may be stale or uncertain. "
+    "When evidence is needed, explain what evidence would change the answer. "
+    "Do not execute probes or agents, do not write the final user reply, and do not treat missing evidence as fact."
 )
 
 EXECUTION_PLAN_SYSTEM = (
-    "You are Veyra Core's planner. You receive turn understanding, awareness_snapshot, expanded context, "
-    "and available_capabilities. Choose the minimal safe route. Return strict JSON only. "
-    "Your main output contract is capability_request: the same adapter-shaped request used by native probes, "
-    "skills, and selected Agent Runtime handoff. "
-    "Routing policy: "
-    "1) If awareness_snapshot already contains fresh sufficient evidence, use direct_answer and cite it in draft_response. "
-    "2) Else if a read-only probe can fetch evidence and is available, use probe with concrete probe_params. "
-    "3) Use agent only for multi-step implementation/debugging/browser/code workflows. "
-    "4) Use ask_user when required evidence is missing and cannot be inferred. "
-    "Probes are executors - you supply params (location, query, url, port); do not rely on regex inside probes."
+    "You are Veyra Core's awareness decision judge. You receive a situation assessment, awareness_snapshot, "
+    "expanded context, evidence_sufficiency, and available_capabilities. Return strict JSON only. "
+    "First decide what evidence or reasoning is actually needed, then choose the smallest safe route. "
+    "direct_answer is allowed only when the current context is sufficient, no fresh workspace/runtime/local/external/"
+    "attachment evidence is needed, risk is low, and confidence is high enough to be useful. "
+    "probe is for a concrete evidence gap: state what evidence would change the answer and choose the smallest "
+    "read-only observation with concrete params. Do not request probes merely because a keyword appears. "
+    "agent is a Veyra-governed reasoning/execution body. Use it when the task benefits from deeper reasoning, "
+    "multi-step synthesis, external search, workspace/code/browser/debugging operations, or Veyra's direct confidence "
+    "is insufficient while policy allows delegation. The Agent returns a proposal or bounded low-risk result; "
+    "Veyra remains responsible for policy, confirmation, verification, memory, and delivery. "
+    "ask_user only when the missing input is a user preference, permission, or necessary detail that cannot be "
+    "obtained by safe observation. block only for clearly unacceptable or policy-forbidden requests. "
+    "Your main output contract is decision + capability_request + risk + reply_strategy."
 )
 
 
@@ -42,7 +48,13 @@ EXECUTION_PLAN_SYSTEM = (
 class TurnUnderstanding:
     intent: str = "unknown"
     task_summary: str = ""
+    user_goal: str = ""
+    what_user_really_needs: str = ""
+    task_type: str = "unknown"
     entities: dict[str, Any] = field(default_factory=dict)
+    relevant_awareness: list[Any] = field(default_factory=list)
+    stale_or_uncertain_awareness: list[Any] = field(default_factory=list)
+    evidence_gap: dict[str, Any] = field(default_factory=dict)
     needs_fresh_evidence: bool = False
     evidence_kind: str = ""
     can_answer_from_world_state: bool = False
@@ -53,22 +65,51 @@ class TurnUnderstanding:
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> TurnUnderstanding:
+        situation = payload.get("situation_assessment") if isinstance(payload.get("situation_assessment"), dict) else {}
+        if not situation:
+            situation = payload
         entities = payload.get("entities") if isinstance(payload.get("entities"), dict) else {}
+        if not entities:
+            raw_entities = situation.get("entities")
+            if isinstance(raw_entities, dict):
+                entities = raw_entities
+            elif isinstance(raw_entities, list):
+                entities = {"items": raw_entities[:12]}
+            else:
+                entities = {}
+        evidence_gap = situation.get("evidence_gap") if isinstance(situation.get("evidence_gap"), dict) else {}
         hints = payload.get("retrieval_hints") if isinstance(payload.get("retrieval_hints"), list) else []
+        if not hints:
+            hints = situation.get("retrieval_hints") if isinstance(situation.get("retrieval_hints"), list) else []
         try:
-            confidence = float(payload.get("confidence") or 0.0)
+            confidence = float(situation.get("confidence", payload.get("confidence") or 0.0) or 0.0)
         except (TypeError, ValueError):
             confidence = 0.0
+        evidence_kind = str(evidence_gap.get("evidence_kind") or situation.get("evidence_kind") or payload.get("evidence_kind") or "")
+        needs_fresh = bool(evidence_gap.get("needs_fresh_evidence", payload.get("needs_fresh_evidence")))
+        can_answer = bool(situation.get("can_answer_from_current_context", payload.get("can_answer_from_world_state")))
+        task_summary = str(situation.get("task_summary") or payload.get("task_summary") or payload.get("summary") or "")
+        user_goal = str(situation.get("user_goal") or task_summary or "")
         return cls(
-            intent=str(payload.get("intent") or "unknown"),
-            task_summary=str(payload.get("task_summary") or payload.get("summary") or ""),
+            intent=str(situation.get("intent") or payload.get("intent") or "unknown"),
+            task_summary=task_summary,
+            user_goal=user_goal,
+            what_user_really_needs=str(situation.get("what_user_really_needs") or ""),
+            task_type=str(situation.get("task_type") or payload.get("task_type") or "unknown"),
             entities=entities,
-            needs_fresh_evidence=bool(payload.get("needs_fresh_evidence")),
-            evidence_kind=str(payload.get("evidence_kind") or ""),
-            can_answer_from_world_state=bool(payload.get("can_answer_from_world_state")),
+            relevant_awareness=situation.get("relevant_awareness")[:12]
+            if isinstance(situation.get("relevant_awareness"), list)
+            else [],
+            stale_or_uncertain_awareness=situation.get("stale_or_uncertain_awareness")[:12]
+            if isinstance(situation.get("stale_or_uncertain_awareness"), list)
+            else [],
+            evidence_gap=evidence_gap,
+            needs_fresh_evidence=needs_fresh,
+            evidence_kind=evidence_kind,
+            can_answer_from_world_state=can_answer,
             retrieval_hints=[str(item) for item in hints[:8] if item],
             confidence=max(0.0, min(confidence, 1.0)),
-            reason=str(payload.get("reason") or ""),
+            reason=str(situation.get("reason") or payload.get("reason") or ""),
             raw=payload,
         )
 
@@ -97,30 +138,52 @@ class ExecutionPlan:
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> ExecutionPlan:
-        probe_params = payload.get("probe_params") if isinstance(payload.get("probe_params"), dict) else {}
+        decision = payload.get("decision") if isinstance(payload.get("decision"), dict) else {}
+        risk = payload.get("risk") if isinstance(payload.get("risk"), dict) else {}
+        reply_strategy = payload.get("reply_strategy") if isinstance(payload.get("reply_strategy"), dict) else {}
         capability_request = payload.get("capability_request") if isinstance(payload.get("capability_request"), dict) else {}
+        request_input = capability_request.get("input") if isinstance(capability_request.get("input"), dict) else {}
+        probe_params = payload.get("probe_params") if isinstance(payload.get("probe_params"), dict) else {}
+        if not probe_params and isinstance(request_input, dict):
+            probe_params = dict(request_input)
         try:
             confidence = float(payload.get("confidence") or 0.0)
         except (TypeError, ValueError):
             confidence = 0.0
+        if not confidence:
+            try:
+                confidence = float(decision.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+        memory_policy = str(payload.get("memory_policy") or "")
+        if not memory_policy:
+            memory_policy = str(reply_strategy.get("memory_policy") or "")
+        memory_policy = {
+            "none": "forget",
+            "read": "short_term",
+            "write_candidate": "long_term",
+        }.get(memory_policy, memory_policy or "forget")
+        route = str(decision.get("route") or payload.get("recommended_route") or payload.get("route") or "direct_answer")
+        answer_source = str(decision.get("answer_source") or payload.get("answer_source") or "model_knowledge")
+        risk_level = str(risk.get("level") or payload.get("risk_level") or "R0")
         return cls(
-            recommended_route=str(payload.get("recommended_route") or payload.get("route") or "direct_answer"),
-            answer_source=str(payload.get("answer_source") or "model_knowledge"),
+            recommended_route=route,
+            answer_source=answer_source,
             probe=str(payload.get("probe") or payload.get("selected_probe") or "").strip() or None,
             probe_params=probe_params,
             skill=str(payload.get("skill") or "").strip() or None,
             needs_agent=bool(payload.get("needs_agent")),
             agent_goal=str(payload.get("agent_goal") or payload.get("user_goal") or ""),
-            draft_response=str(payload.get("draft_response") or payload.get("response") or "")[:2000],
-            risk_level=str(payload.get("risk_level") or "R0"),
+            draft_response=str(reply_strategy.get("draft_response") or payload.get("draft_response") or payload.get("response") or "")[:2000],
+            risk_level=risk_level,
             intent=str(payload.get("intent") or "unknown"),
             complexity=str(payload.get("complexity") or "simple"),
             freshness_required=bool(payload.get("freshness_required") or payload.get("needs_probe")),
-            memory_policy=str(payload.get("memory_policy") or "forget"),
+            memory_policy=memory_policy,
             reasoning_mode=str(payload.get("reasoning_mode") or "direct"),
             required_capabilities=[str(item) for item in (payload.get("required_capabilities") or [])[:12] if item],
             capability_request=capability_request,
-            reason=str(payload.get("reason") or payload.get("rationale") or ""),
+            reason=str(decision.get("why_this_route") or payload.get("reason") or payload.get("rationale") or ""),
             confidence=max(0.0, min(confidence, 1.0)),
             raw=payload,
         )
@@ -220,15 +283,25 @@ class CognitionPipeline:
                 "persona": active.get("persona"),
             },
             "required_json_fields": {
-                "intent": "conversation|information|action|implementation|preference|unknown",
-                "task_summary": "one sentence summary of user goal",
-                "entities": "object: location, person, query, url, port, platform, topic",
-                "needs_fresh_evidence": "boolean",
-                "evidence_kind": "weather|time|search|local_status|web|other|none",
-                "can_answer_from_world_state": "boolean - true if awareness_snapshot already enough",
+                "situation_assessment": {
+                    "user_goal": "what the user explicitly asks for",
+                    "what_user_really_needs": "practical need behind the words, including frustration/confusion if present",
+                    "task_type": "chat|explanation|current_fact|local_status|workspace_task|code_task|proactive_request|meta_question|other",
+                    "intent": "conversation|information|action|implementation|preference|unknown",
+                    "task_summary": "one sentence summary of user goal",
+                    "entities": "object or list: location, person, query, url, port, platform, topic",
+                    "relevant_awareness": "list of current perception items that may help",
+                    "stale_or_uncertain_awareness": "list of claims that must not be treated as fresh fact",
+                    "evidence_gap": {
+                        "needs_fresh_evidence": "boolean",
+                        "evidence_kind": "none|local|runtime|external|file|attachment|calendar|email|memory|weather|time|search|web",
+                        "what_would_change_the_answer": "concrete observation needed before a reliable answer",
+                    },
+                    "can_answer_from_current_context": "boolean",
+                    "confidence": "0.0-1.0",
+                    "reason": "short rationale",
+                },
                 "retrieval_hints": "optional list: conversation, belief, user, task, capabilities, runtime",
-                "confidence": "0.0-1.0",
-                "reason": "short rationale",
             },
         }
         result = self.reasoning.client.complete_json(
@@ -301,29 +374,39 @@ class CognitionPipeline:
             "allowed_routes": ["direct_answer", "probe", "skill", "agent", "ask_user", "human_review", "block"],
             "probe_catalog": self._probe_catalog(),
             "required_json_fields": {
-                "recommended_route": "direct_answer|probe|skill|agent|ask_user|human_review|block",
-                "answer_source": "world_state|probe|model_knowledge|agent",
-                "probe": "probe name when route=probe",
-                "probe_params": "object with concrete inputs",
-                "draft_response": "natural reply; cite world_state evidence when answer_source=world_state",
-                "risk_level": "R0-R5",
+                "decision": {
+                    "route": "direct_answer|probe|skill|agent|ask_user|human_review|block",
+                    "answer_source": "current_context|world_state|probe_evidence|agent_proposal|user_confirmation|model_knowledge|none",
+                    "why_this_route": "why this is the smallest safe useful route",
+                    "why_not_other_routes": "list of alternatives rejected",
+                },
+                "capability_request": {
+                    "target_route": "direct_answer|probe|skill|agent|ask_user|human_review|block",
+                    "receiver_type": "core|probe|skill|agent|user|guardian",
+                    "capability_id": "capability id from available_capabilities when possible",
+                    "executor": "probe name, skill id, selected_agent_runtime, or empty",
+                    "input": "object; exact params the receiver needs, e.g. location/query/url/port/user_goal",
+                    "missing_context": "list",
+                    "fit_score": "0.0-1.0 adapter fit for the user request",
+                    "reason": "short rationale",
+                },
+                "risk": {
+                    "level": "R0-R5",
+                    "requires_confirmation": "boolean",
+                    "unsafe_assumptions": "list",
+                },
+                "reply_strategy": {
+                    "draft_response": "natural final-text candidate when direct_answer/ask_user is appropriate",
+                    "tone": "natural|direct|technical|supportive",
+                    "must_include": "list",
+                    "must_avoid": "list",
+                },
                 "intent": "conversation|information|action|implementation|preference|unknown",
                 "complexity": "simple|moderate|complex",
                 "freshness_required": "boolean",
-                "memory_policy": "forget|short_term|long_term",
+                "memory_policy": "none|read|write_candidate|forget|short_term|long_term",
                 "reasoning_mode": "direct|evidence|execution",
                 "required_capabilities": "list",
-                "capability_request": {
-                    "target_route": "direct_answer|probe|skill|agent|ask_user",
-                    "receiver_type": "native|probe|skill|agent|user",
-                    "capability_id": "capability id from available_capabilities when possible",
-                    "executor": "probe name, skill id, or selected_agent_runtime",
-                    "adapter": "native_probe|skill_executor|agent_task_packet|none",
-                    "input": "object; exact params the receiver needs, e.g. location/query/url/port/user_goal",
-                    "fit_score": "0.0-1.0 adapter fit for the user request",
-                    "missing_context": "list",
-                    "reason": "short rationale",
-                },
                 "confidence": "0.0-1.0",
                 "reason": "short rationale",
             },
@@ -396,6 +479,16 @@ class CognitionPipeline:
             if "weather_probe" not in plan.required_capabilities:
                 plan.required_capabilities.append("weather_probe")
             plan.reason = f"{plan.reason}; adapter_contract:weather_probe".strip("; ")
+        evidence_probe = self._probe_for_evidence_gap(text=text, understanding=understanding, plan=plan, sufficiency=sufficiency)
+        if evidence_probe:
+            plan.recommended_route = "probe"
+            plan.probe = evidence_probe
+            plan.answer_source = "probe"
+            plan.freshness_required = True
+            capability = self._capability_for_probe_name(evidence_probe)
+            if capability and capability not in plan.required_capabilities:
+                plan.required_capabilities.append(capability)
+            plan.reason = f"{plan.reason}; evidence_gap:{evidence_probe}".strip("; ")
         if self._requires_agent_handoff(text=text, understanding=understanding):
             plan.recommended_route = "agent"
             plan.needs_agent = True
@@ -404,6 +497,14 @@ class CognitionPipeline:
             if not plan.agent_goal:
                 plan.agent_goal = text
             plan.reason = f"{plan.reason}; adapter_contract:agent_task_packet".strip("; ")
+        if self._is_proactive_weather_request(text) and plan.recommended_route == "probe" and plan.probe == "weather_probe":
+            plan.recommended_route = "direct_answer"
+            plan.probe = None
+            plan.freshness_required = False
+            plan.answer_source = "current_context"
+            plan.intent = "proactive_request"
+            plan.memory_policy = "forget"
+            plan.reason = f"{plan.reason}; policy:recurring_weather_needs_authorization_not_current_probe".strip("; ")
         if plan.recommended_route == "agent" or plan.needs_agent:
             plan.required_capabilities = self._agent_handoff_capabilities(plan.required_capabilities)
             if "selected_agent_runtime" not in plan.required_capabilities:
@@ -433,26 +534,64 @@ class CognitionPipeline:
                 plan.agent_goal = str(request_input.get("user_goal"))
         if capability_id and receiver_type != "agent" and capability_id not in plan.required_capabilities:
             plan.required_capabilities.append(capability_id)
+        if capability_id and receiver_type == "agent" and "selected_agent_runtime" not in plan.required_capabilities:
+            plan.required_capabilities.insert(0, "selected_agent_runtime")
         probe_params = dict(plan.probe_params)
         probe_params.update(request_input)
         if plan.probe == "weather_probe" and not probe_params.get("location"):
-            location = entities.get("location") or entities.get("place") or entities.get("city")
+            location = entities.get("location") or entities.get("place") or entities.get("city") or self._text_location_hint(text)
             if location:
                 probe_params["location"] = str(location)
         if plan.probe == "search_probe" and not probe_params.get("query"):
-            query = entities.get("query") or entities.get("person") or entities.get("topic")
+            query = entities.get("query") or entities.get("person") or entities.get("topic") or text
             if query:
                 probe_params["query"] = str(query)
         if plan.probe == "time":
             plan.probe = "time_probe"
+        probe_aliases = {
+            "openclaw_probe": "openclaw",
+            "hermes_probe": "hermes",
+            "mcp_probe": "mcp",
+            "system_probe": "system",
+            "git_probe": "git",
+            "port_probe": "port",
+            "process_probe": "process",
+            "file_probe": "file",
+            "log_probe": "log",
+            "network_probe": "network",
+            "web_url_probe": "web",
+        }
+        if plan.probe in probe_aliases:
+            plan.probe = probe_aliases[plan.probe]
         if plan.probe == "time_probe" and not probe_params.get("timezone"):
             tz = entities.get("timezone") or entities.get("city")
             if tz:
                 probe_params["timezone"] = str(tz)
         plan.probe_params = probe_params
+        if self._is_proactive_weather_request(text) and plan.recommended_route == "probe" and plan.probe == "weather_probe":
+            plan.recommended_route = "direct_answer"
+            plan.probe = None
+            plan.freshness_required = False
+            plan.answer_source = "current_context"
+            plan.intent = "proactive_request"
+            plan.memory_policy = "forget"
+            plan.reason = f"{plan.reason}; policy:recurring_weather_needs_authorization_not_current_probe".strip("; ")
         if understanding.needs_fresh_evidence and plan.recommended_route == "direct_answer" and plan.probe:
             plan.recommended_route = "probe"
             plan.freshness_required = True
+        if self._is_meta_cognition_question(text) and (
+            plan.recommended_route in {"skill", "probe"}
+            or plan.probe in {"diagnose_openclaw", "diagnose_openclaw_skill"}
+            or plan.skill in {"diagnose_openclaw", "diagnose_openclaw_skill"}
+            or capability_id in {"diagnose_openclaw_skill", "log_probe"}
+        ) and not self._explicitly_asks_runtime_evidence(text):
+            plan.recommended_route = "direct_answer"
+            plan.skill = None
+            plan.probe = None
+            plan.reason = f"{plan.reason}; policy:meta_cognition_not_skill_diagnosis".strip("; ")
+        if self._is_proactive_weather_request(text):
+            plan.intent = "proactive_request"
+            plan.memory_policy = "forget"
         return plan
 
     def _probe_for_capability_request(self, plan: ExecutionPlan) -> str:
@@ -470,6 +609,11 @@ class CognitionPipeline:
                 "search": "search_probe",
                 "search_probe": "search_probe",
                 "web_url_probe": "web",
+                "openclaw_probe": "openclaw",
+                "hermes_probe": "hermes",
+                "mcp_probe": "mcp",
+                "runtime": "openclaw",
+                "local_status": "system",
             }.get(str(item or "").strip())
             if probe:
                 return probe
@@ -503,6 +647,8 @@ class CognitionPipeline:
         understanding: TurnUnderstanding,
         sufficiency: dict[str, Any],
     ) -> bool:
+        if self._is_proactive_weather_request(text):
+            return False
         if understanding.evidence_kind == "weather" and not self._has_real_world_state_evidence(sufficiency):
             return True
         lowered = (text or "").lower()
@@ -511,6 +657,80 @@ class CognitionPipeline:
             marker in lowered for marker in ("now", "current", "today")
         )
         return bool(asks_weather and current and not self._has_real_world_state_evidence(sufficiency))
+
+    def _probe_for_evidence_gap(
+        self,
+        *,
+        text: str,
+        understanding: TurnUnderstanding,
+        plan: ExecutionPlan,
+        sufficiency: dict[str, Any],
+    ) -> str:
+        if self._has_real_world_state_evidence(sufficiency):
+            return ""
+        if self._is_meta_cognition_question(text) and not self._explicitly_asks_runtime_evidence(text):
+            return ""
+        if self._is_proactive_weather_request(text):
+            return ""
+        lowered = (text or "").lower()
+        evidence_kind = str(understanding.evidence_kind or "").lower()
+        if not understanding.needs_fresh_evidence and plan.recommended_route != "direct_answer":
+            return ""
+        if plan.probe and plan.recommended_route == "probe":
+            return ""
+        if evidence_kind in {"search", "external", "latest", "web"} or any(
+            marker in lowered for marker in ("最新", "新闻", "latest", "recent", "today's")
+        ):
+            return "search_probe"
+        volatile_status = any(marker in lowered for marker in ("现在", "当前", "状态", "运行", "running", "status", "now", "current"))
+        if "openclaw" in lowered and volatile_status:
+            return "openclaw"
+        if "hermes" in lowered and volatile_status:
+            return "hermes"
+        if "mcp" in lowered and volatile_status:
+            return "mcp"
+        if evidence_kind in {"runtime", "local", "local_status"}:
+            if "openclaw" in lowered:
+                return "openclaw"
+            if "hermes" in lowered:
+                return "hermes"
+            if "mcp" in lowered:
+                return "mcp"
+            if "端口" in text or "port" in lowered:
+                return "port"
+            return "system"
+        if evidence_kind == "file":
+            return "file"
+        if evidence_kind == "weather":
+            return "weather_probe"
+        if evidence_kind == "time":
+            return "time_probe"
+        return ""
+
+    def _capability_for_probe_name(self, probe: str) -> str:
+        return {
+            "time": "time_probe",
+            "time_probe": "time_probe",
+            "weather_probe": "weather_probe",
+            "search_probe": "web_search",
+            "web": "web_url_probe",
+            "openclaw": "openclaw_probe",
+            "hermes": "hermes_probe",
+            "mcp": "mcp_probe",
+            "system": "system_probe",
+            "git": "git_probe",
+            "port": "port_probe",
+            "process": "process_probe",
+            "file": "file_probe",
+            "log": "log_probe",
+            "network": "network_probe",
+        }.get(probe, probe)
+
+    def _text_location_hint(self, text: str) -> str:
+        for marker in ("北京", "上海", "广州", "深圳", "贵阳", "大阪", "东京", "伦敦"):
+            if marker in text:
+                return marker
+        return ""
 
     def _agent_handoff_capabilities(self, capabilities: list[str]) -> list[str]:
         output: list[str] = []
@@ -523,6 +743,8 @@ class CognitionPipeline:
 
     def _requires_agent_handoff(self, *, text: str, understanding: TurnUnderstanding) -> bool:
         if understanding.intent == "implementation":
+            return True
+        if understanding.task_type in {"workspace_task", "code_task"}:
             return True
         lowered = (text or "").lower()
         markers = (
@@ -540,6 +762,26 @@ class CognitionPipeline:
             "fix bug",
         )
         return any(marker in text for marker in markers[:7]) or any(marker in lowered for marker in markers[7:])
+
+    def _is_meta_cognition_question(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        return any(marker in text for marker in ("架构", "认知", "prompt", "提示词", "智障")) or any(
+            marker in lowered for marker in ("cognition", "prompt", "architecture")
+        )
+
+    def _explicitly_asks_runtime_evidence(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        return any(marker in text for marker in ("日志", "运行状态", "端口", "进程", "错误堆栈")) or any(
+            marker in lowered for marker in ("log", "runtime status", "port", "process", "stack trace")
+        )
+
+    def _is_proactive_weather_request(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        wants_recurring = any(marker in text for marker in ("每天", "每日", "定时", "定期")) or any(
+            marker in lowered for marker in ("daily", "every morning", "each day")
+        )
+        asks_weather = "天气" in text or "weather" in lowered
+        return wants_recurring and asks_weather
 
     def _to_decision(
         self,
@@ -577,6 +819,9 @@ class CognitionPipeline:
             "pipeline": "awareness_model_first",
             "reason": plan.reason or understanding.reason,
             "recommended_route": route.value,
+            "situation_assessment": plan.raw.get("situation_assessment") if isinstance(plan.raw.get("situation_assessment"), dict) else {},
+            "route_decision": plan.raw.get("decision") if isinstance(plan.raw.get("decision"), dict) else {},
+            "reply_strategy": plan.raw.get("reply_strategy") if isinstance(plan.raw.get("reply_strategy"), dict) else {},
             "risk_level": risk.value,
             "freshness_required": plan.freshness_required,
             "needs_probe": route == Route.PROBE,
@@ -594,7 +839,11 @@ class CognitionPipeline:
             "turn_understanding": {
                 "intent": understanding.intent,
                 "task_summary": understanding.task_summary,
+                "user_goal": understanding.user_goal,
+                "what_user_really_needs": understanding.what_user_really_needs,
+                "task_type": understanding.task_type,
                 "entities": understanding.entities,
+                "evidence_gap": understanding.evidence_gap,
                 "evidence_kind": understanding.evidence_kind,
                 "can_answer_from_world_state": understanding.can_answer_from_world_state,
             },
@@ -676,6 +925,8 @@ class CognitionPipeline:
             "probe": Route.PROBE,
             "skill": Route.SKILL,
             "agent": Route.AGENT,
+            "agent_reasoning": Route.AGENT,
+            "agent_proposal": Route.AGENT,
             "ask_user": Route.ASK_USER,
             "human_review": Route.HUMAN_REVIEW,
             "block": Route.BLOCK,
