@@ -48,6 +48,18 @@ class Verifier:
         has_evidence = has_result or changed_files or has_tool_calls or has_raw
         tool_proxy_compliance = self.agent_tool_compliance.review_execution(execution_result)
         evidence["tool_proxy_compliance"] = tool_proxy_compliance
+        evidence_mismatch = self._evidence_mismatch(execution_result)
+        if evidence_mismatch:
+            evidence["evidence_mismatch"] = evidence_mismatch
+            return {
+                "status": "verified_failed",
+                "verdict": "evidence_mismatch",
+                "confidence": 0.87,
+                "evidence": evidence,
+                "next_action": "refresh_evidence_or_retry_agent",
+                "needs_rollback": bool(changed_files),
+                "needs_memory_patch": False,
+            }
 
         if status == "success" and self._has_failure_marker(execution_result):
             return {
@@ -185,3 +197,34 @@ class Verifier:
         if raw.get("snapshot") or raw.get("snapshot_id"):
             return True
         return any(isinstance(value, dict) and self._raw_has_snapshot(value) for value in raw.values())
+
+    def _evidence_mismatch(self, execution_result: ExecutionResult) -> dict[str, Any] | None:
+        raw = execution_result.raw if isinstance(execution_result.raw, dict) else {}
+        text = str(execution_result.result or "")
+        if not raw or not text:
+            return None
+        expected_terms = self._string_list(raw.get("expected_terms"))
+        forbidden_terms = self._string_list(raw.get("forbidden_terms"))
+        probe = raw.get("probe_result") if isinstance(raw.get("probe_result"), dict) else {}
+        if probe.get("probe") == "weather_probe":
+            details = probe.get("details") if isinstance(probe.get("details"), dict) else {}
+            location = str(details.get("location") or probe.get("target") or "").strip()
+            requested = str(probe.get("target") or details.get("location_query") or "").strip()
+            if (location or requested) and any(term in text for term in ("纽约", "New York", "new york")) and not any(
+                term and term in text for term in (location, requested)
+            ):
+                return {"reason": "weather_location_conflict", "expected_location": location or requested, "conflicting_location": "New York"}
+        missing = [term for term in expected_terms if term and term not in text]
+        forbidden = [term for term in forbidden_terms if term and term in text]
+        if forbidden:
+            return {"reason": "forbidden_term_present", "forbidden_terms": forbidden[:8]}
+        if expected_terms and len(missing) == len(expected_terms):
+            return {"reason": "expected_evidence_absent", "missing_terms": missing[:8]}
+        return None
+
+    def _string_list(self, value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            return [str(item) for item in value if item]
+        return []

@@ -38,6 +38,45 @@ class VeyraController:
         missing = self.capabilities.missing(required)
         if normalized.route == Route.BLOCK:
             return normalized, ControllerPlan(Route.BLOCK, "ready", delegation_trace.get("reason", "guardian block route selected"), missing)
+        unsupported_probe = self._unsupported_probe(normalized)
+        if unsupported_probe:
+            fallback_required = self._probe_fallback_capabilities(normalized, unsupported_probe)
+            agent_capabilities = self._available_agent_capabilities_for_missing(
+                replace(normalized, required_capabilities=fallback_required),
+                [{"capability": capability} for capability in fallback_required],
+            )
+            if agent_capabilities:
+                adjusted = replace(
+                    normalized,
+                    route=Route.AGENT,
+                    reason=f"selected Agent Runtime can satisfy unsupported probe `{unsupported_probe}` via {', '.join(agent_capabilities)}",
+                    capability="selected_agent_runtime",
+                    needs_agent=True,
+                    needs_probe=False,
+                    needs_user_confirmation=False,
+                    required_capabilities=list(dict.fromkeys(["selected_agent_runtime", *agent_capabilities])),
+                    signals=list(dict.fromkeys(normalized.signals + ["controller:unsupported_probe_agent_fallback"])),
+                    constraints=list(
+                        dict.fromkeys(
+                            normalized.constraints
+                            + [
+                                "selected Agent Runtime must return evidence for external facts",
+                                "do not fabricate unavailable probe results",
+                            ]
+                        )
+                    ),
+                )
+                return adjusted, ControllerPlan(Route.AGENT, "rerouted", adjusted.reason, [{"capability": unsupported_probe, "reason": "unsupported_native_probe"}])
+            adjusted = replace(
+                normalized,
+                route=Route.ASK_USER,
+                reason=f"unsupported native probe: {unsupported_probe}",
+                capability="ask_user",
+                needs_probe=False,
+                signals=list(dict.fromkeys(normalized.signals + ["controller:unsupported_probe"])),
+                constraints=list(dict.fromkeys(normalized.constraints + ["do not execute unsupported probe"])),
+            )
+            return adjusted, ControllerPlan(Route.ASK_USER, "missing_probe", adjusted.reason, [{"capability": unsupported_probe, "reason": "unsupported_native_probe"}])
         if missing:
             agent_capabilities = self._available_agent_capabilities_for_missing(normalized, missing)
             if agent_capabilities:
@@ -172,3 +211,17 @@ class VeyraController:
         elif decision.route == Route.ROLLBACK:
             required.append("rollback_audit")
         return replace(decision, required_capabilities=list(dict.fromkeys(item for item in required if item)))
+
+    def _unsupported_probe(self, decision: Decision) -> str:
+        if decision.route != Route.PROBE or not decision.selected_probe:
+            return ""
+        return "" if self.capabilities.capability_for_probe(decision.selected_probe) else str(decision.selected_probe)
+
+    def _probe_fallback_capabilities(self, decision: Decision, unsupported_probe: str) -> list[str]:
+        required = list(decision.required_capabilities)
+        lowered = unsupported_probe.lower()
+        if "search" in lowered and "web_search" not in required:
+            required.append("web_search")
+        if "web" in lowered and "web_url_probe" not in required:
+            required.append("web_url_probe")
+        return list(dict.fromkeys(required))

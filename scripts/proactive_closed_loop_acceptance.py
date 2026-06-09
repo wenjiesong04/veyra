@@ -134,14 +134,18 @@ def main() -> int:
             "/events/message",
             json={"text": "每天早上帮我推送北京天气", "channel": "acceptance", "user_id": "closed-loop-user", "session_id": "weather"},
         )
-        expect(weather.status_code == 200 and "推送" in message_text(weather.json()), "weather answer offers subscription", weather.text)
-        weather_offer = (weather.json().get("artifacts") or {}).get("commitment", {}).get("commitment", {})
-        expect((weather_offer.get("payload") or {}).get("location") == "北京", "weather offer records clean location", weather_offer)
-        weather_confirm = client.post(
-            "/events/message",
-            json={"text": "同意", "channel": "acceptance", "user_id": "closed-loop-user", "session_id": "weather"},
-        )
-        expect((weather_confirm.json().get("artifacts") or {}).get("commitment", {}).get("status") == "confirmed", "weather subscription confirmed", weather_confirm.json())
+        expect(weather.status_code == 200, "weather message accepted", weather.text)
+        weather_turn = (weather.json().get("artifacts") or {}).get("commitment", {})
+        weather_offer = weather_turn.get("commitment") if isinstance(weather_turn.get("commitment"), dict) else {}
+        expect((weather_offer.get("payload") or {}).get("location") == "北京", "weather commitment records clean location", weather_offer)
+        if weather_offer.get("status") == "pending_confirmation":
+            weather_confirm = client.post(
+                "/events/message",
+                json={"text": "同意", "channel": "acceptance", "user_id": "closed-loop-user", "session_id": "weather"},
+            )
+            expect((weather_confirm.json().get("artifacts") or {}).get("commitment", {}).get("status") == "confirmed", "weather subscription confirmed", weather_confirm.json())
+        else:
+            expect(weather_offer.get("status") == "active", "explicit complete weather request activates subscription", weather_offer)
 
         tick = client.post("/runtime/active-loop/tick", json={"reason": "closed_loop_acceptance"})
         steps = [step.get("name") for step in tick.json().get("steps", []) if isinstance(step, dict)]

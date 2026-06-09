@@ -44,7 +44,7 @@ class GuardianController:
             "risk_level": risk_level.value,
             "risk_policy": policy.to_dict(),
             "risk_catalog": risk_catalog(),
-            "forbidden_actions": ["rm -rf", "curl | bash", "drop database", "drop table", "truncate table", "git push --force", "externalize_secrets"],
+            "forbidden_actions": ["rm -rf", "curl | bash", "drop database", "drop table", "truncate table", "git push --force", "git reset --hard", "externalize_secrets"],
             "requires_review": ["service_restart", "config_modify", "file_delete", "paid_api_call"],
             "requires_snapshot": policy.requires_snapshot,
             "whether_snapshot_required": policy.requires_snapshot,
@@ -124,4 +124,4 @@ class GuardianController:
         return ["do not execute"]
 
     def _forbidden_actions(self) -> list[str]:
-        return ["rm -rf", "curl | bash", "drop database", "drop table", "truncate table", "git push --force", "externalize_secrets"]
+        return ["rm -rf", "curl | bash", "drop database", "drop table", "truncate table", "git push --force", "git reset --hard", "externalize_secrets"]

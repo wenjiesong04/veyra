@@ -452,9 +452,10 @@ class ProactiveIntentPlanner:
 
     def _topic(self, text: str) -> str:
         known = [
+            "PyTorch 3.0",
             "PyTorch",
-            "Kotlin",
             "GSoC Kotlin",
+            "Kotlin",
             "深度学习",
             "考研",
             "湾区短租房源",

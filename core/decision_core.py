@@ -47,6 +47,25 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
         "markers": ("进程", "process"),
     },
     {
+        "name": "local_service_failure",
+        "probe": "process",
+        "capability": "process_probe",
+        "markers": (
+            "无法响应",
+            "不响应",
+            "没回应",
+            "没有回应",
+            "服务挂",
+            "服务挂了",
+            "挂了",
+            "无法访问",
+            "打不开",
+            "not responding",
+            "service down",
+            "service failed",
+        ),
+    },
+    {
         "name": "local_system_status",
         "probe": "system",
         "capability": "system_probe",
@@ -133,6 +152,116 @@ class DecisionCore:
         intent, intent_signals = self._intent_for_text(lowered)
         complexity, complexity_signals = self._complexity_for_text(lowered, attention_focus)
         signals = intent_signals + complexity_signals + self._risk_signals(risk)
+        if self._is_rollback_request(lowered):
+            return self._decision(
+                route=Route.ROLLBACK,
+                risk=RiskLevel.R4,
+                reason="snapshot rollback requires guarded confirmation",
+                intent="action",
+                complexity="moderate",
+                capability="rollback_audit",
+                signals=signals + ["route:rollback"],
+                requires_confirmation=True,
+                needs_user_confirmation=True,
+                memory_policy="short_term",
+                reasoning_mode="execution",
+                required_capabilities=["rollback_audit"],
+                constraints=["restore only an existing snapshot", "record rollback trace", "verify restored checksum"],
+            )
+        if risk == RiskLevel.R5:
+            return self._decision(
+                route=Route.BLOCK,
+                risk=risk,
+                reason="destructive or forbidden action detected",
+                intent=intent,
+                complexity=complexity,
+                capability="guardian",
+                signals=signals,
+                reasoning_mode="execution" if intent in {"action", "implementation"} else "direct",
+                required_capabilities=["guardian"],
+                constraints=["block unsafe action", "require safer alternative"],
+            )
+        if risk in {RiskLevel.R3, RiskLevel.R4}:
+            return self._decision(
+                route=Route.HUMAN_REVIEW,
+                risk=risk,
+                reason="medium/high risk action requires review",
+                intent=intent,
+                complexity=complexity,
+                capability="human_review",
+                signals=signals,
+                requires_confirmation=True,
+                needs_user_confirmation=True,
+                memory_policy="short_term",
+                reasoning_mode="execution",
+                required_capabilities=["human_review"],
+                constraints=["explain impact", "check rollback path", "wait for explicit approval"],
+            )
+        priority = self._priority_intent_decision(lowered=lowered, risk=risk, complexity=complexity, signals=signals)
+        if priority:
+            return priority
+        preference = self._preference_decision(lowered=lowered, risk=risk, complexity=complexity, signals=signals)
+        if preference:
+            return preference
+        freshness = self._freshness_for_text(lowered)
+        if freshness.get("required"):
+            probe = str(freshness.get("probe") or "")
+            capability = str(freshness.get("capability") or "")
+            capability_available = self._capability_available(capability)
+            route = Route.PROBE if probe and capability_available else Route.ASK_USER
+            return self._decision(
+                route=route,
+                risk=RiskLevel.R1,
+                reason=str(freshness.get("reason") or "fresh evidence required"),
+                intent=intent,
+                complexity=complexity,
+                capability="probe" if route == Route.PROBE else "ask_user",
+                signals=signals + [f"freshness:{freshness.get('name')}", f"capability:{capability}", "policy:required_probe_preserved"],
+                selected_probe=probe or None,
+                freshness_required=True,
+                needs_probe=route == Route.PROBE,
+                memory_policy="forget",
+                reasoning_mode="evidence",
+                required_capabilities=[capability] if capability else [],
+                capability_request={
+                    "capability": capability,
+                    "probe": probe or None,
+                    "reason": freshness.get("reason"),
+                },
+                constraints=["refresh volatile evidence before answering"]
+                if route == Route.PROBE
+                else ["do not fabricate unavailable live evidence"],
+            )
+        if self._needs_agent(lowered, attention_focus, complexity):
+            return self._decision(
+                route=Route.AGENT,
+                risk=risk,
+                reason="complex task requires selected agent runtime",
+                intent=intent,
+                complexity=complexity,
+                capability="selected_agent_runtime",
+                signals=signals + ["agent_required"],
+                needs_agent=True,
+                memory_policy="short_term",
+                reasoning_mode="execution",
+                required_capabilities=["selected_agent_runtime"],
+                constraints=["inject context patch", "enforce policy patch", "verify result"],
+            )
+        if risk == RiskLevel.R2 and intent == "action":
+            return self._decision(
+                route=Route.AGENT,
+                risk=risk,
+                reason="low-risk write action requires governed execution",
+                intent=intent,
+                complexity=complexity,
+                capability="selected_agent_runtime",
+                signals=signals + ["agent_required", "write_action"],
+                needs_agent=True,
+                memory_policy="long_term",
+                reasoning_mode="execution",
+                required_capabilities=["selected_agent_runtime"],
+                constraints=["limit write scope", "record diff or snapshot", "verify result"],
+            )
         priority = self._priority_intent_decision(lowered=lowered, risk=risk, complexity=complexity, signals=signals)
         if priority:
             return priority
@@ -633,7 +762,7 @@ class DecisionCore:
         return classify_text_risk(lowered)
 
     def _intent_for_text(self, lowered: str) -> tuple[str, list[str]]:
-        action_markers = ["检查", "查看", "修复", "执行", "修改", "部署", "重启", "创建", "写入", "诊断"]
+        action_markers = ["检查", "查看", "看看", "排查", "修复", "执行", "修改", "部署", "重启", "创建", "写入", "诊断"]
         if any(marker in lowered for marker in action_markers):
             return "action", ["intent:action"]
         if any(marker in lowered for marker in ["为什么", "是什么", "解释", "说明", "总结"]):

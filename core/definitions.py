@@ -149,6 +149,7 @@ HIGH_RISK_PATTERNS: tuple[str, ...] = (
     r"\brestore\b",
     r"\bdeploy\b",
     r"\bdelete\b",
+    r"\bgit\s+reset\s+(?:--|–|—)?hard\b",
     r"\bchmod\s+-R\b",
     r"\bchown\s+-R\b",
     r"重启",

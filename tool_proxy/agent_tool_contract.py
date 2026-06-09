@@ -28,7 +28,7 @@ def agent_tool_proxy_contract(task_id: str | None = None) -> dict[str, Any]:
             "raw.action_proposals or raw.tool_proxy_traces for R2+ tool actions",
             "review_id or approved_by for R3-R4 actions",
         ],
-        "forbidden": ["rm -rf", "curl | bash", "drop database", "git push --force", "externalize_secrets"],
+        "forbidden": ["rm -rf", "curl | bash", "drop database", "drop table", "truncate table", "git push --force", "git reset --hard", "externalize_secrets"],
     }
 
 

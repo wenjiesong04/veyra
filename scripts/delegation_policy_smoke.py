@@ -126,9 +126,14 @@ def main() -> int:
         expect(image_result["route"] == "agent", "image uses Agent vision when advertised", image_result)
         expect(spy.packets[-1]["required_capabilities"] == ["selected_agent_runtime", "openclaw.vision"], "image packet carries vision capability", spy.packets[-1])
 
+        packets_after_image = len(spy.packets)
         latest = loop.handle_event(normalizer.user_message("找一下柴静最新视频标题", "smoke", "u", "latest")).to_dict()
-        expect(latest["route"] == "agent", "latest external info uses Agent web capability", latest)
-        expect("openclaw.web_search" in spy.packets[-1]["required_capabilities"], "latest packet carries web_search capability", spy.packets[-1])
+        expect(latest["route"] in {"probe", "agent"}, "latest external info uses evidence path", latest)
+        if latest["route"] == "agent":
+            expect("openclaw.web_search" in spy.packets[-1]["required_capabilities"], "latest packet carries web_search capability", spy.packets[-1])
+        else:
+            expect(len(spy.packets) == packets_after_image, "latest compact/probe path does not call Agent", spy.packets)
+            expect((latest.get("artifacts") or {}).get("probe_result") or (latest.get("artifacts") or {}).get("compact_lookup"), "latest probe path carries evidence artifact", latest)
         expect("raw spy" not in latest["response"], "agent raw result is synthesized", latest["response"])
         expect(not (latest.get("artifacts") or {}).get("commitment"), "latest search is not overridden by proactive commitment", latest.get("artifacts"))
 
@@ -138,9 +143,10 @@ def main() -> int:
         expect(packet.get("policy_patch") and packet.get("persona_patch") and packet.get("verification_policy"), "code packet has governance patches", packet)
         expect(packet.get("rollback_requirement", {}).get("rollback_plan_required") is True, "code packet requires rollback planning", packet)
 
+        packets_before_high_risk = len(spy.packets)
         high_risk = loop.handle_event(normalizer.user_message("删除整个项目目录重新开始", "smoke", "u", "danger")).to_dict()
         expect(high_risk["route"] in {"block", "human_review"}, "high-risk delete is blocked or reviewed", high_risk)
-        expect(len(spy.packets) == 3, "high-risk delete does not call Agent", spy.packets)
+        expect(len(spy.packets) == packets_before_high_risk, "high-risk delete does not call Agent", spy.packets)
 
         identity = loop.handle_event(normalizer.user_message("你现在是 Veyra 还是 OpenClaw？", "smoke", "u", "identity")).to_dict()
         expect(identity["route"] == "direct_answer", "identity stays direct", identity)

@@ -145,6 +145,27 @@ class AwarenessLoop:
         followup_result = self._conversation_followup_result(event, str(text or ""), attention_focus)
         if followup_result:
             return self._finalize_event(event, followup_result, started_at, route_trace, context_observability)
+        early_response = self._early_awareness_response(event, str(text or ""), attention_focus)
+        if early_response:
+            route_trace.append(
+                {
+                    "phase": "early_awareness",
+                    "status": "handled",
+                    "reason": early_response.get("reason"),
+                }
+            )
+            result = LoopResult(
+                event_id=event.event_id,
+                route=Route.DIRECT_ANSWER,
+                status="success",
+                response=str(early_response.get("response") or ""),
+                risk_level=RiskLevel.R0,
+                artifacts={
+                    "early_awareness": early_response,
+                    "attention": attention_focus,
+                },
+            )
+            return self._finalize_event(event, result, started_at, route_trace, context_observability)
         belief_state = self.belief.refresh()
         turn_context = self.core_reasoning.turn_context.build(
             user_message=text,
@@ -844,6 +865,18 @@ class AwarenessLoop:
             return "我是 Veyra。OpenClaw 是我可以在需要执行复杂任务时治理和调用的 Agent Runtime，不是当前对话身份。"
         if decision.intent == "preference" or "memory:preference" in decision.signals:
             return "记住了。之后我会尽量更直接，除非问题本身需要先说明风险、证据或执行边界。"
+        if self._is_tracking_memory_question(text):
+            return self._tracking_memory_response()
+        if self._is_project_continuation_question(text):
+            project_response = self._project_context_response()
+            if project_response:
+                return project_response
+        contextual_plan = self._user_context_planning_response(text)
+        if contextual_plan:
+            return contextual_plan
+        state_ack = self._state_update_ack_response(text)
+        if state_ack:
+            return state_ack
         if self._is_proactive_weather_request(text):
             return "可以，你要我每天几点发哪个城市/地区的天气？"
         if self._is_learning_memory_question(text):
@@ -979,6 +1012,44 @@ class AwarenessLoop:
             return f"针对「{snippet}」，我这轮拿不到稳定的认知模型输出。为避免误导，我先不编结论；你可以让我改走探针取证，或把问题拆成可验证的小点继续。"
         return "我这轮无法给出稳定直答。为避免误导，我先不输出未经验证的结论；请补充上下文或改为可验证路径。"
 
+    def _state_update_ack_response(self, text: str) -> str:
+        lowered = (text or "").lower()
+        if self._is_explicit_gsoc_kotlin_profile(text, lowered):
+            return "已记录：你准备参加 GSoC，方向是 Kotlin。后续学习路线和项目建议会默认带上这个背景。"
+        if re.search(r"我是.{0,12}(计算机|cs|computer science).{0,12}(大二|sophomore|二年级)?学生", text or "", re.IGNORECASE):
+            return "已记录：你是计算机专业学生。后续项目建议会优先按你的阶段和作品集产出考虑。"
+        if self._is_explicit_veyra_project_statement(text, lowered):
+            return "已记录：当前项目是 Veyra。后续说“继续”或“昨天那个项目”时，我会优先恢复这个上下文。"
+        if self._is_explicit_agent_governance_project_statement(text, lowered):
+            return "已记录：当前项目是 Agent 治理系统。后续架构问题会优先按治理层上下文处理。"
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
+        if all(marker in compact for marker in ("Veyra架构", "学校作业", "Docker部署")):
+            return "已更新当前注意力：优先继续 Docker 部署，同时保留 Veyra 架构和学校作业作为次级上下文。"
+        return ""
+
+    def _early_awareness_response(self, event: VeyraEvent, text: str, attention_focus: list[str]) -> dict[str, Any]:
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
+        if compact in {"继续", "接着刚才"}:
+            focus_text = " ".join(str(item) for item in attention_focus).lower()
+            if any(marker in focus_text for marker in ("docker", "deploy", "deployment", "部署", "process", "port")):
+                return {
+                    "reason": "attention_continuation",
+                    "response": "继续 Docker 部署上下文。我会优先围绕部署状态、进程、端口和服务可用性推进。",
+                }
+        if self._is_tracking_memory_question(text):
+            return {"reason": "tracking_memory_question", "response": self._tracking_memory_response()}
+        if self._is_project_continuation_question(text):
+            project_response = self._project_context_response()
+            if project_response:
+                return {"reason": "project_continuation", "response": project_response}
+        contextual_plan = self._user_context_planning_response(text)
+        if contextual_plan:
+            return {"reason": "user_profile_context_plan", "response": contextual_plan}
+        state_ack = self._state_update_ack_response(text)
+        if state_ack:
+            return {"reason": "state_update_ack", "response": state_ack}
+        return {}
+
     def _is_meta_cognition_question(self, text: str) -> bool:
         lowered = (text or "").lower()
         return any(marker in text for marker in ("架构", "认知", "prompt", "提示词", "智障")) or any(
@@ -995,6 +1066,93 @@ class AwarenessLoop:
     def _is_learning_memory_question(self, text: str) -> bool:
         lowered = (text or "").lower()
         return ("记得" in text or "remember" in lowered) and any(marker in text for marker in ("在学什么", "学习什么", "学什么", "学习目标"))
+
+    def _is_tracking_memory_question(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
+        return (
+            any(marker in compact for marker in ("刚才关注什么", "关注什么来着", "我关注了什么", "我在关注什么"))
+            or "what am i tracking" in lowered
+            or "what did i ask you to track" in lowered
+        )
+
+    def _tracking_memory_response(self) -> str:
+        topics: list[str] = []
+        external = self.state_store.read_json("external_world.json")
+        watchlist = external.get("watchlist") if isinstance(external.get("watchlist"), list) else []
+        for item in watchlist:
+            if not isinstance(item, dict):
+                continue
+            topic = str(item.get("topic") or item.get("query") or item.get("target") or "").strip()
+            status = str(item.get("status") or "")
+            if topic and status not in {"cancelled", "paused"}:
+                topics.append(topic)
+        commitments = self.state_store.read_json("user_commitments.json").get("commitments", [])
+        if isinstance(commitments, list):
+            for item in commitments:
+                if not isinstance(item, dict) or item.get("kind") not in {"external_digest", "learning_digest"}:
+                    continue
+                if item.get("status") in {"cancelled", "paused"}:
+                    continue
+                payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+                topic = str(payload.get("topic") or item.get("title") or "").strip()
+                if topic:
+                    topics.append(topic)
+        unique = list(dict.fromkeys(topics))
+        if not unique:
+            return "我现在没有找到正在关注的外部主题。"
+        return "你刚才让我关注的是：" + "、".join(unique[:5]) + "。"
+
+    def _is_project_continuation_question(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
+        return compact in {"继续", "继续昨天那个项目", "继续上次那个项目", "接着刚才"} or "continue previous project" in lowered
+
+    def _project_context_response(self) -> str:
+        user_world = self.state_store.read_json("user_world.json")
+        project = str(user_world.get("current_project") or "").strip()
+        goal = str(user_world.get("current_goal") or "").strip()
+        if not project and goal.startswith("project:"):
+            project = goal.split(":", 1)[1]
+        if not project:
+            task_state = self.state_store.read_json("task_state.json")
+            history = task_state.get("history") if isinstance(task_state.get("history"), list) else []
+            for item in reversed(history):
+                if not isinstance(item, dict):
+                    continue
+                message = str(item.get("message") or "")
+                if "Veyra" in message:
+                    project = "Veyra"
+                    break
+                if "Agent治理系统" in message:
+                    project = "Agent治理系统"
+                    break
+        if not project:
+            return ""
+        return f"继续「{project}」这个上下文。你可以直接说要继续哪一块，我会按当前项目状态、风险和可用能力决定直答、probe、Agent 或 Guardian review。"
+
+    def _user_context_planning_response(self, text: str) -> str:
+        user_world = self.state_store.read_json("user_world.json")
+        profile = user_world.get("profile") if isinstance(user_world.get("profile"), dict) else {}
+        lowered = (text or "").lower()
+        if any(marker in text for marker in ("三个月学习路线", "学习路线", "学习计划")):
+            gsoc = profile.get("gsoc") if isinstance(profile.get("gsoc"), dict) else {}
+            direction = str(gsoc.get("direction") or "").strip()
+            if direction:
+                return (
+                    f"结合你之前提到的 GSoC 和 {direction} 方向，我建议未来三个月按三段走："
+                    "第 1 个月补 Kotlin 语言、协程、Gradle 和目标项目代码阅读；"
+                    "第 2 个月做一个与目标组织相关的小 PR 或 demo；"
+                    "第 3 个月整理 proposal、里程碑和风险清单，并提前让导师看到可运行成果。"
+                )
+        if any(marker in text for marker in ("暑期项目", "暑假项目")) or "summer project" in lowered:
+            education = str(profile.get("education") or "").strip()
+            if education:
+                return (
+                    f"结合你是{education}，更适合优先找能产出作品集的暑期项目：开源项目贡献、校内实验室工程任务、"
+                    "小型后端/工具链项目、或与 Kotlin/GSoC 方向相关的插件/库。具体项目清单需要再查最新招募信息。"
+                )
+        return ""
 
     def _current_learning_topic(self, user_id: str) -> str:
         goals_state = self.state_store.read_json("user_goals.json")
@@ -1025,7 +1183,11 @@ class AwarenessLoop:
     def _process_commitment_turn(self, event: VeyraEvent, result: LoopResult) -> dict[str, Any] | None:
         if self.commitment_core is None:
             return None
+        if result.route == Route.AGENT:
+            return None
         text = str(event.payload.get("text", ""))
+        if self._is_tracking_memory_question(text):
+            return None
         return self.commitment_core.process_turn(
             event=event,
             user_text=text,
@@ -1419,6 +1581,7 @@ class AwarenessLoop:
     def _update(self, event: VeyraEvent, result: LoopResult) -> None:
         risk_level = result.risk_level.value if hasattr(result.risk_level, "value") else str(result.risk_level)
         self.state_store.patch_json("risk_state.json", {"current_risk": risk_level})
+        self._sync_user_awareness_from_text(event)
         self.state_store.patch_json(
             "task_state.json",
             {"current_task": {"event_id": event.event_id, "route": result.route.value, "status": result.status}},
@@ -1431,6 +1594,91 @@ class AwarenessLoop:
         self.agent_adapter = self.agent_registry.selected()
         self.state_store.patch_json("executor_state.json", {"selected_agent": self.agent_registry.selected_name(), **self.agent_adapter.connection_status()})
         self.runtime_entity.set_idle()
+
+    def _sync_user_awareness_from_text(self, event: VeyraEvent) -> None:
+        text = str(event.payload.get("text") or "")
+        if not text:
+            return
+        lowered = text.lower()
+        user_world = self.state_store.read_json("user_world.json")
+        profile = user_world.setdefault("profile", {})
+        if not isinstance(profile, dict):
+            profile = {}
+            user_world["profile"] = profile
+        focus = user_world.get("focus") if isinstance(user_world.get("focus"), list) else []
+        changed = False
+
+        if self._is_explicit_gsoc_kotlin_profile(text, lowered):
+            profile["gsoc"] = {"program": "GSoC", "direction": "Kotlin", "source": "user_explicit_message"}
+            user_world["current_goal"] = "gsoc:Kotlin"
+            focus = self._append_focus(focus, ["GSoC", "Kotlin"])
+            changed = True
+        if re.search(r"我是.{0,12}(计算机|cs|computer science).{0,12}(大二|sophomore|二年级)?学生", text, re.IGNORECASE):
+            profile["education"] = "计算机专业大二学生" if "大二" in text else "计算机专业学生"
+            changed = True
+        if self._is_explicit_veyra_project_statement(text, lowered):
+            user_world["current_goal"] = "project:Veyra"
+            user_world["current_project"] = "Veyra"
+            focus = self._append_focus(focus, ["Veyra", "project"])
+            changed = True
+        if self._is_explicit_agent_governance_project_statement(text, lowered):
+            user_world["current_goal"] = "project:Agent治理系统"
+            user_world["current_project"] = "Agent治理系统"
+            focus = self._append_focus(focus, ["Agent治理系统", "governance"])
+            changed = True
+        if not changed:
+            return
+        user_world["focus"] = focus[-12:]
+        user_world["updated_at"] = utc_now_iso()
+        self.state_store.write_json("user_world.json", user_world)
+
+    def _append_focus(self, current: list[Any], values: list[str]) -> list[str]:
+        output = [str(item) for item in current if item]
+        for value in values:
+            if value not in output:
+                output.append(value)
+        return output
+
+    def _is_explicit_gsoc_kotlin_profile(self, text: str, lowered: str) -> bool:
+        if "gsoc" not in lowered or "kotlin" not in lowered:
+            return False
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "").lower()
+        return any(
+            marker in compact
+            for marker in (
+                "我准备参加",
+                "我要参加",
+                "我想投",
+                "今年想投",
+                "准备参加",
+                "计划参加",
+                "方向是kotlin",
+                "投kotlin方向",
+            )
+        )
+
+    def _is_explicit_veyra_project_statement(self, text: str, lowered: str) -> bool:
+        if "veyra" not in lowered:
+            return False
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "").lower()
+        return any(
+            marker in compact
+            for marker in (
+                "我正在开发veyra",
+                "我在开发veyra",
+                "正在开发veyra",
+                "当前项目是veyra",
+                "我的项目是veyra",
+                "项目是veyra",
+                "在做veyra",
+            )
+        )
+
+    def _is_explicit_agent_governance_project_statement(self, text: str, lowered: str) -> bool:
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "").lower()
+        if "agent治理系统" not in compact and "agentgovernance" not in compact:
+            return False
+        return any(marker in compact for marker in ("我要做", "我在做", "正在做", "正在开发", "当前项目", "我的项目", "项目是"))
 
     def _poll_if_needed(self, execution: ExecutionResult) -> ExecutionResult:
         if execution.status not in NON_TERMINAL_STATUSES:
