@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import json
-import os
 import re
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -13,6 +10,8 @@ from core.definitions import RiskLevel
 from core.proactive_authorization import AuthorizationPolicy
 from core.proactive_intent import ProactiveIntent, WatchlistDraft
 from core.proactive_intent_planner import ProactiveIntentPlanner
+from core.schedule_parser import chinese_hour as parsed_chinese_hour
+from core.schedule_parser import end_of_local_day_iso, has_explicit_schedule_time, parse_schedule_text
 from core.proactive_templates import ProactiveTemplateRegistry, watchlist_id_for
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent, utc_now_iso
@@ -137,7 +136,6 @@ class CommitmentCore:
         state["updated_at"] = now
         self._write_state(state)
         self._sync_user_world(item)
-        self._sync_agency_goal(item)
         self._sync_goal_permission_from_commitment(item)
         self.set_watchlists_for_commitment(item)
         self.authorization.record_commitment(item)
@@ -164,6 +162,10 @@ class CommitmentCore:
         now = now or datetime.now(timezone.utc)
         due: list[dict[str, Any]] = []
         for item in self.list_commitments(status="active"):
+            schedule = item.get("schedule") if isinstance(item.get("schedule"), dict) else {}
+            if self._schedule_has_ended(schedule, now=now):
+                self._pause_ended_commitment(item, now=now)
+                continue
             pushable, _reason = self.pushable_reason(item, now=now)
             if not pushable:
                 continue
@@ -181,6 +183,9 @@ class CommitmentCore:
             return False, f"status:{status}"
         if not commitment.get("confirmed_at"):
             return False, "not_confirmed"
+        schedule = commitment.get("schedule") if isinstance(commitment.get("schedule"), dict) else {}
+        if self._schedule_has_ended(schedule, now=now):
+            return False, "schedule_ended"
         for field in ("last_run_at", "last_attempt_at"):
             last = self._parse_time(commitment.get(field))
             if last is not None and (now - last).total_seconds() < self.PUSH_COOLDOWN_SECONDS:
@@ -218,7 +223,12 @@ class CommitmentCore:
             patch["last_run_at"] = utc_now_iso()
             patch["run_count"] = int(item.get("run_count") or 0) + 1
         if advance_schedule:
-            patch["next_run_at"] = self._compute_next_run_at(schedule)
+            next_run_at = self._compute_next_run_at(schedule)
+            patch["next_run_at"] = next_run_at
+            if str(schedule.get("kind") or "") == "once" and not next_run_at:
+                patch["status"] = "paused"
+                patch["ended_at"] = utc_now_iso()
+                patch["end_reason"] = "once_completed"
         return self._patch_commitment(commitment_id, patch)
 
     def process_turn(
@@ -993,35 +1003,10 @@ class CommitmentCore:
         return False
 
     def _has_explicit_schedule_time(self, text: str) -> bool:
-        value = text or ""
-        if re.search(r"\d{1,2}[:：]\d{2}", value):
-            return True
-        if self._chinese_hour(value) is not None:
-            return True
-        return any(marker in value for marker in ("每天早上", "每天早晨", "早上", "早晨", "上午", "中午", "晚上"))
+        return has_explicit_schedule_time(text)
 
     def _chinese_hour(self, text: str) -> int | None:
-        match = re.search(r"([一二两三四五六七八九十]|十[一二]?|二十[一二三]?|[0-2]?\d)点", text or "")
-        if not match:
-            return None
-        raw = match.group(1)
-        if raw.isdigit():
-            hour = int(raw)
-        else:
-            mapping = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
-            if raw.startswith("二十"):
-                tail = raw[2:]
-                hour = 20 + (mapping.get(tail, 0) if tail else 0)
-            elif raw.startswith("十") and len(raw) > 1:
-                hour = 10 + mapping.get(raw[1:], 0)
-            else:
-                hour = mapping.get(raw, 0)
-        if "下午" in (text or "") or "晚上" in (text or ""):
-            if 1 <= hour <= 11:
-                hour += 12
-        if 0 <= hour <= 23:
-            return hour
-        return None
+        return parsed_chinese_hour(text)
 
     def _extract_from_user_text(self, text: str, *, event: VeyraEvent) -> dict[str, Any] | None:
         lowered = (text or "").lower()
@@ -1095,11 +1080,9 @@ class CommitmentCore:
     def _confirmation_schedule(self, *, user_text: str, pending: dict[str, Any]) -> dict[str, Any] | None:
         text = user_text or ""
         lowered = text.lower()
-        if any(marker in lowered for marker in ("每天", "每日", "daily", "every morning", "each day")):
+        if any(marker in lowered for marker in ("每天", "每日", "daily", "every morning", "each day", "tomorrow")) or "明天" in text:
             return self._default_daily_schedule(text)
-        if any(marker in text for marker in ("早上", "早晨")) or "morning" in lowered:
-            return self._default_daily_schedule(text)
-        if re.search(r"\d{1,2}[:：]\d{2}", text):
+        if has_explicit_schedule_time(text):
             return self._default_daily_schedule(text)
         if pending.get("kind") == "learning_digest" and any(marker in lowered for marker in PUSH_MARKERS):
             return self._default_learning_schedule(text)
@@ -1159,73 +1142,35 @@ class CommitmentCore:
         user_world["updated_at"] = utc_now_iso()
         self.state_store.write_json("user_world.json", user_world)
 
-    def _sync_agency_goal(self, commitment: dict[str, Any]) -> None:
-        if commitment.get("status") != "active":
-            return
-        agency_root = self._selected_agency_root()
-        goals_path = agency_root / "goals.json"
-        if not goals_path.parent.exists():
-            return
-        try:
-            goals = json.loads(goals_path.read_text(encoding="utf-8") or "{}")
-        except (OSError, json.JSONDecodeError):
-            goals = {}
-        active = goals.setdefault("user_commitments", [])
-        if not isinstance(active, list):
-            active = []
-        active.append(
-            {
-                "commitment_id": commitment.get("commitment_id"),
-                "kind": commitment.get("kind"),
-                "title": commitment.get("title"),
-                "updated_at": utc_now_iso(),
-            }
-        )
-        goals["user_commitments"] = active[-20:]
-        try:
-            goals_path.write_text(json.dumps(goals, ensure_ascii=False, indent=2), encoding="utf-8")
-        except OSError:
-            return
-
-    def _selected_agency_root(self) -> Path:
-        explicit = os.getenv("VEYRA_AGENCY_DIR") or os.getenv("VEYRA_AGENCY_ROOT")
-        if explicit:
-            return Path(explicit)
-        env = os.getenv("VEYRA_ENV", "").strip().lower()
-        if env in {"dev", "prod", "test"}:
-            return Path("agency") / env
-        return Path("agency")
-
     def _normalize_schedule(self, schedule: dict[str, Any]) -> dict[str, Any]:
         kind = str(schedule.get("kind") or "daily")
         timezone_name = str(schedule.get("timezone") or "Asia/Shanghai")
-        return {
+        normalized = {
             "kind": kind,
             "time_local": str(schedule.get("time_local") or "08:00"),
             "timezone": timezone_name,
             "interval_seconds": max(3600.0, float(schedule.get("interval_seconds") or 86400.0)),
         }
+        for key in ("relative_day", "date", "end_date", "end_at"):
+            if schedule.get(key):
+                normalized[key] = str(schedule.get(key))
+        return normalized
 
     def _default_daily_schedule(self, text: str) -> dict[str, Any]:
-        match = re.search(r"(\d{1,2})[:：](\d{2})", text or "")
-        time_local = f"{int(match.group(1)):02d}:{match.group(2)}" if match else "08:00"
-        chinese_hour = self._chinese_hour(text)
-        if chinese_hour is not None and not match:
-            time_local = f"{chinese_hour:02d}:00"
-        if "早上" in (text or "") or "早晨" in (text or "") or "morning" in (text or "").lower():
-            time_local = "08:00" if time_local == "08:00" and not match else time_local
-        return self._normalize_schedule({"kind": "daily", "time_local": time_local, "timezone": "Asia/Shanghai"})
+        return self._normalize_schedule(parse_schedule_text(text, default_kind="daily", default_time="08:00"))
 
     def _default_learning_schedule(self, text: str) -> dict[str, Any]:
         if any(marker in (text or "") for marker in ("早上", "早晨")) or "morning" in (text or "").lower():
-            return self._normalize_schedule({"kind": "daily", "time_local": "08:00", "timezone": "Asia/Shanghai"})
+            return self._normalize_schedule(parse_schedule_text(text, default_kind="daily", default_time="08:00"))
         if any(marker in (text or "").lower() for marker in ("每天", "每日", "daily")):
-            return self._normalize_schedule({"kind": "daily", "time_local": "09:00", "timezone": "Asia/Shanghai"})
+            return self._normalize_schedule(parse_schedule_text(text, default_kind="daily", default_time="09:00"))
         return self._normalize_schedule({"kind": "interval", "interval_seconds": 86400, "timezone": "Asia/Shanghai"})
 
     def _compute_next_run_at(self, schedule: dict[str, Any]) -> str:
         kind = str(schedule.get("kind") or "daily")
         now = datetime.now(timezone.utc)
+        if self._schedule_has_ended(schedule, now=now):
+            return ""
         if kind == "interval":
             interval = max(3600.0, float(schedule.get("interval_seconds") or 86400.0))
             return (now + timedelta(seconds=interval)).isoformat()
@@ -1240,10 +1185,69 @@ class CommitmentCore:
             hour, minute = [int(part) for part in time_local.split(":", 1)]
         except (ValueError, IndexError):
             hour, minute = 8, 0
+        if kind == "once":
+            date_value = str(schedule.get("date") or "")
+            if not date_value and str(schedule.get("relative_day") or "") == "tomorrow":
+                date_value = (local_now + timedelta(days=1)).date().isoformat()
+            if date_value:
+                try:
+                    year, month, day = [int(part) for part in date_value.split("-", 2)]
+                    candidate = datetime(year, month, day, hour, minute, tzinfo=tz)
+                except (ValueError, IndexError):
+                    candidate = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            else:
+                candidate = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if candidate <= local_now:
+                return ""
+            return candidate.astimezone(timezone.utc).isoformat()
         candidate = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if candidate <= local_now:
             candidate = candidate + timedelta(days=1)
+        end_time = self._schedule_end_time(schedule)
+        if end_time and candidate.astimezone(timezone.utc) > end_time:
+            return ""
         return candidate.astimezone(timezone.utc).isoformat()
+
+    def _schedule_has_ended(self, schedule: dict[str, Any], *, now: datetime) -> bool:
+        end_time = self._schedule_end_time(schedule)
+        return bool(end_time and now > end_time)
+
+    def _schedule_end_time(self, schedule: dict[str, Any]) -> datetime | None:
+        end_at = schedule.get("end_at")
+        if not end_at and schedule.get("end_date"):
+            try:
+                end_at = end_of_local_day_iso(str(schedule.get("end_date")), timezone_name=str(schedule.get("timezone") or "Asia/Shanghai"))
+            except (ValueError, TypeError):
+                return None
+        return self._parse_time(end_at)
+
+    def _pause_ended_commitment(self, commitment: dict[str, Any], *, now: datetime) -> None:
+        commitment_id = str(commitment.get("commitment_id") or "")
+        if not commitment_id:
+            return
+        changed = self._patch_commitment(
+            commitment_id,
+            {
+                "status": "paused",
+                "ended_at": now.isoformat(),
+                "end_reason": "schedule_end_reached",
+                "next_run_at": None,
+            },
+            recompute_next_run=False,
+        )
+        if not changed:
+            return
+        self.state_store.append_jsonl(
+            "action_record.jsonl",
+            {
+                "route": "commitment_schedule",
+                "status": "paused",
+                "reason": "schedule_end_reached",
+                "commitment_id": commitment_id,
+                "kind": changed.get("kind"),
+                "ended_at": now.isoformat(),
+            },
+        )
 
     def _parse_time(self, value: Any) -> datetime | None:
         if not value:

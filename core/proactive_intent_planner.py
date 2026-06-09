@@ -6,6 +6,7 @@ from typing import Any
 
 from core.model_client import CoreModelClient, redact_sensitive
 from core.proactive_intent import PROACTIVE_INTENT_TYPES, PROACTIVE_NEXT_ACTIONS, ProactiveIntent
+from core.schedule_parser import has_explicit_schedule_time, parse_schedule_text
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent, utc_now_iso
 
@@ -506,20 +507,14 @@ class ProactiveIntentPlanner:
 
     def _cadence(self, text: str) -> dict[str, Any]:
         lowered = text.lower()
-        match = re.search(r"(\d{1,2})[:：](\d{2})", text or "")
-        if match:
-            time_local = f"{int(match.group(1)):02d}:{match.group(2)}"
-        elif any(marker in text for marker in ("上午九点", "早上九点")):
-            time_local = "09:00"
-        elif any(marker in text for marker in ("每天早上", "每天早晨", "早上", "早晨")):
-            time_local = "08:00"
-        else:
-            time_local = ""
-        if any(marker in text for marker in ("每天", "每日", "每天早上", "每天早晨")) or "daily" in lowered:
-            return {"kind": "daily", "time_local": time_local or "08:00", "timezone": "Asia/Shanghai"}
-        if "明天" in text:
-            return {"kind": "once", "time_local": time_local or "09:00", "timezone": "Asia/Shanghai", "relative_day": "tomorrow"}
-        return {}
+        has_marker = (
+            any(marker in text for marker in ("每天", "每日", "明天", "早上", "早晨", "上午", "下午", "晚上", "中午"))
+            or any(marker in lowered for marker in ("daily", "every morning", "each day", "tomorrow", "morning", "afternoon", "evening", "tonight"))
+            or has_explicit_schedule_time(text)
+        )
+        if not has_marker:
+            return {}
+        return parse_schedule_text(text, default_kind="daily", default_time="08:00")
 
     def _external_sources(self, text: str) -> list[str]:
         lowered = text.lower()

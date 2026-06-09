@@ -69,7 +69,10 @@ class TurnContextBuilder:
                         state.get("task_state", {}),
                         session_id=event.source.session_id if event else None,
                     ),
-                    "user": self._user_world_summary(state.get("user_world", {})),
+                    "user": self._user_world_summary(
+                        state.get("user_world", {}),
+                        user_id=event.source.user_id if event else None,
+                    ),
                     "task": self._task_summary(
                         state.get("task_state", {}),
                         session_id=event.source.session_id if event else None,
@@ -282,13 +285,23 @@ class TurnContextBuilder:
             }
         ]
 
-    def _user_world_summary(self, value: Any) -> dict[str, Any]:
+    def _user_world_summary(self, value: Any, *, user_id: str | None = None) -> dict[str, Any]:
         if not isinstance(value, dict):
             return {}
+        scoped: dict[str, Any] = {}
+        profiles = value.get("profiles_by_user") if isinstance(value.get("profiles_by_user"), dict) else {}
+        if user_id and isinstance(profiles.get(user_id), dict):
+            scoped = profiles.get(user_id) or {}
+        preferences = value.get("preferences", {}) if isinstance(value.get("preferences"), dict) else {}
+        scoped_preferences = scoped.get("preferences") if isinstance(scoped.get("preferences"), dict) else {}
+        profile = scoped.get("profile") if isinstance(scoped.get("profile"), dict) else value.get("profile", {})
+        focus = scoped.get("focus") if isinstance(scoped.get("focus"), list) else value.get("focus", [])
         return {
-            "preferences": self._limit_mapping(value.get("preferences", {}), 6),
-            "current_goal": self._clip(value.get("current_goal", ""), 180),
-            "focus": value.get("focus", []),
+            "preferences": self._limit_mapping({**preferences, **scoped_preferences}, 6),
+            "profile": self._limit_mapping(profile, 6),
+            "current_goal": self._clip(scoped.get("current_goal") or value.get("current_goal", ""), 180),
+            "current_project": self._clip(scoped.get("current_project") or value.get("current_project", ""), 120),
+            "focus": focus,
         }
 
     def _task_summary(self, value: Any, *, session_id: str | None = None) -> dict[str, Any]:

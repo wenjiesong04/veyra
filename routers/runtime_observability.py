@@ -43,7 +43,7 @@ def build_runtime_observability_router(
         return metrics.model_cost(limit=min(max(limit, 1), 5000))
 
     @router.get("/runtime/metrics/failures")
-    async def runtime_metrics_failures(limit: int = 50) -> dict[str, Any]:
-        return metrics.failures(limit=min(max(limit, 1), 500))
+    async def runtime_metrics_failures(limit: int = 50, include_expected: bool = False) -> dict[str, Any]:
+        return metrics.failures(limit=min(max(limit, 1), 500), include_expected=include_expected)
 
     return router

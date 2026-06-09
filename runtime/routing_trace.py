@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import time
+from collections import Counter
 from typing import Any
 from uuid import uuid4
 
@@ -14,6 +15,22 @@ from interface.event_schema import LoopResult, VeyraEvent, utc_now_iso
 
 
 SUCCESS_STATUSES = {"success", "ok", "verified_success", "partially_success", "submitted", "running", "pending"}
+OUTCOME_SUCCESS = "success"
+OUTCOME_DUPLICATE_INTAKE = "duplicate_intake"
+OUTCOME_EXPECTED_GOVERNANCE = "expected_governance"
+OUTCOME_NEEDS_USER_INPUT = "needs_user_input"
+OUTCOME_RUNTIME_FAILURE = "runtime_failure"
+OUTCOME_CATEGORIES = {
+    OUTCOME_SUCCESS,
+    OUTCOME_DUPLICATE_INTAKE,
+    OUTCOME_EXPECTED_GOVERNANCE,
+    OUTCOME_NEEDS_USER_INPUT,
+    OUTCOME_RUNTIME_FAILURE,
+}
+EXPECTED_GOVERNANCE_ROUTES = {"human_review", "block"}
+EXPECTED_GOVERNANCE_STATUSES = {"human_review", "needs_confirmation", "blocked", "rejected_by_guardian"}
+NEEDS_USER_INPUT_ROUTES = {"ask_user"}
+NEEDS_USER_INPUT_STATUSES = {"needs_user_input", "needs_parameters", "missing_parameters", "ask_parameters", "awaiting_user"}
 
 
 class RuntimeTraceRecorder:
@@ -45,6 +62,15 @@ class RuntimeTraceRecorder:
         status = str(result.status)
         risk_level = result.risk_level.value if isinstance(result.risk_level, RiskLevel) else str(result.risk_level)
         trace_id = f"rt_{uuid4().hex[:12]}"
+        computed_failure_reason = failure_reason or self._failure_reason(result, artifacts)
+        outcome_category = classify_trace_outcome(
+            {
+                "final_route": result.route.value,
+                "route": result.route.value,
+                "status": status,
+                "failure_reason": computed_failure_reason,
+            }
+        )
         trace = {
             "trace_id": trace_id,
             "event_id": event.event_id,
@@ -81,7 +107,8 @@ class RuntimeTraceRecorder:
             "context_drift": redact_sensitive(artifacts.get("context_drift") or {}, max_string=480, max_list=12),
             "memory_policy": self._memory_policy(artifacts),
             "fallback_reason": self._fallback_reason(controller, result, artifacts),
-            "failure_reason": failure_reason or self._failure_reason(result, artifacts),
+            "failure_reason": computed_failure_reason,
+            "outcome_category": outcome_category,
             "openclaw_call": self._openclaw_call(probe_used, agent_used),
         }
         self.state_store.append_jsonl(self.filename, trace)
@@ -104,6 +131,17 @@ class RuntimeTraceRecorder:
         reason: str,
     ) -> dict[str, Any]:
         latency_ms = int(max(0.0, time.perf_counter() - started_at) * 1000)
+        normalized_status = str(status or "")
+        normalized_route = str(final_route or "")
+        outcome_category = classify_trace_outcome(
+            {
+                "final_route": normalized_route,
+                "route": normalized_route,
+                "status": normalized_status,
+                "failure_reason": reason,
+            }
+        )
+        failure_reason = "" if outcome_category == OUTCOME_DUPLICATE_INTAKE else reason
         trace = {
             "trace_id": f"rt_{uuid4().hex[:12]}",
             "event_id": None,
@@ -119,12 +157,12 @@ class RuntimeTraceRecorder:
             "completed_at": utc_now_iso(),
             "latency_ms": latency_ms,
             "route_trace": [
-                {"phase": "intake", "status": status, "channel": channel},
-                {"phase": "response", "status": status, "final_route": final_route},
+                {"phase": "intake", "status": normalized_status, "channel": channel},
+                {"phase": "response", "status": normalized_status, "final_route": normalized_route},
             ],
-            "final_route": final_route,
-            "route": final_route,
-            "status": status,
+            "final_route": normalized_route,
+            "route": normalized_route,
+            "status": normalized_status,
             "risk_level": "R0",
             "intent": "intake",
             "why": reason,
@@ -142,7 +180,9 @@ class RuntimeTraceRecorder:
             "context_drift": {},
             "memory_policy": "",
             "fallback_reason": reason,
-            "failure_reason": reason,
+            "failure_reason": failure_reason,
+            "legacy_failure_reason": reason,
+            "outcome_category": outcome_category,
             "openclaw_call": False,
         }
         self.state_store.append_jsonl(self.filename, trace)
@@ -165,16 +205,23 @@ class RuntimeTraceRecorder:
     def soak_status(self, *, limit: int = 200) -> dict[str, Any]:
         traces = self.state_store.read_jsonl(self.filename, limit=limit)
         feishu = [item for item in traces if item.get("channel") == "feishu"]
-        failures = [item for item in feishu if item.get("failure_reason")]
+        categorized = [(item, classify_trace_outcome(item)) for item in feishu]
+        outcome_counts = Counter(category for _, category in categorized)
+        runtime_failures = [item for item, category in categorized if category == OUTCOME_RUNTIME_FAILURE]
+        legacy_failures = [item for item in feishu if item.get("failure_reason")]
         latencies = [int(item.get("latency_ms") or 0) for item in feishu if item.get("latency_ms") is not None]
         avg_latency = int(sum(latencies) / len(latencies)) if latencies else 0
         return {
-            "status": "no_feishu_traces" if not feishu else "degraded" if failures else "healthy",
+            "status": "no_feishu_traces" if not feishu else "degraded" if runtime_failures else "healthy",
             "window_size": len(feishu),
             "last_trace_at": feishu[-1].get("completed_at") if feishu else None,
             "avg_latency_ms": avg_latency,
-            "failure_count": len(failures),
-            "recent_failures": redact_sensitive(failures[-5:], max_string=800, max_list=20),
+            "failure_count": len(runtime_failures),
+            "legacy_failure_count": len(legacy_failures),
+            "runtime_failure_count": len(runtime_failures),
+            "outcome_counts": dict(outcome_counts),
+            "recent_failures": redact_sensitive(runtime_failures[-5:], max_string=800, max_list=20),
+            "recent_runtime_failures": redact_sensitive(runtime_failures[-5:], max_string=800, max_list=20),
         }
 
     def _message_id(self, event: VeyraEvent) -> str:
@@ -318,3 +365,31 @@ def estimate_tokens(chars: int) -> int:
     if chars <= 0:
         return 0
     return int(math.ceil(chars / 4))
+
+
+def classify_trace_outcome(item: dict[str, Any]) -> str:
+    stored = str(item.get("outcome_category") or "")
+    if stored in OUTCOME_CATEGORIES:
+        return stored
+
+    route = str(item.get("final_route") or item.get("route") or "")
+    status = str(item.get("status") or "")
+    status_l = status.lower()
+    route_l = route.lower()
+    failure_reason = str(item.get("failure_reason") or "")
+
+    if route_l == "duplicate" or status_l == "duplicate":
+        return OUTCOME_DUPLICATE_INTAKE
+    if route_l in EXPECTED_GOVERNANCE_ROUTES or status_l in EXPECTED_GOVERNANCE_STATUSES:
+        return OUTCOME_EXPECTED_GOVERNANCE
+    if route_l in NEEDS_USER_INPUT_ROUTES or status_l in NEEDS_USER_INPUT_STATUSES:
+        return OUTCOME_NEEDS_USER_INPUT
+    if status_l in SUCCESS_STATUSES and not failure_reason:
+        return OUTCOME_SUCCESS
+    if failure_reason or (status_l and status_l not in SUCCESS_STATUSES):
+        return OUTCOME_RUNTIME_FAILURE
+    return OUTCOME_SUCCESS
+
+
+def is_runtime_failure_trace(item: dict[str, Any]) -> bool:
+    return classify_trace_outcome(item) == OUTCOME_RUNTIME_FAILURE

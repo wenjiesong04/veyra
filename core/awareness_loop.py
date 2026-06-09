@@ -868,10 +868,10 @@ class AwarenessLoop:
         if self._is_tracking_memory_question(text):
             return self._tracking_memory_response()
         if self._is_project_continuation_question(text):
-            project_response = self._project_context_response()
+            project_response = self._project_context_response(event)
             if project_response:
                 return project_response
-        contextual_plan = self._user_context_planning_response(text)
+        contextual_plan = self._user_context_planning_response(text, event)
         if contextual_plan:
             return contextual_plan
         state_ack = self._state_update_ack_response(text)
@@ -1039,10 +1039,10 @@ class AwarenessLoop:
         if self._is_tracking_memory_question(text):
             return {"reason": "tracking_memory_question", "response": self._tracking_memory_response()}
         if self._is_project_continuation_question(text):
-            project_response = self._project_context_response()
+            project_response = self._project_context_response(event)
             if project_response:
                 return {"reason": "project_continuation", "response": project_response}
-        contextual_plan = self._user_context_planning_response(text)
+        contextual_plan = self._user_context_planning_response(text, event)
         if contextual_plan:
             return {"reason": "user_profile_context_plan", "response": contextual_plan}
         state_ack = self._state_update_ack_response(text)
@@ -1108,10 +1108,11 @@ class AwarenessLoop:
         compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
         return compact in {"继续", "继续昨天那个项目", "继续上次那个项目", "接着刚才"} or "continue previous project" in lowered
 
-    def _project_context_response(self) -> str:
+    def _project_context_response(self, event: VeyraEvent | None = None) -> str:
         user_world = self.state_store.read_json("user_world.json")
-        project = str(user_world.get("current_project") or "").strip()
-        goal = str(user_world.get("current_goal") or "").strip()
+        scoped = self._scoped_user_profile(user_world, event.source.user_id if event else None)
+        project = str(scoped.get("current_project") or user_world.get("current_project") or "").strip()
+        goal = str(scoped.get("current_goal") or user_world.get("current_goal") or "").strip()
         if not project and goal.startswith("project:"):
             project = goal.split(":", 1)[1]
         if not project:
@@ -1119,6 +1120,8 @@ class AwarenessLoop:
             history = task_state.get("history") if isinstance(task_state.get("history"), list) else []
             for item in reversed(history):
                 if not isinstance(item, dict):
+                    continue
+                if event and item.get("session_id") and str(item.get("session_id")) != event.source.session_id:
                     continue
                 message = str(item.get("message") or "")
                 if "Veyra" in message:
@@ -1131,9 +1134,10 @@ class AwarenessLoop:
             return ""
         return f"继续「{project}」这个上下文。你可以直接说要继续哪一块，我会按当前项目状态、风险和可用能力决定直答、probe、Agent 或 Guardian review。"
 
-    def _user_context_planning_response(self, text: str) -> str:
+    def _user_context_planning_response(self, text: str, event: VeyraEvent | None = None) -> str:
         user_world = self.state_store.read_json("user_world.json")
-        profile = user_world.get("profile") if isinstance(user_world.get("profile"), dict) else {}
+        scoped = self._scoped_user_profile(user_world, event.source.user_id if event else None)
+        profile = scoped.get("profile") if isinstance(scoped.get("profile"), dict) else user_world.get("profile") if isinstance(user_world.get("profile"), dict) else {}
         lowered = (text or "").lower()
         if any(marker in text for marker in ("三个月学习路线", "学习路线", "学习计划")):
             gsoc = profile.get("gsoc") if isinstance(profile.get("gsoc"), dict) else {}
@@ -1153,6 +1157,13 @@ class AwarenessLoop:
                     "小型后端/工具链项目、或与 Kotlin/GSoC 方向相关的插件/库。具体项目清单需要再查最新招募信息。"
                 )
         return ""
+
+    def _scoped_user_profile(self, user_world: dict[str, Any], user_id: str | None) -> dict[str, Any]:
+        if not user_id or not isinstance(user_world, dict):
+            return {}
+        profiles = user_world.get("profiles_by_user") if isinstance(user_world.get("profiles_by_user"), dict) else {}
+        scoped = profiles.get(user_id) if isinstance(profiles.get(user_id), dict) else {}
+        return scoped
 
     def _current_learning_topic(self, user_id: str) -> str:
         goals_state = self.state_store.read_json("user_goals.json")
@@ -1601,34 +1612,64 @@ class AwarenessLoop:
             return
         lowered = text.lower()
         user_world = self.state_store.read_json("user_world.json")
-        profile = user_world.setdefault("profile", {})
-        if not isinstance(profile, dict):
-            profile = {}
-            user_world["profile"] = profile
+        user_id = str(event.source.user_id or "local-user")
+        legacy_profile = user_world.setdefault("profile", {})
+        if not isinstance(legacy_profile, dict):
+            legacy_profile = {}
+            user_world["profile"] = legacy_profile
+        profiles_by_user = user_world.setdefault("profiles_by_user", {})
+        if not isinstance(profiles_by_user, dict):
+            profiles_by_user = {}
+            user_world["profiles_by_user"] = profiles_by_user
+        scoped = profiles_by_user.setdefault(user_id, {})
+        if not isinstance(scoped, dict):
+            scoped = {}
+        scoped_profile = scoped.setdefault("profile", {})
+        if not isinstance(scoped_profile, dict):
+            scoped_profile = {}
+            scoped["profile"] = scoped_profile
         focus = user_world.get("focus") if isinstance(user_world.get("focus"), list) else []
+        scoped_focus = scoped.get("focus") if isinstance(scoped.get("focus"), list) else []
         changed = False
 
         if self._is_explicit_gsoc_kotlin_profile(text, lowered):
-            profile["gsoc"] = {"program": "GSoC", "direction": "Kotlin", "source": "user_explicit_message"}
+            value = {"program": "GSoC", "direction": "Kotlin", "source": "user_explicit_message"}
+            legacy_profile["gsoc"] = value
+            scoped_profile["gsoc"] = value
             user_world["current_goal"] = "gsoc:Kotlin"
+            scoped["current_goal"] = "gsoc:Kotlin"
             focus = self._append_focus(focus, ["GSoC", "Kotlin"])
+            scoped_focus = self._append_focus(scoped_focus, ["GSoC", "Kotlin"])
             changed = True
         if re.search(r"我是.{0,12}(计算机|cs|computer science).{0,12}(大二|sophomore|二年级)?学生", text, re.IGNORECASE):
-            profile["education"] = "计算机专业大二学生" if "大二" in text else "计算机专业学生"
+            value = "计算机专业大二学生" if "大二" in text else "计算机专业学生"
+            legacy_profile["education"] = value
+            scoped_profile["education"] = value
             changed = True
         if self._is_explicit_veyra_project_statement(text, lowered):
             user_world["current_goal"] = "project:Veyra"
             user_world["current_project"] = "Veyra"
+            scoped["current_goal"] = "project:Veyra"
+            scoped["current_project"] = "Veyra"
             focus = self._append_focus(focus, ["Veyra", "project"])
+            scoped_focus = self._append_focus(scoped_focus, ["Veyra", "project"])
             changed = True
         if self._is_explicit_agent_governance_project_statement(text, lowered):
             user_world["current_goal"] = "project:Agent治理系统"
             user_world["current_project"] = "Agent治理系统"
+            scoped["current_goal"] = "project:Agent治理系统"
+            scoped["current_project"] = "Agent治理系统"
             focus = self._append_focus(focus, ["Agent治理系统", "governance"])
+            scoped_focus = self._append_focus(scoped_focus, ["Agent治理系统", "governance"])
             changed = True
         if not changed:
             return
         user_world["focus"] = focus[-12:]
+        scoped["profile"] = scoped_profile
+        scoped["focus"] = scoped_focus[-12:]
+        scoped["updated_at"] = utc_now_iso()
+        profiles_by_user[user_id] = scoped
+        user_world["profiles_by_user"] = profiles_by_user
         user_world["updated_at"] = utc_now_iso()
         self.state_store.write_json("user_world.json", user_world)
 

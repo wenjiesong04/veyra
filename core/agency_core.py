@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -54,6 +55,7 @@ class AgencyCore:
     def state(self) -> dict[str, Any]:
         return {
             "goals": self._read_json(self.goals_path, {}),
+            "active_commitments": self._active_commitments(),
             "triggers": self._read_triggers(),
             "intentions": self.read_intentions(),
         }
@@ -119,20 +121,33 @@ class AgencyCore:
             )
 
         belief = world_state.get("belief_state", {}) if isinstance(world_state.get("belief_state"), dict) else {}
+        stale_groups: dict[str, dict[str, Any]] = {}
         for claim in belief.get("claims", []) if isinstance(belief.get("claims"), list) else []:
             if not isinstance(claim, dict):
                 continue
             if claim.get("status") == "stale" and claim.get("next_action") == "refresh_probe":
-                gaps.append(
-                    {
-                        "gap_id": f"stale_claim:{claim.get('key') or claim.get('claim')}",
-                        "target": claim.get("key") or claim.get("source") or "belief",
-                        "observed_status": "stale",
-                        "risk_level": RiskLevel.R1.value,
-                        "suggested_action": "refresh_probe",
-                        "action_text": f"refresh stale belief claim from {claim.get('source', 'unknown')}",
-                    }
-                )
+                source = str(claim.get("source") or "unknown")
+                key = str(claim.get("key") or claim.get("claim") or "")
+                category = str(claim.get("category") or claim.get("type") or key.split(":", 1)[0] or "belief")
+                group_key = f"{source}:{category}"
+                group = stale_groups.setdefault(group_key, {"source": source, "category": category, "count": 0, "samples": []})
+                group["count"] = int(group.get("count") or 0) + 1
+                samples = group.setdefault("samples", [])
+                if isinstance(samples, list) and key and len(samples) < 5:
+                    samples.append(key)
+        for group_key, group in sorted(stale_groups.items(), key=lambda item: (-int(item[1].get("count") or 0), item[0]))[:5]:
+            safe_group = re.sub(r"[^A-Za-z0-9_.:-]+", "_", group_key)[:120]
+            gaps.append(
+                {
+                    "gap_id": f"stale_claim_group:{safe_group}",
+                    "target": f"{group.get('source')}:{group.get('category')}",
+                    "observed_status": f"{group.get('count')}_stale_claims",
+                    "risk_level": RiskLevel.R1.value,
+                    "suggested_action": "refresh_probe_group",
+                    "action_text": f"refresh {group.get('count')} stale belief claims from {group.get('source', 'unknown')} / {group.get('category', 'belief')}",
+                    "sample_claims": group.get("samples") if isinstance(group.get("samples"), list) else [],
+                }
+            )
 
         local_world = world_state.get("local_world", {}) if isinstance(world_state.get("local_world"), dict) else {}
         git_probe = ((local_world.get("probes") or {}).get("git_probe") if isinstance(local_world.get("probes"), dict) else {}) or {}
@@ -252,6 +267,28 @@ class AgencyCore:
         if current:
             triggers.append(current)
         return triggers
+
+    def _active_commitments(self) -> list[dict[str, Any]]:
+        if not self.state_store:
+            return []
+        state = self.state_store.read_json("user_commitments.json")
+        items = state.get("commitments") if isinstance(state.get("commitments"), list) else []
+        active: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict) or item.get("status") != "active":
+                continue
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            active.append(
+                {
+                    "commitment_id": item.get("commitment_id"),
+                    "kind": item.get("kind"),
+                    "title": item.get("title"),
+                    "topic": payload.get("topic"),
+                    "channel": item.get("channel"),
+                    "next_run_at": item.get("next_run_at"),
+                }
+            )
+        return active[-20:]
 
     def _merge_model_gaps(self, goals: dict[str, Any], world_state: dict[str, Any], gaps: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not self.reasoning or not self.model_assist_enabled:

@@ -5,6 +5,7 @@ from typing import Any
 
 from core.model_client import redact_sensitive
 from core.world_state import WorldStateStore
+from runtime.routing_trace import OUTCOME_RUNTIME_FAILURE, classify_trace_outcome
 
 
 class RoutingMetrics:
@@ -21,11 +22,14 @@ class RoutingMetrics:
         agent_calls = sum(1 for item in traces if item.get("agent_used"))
         probe_calls = sum(1 for item in traces if item.get("probe_used"))
         openclaw_calls = sum(1 for item in traces if item.get("openclaw_call"))
+        outcomes = Counter(classify_trace_outcome(item) for item in traces)
         failures = self.failures(limit=10)["items"]
         return {
             "status": "success",
             "window_size": len(traces),
             "route_distribution": dict(routes),
+            "outcome_counts": dict(outcomes),
+            "runtime_failure_count": outcomes.get(OUTCOME_RUNTIME_FAILURE, 0),
             "avg_latency_ms": self._avg(latencies),
             "core_model_calls": model_calls,
             "agent_calls": agent_calls,
@@ -67,9 +71,16 @@ class RoutingMetrics:
         }
         return {"status": "success", "estimate": estimate, "by_model": dict(by_model)}
 
-    def failures(self, *, limit: int = 50) -> dict[str, Any]:
+    def failures(self, *, limit: int = 50, include_expected: bool = False) -> dict[str, Any]:
         traces = self._traces(max(limit, 1000))
-        failures = [item for item in traces if item.get("failure_reason")]
+        if include_expected:
+            failures = [
+                item
+                for item in traces
+                if classify_trace_outcome(item) != "success" or item.get("failure_reason")
+            ]
+        else:
+            failures = [item for item in traces if classify_trace_outcome(item) == OUTCOME_RUNTIME_FAILURE]
         return {"status": "success", "items": [self._public_trace(item) for item in failures[-limit:]]}
 
     def _traces(self, limit: int) -> list[dict[str, Any]]:
