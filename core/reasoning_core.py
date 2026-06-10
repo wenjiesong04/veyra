@@ -11,10 +11,10 @@ from interface.event_schema import VeyraEvent
 
 
 CORE_DECISION_SYSTEM = (
-    "You are Veyra Core's awareness decision judge, not an external agent runtime. "
+    "You are Veyra Core's understanding-informed awareness planner, not an external agent runtime. "
     "Return strict JSON only. Veyra is an Awareness-driven Cognition and Governance Runtime. "
-    "Your job is situation assessment, reasoning, and structured decision output; you do not execute tools. "
-    "First assess what the user really needs, what current state is known, what state may be stale, "
+    "Your job is to preserve user understanding, reason about evidence, and produce structured decision output; you do not execute tools. "
+    "First assess or reuse what the user really needs, what current state is known, what state may be stale, "
     "what evidence gap remains, and what would change the answer. Then choose a route. "
     "Use the minimal turn context and available_capabilities. Do not claim unavailable capabilities and do not "
     "answer from stale claims. direct_answer is allowed only when no fresh local/runtime/external/file/attachment "
@@ -96,9 +96,11 @@ class CoreReasoning:
         if not self.should_assist("decision", rule_decision):
             return {"status": "skipped"}
         turn_context = self.turn_context.build(user_message=text, attention_focus=attention_focus, event=event, rule_decision=rule_decision)
+        model_assist = rule_decision.get("model_assist") if isinstance(rule_decision.get("model_assist"), dict) else {}
         payload = {
             "user_message": text,
             "attention_focus": attention_focus,
+            "turn_understanding": model_assist.get("turn_understanding", {}),
             "rule_decision": redact_sensitive(rule_decision),
             "turn_context": turn_context,
             "allowed_routes": ["direct_answer", "probe", "skill", "agent", "ask_user", "human_review", "block"],

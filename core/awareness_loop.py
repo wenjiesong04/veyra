@@ -27,6 +27,7 @@ from core.result_interpreter import ResultInterpreter
 from core.runtime_entity import RuntimeEntity
 from core.response_synthesizer import ResponseSynthesizer
 from core.task_packet_builder import TaskPacketBuilder
+from core.understanding_core import UnderstandingCore
 from core.verifier import Verifier
 from core.veyra_controller import VeyraController
 from core.world_state import WorldStateStore
@@ -78,6 +79,7 @@ class AwarenessLoop:
         self.belief = BeliefCore(state_store)
         self.uncertainty = UncertaintyCore()
         self.decision_core = DecisionCore(state_store=state_store, reasoning=self.core_reasoning)
+        self.understanding_core = UnderstandingCore(self.core_reasoning, state_store)
         self.foresight = ForesightEngine(reasoning=self.core_reasoning)
         self.guardian = GuardianController()
         self.persona_engine = PersonaEngine(state_store)
@@ -186,11 +188,31 @@ class AwarenessLoop:
                 "drift_score": context_observability.get("context_drift", {}).get("drift_score"),
             }
         )
+        turn_understanding = self.understanding_core.build(
+            text=str(text or ""),
+            attention_focus=attention_focus,
+            event=event,
+            turn_context=turn_context,
+        )
+        understanding_payload = turn_understanding.to_dict(include_raw=False)
+        turn_context["turn_understanding"] = understanding_payload
+        route_trace.append(
+            {
+                "phase": "understanding",
+                "status": turn_understanding.source or "available",
+                "intent": turn_understanding.intent,
+                "suggested_mode": turn_understanding.suggested_mode,
+                "project": turn_understanding.project,
+                "needs_fresh_evidence": turn_understanding.needs_fresh_evidence,
+                "evidence_kind": turn_understanding.evidence_kind,
+            }
+        )
         decision = self.decision_core.decide(
             text=text,
             attention_focus=attention_focus,
             event=event,
             turn_context=turn_context,
+            turn_understanding=turn_understanding,
         )
         route_trace.append(
             {
@@ -308,6 +330,7 @@ class AwarenessLoop:
                     },
                 )
                 return self._finalize_event(event, result, started_at, route_trace, context_observability)
+            failed_probe_result = self._compact_lookup_failure_probe_result(compact)
             result = LoopResult(
                 event_id=event.event_id,
                 route=Route.PROBE,
@@ -323,6 +346,13 @@ class AwarenessLoop:
                     "persona": persona_patch,
                     "execution_tier": execution_tier,
                     "compact_lookup": compact,
+                    "probe_result": failed_probe_result,
+                    "evidence_attempt": {
+                        "provider": "compact_external_lookup",
+                        "probe": failed_probe_result.get("probe"),
+                        "status": failed_probe_result.get("status"),
+                        "reason": compact.get("reason"),
+                    },
                 },
             )
             return self._finalize_event(event, result, started_at, route_trace, context_observability)
@@ -370,6 +400,7 @@ class AwarenessLoop:
                     "reason": decision.model_assist.get("reason"),
                     "solution_outline": decision.model_assist.get("solution_outline", []),
                     "agent_context": decision.model_assist.get("agent_context", {}),
+                    "turn_understanding": decision.model_assist.get("turn_understanding", {}),
                 }
             agent_memory_summary = self.agent_adapter.fetch_memory_summary(event.source.session_id)
             if agent_memory_summary.get("summary"):
@@ -884,6 +915,14 @@ class AwarenessLoop:
             if topic:
                 return f"记得。你现在在学习「{topic}」。我会把它作为当前学习目标来组织后续建议。"
             return "我现在没有找到明确的学习目标记录；你可以直接告诉我要学习的主题，我会记录到 Veyra memory。"
+        understanding = decision.model_assist.get("turn_understanding") if isinstance(decision.model_assist, dict) else {}
+        if isinstance(understanding, dict) and str(understanding.get("source") or "") == "rule_fallback":
+            if str(understanding.get("suggested_mode") or "") in {
+                "strategic_discussion",
+                "meta_cognition_discussion",
+                "project_direction_review",
+            }:
+                return self._direct_answer_degraded(text=text, decision=decision, answer_assist={})
         answer_assist = self.core_reasoning.answer_assist(text=text, attention_focus=attention_focus, decision=decision.to_dict(), event=event)
         draft = str(answer_assist.get("draft_response") or answer_assist.get("response") or "").strip()
         if not draft:
@@ -997,6 +1036,19 @@ class AwarenessLoop:
     def _direct_answer_degraded(self, *, text: str, decision: Decision, answer_assist: dict[str, object]) -> str:
         compact = " ".join(text.split())
         snippet = compact[:48] + ("..." if len(compact) > 48 else "")
+        understanding = decision.model_assist.get("turn_understanding") if isinstance(decision.model_assist, dict) else {}
+        if isinstance(understanding, dict) and str(understanding.get("suggested_mode") or "") in {
+            "strategic_discussion",
+            "meta_cognition_discussion",
+            "project_direction_review",
+        }:
+            project = str(understanding.get("project") or "Veyra")
+            hidden = str(understanding.get("hidden_need") or understanding.get("what_user_really_needs") or "项目方向验证")
+            return (
+                f"这不是一个需要先调 probe 或下发 Agent 的问题，而是「{project}」的方向问题。"
+                f"我理解你的核心需求是：{hidden}。应该先把用户到底要什么、当前项目风险、可验证的价值闭环拆清楚，"
+                "再决定是否需要运行态证据或执行任务；否则 Veyra 会继续在理解之前路由。"
+            )
         if self._is_meta_cognition_question(text):
             return (
                 "问题主要不在架构名词，而在认知链路被压成了机械路由：先急着选 direct/probe/agent，"
@@ -1272,6 +1324,31 @@ class AwarenessLoop:
             if results:
                 return item
         return {}
+
+    def _compact_lookup_failure_probe_result(self, compact: dict[str, Any]) -> dict[str, Any]:
+        search = compact.get("search") if isinstance(compact.get("search"), dict) else {}
+        if search.get("probe") == "search_probe":
+            result = dict(search)
+            result.setdefault("status", "failed")
+            result.setdefault("summary", "compact external lookup attempted search but found no reliable evidence")
+            return result
+        task = compact.get("compact_task") if isinstance(compact.get("compact_task"), dict) else {}
+        target = task.get("target") if isinstance(task.get("target"), dict) else {}
+        creator = str(target.get("creator") or "").strip()
+        query = f"{creator} YouTube 最新视频".strip() if creator else "latest external fact"
+        return {
+            "probe": "search_probe",
+            "status": "failed",
+            "source": "compact_external_lookup",
+            "target": query,
+            "confidence": 0.0,
+            "summary": "compact external lookup attempted search but found no reliable evidence",
+            "details": {
+                "query": query,
+                "reason": compact.get("reason") or "compact_lookup_failed",
+                "compact_task": task,
+            },
+        }
 
     def _conversation_slots_for_event(self, event: VeyraEvent) -> dict[str, Any]:
         state = self.state_store.read_json("task_state.json")

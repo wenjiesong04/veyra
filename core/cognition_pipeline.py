@@ -11,20 +11,10 @@ from core.definitions import RiskLevel, normalize_risk
 from core.memory_policy_runtime import normalize_memory_policy
 from core.model_client import redact_sensitive
 from core.reasoning_core import CoreReasoning, safe_model_risk
+from core.understanding_core import TurnUnderstanding, UnderstandingCore
 from core.world_state import WorldStateStore
 from interface.event_schema import Decision, Route, VeyraEvent
 
-
-TURN_UNDERSTANDING_SYSTEM = (
-    "You are Veyra Core's orientation layer inside an awareness-driven runtime. "
-    "The user message is the primary input. The awareness_snapshot contains Veyra's current perception "
-    "from belief claims and local_world probe cache; treat it as useful but not automatically true or fresh. "
-    "Return strict JSON only. Produce a situation understanding, not a route decision. "
-    "Identify the user's explicit goal, what they likely really need, emotional/context signals, entities, "
-    "task type, awareness that is relevant, and awareness that may be stale or uncertain. "
-    "When evidence is needed, explain what evidence would change the answer. "
-    "Do not execute probes or agents, do not write the final user reply, and do not treat missing evidence as fact."
-)
 
 EXECUTION_PLAN_SYSTEM = (
     "You are Veyra Core's awareness decision judge. You receive a situation assessment, awareness_snapshot, "
@@ -42,76 +32,6 @@ EXECUTION_PLAN_SYSTEM = (
     "obtained by safe observation. block only for clearly unacceptable or policy-forbidden requests. "
     "Your main output contract is decision + capability_request + risk + reply_strategy."
 )
-
-
-@dataclass(slots=True)
-class TurnUnderstanding:
-    intent: str = "unknown"
-    task_summary: str = ""
-    user_goal: str = ""
-    what_user_really_needs: str = ""
-    task_type: str = "unknown"
-    entities: dict[str, Any] = field(default_factory=dict)
-    relevant_awareness: list[Any] = field(default_factory=list)
-    stale_or_uncertain_awareness: list[Any] = field(default_factory=list)
-    evidence_gap: dict[str, Any] = field(default_factory=dict)
-    needs_fresh_evidence: bool = False
-    evidence_kind: str = ""
-    can_answer_from_world_state: bool = False
-    retrieval_hints: list[str] = field(default_factory=list)
-    confidence: float = 0.0
-    reason: str = ""
-    raw: dict[str, Any] = field(default_factory=dict)
-
-    @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> TurnUnderstanding:
-        situation = payload.get("situation_assessment") if isinstance(payload.get("situation_assessment"), dict) else {}
-        if not situation:
-            situation = payload
-        entities = payload.get("entities") if isinstance(payload.get("entities"), dict) else {}
-        if not entities:
-            raw_entities = situation.get("entities")
-            if isinstance(raw_entities, dict):
-                entities = raw_entities
-            elif isinstance(raw_entities, list):
-                entities = {"items": raw_entities[:12]}
-            else:
-                entities = {}
-        evidence_gap = situation.get("evidence_gap") if isinstance(situation.get("evidence_gap"), dict) else {}
-        hints = payload.get("retrieval_hints") if isinstance(payload.get("retrieval_hints"), list) else []
-        if not hints:
-            hints = situation.get("retrieval_hints") if isinstance(situation.get("retrieval_hints"), list) else []
-        try:
-            confidence = float(situation.get("confidence", payload.get("confidence") or 0.0) or 0.0)
-        except (TypeError, ValueError):
-            confidence = 0.0
-        evidence_kind = str(evidence_gap.get("evidence_kind") or situation.get("evidence_kind") or payload.get("evidence_kind") or "")
-        needs_fresh = bool(evidence_gap.get("needs_fresh_evidence", payload.get("needs_fresh_evidence")))
-        can_answer = bool(situation.get("can_answer_from_current_context", payload.get("can_answer_from_world_state")))
-        task_summary = str(situation.get("task_summary") or payload.get("task_summary") or payload.get("summary") or "")
-        user_goal = str(situation.get("user_goal") or task_summary or "")
-        return cls(
-            intent=str(situation.get("intent") or payload.get("intent") or "unknown"),
-            task_summary=task_summary,
-            user_goal=user_goal,
-            what_user_really_needs=str(situation.get("what_user_really_needs") or ""),
-            task_type=str(situation.get("task_type") or payload.get("task_type") or "unknown"),
-            entities=entities,
-            relevant_awareness=situation.get("relevant_awareness")[:12]
-            if isinstance(situation.get("relevant_awareness"), list)
-            else [],
-            stale_or_uncertain_awareness=situation.get("stale_or_uncertain_awareness")[:12]
-            if isinstance(situation.get("stale_or_uncertain_awareness"), list)
-            else [],
-            evidence_gap=evidence_gap,
-            needs_fresh_evidence=needs_fresh,
-            evidence_kind=evidence_kind,
-            can_answer_from_world_state=can_answer,
-            retrieval_hints=[str(item) for item in hints[:8] if item],
-            confidence=max(0.0, min(confidence, 1.0)),
-            reason=str(situation.get("reason") or payload.get("reason") or ""),
-            raw=payload,
-        )
 
 
 @dataclass(slots=True)
@@ -201,6 +121,7 @@ class CognitionPipeline:
         self.reasoning = reasoning
         self.capabilities = capabilities
         self.assembler = AwarenessContextAssembler(state_store) if state_store else None
+        self.understanding_core = UnderstandingCore(reasoning, state_store)
 
     def run(
         self,
@@ -209,6 +130,7 @@ class CognitionPipeline:
         attention_focus: list[str],
         event: VeyraEvent | None = None,
         turn_context: dict[str, Any] | None = None,
+        turn_understanding: TurnUnderstanding | dict[str, Any] | None = None,
     ) -> Decision | None:
         if not self.reasoning.is_enabled():
             return None
@@ -216,7 +138,15 @@ class CognitionPipeline:
             text=text, attention_focus=attention_focus, event=event
         )
         awareness = self._awareness_snapshot(text=text, attention_focus=attention_focus)
-        understanding = self._orient_turn(text=text, awareness_snapshot=awareness, turn_context=ctx, event=event)
+        understanding = self._normalize_understanding(turn_understanding)
+        if understanding is None:
+            understanding = self._orient_turn(
+                text=text,
+                awareness_snapshot=awareness,
+                attention_focus=attention_focus,
+                turn_context=ctx,
+                event=event,
+            )
         if understanding is None:
             return None
         awareness = self._awareness_snapshot(
@@ -269,50 +199,25 @@ class CognitionPipeline:
         *,
         text: str,
         awareness_snapshot: dict[str, Any],
+        attention_focus: list[str],
         turn_context: dict[str, Any],
         event: VeyraEvent | None,
     ) -> TurnUnderstanding | None:
-        active = turn_context.get("active_context") if isinstance(turn_context.get("active_context"), dict) else {}
-        payload = {
-            "user_message": text,
-            "awareness_snapshot": awareness_snapshot,
-            "session_context": {
-                "current_time": active.get("current_time"),
-                "event": active.get("event"),
-                "attention_focus": active.get("attention_focus"),
-                "persona": active.get("persona"),
-            },
-            "required_json_fields": {
-                "situation_assessment": {
-                    "user_goal": "what the user explicitly asks for",
-                    "what_user_really_needs": "practical need behind the words, including frustration/confusion if present",
-                    "task_type": "chat|explanation|current_fact|local_status|workspace_task|code_task|proactive_request|meta_question|other",
-                    "intent": "conversation|information|action|implementation|preference|unknown",
-                    "task_summary": "one sentence summary of user goal",
-                    "entities": "object or list: location, person, query, url, port, platform, topic",
-                    "relevant_awareness": "list of current perception items that may help",
-                    "stale_or_uncertain_awareness": "list of claims that must not be treated as fresh fact",
-                    "evidence_gap": {
-                        "needs_fresh_evidence": "boolean",
-                        "evidence_kind": "none|local|runtime|external|file|attachment|calendar|email|memory|weather|time|search|web",
-                        "what_would_change_the_answer": "concrete observation needed before a reliable answer",
-                    },
-                    "can_answer_from_current_context": "boolean",
-                    "confidence": "0.0-1.0",
-                    "reason": "short rationale",
-                },
-                "retrieval_hints": "optional list: conversation, belief, user, task, capabilities, runtime",
-            },
-        }
-        result = self.reasoning.client.complete_json(
-            purpose="turn_understanding",
-            system=TURN_UNDERSTANDING_SYSTEM,
-            user=json.dumps(payload, ensure_ascii=False),
+        return self.understanding_core.build(
+            text=text,
+            awareness_snapshot=awareness_snapshot,
+            attention_focus=attention_focus,
+            turn_context=turn_context,
+            event=event,
+            allow_model=True,
         )
-        self._trace("turn_understanding", result, {"text_len": len(text)})
-        if result.get("status") != "model_assisted":
-            return None
-        return TurnUnderstanding.from_payload(result)
+
+    def _normalize_understanding(self, value: TurnUnderstanding | dict[str, Any] | None) -> TurnUnderstanding | None:
+        if isinstance(value, TurnUnderstanding):
+            return value
+        if isinstance(value, dict):
+            return TurnUnderstanding.from_payload(value)
+        return None
 
     def _retrieve_context(
         self,
@@ -357,16 +262,7 @@ class CognitionPipeline:
     ) -> ExecutionPlan | None:
         payload = {
             "user_message": text,
-            "turn_understanding": {
-                "intent": understanding.intent,
-                "task_summary": understanding.task_summary,
-                "entities": understanding.entities,
-                "needs_fresh_evidence": understanding.needs_fresh_evidence,
-                "evidence_kind": understanding.evidence_kind,
-                "can_answer_from_world_state": understanding.can_answer_from_world_state,
-                "confidence": understanding.confidence,
-                "reason": understanding.reason,
-            },
+            "turn_understanding": understanding.to_dict(include_raw=False),
             "awareness_snapshot": awareness_snapshot,
             "expanded_context": expanded_context,
             "evidence_sufficiency": sufficiency,
@@ -505,6 +401,16 @@ class CognitionPipeline:
             plan.intent = "proactive_request"
             plan.memory_policy = "forget"
             plan.reason = f"{plan.reason}; policy:recurring_weather_needs_authorization_not_current_probe".strip("; ")
+        if self._is_strategic_discussion(understanding) and not self._explicitly_asks_execution_or_runtime(text, understanding):
+            if plan.recommended_route in {"agent", "probe", "skill"} or plan.needs_agent or plan.probe or plan.skill:
+                plan.recommended_route = "direct_answer"
+                plan.answer_source = "current_context"
+                plan.probe = None
+                plan.skill = None
+                plan.needs_agent = False
+                plan.freshness_required = False
+                plan.required_capabilities = [cap for cap in plan.required_capabilities if cap not in {"selected_agent_runtime"}]
+                plan.reason = f"{plan.reason}; policy:understanding_strategic_discussion_not_execution".strip("; ")
         if plan.recommended_route == "agent" or plan.needs_agent:
             plan.required_capabilities = self._agent_handoff_capabilities(plan.required_capabilities)
             if "selected_agent_runtime" not in plan.required_capabilities:
@@ -592,6 +498,16 @@ class CognitionPipeline:
         if self._is_proactive_weather_request(text):
             plan.intent = "proactive_request"
             plan.memory_policy = "forget"
+        if self._is_strategic_discussion(understanding) and not self._explicitly_asks_execution_or_runtime(text, understanding):
+            if plan.recommended_route in {"agent", "probe", "skill"} or plan.needs_agent or plan.probe or plan.skill:
+                plan.recommended_route = "direct_answer"
+                plan.answer_source = "current_context"
+                plan.probe = None
+                plan.skill = None
+                plan.needs_agent = False
+                plan.freshness_required = False
+                plan.required_capabilities = [cap for cap in plan.required_capabilities if cap not in {"selected_agent_runtime"}]
+                plan.reason = f"{plan.reason}; policy:understanding_strategic_discussion_not_execution".strip("; ")
         return plan
 
     def _probe_for_capability_request(self, plan: ExecutionPlan) -> str:
@@ -742,6 +658,8 @@ class CognitionPipeline:
         return list(dict.fromkeys(output))
 
     def _requires_agent_handoff(self, *, text: str, understanding: TurnUnderstanding) -> bool:
+        if self._is_strategic_discussion(understanding) and not self._explicitly_asks_execution_or_runtime(text, understanding):
+            return False
         if understanding.intent == "implementation":
             return True
         if understanding.task_type in {"workspace_task", "code_task"}:
@@ -762,6 +680,19 @@ class CognitionPipeline:
             "fix bug",
         )
         return any(marker in text for marker in markers[:7]) or any(marker in lowered for marker in markers[7:])
+
+    def _is_strategic_discussion(self, understanding: TurnUnderstanding) -> bool:
+        return understanding.is_strategic_discussion()
+
+    def _explicitly_asks_execution_or_runtime(self, text: str, understanding: TurnUnderstanding) -> bool:
+        if understanding.intent == "implementation" or understanding.task_type in {"workspace_task", "code_task", "local_status"}:
+            return True
+        if understanding.needs_fresh_evidence and understanding.evidence_kind in {"runtime", "local", "file", "attachment"}:
+            return True
+        lowered = (text or "").lower()
+        return any(marker in text for marker in ("改代码", "修改代码", "实现", "调试", "运行状态", "日志", "端口", "进程")) or any(
+            marker in lowered for marker in ("implement", "debug", "runtime status", "log", "port", "process")
+        )
 
     def _is_meta_cognition_question(self, text: str) -> bool:
         lowered = (text or "").lower()
@@ -837,15 +768,7 @@ class CognitionPipeline:
             "agent_goal": plan.agent_goal,
             "answer_source": plan.answer_source,
             "turn_understanding": {
-                "intent": understanding.intent,
-                "task_summary": understanding.task_summary,
-                "user_goal": understanding.user_goal,
-                "what_user_really_needs": understanding.what_user_really_needs,
-                "task_type": understanding.task_type,
-                "entities": understanding.entities,
-                "evidence_gap": understanding.evidence_gap,
-                "evidence_kind": understanding.evidence_kind,
-                "can_answer_from_world_state": understanding.can_answer_from_world_state,
+                **understanding.to_dict(include_raw=False),
             },
             "awareness_snapshot": awareness,
             "evidence_sufficiency": sufficiency,

@@ -115,9 +115,14 @@ SMOKE_CASES: list[dict[str, Any]] = [
         "expectation": "Runtime status needs fresh local/runtime evidence; stale awareness is not enough.",
     },
     {
+        "id": "strategic_veyra_abandonment",
+        "message": "我最近 Veyra 做不下去了",
+        "expectation": "Understand project-direction frustration and keep the discussion in Veyra Core, not probe/Agent execution.",
+    },
+    {
         "id": "frustrated_architecture_meta",
         "message": "这个架构为什么还是像智障？",
-        "expectation": "Acknowledge the issue and analyze cognition/prompt causes without architecture slogans.",
+        "expectation": "Acknowledge the issue and analyze cognition/prompt causes without architecture slogans or OpenClaw handoff.",
     },
     {
         "id": "code_capability_agent",
@@ -271,6 +276,7 @@ def _record_case(
             "capability_request": decision.get("capability_request", {}),
             "draft_response_present": bool(str(model_assist.get("draft_response") or "").strip()),
             "context_gaps": model_assist.get("context_gaps", []),
+            "turn_understanding": model_assist.get("turn_understanding", {}),
         },
         "controller_route": controller,
         "executed_action": _executed_action(result, probe_result, task_packet),
@@ -524,9 +530,21 @@ def _expectation_failures(record: dict[str, Any]) -> list[str]:
             failures.append(f"expected probe/agent/ask_user for runtime status, got {route}")
         if route == "probe" and record["probe_used"] not in {"openclaw", "openclaw_probe"}:
             failures.append(f"expected openclaw probe, got {record['probe_used']}")
+    elif case_id == "strategic_veyra_abandonment":
+        understanding = (record.get("core_model_decision") or {}).get("turn_understanding") or {}
+        if route != "direct_answer":
+            failures.append(f"expected direct_answer for Veyra strategic frustration, got {route}")
+        if record["agent_used"] or record["probe_used"]:
+            failures.append("strategic frustration should not execute probe or Agent")
+        if understanding.get("hidden_need") != "项目方向验证":
+            failures.append(f"expected project-direction hidden_need, got {understanding.get('hidden_need')}")
+        if understanding.get("suggested_mode") != "strategic_discussion":
+            failures.append(f"expected strategic_discussion, got {understanding.get('suggested_mode')}")
     elif case_id == "frustrated_architecture_meta":
-        if route not in {"direct_answer", "agent"}:
-            failures.append(f"expected direct_answer or agent for meta architecture critique, got {route}")
+        if route != "direct_answer":
+            failures.append(f"expected direct_answer for meta architecture critique, got {route}")
+        if record["agent_used"]:
+            failures.append("meta architecture critique should not be handed to Agent")
         if "Veyra 是" in response and "架构" not in response:
             failures.append("response looks like identity slogan instead of architecture critique")
         if len(response.strip()) < 20:

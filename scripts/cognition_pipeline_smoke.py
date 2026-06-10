@@ -13,10 +13,10 @@ from core.awareness_context_assembler import AwarenessContextAssembler  # noqa: 
 from core.cognition_pipeline import (  # noqa: E402
     CognitionPipeline,
     ExecutionPlan,
-    TurnUnderstanding,
     cognition_mode,
 )
 from core.decision_core import DecisionCore  # noqa: E402
+from core.understanding_core import TurnUnderstanding  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
 from probes.weather_probe import WeatherProbe  # noqa: E402
 
@@ -26,6 +26,7 @@ class FakeReasoning:
         self.enabled = True
         self.client = self
         self.turn_context = None
+        self.calls: list[str] = []
 
     def is_enabled(self) -> bool:
         return self.enabled
@@ -35,6 +36,31 @@ class FakeReasoning:
 
     def _trace(self, purpose: str, result: dict, summary: dict) -> None:
         return None
+
+    def complete_json(self, *, purpose: str, system: str, user: str) -> dict:
+        self.calls.append(purpose)
+        if purpose == "execution_plan":
+            return {
+                "status": "model_assisted",
+                "decision": {
+                    "route": "direct_answer",
+                    "answer_source": "current_context",
+                    "why_this_route": "precomputed understanding is enough",
+                },
+                "capability_request": {
+                    "target_route": "direct_answer",
+                    "receiver_type": "core",
+                    "capability_id": "native_answer",
+                    "executor": "",
+                    "input": {},
+                },
+                "risk": {"level": "R0", "requires_confirmation": False},
+                "reply_strategy": {"draft_response": "理解完成。"},
+                "intent": "conversation",
+                "complexity": "simple",
+                "confidence": 0.8,
+            }
+        return {"status": "model_assisted", "situation_assessment": {"intent": "conversation"}}
 
 
 def test_cognition_mode_defaults_model_first() -> None:
@@ -128,6 +154,30 @@ def test_governance_lock_before_pipeline() -> None:
     assert decision.intent == "identity"
 
 
+def test_precomputed_understanding_skips_orientation_call() -> None:
+    reasoning = FakeReasoning()
+    pipeline = CognitionPipeline(reasoning)  # type: ignore[arg-type]
+    understanding = TurnUnderstanding(
+        intent="conversation",
+        task_type="meta_question",
+        explicit_request="讨论项目问题",
+        hidden_need="项目方向验证",
+        suggested_mode="strategic_discussion",
+        confidence=0.9,
+        source="test_precomputed",
+    )
+    decision = pipeline.run(
+        text="我最近 Veyra 做不下去了",
+        attention_focus=[],
+        turn_context={"active_context": {}},
+        turn_understanding=understanding,
+    )
+    assert decision is not None
+    assert "turn_understanding" not in reasoning.calls
+    assert reasoning.calls == ["execution_plan"]
+    assert decision.model_assist.get("turn_understanding", {}).get("hidden_need") == "项目方向验证"
+
+
 def main() -> int:
     test_cognition_mode_defaults_model_first()
     test_turn_understanding_world_state_flag()
@@ -135,6 +185,7 @@ def main() -> int:
     test_awareness_assembler_fresh_claim_match()
     test_weather_probe_accepts_model_location()
     test_governance_lock_before_pipeline()
+    test_precomputed_understanding_skips_orientation_call()
     print("cognition_pipeline_smoke: ok")
     return 0
 

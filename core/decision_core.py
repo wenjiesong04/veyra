@@ -8,6 +8,7 @@ from core.model_driven_decision_core import ModelDrivenDecisionCore
 from core.definitions import RiskLevel, classify_text_risk
 from core.memory_policy_runtime import normalize_memory_policy
 from core.reasoning_core import CoreReasoning, safe_model_risk
+from core.understanding_core import TurnUnderstanding
 from core.world_state import WorldStateStore
 from interface.event_schema import Decision, Route, VeyraEvent
 
@@ -127,10 +128,16 @@ class DecisionCore:
         event: VeyraEvent | None = None,
         *,
         turn_context: dict[str, Any] | None = None,
+        turn_understanding: TurnUnderstanding | dict[str, Any] | None = None,
     ) -> Decision:
+        understanding = self._normalize_turn_understanding(turn_understanding)
         locked = self._governance_locked_decision(text, attention_focus, event=event)
         if locked:
-            return self.model_driven.enrich(text, locked, event=event)
+            return self.model_driven.enrich(text, self._with_turn_understanding(locked, understanding), event=event)
+        if self._should_trust_rule_understanding(understanding):
+            base = self._rule_decide(text, attention_focus, event=event)
+            base = self._apply_understanding_guardrails(text, base, understanding)
+            return self.model_driven.enrich(text, self._with_turn_understanding(base, understanding), event=event)
         if use_model_first_pipeline(self.reasoning):
             pipeline = CognitionPipeline(self.reasoning, self.state_store, self.capabilities)
             pipeline_decision = pipeline.run(
@@ -138,12 +145,17 @@ class DecisionCore:
                 attention_focus=attention_focus,
                 event=event,
                 turn_context=turn_context,
+                turn_understanding=understanding,
             )
             if pipeline_decision is not None:
-                return self.model_driven.enrich(text, pipeline_decision, event=event)
+                pipeline_decision = self._apply_understanding_guardrails(text, pipeline_decision, understanding)
+                return self.model_driven.enrich(text, self._with_turn_understanding(pipeline_decision, understanding), event=event)
         base = self._rule_decide(text, attention_focus, event=event)
+        base = self._apply_understanding_guardrails(text, base, understanding)
+        base = self._with_turn_understanding(base, understanding)
         decision = self._apply_model_assist(text, attention_focus, base, event=event)
-        return self.model_driven.enrich(text, decision, event=event)
+        decision = self._apply_understanding_guardrails(text, decision, understanding)
+        return self.model_driven.enrich(text, self._with_turn_understanding(decision, understanding), event=event)
 
     def _governance_locked_decision(self, text: str, attention_focus: list[str], event: VeyraEvent | None = None) -> Decision | None:
         """Deterministic locks that must never be overridden by model routing."""
@@ -152,6 +164,7 @@ class DecisionCore:
         intent, intent_signals = self._intent_for_text(lowered)
         complexity, complexity_signals = self._complexity_for_text(lowered, attention_focus)
         signals = intent_signals + complexity_signals + self._risk_signals(risk)
+        attachment_gap = self._attachment_capability_gap(event)
         if self._is_rollback_request(lowered):
             return self._decision(
                 route=Route.ROLLBACK,
@@ -168,107 +181,6 @@ class DecisionCore:
                 required_capabilities=["rollback_audit"],
                 constraints=["restore only an existing snapshot", "record rollback trace", "verify restored checksum"],
             )
-        if risk == RiskLevel.R5:
-            return self._decision(
-                route=Route.BLOCK,
-                risk=risk,
-                reason="destructive or forbidden action detected",
-                intent=intent,
-                complexity=complexity,
-                capability="guardian",
-                signals=signals,
-                reasoning_mode="execution" if intent in {"action", "implementation"} else "direct",
-                required_capabilities=["guardian"],
-                constraints=["block unsafe action", "require safer alternative"],
-            )
-        if risk in {RiskLevel.R3, RiskLevel.R4}:
-            return self._decision(
-                route=Route.HUMAN_REVIEW,
-                risk=risk,
-                reason="medium/high risk action requires review",
-                intent=intent,
-                complexity=complexity,
-                capability="human_review",
-                signals=signals,
-                requires_confirmation=True,
-                needs_user_confirmation=True,
-                memory_policy="short_term",
-                reasoning_mode="execution",
-                required_capabilities=["human_review"],
-                constraints=["explain impact", "check rollback path", "wait for explicit approval"],
-            )
-        priority = self._priority_intent_decision(lowered=lowered, risk=risk, complexity=complexity, signals=signals)
-        if priority:
-            return priority
-        preference = self._preference_decision(lowered=lowered, risk=risk, complexity=complexity, signals=signals)
-        if preference:
-            return preference
-        freshness = self._freshness_for_text(lowered)
-        if freshness.get("required"):
-            probe = str(freshness.get("probe") or "")
-            capability = str(freshness.get("capability") or "")
-            capability_available = self._capability_available(capability)
-            route = Route.PROBE if probe and capability_available else Route.ASK_USER
-            return self._decision(
-                route=route,
-                risk=RiskLevel.R1,
-                reason=str(freshness.get("reason") or "fresh evidence required"),
-                intent=intent,
-                complexity=complexity,
-                capability="probe" if route == Route.PROBE else "ask_user",
-                signals=signals + [f"freshness:{freshness.get('name')}", f"capability:{capability}", "policy:required_probe_preserved"],
-                selected_probe=probe or None,
-                freshness_required=True,
-                needs_probe=route == Route.PROBE,
-                memory_policy="forget",
-                reasoning_mode="evidence",
-                required_capabilities=[capability] if capability else [],
-                capability_request={
-                    "capability": capability,
-                    "probe": probe or None,
-                    "reason": freshness.get("reason"),
-                },
-                constraints=["refresh volatile evidence before answering"]
-                if route == Route.PROBE
-                else ["do not fabricate unavailable live evidence"],
-            )
-        if self._needs_agent(lowered, attention_focus, complexity):
-            return self._decision(
-                route=Route.AGENT,
-                risk=risk,
-                reason="complex task requires selected agent runtime",
-                intent=intent,
-                complexity=complexity,
-                capability="selected_agent_runtime",
-                signals=signals + ["agent_required"],
-                needs_agent=True,
-                memory_policy="short_term",
-                reasoning_mode="execution",
-                required_capabilities=["selected_agent_runtime"],
-                constraints=["inject context patch", "enforce policy patch", "verify result"],
-            )
-        if risk == RiskLevel.R2 and intent == "action":
-            return self._decision(
-                route=Route.AGENT,
-                risk=risk,
-                reason="low-risk write action requires governed execution",
-                intent=intent,
-                complexity=complexity,
-                capability="selected_agent_runtime",
-                signals=signals + ["agent_required", "write_action"],
-                needs_agent=True,
-                memory_policy="long_term",
-                reasoning_mode="execution",
-                required_capabilities=["selected_agent_runtime"],
-                constraints=["limit write scope", "record diff or snapshot", "verify result"],
-            )
-        priority = self._priority_intent_decision(lowered=lowered, risk=risk, complexity=complexity, signals=signals)
-        if priority:
-            return priority
-        preference = self._preference_decision(lowered=lowered, risk=risk, complexity=complexity, signals=signals)
-        if preference:
-            return preference
-        attachment_gap = self._attachment_capability_gap(event)
         if attachment_gap:
             return self._decision(
                 route=Route.ASK_USER,
@@ -284,22 +196,6 @@ class DecisionCore:
                 required_capabilities=["vision"],
                 capability_request=attachment_gap,
                 constraints=["do not infer unreadable attachment content"],
-            )
-        if self._is_rollback_request(lowered):
-            return self._decision(
-                route=Route.ROLLBACK,
-                risk=RiskLevel.R4,
-                reason="snapshot rollback requires guarded confirmation",
-                intent="action",
-                complexity="moderate",
-                capability="rollback_audit",
-                signals=signals + ["route:rollback"],
-                requires_confirmation=True,
-                needs_user_confirmation=True,
-                memory_policy="short_term",
-                reasoning_mode="execution",
-                required_capabilities=["rollback_audit"],
-                constraints=["restore only an existing snapshot", "record rollback trace", "verify restored checksum"],
             )
         if risk == RiskLevel.R5:
             return self._decision(
@@ -331,6 +227,94 @@ class DecisionCore:
                 constraints=["explain impact", "check rollback path", "wait for explicit approval"],
             )
         return None
+
+    def _normalize_turn_understanding(self, value: TurnUnderstanding | dict[str, Any] | None) -> TurnUnderstanding | None:
+        if isinstance(value, TurnUnderstanding):
+            return value
+        if isinstance(value, dict):
+            return TurnUnderstanding.from_payload(value)
+        return None
+
+    def _with_turn_understanding(self, decision: Decision, understanding: TurnUnderstanding | None) -> Decision:
+        if understanding is None:
+            return decision
+        assist = dict(decision.model_assist or {})
+        assist["turn_understanding"] = understanding.to_dict(include_raw=False)
+        if understanding.source:
+            assist["understanding_source"] = understanding.source
+        decision.model_assist = assist
+        decision.signals = self._dedupe([*(decision.signals or []), f"understanding:{understanding.suggested_mode or understanding.intent}"])
+        return decision
+
+    def _apply_understanding_guardrails(
+        self,
+        text: str,
+        decision: Decision,
+        understanding: TurnUnderstanding | None,
+    ) -> Decision:
+        if understanding is None:
+            return decision
+        if not understanding.is_strategic_discussion():
+            return decision
+        if self._understanding_explicitly_needs_execution_or_runtime(text, understanding):
+            return self._with_turn_understanding(decision, understanding)
+        if decision.route not in {Route.AGENT, Route.PROBE, Route.SKILL} and not decision.needs_agent and not decision.needs_probe:
+            return self._with_turn_understanding(decision, understanding)
+        assist = dict(decision.model_assist or {})
+        assist.update(
+            {
+                "recommended_route": Route.DIRECT_ANSWER.value,
+                "reason": "understanding classified this as strategic discussion, not execution",
+                "turn_understanding": understanding.to_dict(include_raw=False),
+            }
+        )
+        return self._decision(
+            route=Route.DIRECT_ANSWER,
+            risk=decision.risk_level if decision.risk_level in {RiskLevel.R0, RiskLevel.R1} else decision.risk_level,
+            reason="understanding-first guardrail: strategic discussion should stay in Veyra Core",
+            intent="conversation",
+            complexity="moderate" if decision.complexity == "complex" else decision.complexity,
+            capability="native_answer",
+            signals=self._dedupe(
+                [
+                    *(decision.signals or []),
+                    "understanding:strategic_discussion",
+                    "policy:understanding_before_route",
+                    "policy:agent_route_rejected_for_strategy",
+                ]
+            ),
+            memory_policy="short_term",
+            reasoning_mode="direct",
+            required_capabilities=["native_answer"],
+            capability_request={
+                "capability": "native_answer",
+                "target_route": Route.DIRECT_ANSWER.value,
+                "receiver_type": "core",
+                "reason": "strategic discussion needs core reasoning, not probe/agent execution",
+            },
+            constraints=["do not execute tools or Agent for strategic discussion unless explicitly requested"],
+            model_assist=assist,
+        )
+
+    def _understanding_explicitly_needs_execution_or_runtime(self, text: str, understanding: TurnUnderstanding) -> bool:
+        if understanding.intent == "implementation" or understanding.task_type in {"workspace_task", "code_task", "local_status"}:
+            return True
+        if understanding.needs_fresh_evidence and understanding.evidence_kind in {"runtime", "local", "file", "attachment"}:
+            return True
+        lowered = (text or "").lower()
+        return any(marker in text for marker in ("改代码", "修改代码", "实现", "调试", "运行状态", "日志", "端口", "进程")) or any(
+            marker in lowered for marker in ("implement", "debug", "runtime status", "log", "port", "process")
+        )
+
+    def _should_trust_rule_understanding(self, understanding: TurnUnderstanding | None) -> bool:
+        if understanding is None or understanding.source != "rule_fallback" or understanding.confidence < 0.8:
+            return False
+        return understanding.suggested_mode in {
+            "strategic_discussion",
+            "meta_cognition_discussion",
+            "runtime_evidence",
+            "governed_execution",
+        }
 
     def _rule_decide(self, text: str, attention_focus: list[str], event: VeyraEvent | None = None) -> Decision:
         lowered = text.lower()
@@ -739,8 +723,39 @@ class DecisionCore:
         return None
 
     def _needs_agent(self, lowered: str, attention_focus: list[str], complexity: str) -> bool:
-        complex_markers = ["修改", "实现", "开发", "重构", "修复", "调试", "多文件", "代码", "agent", "openclaw", "hermes"]
-        return complexity == "complex" or any(marker in lowered for marker in complex_markers) or len(attention_focus) >= 3
+        execution_markers = [
+            "修改",
+            "实现",
+            "开发",
+            "重构",
+            "修复",
+            "调试",
+            "多文件",
+            "代码",
+            "部署",
+            "执行",
+            "写入",
+            "创建",
+            "code edit",
+            "implement",
+            "debug",
+            "fix bug",
+        ]
+        explicit_agent_markers = [
+            "通过 openclaw",
+            "让 openclaw",
+            "用 openclaw",
+            "openclaw 回答",
+            "通过 hermes",
+            "让 hermes",
+            "用 hermes",
+            "agent 执行",
+        ]
+        if any(marker in lowered for marker in execution_markers + explicit_agent_markers):
+            return True
+        if complexity == "complex" and any(marker in lowered for marker in ("执行", "修改", "实现", "代码", "部署", "debug", "implement")):
+            return True
+        return len(attention_focus) >= 3 and any(marker in lowered for marker in execution_markers)
 
     def _capability_available(self, capability_id: str) -> bool:
         if not capability_id:
