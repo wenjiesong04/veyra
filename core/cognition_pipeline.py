@@ -445,7 +445,7 @@ class CognitionPipeline:
         probe_params = dict(plan.probe_params)
         probe_params.update(request_input)
         if plan.probe == "weather_probe" and not probe_params.get("location"):
-            location = entities.get("location") or entities.get("place") or entities.get("city") or self._text_location_hint(text)
+            location = entities.get("location") or entities.get("place") or entities.get("city")
             if location:
                 probe_params["location"] = str(location)
         if plan.probe == "search_probe" and not probe_params.get("query"):
@@ -542,16 +542,9 @@ class CognitionPipeline:
         understanding: TurnUnderstanding,
         sufficiency: dict[str, Any],
     ) -> bool:
-        if understanding.evidence_kind in {"time", "current_time"} and not self._has_real_world_state_evidence(sufficiency):
-            return True
-        lowered = (text or "").lower()
-        has_time_subject = any(marker in text for marker in ("几点", "几号", "时间", "日期")) or any(
-            marker in lowered for marker in ("what time", "current time", "date")
-        )
-        has_current_marker = any(marker in text for marker in ("现在", "当前", "今天")) or any(
-            marker in lowered for marker in ("now", "current", "today")
-        )
-        return bool(has_time_subject and has_current_marker and not self._has_real_world_state_evidence(sufficiency))
+        # Model-first: trust the understanding model's evidence_kind instead of
+        # scanning the text for time keywords, so any phrasing generalizes.
+        return understanding.evidence_kind in {"time", "current_time"} and not self._has_real_world_state_evidence(sufficiency)
 
     def _has_real_world_state_evidence(self, sufficiency: dict[str, Any]) -> bool:
         return bool(sufficiency.get("sufficient") and sufficiency.get("source") in {"belief", "local_world"})
@@ -565,14 +558,9 @@ class CognitionPipeline:
     ) -> bool:
         if self._is_proactive_weather_request(text):
             return False
-        if understanding.evidence_kind == "weather" and not self._has_real_world_state_evidence(sufficiency):
-            return True
-        lowered = (text or "").lower()
-        asks_weather = "天气" in text or "weather" in lowered
-        current = any(marker in text for marker in ("现在", "当前", "今天", "最近")) or any(
-            marker in lowered for marker in ("now", "current", "today")
-        )
-        return bool(asks_weather and current and not self._has_real_world_state_evidence(sufficiency))
+        # Model-first: any way of asking about current weather should be captured
+        # by the understanding model's evidence_kind, not by a fixed keyword set.
+        return understanding.evidence_kind == "weather" and not self._has_real_world_state_evidence(sufficiency)
 
     def _probe_for_evidence_gap(
         self,
@@ -584,35 +572,23 @@ class CognitionPipeline:
     ) -> str:
         if self._has_real_world_state_evidence(sufficiency):
             return ""
-        if self._is_meta_cognition_question(text) and not self._explicitly_asks_runtime_evidence(text):
-            return ""
         if self._is_proactive_weather_request(text):
             return ""
-        lowered = (text or "").lower()
-        evidence_kind = str(understanding.evidence_kind or "").lower()
         if not understanding.needs_fresh_evidence and plan.recommended_route != "direct_answer":
             return ""
         if plan.probe and plan.recommended_route == "probe":
             return ""
-        if evidence_kind in {"search", "external", "latest", "web"} or any(
-            marker in lowered for marker in ("最新", "新闻", "latest", "recent", "today's")
-        ):
+        # Model-first: derive the probe from the understanding model's evidence_kind
+        # and extracted entities (e.g. platform/port) rather than text keyword scans.
+        evidence_kind = str(understanding.evidence_kind or "").lower()
+        entities = understanding.entities if isinstance(understanding.entities, dict) else {}
+        platform = str(entities.get("platform") or entities.get("runtime") or "").strip().lower()
+        if evidence_kind in {"search", "external", "latest", "web"}:
             return "search_probe"
-        volatile_status = any(marker in lowered for marker in ("现在", "当前", "状态", "运行", "running", "status", "now", "current"))
-        if "openclaw" in lowered and volatile_status:
-            return "openclaw"
-        if "hermes" in lowered and volatile_status:
-            return "hermes"
-        if "mcp" in lowered and volatile_status:
-            return "mcp"
         if evidence_kind in {"runtime", "local", "local_status"}:
-            if "openclaw" in lowered:
-                return "openclaw"
-            if "hermes" in lowered:
-                return "hermes"
-            if "mcp" in lowered:
-                return "mcp"
-            if "端口" in text or "port" in lowered:
+            if platform in {"openclaw", "hermes", "mcp"}:
+                return platform
+            if entities.get("port"):
                 return "port"
             return "system"
         if evidence_kind == "file":
@@ -642,12 +618,6 @@ class CognitionPipeline:
             "network": "network_probe",
         }.get(probe, probe)
 
-    def _text_location_hint(self, text: str) -> str:
-        for marker in ("北京", "上海", "广州", "深圳", "贵阳", "大阪", "东京", "伦敦"):
-            if marker in text:
-                return marker
-        return ""
-
     def _agent_handoff_capabilities(self, capabilities: list[str]) -> list[str]:
         output: list[str] = []
         for capability in capabilities:
@@ -658,28 +628,13 @@ class CognitionPipeline:
         return list(dict.fromkeys(output))
 
     def _requires_agent_handoff(self, *, text: str, understanding: TurnUnderstanding) -> bool:
+        # Model-first: the understanding model classifies implementation/code/workspace
+        # intent; we no longer keyword-match the raw text to force an agent handoff.
         if self._is_strategic_discussion(understanding) and not self._explicitly_asks_execution_or_runtime(text, understanding):
             return False
         if understanding.intent == "implementation":
             return True
-        if understanding.task_type in {"workspace_task", "code_task"}:
-            return True
-        lowered = (text or "").lower()
-        markers = (
-            "修改项目代码",
-            "修改代码",
-            "实现功能",
-            "把 xxx 功能实现",
-            "调试",
-            "修复 bug",
-            "写代码",
-            "改代码",
-            "code edit",
-            "implement",
-            "debug",
-            "fix bug",
-        )
-        return any(marker in text for marker in markers[:7]) or any(marker in lowered for marker in markers[7:])
+        return understanding.task_type in {"workspace_task", "code_task"}
 
     def _is_strategic_discussion(self, understanding: TurnUnderstanding) -> bool:
         return understanding.is_strategic_discussion()

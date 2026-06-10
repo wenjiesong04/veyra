@@ -88,24 +88,40 @@ def has_explicit_schedule_time(text: str) -> bool:
 
 def chinese_hour(text: str) -> int | None:
     value = text or ""
-    match = re.search(r"([一二两三四五六七八九十〇零]|十[一二三四五六七八九]?|二十[一二三]?|[0-2]?\d)点", value)
-    if not match:
-        return None
-    hour = _parse_chinese_number(match.group(1))
-    if hour is None:
-        return None
-    lowered = value.lower()
-    if any(marker in value or marker in lowered for marker in AFTERNOON_MARKERS + EVENING_MARKERS):
-        if 1 <= hour <= 11:
-            hour += 12
-    if any(marker in value or marker in lowered for marker in NOON_MARKERS):
-        if 1 <= hour <= 10:
-            hour += 12
-        elif hour == 0:
-            hour = 12
-    if 0 <= hour <= 23:
-        return hour
+    for match in re.finditer(r"([一二两三四五六七八九十〇零]|十[一二三四五六七八九]?|二十[一二三]?|[0-2]?\d)点", value):
+        raw = match.group(1)
+        if _looks_like_quantity_point(value, match):
+            continue
+        hour = _parse_chinese_number(raw)
+        if hour is None:
+            continue
+        lowered = value.lower()
+        if any(marker in value or marker in lowered for marker in AFTERNOON_MARKERS + EVENING_MARKERS):
+            if 1 <= hour <= 11:
+                hour += 12
+        if any(marker in value or marker in lowered for marker in NOON_MARKERS):
+            if 1 <= hour <= 10:
+                hour += 12
+            elif hour == 0:
+                hour = 12
+        if 0 <= hour <= 23:
+            return hour
     return None
+
+
+def _looks_like_quantity_point(value: str, match: re.Match[str]) -> bool:
+    raw = match.group(1)
+    if raw not in {"一", "二", "两"}:
+        return False
+    after = value[match.end() : match.end() + 1]
+    if after == "钟":
+        return False
+    context = value[max(0, match.start() - 4) : match.end() + 2]
+    lowered = context.lower()
+    if any(marker in context or marker in lowered for marker in MORNING_MARKERS + AFTERNOON_MARKERS + EVENING_MARKERS + NOON_MARKERS):
+        return False
+    before = value[match.start() - 1 : match.start()] if match.start() > 0 else ""
+    return before in {"推", "发", "看", "学", "读", "做", "来", "要", "吃", "喝", "写", "练", "讲", "整"}
 
 
 def extract_end_date(text: str, *, timezone_name: str = DEFAULT_TIMEZONE, now: datetime | None = None) -> str | None:

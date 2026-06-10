@@ -198,6 +198,16 @@ class CommitmentPushRuntime:
                 return "", {"kind": "invalid_weather_commitment", "status": "paused", "reason": validation.get("reason")}
             raw = self.weather_probe.run(f"{location}天气")
             summary = str(raw.get("summary") or "暂时无法获取天气。")
+            raw_details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
+            raw_reason = f"{summary} {raw_details.get('summary') or ''}"
+            if str(raw.get("status") or "") == "unavailable" and "No geocoding result" in raw_reason:
+                commitment_id = str(commitment.get("commitment_id") or "")
+                self.commitment_core._mark_invalid_commitment(commitment_id, "invalid_weather_location")
+                self.commitment_core.mark_invalid_notified(commitment_id)
+                return (
+                    f"【每日天气】之前的天气任务地点「{location}」无法识别，我已先暂停这个任务。请告诉我完整城市/地区后再开启。",
+                    {"kind": "invalid_weather_commitment", "status": "paused", "reason": "invalid_weather_location"},
+                )
             if str(raw.get("status") or "") in {"missing_target", "unavailable", "error", "http_error"}:
                 summary = f"暂时没查到{location}的天气。我会下次继续尝试；你也可以告诉我更完整的城市/地区。"
             return f"【每日天气】{summary}", raw

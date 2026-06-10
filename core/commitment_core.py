@@ -248,48 +248,41 @@ class CommitmentCore:
             return {}
 
         lowered = (user_text or "").lower()
-        result: dict[str, Any] = {"status": "idle", "actions": []}
+        semantic_intent = self.semantic_intent_for_turn(user_text=user_text, event=event)
+        result: dict[str, Any] = {"status": "idle", "actions": [], "semantic_intent": semantic_intent}
 
-        if self._is_commitment_control_request(user_text, lowered):
-            intent = self.intent_planner.plan(user_text=user_text, event=event)
-            if intent.intent_type in {"cancel_commitment", "pause_commitment", "resume_commitment"}:
-                intent_record = self.intent_planner.record_intent(intent)
-                control = self.template_registry.apply(
-                    intent=intent,
-                    core=self,
-                    event=event,
-                    user_text=user_text,
-                    assistant_response=assistant_response,
-                    route=route,
-                )
-                if control:
-                    control["intent"] = intent_record
-                    return control
+        if semantic_intent.get("operation") == "query_status":
+            return self.answer_commitment_status(semantic_intent, event=event)
 
         pending = self._pending_for_session(event.source.session_id)
-        if pending and self._is_affirmation(lowered):
+        if pending and (semantic_intent.get("operation") == "confirm" or self._is_affirmation(lowered)):
             confirmed = self._confirm_pending_commitment(pending, user_text=user_text)
             if confirmed:
                 result = {
                     "status": "confirmed",
                     "commitment": confirmed,
                     "actions": ["confirmed_pending"],
+                    "semantic_intent": semantic_intent,
                     "primary_response_override": f"已开启：{confirmed.get('title') or confirmed.get('kind')}",
                 }
                 return result
-        if pending and self._is_decline(lowered):
+        if pending and (semantic_intent.get("operation") == "decline" or self._is_decline(lowered)):
             cancelled = self.cancel_commitment(str(pending.get("commitment_id")))
             if cancelled:
                 return {
                     "status": "declined",
                     "commitment": cancelled,
                     "actions": ["cancelled_pending"],
+                    "semantic_intent": semantic_intent,
                     "primary_response_override": f"已取消：{cancelled.get('title') or cancelled.get('kind')}",
                 }
 
         # Bare confirmations without a pending offer must not create or confirm commitments.
         if self._is_affirmation(lowered) and not pending:
             return {}
+
+        if semantic_intent.get("operation") in {"cancel", "pause", "resume"}:
+            return self.apply_control_semantic(semantic_intent, event=event)
 
         if self._looks_like_plain_information_query(user_text, lowered):
             return {}
@@ -381,6 +374,566 @@ class CommitmentCore:
             result["intent"] = intent_record
         return result if result.get("status") != "idle" else {}
 
+    def semantic_intent_for_turn(self, *, user_text: str, event: VeyraEvent) -> dict[str, Any]:
+        """Narrow semantic guardrail for commitment state/control turns.
+
+        The model planner can still propose proactive creations, but local state
+        queries and destructive controls must be classified before mutation.
+        """
+        text = user_text or ""
+        lowered = text.lower()
+        pending = self._pending_for_session(event.source.session_id)
+        operation = self._semantic_operation(text=text, lowered=lowered, pending=pending)
+        scope = "all" if self._semantic_all_scope(text, lowered) else "matching"
+        target_type = self._semantic_target_type(text, lowered, scope=scope)
+        topic = self._semantic_topic(text)
+        location = ""
+        if target_type == "weather":
+            location = self._normalize_weather_location(self._extract_location(text))
+        confidence = 0.15
+        if operation in {"query_status", "cancel", "pause", "resume"}:
+            confidence = 0.72
+        if topic or location or scope == "all":
+            confidence = max(confidence, 0.84)
+        if operation == "query_status":
+            confidence = max(confidence, 0.88)
+        if operation in {"confirm", "decline"} and pending:
+            confidence = max(confidence, 0.9)
+        ambiguous = operation in {"cancel", "pause", "resume"} and scope != "all" and not topic and not location and not pending
+        return {
+            "operation": operation,
+            "target_type": target_type,
+            "entities": {
+                "topic": topic,
+                "location": location,
+                "scope": scope,
+                "session_id": event.source.session_id,
+                "user_id": event.source.user_id,
+            },
+            "confidence": round(confidence, 3),
+            "ambiguous": bool(ambiguous),
+            "source": "commitment_semantic_guardrail",
+            "raw_text": text,
+        }
+
+    def answer_commitment_status(self, semantic_intent: dict[str, Any], *, event: VeyraEvent) -> dict[str, Any]:
+        match_info = self.match_commitments_semantic(
+            semantic_intent,
+            event=event,
+            statuses=["active", "pending_confirmation", "paused", "cancelled"],
+        )
+        matches = match_info.get("matches") if isinstance(match_info.get("matches"), list) else []
+        entities = semantic_intent.get("entities") if isinstance(semantic_intent.get("entities"), dict) else {}
+        requested = self._requested_status_from_query(str(entities.get("topic") or ""), semantic_intent)
+        topic = str(entities.get("topic") or entities.get("location") or "").strip()
+        watchlists = self._match_watchlists_for_semantic(semantic_intent, event=event)
+        state_answer = ""
+
+        if matches:
+            label = self._semantic_target_label(topic, matches[0])
+            statuses = {str(item.get("status") or "") for item in matches}
+            if requested == "cancelled":
+                if statuses <= {"cancelled"}:
+                    state_answer = f"是，{label}已取消。"
+                elif "cancelled" in statuses and len(statuses) > 1:
+                    state_answer = f"{label}存在已取消记录，也还有未取消的相关任务：{self._status_summary(matches)}。"
+                elif "paused" in statuses:
+                    state_answer = f"还没有取消，{label}当前是已暂停状态。"
+                else:
+                    state_answer = f"还没有取消，{label}当前仍在运行或待确认：{self._status_summary(matches)}。"
+            elif requested == "paused":
+                if statuses <= {"paused"}:
+                    state_answer = f"是，{label}已暂停。"
+                elif "active" in statuses:
+                    state_answer = f"还没有暂停，{label}当前仍在运行。"
+                else:
+                    state_answer = f"{label}当前状态：{self._status_summary(matches)}。"
+            elif requested == "active":
+                if "active" in statuses:
+                    state_answer = f"还在，{label}当前仍在运行。"
+                elif statuses <= {"cancelled"}:
+                    state_answer = f"不在了，{label}已取消。"
+                elif statuses <= {"paused"}:
+                    state_answer = f"不在运行，{label}已暂停。"
+                else:
+                    state_answer = f"{label}当前状态：{self._status_summary(matches)}。"
+            else:
+                state_answer = f"{label}当前状态：{self._status_summary(matches)}。"
+        elif watchlists:
+            label = topic or str(watchlists[0].get("topic") or "这个追踪")
+            statuses = {str(item.get("status") or "") for item in watchlists}
+            if requested == "cancelled" and statuses <= {"cancelled"}:
+                state_answer = f"是，{label}相关内容追踪已取消。"
+            elif "active" in statuses:
+                state_answer = f"{label}相关内容追踪仍在运行。"
+            else:
+                state_answer = f"{label}相关内容追踪状态：{self._watchlist_status_summary(watchlists)}。"
+        elif match_info.get("ambiguous"):
+            candidates = match_info.get("candidates") if isinstance(match_info.get("candidates"), list) else []
+            state_answer = f"你想查哪个主动任务？当前有：{self._candidate_summary(candidates)}。"
+        else:
+            label = topic or "相关主动任务"
+            state_answer = f"没有找到{label}的主动任务记录。"
+
+        return {
+            "status": "state_answer",
+            "actions": ["answered_commitment_state"],
+            "semantic_intent": semantic_intent,
+            "commitment_matches": [self._compact_commitment(item) for item in matches],
+            "watchlist_matches": [self._compact_watchlist(item) for item in watchlists],
+            "state_answer": state_answer,
+            "primary_response_override": state_answer,
+        }
+
+    def apply_control_semantic(self, semantic_intent: dict[str, Any], *, event: VeyraEvent) -> dict[str, Any]:
+        action = str(semantic_intent.get("operation") or "")
+        statuses = {"cancel": ["active", "pending_confirmation"], "pause": ["active", "pending_confirmation"], "resume": ["paused"]}.get(action, [])
+        match_info = self.match_commitments_semantic(semantic_intent, event=event, statuses=statuses)
+        matches = match_info.get("matches") if isinstance(match_info.get("matches"), list) else []
+        candidates = match_info.get("candidates") if isinstance(match_info.get("candidates"), list) else []
+        if match_info.get("ambiguous"):
+            response = f"你要{self._action_word(action)}哪个主动任务？当前可操作的任务有：{self._candidate_summary(candidates)}。"
+            return {
+                "status": "needs_disambiguation",
+                "actions": [f"{action}_needs_disambiguation"],
+                "semantic_intent": {**semantic_intent, "ambiguous": True},
+                "commitment_matches": [],
+                "state_answer": response,
+                "primary_response_override": response,
+                "template": "cancel_pause_resume",
+            }
+        if not matches:
+            response = "没有找到正在进行的相关主动任务。"
+            return {
+                "status": "not_found",
+                "actions": [f"{action}_matching_commitments"],
+                "semantic_intent": semantic_intent,
+                "commitment_matches": [],
+                "state_answer": response,
+                "primary_response_override": response,
+                "template": "cancel_pause_resume",
+            }
+
+        updated: list[dict[str, Any]] = []
+        for item in matches:
+            commitment_id = str(item.get("commitment_id") or "")
+            if not commitment_id:
+                continue
+            if action == "cancel":
+                changed = self.cancel_commitment(commitment_id)
+            elif action == "pause":
+                changed = self.pause_commitment(commitment_id)
+            elif action == "resume":
+                changed = self.confirm_commitment(commitment_id)
+            else:
+                changed = None
+            if changed:
+                updated.append(changed)
+        intent = self._intent_from_semantic(semantic_intent, event=event, action=action)
+        self._audit_commitment_control(intent, action=action, matches=matches, updated=updated)
+        status_word = {"cancel": "cancelled", "pause": "paused", "resume": "resumed"}.get(action, action)
+        response = self._control_response(action, updated)
+        return {
+            "status": status_word,
+            "actions": [f"{action}_matching_commitments"],
+            "semantic_intent": semantic_intent,
+            "commitment_matches": [self._compact_commitment(item) for item in matches],
+            "matched_commitments": matches,
+            "updated_commitments": updated,
+            "state_answer": response,
+            "primary_response_override": response,
+            "template": "cancel_pause_resume",
+        }
+
+    def match_commitments_semantic(
+        self,
+        semantic_intent: dict[str, Any],
+        *,
+        event: VeyraEvent,
+        statuses: list[str],
+    ) -> dict[str, Any]:
+        entities = semantic_intent.get("entities") if isinstance(semantic_intent.get("entities"), dict) else {}
+        topic = str(entities.get("topic") or "").strip()
+        location = str(entities.get("location") or "").strip()
+        scope = str(entities.get("scope") or "matching")
+        target_type = str(semantic_intent.get("target_type") or "unknown")
+        candidates = [
+            item
+            for item in self.list_commitments(user_id=event.source.user_id)
+            if isinstance(item, dict)
+            and item.get("status") in statuses
+            and self._commitment_kind_matches(target_type, item)
+        ]
+        if scope == "all":
+            return {"matches": candidates, "candidates": candidates, "ambiguous": False}
+
+        exact = self._exact_commitment_matches(entities, candidates)
+        if exact:
+            return {"matches": exact, "candidates": candidates, "ambiguous": False}
+
+        needle = location if target_type == "weather" and location else topic
+        if needle:
+            matches = [item for item in candidates if self._commitment_matches_needle(item, needle)]
+            return {"matches": matches, "candidates": candidates, "ambiguous": False}
+
+        recent_topic = self._recent_commitment_topic_for_session(event.source.session_id)
+        if recent_topic:
+            matches = [item for item in candidates if self._commitment_matches_needle(item, recent_topic)]
+            if matches:
+                return {"matches": matches, "candidates": candidates, "ambiguous": False}
+
+        if len(candidates) == 1:
+            return {"matches": candidates, "candidates": candidates, "ambiguous": False}
+        return {"matches": [], "candidates": candidates, "ambiguous": len(candidates) > 1}
+
+    def _semantic_operation(self, *, text: str, lowered: str, pending: dict[str, Any] | None) -> str:
+        if self._is_commitment_status_query(text, lowered):
+            return "query_status"
+        if pending and self._is_affirmation(lowered):
+            return "confirm"
+        if pending and self._is_decline(lowered):
+            return "decline"
+        if self._has_resume_command(text, lowered):
+            return "resume"
+        if self._has_pause_command(text, lowered):
+            return "pause"
+        if self._has_cancel_command(text, lowered):
+            return "cancel"
+        if self._looks_like_proactive_request(text, lowered):
+            return "create"
+        return "unknown"
+
+    def _is_commitment_status_query(self, text: str, lowered: str) -> bool:
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
+        if not compact:
+            return False
+        questionish = any(
+            marker in compact
+            for marker in (
+                "是否",
+                "是不是",
+                "有没有",
+                "还在吗",
+                "还在",
+                "还会",
+                "了吗",
+                "了么",
+                "状态",
+                "查一下",
+                "现在是否",
+            )
+        ) or any(marker in lowered for marker in ("still", "status", "cancelled", "canceled", "is it", "did you", "has it"))
+        stateish = any(
+            marker in compact
+            for marker in (
+                "取消",
+                "停止",
+                "停了",
+                "停掉",
+                "暂停",
+                "恢复",
+                "追踪",
+                "跟踪",
+                "关注",
+                "推送",
+                "提醒",
+                "任务",
+                "订阅",
+            )
+        ) or any(marker in lowered for marker in ("track", "watch", "monitor", "push", "subscription", "commitment"))
+        return bool(questionish and stateish)
+
+    def _semantic_all_scope(self, text: str, lowered: str) -> bool:
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
+        return any(marker in compact for marker in ("所有", "全部", "全都", "都停止", "都取消")) or any(
+            marker in lowered for marker in ("all", "everything")
+        )
+
+    def _semantic_target_type(self, text: str, lowered: str, *, scope: str) -> str:
+        if scope == "all":
+            return "all"
+        if any(marker in lowered for marker in WEATHER_MARKERS):
+            return "weather"
+        if any(marker in lowered for marker in LEARNING_MARKERS):
+            return "learning"
+        if any(marker in (text or "") for marker in ("追踪", "跟踪", "关注", "订阅")) or any(
+            marker in lowered for marker in TRACKING_REQUEST_MARKERS_EN + ("release", "github", "pytorch")
+        ):
+            return "external_tracking"
+        return "unknown"
+
+    def _semantic_topic(self, text: str) -> str:
+        value = text or ""
+        match = re.search(r"(?i)(PyTorch(?:\s*\d+(?:\.\d+)*)?)", value)
+        if match:
+            return re.sub(r"\s+", " ", match.group(1)).strip()
+        token_match = re.search(r"(?i)(?:关注|追踪|跟踪|留意|订阅|取消|停止|暂停|恢复|monitor|track|watch|cancel|pause|resume)\s*([A-Za-z][A-Za-z0-9_.+-]*(?:\s*\d+(?:\.\d+)*)?)", value)
+        if token_match:
+            return re.sub(r"\s+", " ", token_match.group(1)).strip()
+        cleaned = value.strip(" \t\r\n的了吧吗呢啊？?！!，,。")
+        prefixes = (
+            "现在是否已经",
+            "现在是否",
+            "是不是已经",
+            "是否已经",
+            "有没有",
+            "别再关注",
+            "不要再关注",
+            "不用再关注",
+            "取消",
+            "停止",
+            "停掉",
+            "暂停",
+            "恢复",
+            "继续",
+            "查询",
+            "查一下",
+        )
+        for prefix in prefixes:
+            if cleaned.startswith(prefix) and len(cleaned) > len(prefix):
+                cleaned = cleaned[len(prefix) :]
+                break
+        suffixes = (
+            "相关内容追踪",
+            "内容追踪",
+            "相关追踪",
+            "更新提醒",
+            "相关内容",
+            "新版本和重要更新",
+            "重要更新",
+            "追踪",
+            "跟踪",
+            "关注",
+            "推送",
+            "提醒",
+            "任务",
+            "订阅",
+            "了吗",
+            "吗",
+            "了",
+        )
+        for suffix in suffixes:
+            if cleaned.endswith(suffix) and len(cleaned) > len(suffix):
+                cleaned = cleaned[: -len(suffix)]
+                break
+        cleaned = cleaned.strip(" 的了吧吗呢啊？?！!，,。")
+        if not cleaned or cleaned in {"这个", "刚才那个", "刚才", "所有", "全部", "任务", "推送", "追踪", "关注", "取消", "停止", "暂停", "恢复"}:
+            return ""
+        if len(cleaned) > 64:
+            return ""
+        return cleaned
+
+    def _has_cancel_command(self, text: str, lowered: str) -> bool:
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
+        return any(marker in lowered for marker in ("cancel", "stop")) or any(
+            marker in compact for marker in ("停止", "停掉", "取消", "别再", "不要再", "不用再", "不再关注", "关闭")
+        )
+
+    def _has_pause_command(self, text: str, lowered: str) -> bool:
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
+        return "pause" in lowered or any(marker in compact for marker in ("暂停", "先暂停", "暂时停", "先停一下", "最近先暂停"))
+
+    def _has_resume_command(self, text: str, lowered: str) -> bool:
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
+        return "resume" in lowered or any(marker in compact for marker in ("恢复", "重新开启", "恢复推送", "继续推", "继续给我推"))
+
+    def _commitment_kind_matches(self, target_type: str, item: dict[str, Any]) -> bool:
+        kind = str(item.get("kind") or "")
+        if target_type == "weather":
+            return kind == "weather_daily"
+        if target_type == "learning":
+            return kind == "learning_digest"
+        if target_type == "external_tracking":
+            return kind == "external_digest"
+        return True
+
+    def _exact_commitment_matches(self, entities: dict[str, Any], candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        commitment_id = str(entities.get("commitment_id") or "").strip()
+        watchlist_id = str(entities.get("watchlist_id") or "").strip()
+        if commitment_id:
+            return [item for item in candidates if str(item.get("commitment_id") or "") == commitment_id]
+        if watchlist_id:
+            return [
+                item
+                for item in candidates
+                if str((item.get("payload") if isinstance(item.get("payload"), dict) else {}).get("watchlist_id") or "") == watchlist_id
+            ]
+        return []
+
+    def _commitment_matches_needle(self, item: dict[str, Any], needle: str) -> bool:
+        normalized_needle = self._normalize_match_text(needle)
+        if len(normalized_needle) < 2:
+            return False
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        haystack = " ".join(
+            str(part or "")
+            for part in (
+                item.get("commitment_id"),
+                item.get("kind"),
+                item.get("title"),
+                payload.get("watchlist_id"),
+                payload.get("topic"),
+                payload.get("location"),
+                payload.get("note"),
+                payload.get("query"),
+            )
+        )
+        normalized_haystack = self._normalize_match_text(haystack)
+        return normalized_needle in normalized_haystack or normalized_haystack in normalized_needle
+
+    def _normalize_match_text(self, value: str) -> str:
+        text = re.sub(r"[\s，,。！？!?、·:：；;（）()【】\[\]_\-]+", "", (value or "").lower())
+        for token in ("相关内容", "内容", "更新提醒", "提醒", "追踪", "跟踪", "关注", "外部", "新版本", "重要更新"):
+            text = text.replace(token, "")
+        return text
+
+    def _recent_commitment_topic_for_session(self, session_id: str) -> str:
+        state = self.state_store.read_json("task_state.json")
+        slots_by_session = state.get("conversation_slots") if isinstance(state.get("conversation_slots"), dict) else {}
+        slots = slots_by_session.get(session_id) if isinstance(slots_by_session, dict) else {}
+        if not isinstance(slots, dict):
+            return ""
+        for key in ("last_commitment_topic", "last_search_query", "last_topic"):
+            value = str(slots.get(key) or "").strip()
+            if value and value not in {"weather", "天气"}:
+                return value
+        return ""
+
+    def _requested_status_from_query(self, text: str, semantic_intent: dict[str, Any]) -> str:
+        raw = " ".join(
+            str(part or "")
+            for part in (
+                text,
+                semantic_intent.get("raw_text"),
+                (semantic_intent.get("entities") if isinstance(semantic_intent.get("entities"), dict) else {}).get("topic"),
+            )
+        )
+        compact = re.sub(r"[\s，,。！？!?、]+", "", raw)
+        if any(marker in compact for marker in ("取消", "停止", "停掉", "停了")):
+            return "cancelled"
+        if "暂停" in compact:
+            return "paused"
+        if any(marker in compact for marker in ("还在", "还会", "运行", "开启")):
+            return "active"
+        return ""
+
+    def _match_watchlists_for_semantic(self, semantic_intent: dict[str, Any], *, event: VeyraEvent) -> list[dict[str, Any]]:
+        entities = semantic_intent.get("entities") if isinstance(semantic_intent.get("entities"), dict) else {}
+        topic = str(entities.get("topic") or "").strip()
+        if not topic:
+            return []
+        external = self.state_store.read_json("external_world.json")
+        watchlists = external.get("watchlist") if isinstance(external.get("watchlist"), list) else []
+        matched: list[dict[str, Any]] = []
+        for item in watchlists:
+            if not isinstance(item, dict):
+                continue
+            commitment_id = str(item.get("commitment_id") or "")
+            owner_ok = True
+            if commitment_id:
+                commitment = self.get_commitment(commitment_id)
+                owner_ok = not commitment or commitment.get("user_id") == event.source.user_id
+            if owner_ok and self._normalize_match_text(topic) in self._normalize_match_text(str(item.get("topic") or item.get("query") or "")):
+                matched.append(item)
+        return matched
+
+    def _semantic_target_label(self, topic: str, item: dict[str, Any]) -> str:
+        if topic:
+            if item.get("kind") == "external_digest":
+                return f"{topic} 相关内容追踪"
+            if item.get("kind") == "weather_daily":
+                return f"{topic} 天气推送"
+            return topic
+        title = str(item.get("title") or item.get("kind") or "这个主动任务").strip()
+        return title
+
+    def _status_summary(self, items: list[dict[str, Any]]) -> str:
+        parts = []
+        for item in items[:5]:
+            parts.append(f"{self._commitment_label(item)}：{self._status_label(str(item.get('status') or ''))}")
+        return "；".join(parts) or "无匹配记录"
+
+    def _watchlist_status_summary(self, items: list[dict[str, Any]]) -> str:
+        parts = []
+        for item in items[:5]:
+            topic = str(item.get("topic") or item.get("query") or "追踪")
+            parts.append(f"{topic}：{self._status_label(str(item.get('status') or ''))}")
+        return "；".join(parts) or "无匹配记录"
+
+    def _status_label(self, status: str) -> str:
+        return {
+            "active": "运行中",
+            "pending_confirmation": "待确认",
+            "paused": "已暂停",
+            "cancelled": "已取消",
+        }.get(status, status or "未知")
+
+    def _candidate_summary(self, candidates: list[dict[str, Any]]) -> str:
+        if not candidates:
+            return "没有可操作任务"
+        return "；".join(f"{self._commitment_label(item)}（{self._status_label(str(item.get('status') or ''))}）" for item in candidates[:5])
+
+    def _commitment_label(self, item: dict[str, Any]) -> str:
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        if item.get("kind") == "external_digest":
+            return f"外部追踪：{payload.get('topic') or item.get('title') or '未命名'}"
+        if item.get("kind") == "weather_daily":
+            return f"每日天气：{payload.get('location') or item.get('title') or '未命名'}"
+        if item.get("kind") == "learning_digest":
+            return f"学习资料：{payload.get('topic') or item.get('title') or '未命名'}"
+        return str(item.get("title") or item.get("kind") or item.get("commitment_id") or "主动任务")
+
+    def _compact_commitment(self, item: dict[str, Any]) -> dict[str, Any]:
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        return {
+            "commitment_id": item.get("commitment_id"),
+            "kind": item.get("kind"),
+            "status": item.get("status"),
+            "title": item.get("title"),
+            "topic": payload.get("topic"),
+            "location": payload.get("location"),
+            "watchlist_id": payload.get("watchlist_id"),
+            "session_id": item.get("session_id"),
+        }
+
+    def _compact_watchlist(self, item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "watchlist_id": item.get("watchlist_id"),
+            "status": item.get("status"),
+            "enabled": item.get("enabled"),
+            "topic": item.get("topic"),
+            "query": item.get("query"),
+            "commitment_id": item.get("commitment_id"),
+        }
+
+    def _action_word(self, action: str) -> str:
+        return {"cancel": "取消", "pause": "暂停", "resume": "恢复"}.get(action, action)
+
+    def _control_response(self, action: str, updated: list[dict[str, Any]]) -> str:
+        if not updated:
+            return "没有找到可更新的主动任务。"
+        labels = "；".join(self._commitment_label(item) for item in updated[:5])
+        return f"已{self._action_word(action)}：{labels}。"
+
+    def _intent_from_semantic(self, semantic_intent: dict[str, Any], *, event: VeyraEvent, action: str) -> ProactiveIntent:
+        entities = semantic_intent.get("entities") if isinstance(semantic_intent.get("entities"), dict) else {}
+        return ProactiveIntent(
+            user_id=event.source.user_id,
+            session_id=event.source.session_id,
+            channel_id=event.source.channel,
+            raw_text=str(event.payload.get("text") or ""),
+            intent_type={"cancel": "cancel_commitment", "pause": "pause_commitment", "resume": "resume_commitment"}.get(action, "unknown"),
+            topic=str(entities.get("topic") or entities.get("location") or ""),
+            entities=dict(entities),
+            desired_outcome=f"{action}_matching_commitments",
+            requires_user_authorization=False,
+            authorization_status="granted",
+            risk_level=RiskLevel.R1.value,
+            confidence=float(semantic_intent.get("confidence") or 0.0),
+            proposed_next_action=f"{action}_matching_commitments",
+            source="commitment_semantic_guardrail",
+        )
+
     def _intent_is_answer_only(self, intent: ProactiveIntent) -> bool:
         return str(intent.proposed_next_action or "") == "answer_only"
 
@@ -428,8 +981,10 @@ class CommitmentCore:
             for item in self.list_commitments(user_id=intent.user_id)
             if isinstance(item, dict) and item.get("status") in statuses
         ]
-        if scope == "all" or not topic:
+        if scope == "all":
             return items
+        if not topic:
+            return []
         matched: list[dict[str, Any]] = []
         for item in items:
             payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}

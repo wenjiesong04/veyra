@@ -104,13 +104,8 @@ def main() -> int:
             json={"text": "每天早上帮我推送伦敦天气", "channel": "accept", "user_id": "weather-user", "session_id": "weather"},
         ).json()
         weather_artifact = artifact(weather)
-        expect("推送" in message_text(weather), "explicit weather request offers daily push", weather)
-        expect((weather_artifact.get("commitment") or {}).get("status") == "pending_confirmation", "weather push pending", weather_artifact)
-        weather_confirm = client.post(
-            "/events/message",
-            json={"text": "同意", "channel": "accept", "user_id": "weather-user", "session_id": "weather"},
-        ).json()
-        expect(artifact(weather_confirm).get("status") == "confirmed", "weather push confirms active", weather_confirm)
+        expect("已开启" in message_text(weather), "explicit weather request activates daily push", weather)
+        expect((weather_artifact.get("commitment") or {}).get("status") == "active", "weather push active", weather_artifact)
 
         intents_before_identity = len(store.read_json("proactive_intents.json").get("intents", []))
         proposals_before_identity = len(store.read_json("self_improvement_proposals.json").get("proposals", []))

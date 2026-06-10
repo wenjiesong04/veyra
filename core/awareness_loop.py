@@ -581,7 +581,19 @@ class AwarenessLoop:
             followups = self._commitment_followup_messages(commitment_turn)
             if primary_override and (
                 self._result_execution_tier(result) == TIER_L5_PROACTIVE
-                or commitment_status in {"created", "confirmed", "declined", "already_exists"}
+                or commitment_status
+                in {
+                    "created",
+                    "confirmed",
+                    "declined",
+                    "already_exists",
+                    "state_answer",
+                    "needs_disambiguation",
+                    "not_found",
+                    "cancelled",
+                    "paused",
+                    "resumed",
+                }
             ):
                 result.primary_response = primary_override
                 result.artifacts["commitment_primary_applied"] = primary_override
@@ -923,13 +935,26 @@ class AwarenessLoop:
                 "project_direction_review",
             }:
                 return self._direct_answer_degraded(text=text, decision=decision, answer_assist={})
+        model_assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
+        plan_draft = str(model_assist.get("draft_response") or "").strip()
+        # Speed: the awareness execution-plan step already drafted a final reply for
+        # direct answers. Reuse it instead of making a third sequential model call,
+        # and only fall back to a dedicated answer pass when that draft is unusable.
+        if plan_draft:
+            plan_answer = {
+                "status": "model_assisted",
+                "draft_response": plan_draft,
+                "confidence": model_assist.get("confidence"),
+                "source": "execution_plan_draft",
+            }
+            if self._direct_draft_is_usable(text=text, decision=decision, draft=plan_draft, answer_assist=plan_answer):
+                decision.model_assist = {**decision.model_assist, "answer_assist": plan_answer}
+                return plan_draft
         answer_assist = self.core_reasoning.answer_assist(text=text, attention_focus=attention_focus, decision=decision.to_dict(), event=event)
         draft = str(answer_assist.get("draft_response") or answer_assist.get("response") or "").strip()
-        if not draft:
-            model_assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
-            draft = str(model_assist.get("draft_response") or "").strip()
-            if draft and answer_assist.get("status") != "model_assisted":
-                answer_assist = {**answer_assist, "status": "model_assisted", "draft_response": draft}
+        if not draft and plan_draft:
+            draft = plan_draft
+            answer_assist = {**answer_assist, "status": "model_assisted", "draft_response": draft}
         if answer_assist.get("status") == "model_assisted" and draft and self._direct_draft_is_usable(text=text, decision=decision, draft=draft, answer_assist=answer_assist):
             decision.model_assist = {**decision.model_assist, "answer_assist": answer_assist}
             return draft
@@ -1059,10 +1084,10 @@ class AwarenessLoop:
         if gaps:
             gap_text = "；".join(str(item) for item in gaps[:2] if item)
             if gap_text:
-                return f"针对「{snippet}」，我这轮无法产出足够可靠的直答（缺口：{gap_text}）。我先不乱猜；你可以让我改走可验证探针，或补充约束后我再回答。"
+                return f"我现在缺少可靠信息：{gap_text}。请补充目标或约束后我再回答。"
         if decision.intent in {"information", "unknown"}:
-            return f"针对「{snippet}」，我这轮拿不到稳定的认知模型输出。为避免误导，我先不编结论；你可以让我改走探针取证，或把问题拆成可验证的小点继续。"
-        return "我这轮无法给出稳定直答。为避免误导，我先不输出未经验证的结论；请补充上下文或改为可验证路径。"
+            return f"我现在不能可靠判断「{snippet}」。请补充更明确的目标，或让我先读取当前状态后再回答。"
+        return "我现在不能可靠判断这个问题。请补充上下文，或让我先读取当前状态后再回答。"
 
     def _state_update_ack_response(self, text: str) -> str:
         lowered = (text or "").lower()
@@ -1382,6 +1407,12 @@ class AwarenessLoop:
             resolved_location = self._resolve_weather_location_for_turn(text, slots)
             if resolved_location:
                 slots["last_location"] = resolved_location
+        commitment_artifact = result.artifacts.get("commitment") if isinstance(result.artifacts.get("commitment"), dict) else {}
+        if commitment_artifact:
+            commitment_topic = self._commitment_topic_from_artifact(commitment_artifact)
+            if commitment_topic:
+                slots["last_commitment_topic"] = commitment_topic
+                slots["last_topic"] = commitment_topic
         slots["updated_at"] = utc_now_iso()
         slots_by_session[event.source.session_id] = slots
         if len(slots_by_session) > 200:
@@ -1389,6 +1420,27 @@ class AwarenessLoop:
         state["conversation_slots"] = slots_by_session
         self.state_store.write_json("task_state.json", state)
         result.artifacts["conversation_slots"] = self._compact_conversation_slots(slots)
+
+    def _commitment_topic_from_artifact(self, artifact: dict[str, Any]) -> str:
+        semantic = artifact.get("semantic_intent") if isinstance(artifact.get("semantic_intent"), dict) else {}
+        entities = semantic.get("entities") if isinstance(semantic.get("entities"), dict) else {}
+        for value in (entities.get("topic"), entities.get("location")):
+            text = str(value or "").strip()
+            if text:
+                return text
+        candidates = []
+        for key in ("commitment", "updated_commitments"):
+            value = artifact.get(key)
+            if isinstance(value, dict):
+                candidates.append(value)
+            elif isinstance(value, list):
+                candidates.extend(item for item in value if isinstance(item, dict))
+        for item in candidates:
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            text = str(payload.get("topic") or payload.get("location") or item.get("title") or "").strip()
+            if text:
+                return text
+        return ""
 
     def _structured_tool_result(self, result: LoopResult) -> dict[str, Any]:
         raw = result.artifacts.get("probe_result") if isinstance(result.artifacts.get("probe_result"), dict) else {}
@@ -1480,6 +1532,7 @@ class AwarenessLoop:
         return {
             "last_location": slots.get("last_location"),
             "last_topic": slots.get("last_topic"),
+            "last_commitment_topic": slots.get("last_commitment_topic"),
             "last_search_query": slots.get("last_search_query"),
             "last_intent": slots.get("last_intent"),
             "last_tool_result": compact_tool,
