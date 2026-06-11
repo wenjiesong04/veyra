@@ -5,7 +5,9 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from time import perf_counter
 from typing import Callable, Any
 
-from interface.event_schema import Decision, Route
+from typing import Optional
+
+from interface.event_schema import Decision, Route, utc_now_iso
 from core.agency_core import AgencyCore
 from core.state_compact import compact_foresight, compact_guardian_decision
 from core.definitions import RiskLevel
@@ -14,6 +16,7 @@ from core.guardian_controller import GuardianController
 from core.perception_layer import PerceptionLayer
 from core.reasoning_core import CoreReasoning
 from core.world_state import WorldStateStore
+from guardian.review_queue import ReviewQueue
 from probes.git_probe import GitProbe
 from probes.hermes_probe import HermesProbe
 from probes.mcp_probe import McpProbe
@@ -24,7 +27,13 @@ from probes.web_probe import WebProbe
 
 
 class ProactiveChecks:
-    """A2/A3 MVP: run low-risk read-only checks and surface state gaps."""
+    """A2/A3 MVP: run low-risk read-only checks and surface state gaps.
+
+    Beyond detection, a bounded remediation worker turns reviewed intentions into
+    action: R1 read-only gaps are remediated in place (targeted re-probe / capability
+    refresh), while R2+ gaps become one-click-approvable review proposals. It never
+    auto-executes a write or restart; those stay behind Guardian review.
+    """
 
     def __init__(
         self,
@@ -33,6 +42,8 @@ class ProactiveChecks:
         reasoning: CoreReasoning | None = None,
         *,
         model_assist_enabled: bool = False,
+        review_queue: ReviewQueue | None = None,
+        agent_adapter_resolver: Optional[Callable[[], Any]] = None,
     ) -> None:
         self.state_store = state_store
         self.reasoning = reasoning or CoreReasoning(state_store)
@@ -42,6 +53,8 @@ class ProactiveChecks:
         self.agency = AgencyCore(state_store, agency_root=selected_agency_root, reasoning=self.reasoning, model_assist_enabled=model_assist_enabled)
         self.foresight = ForesightEngine(reasoning=self.reasoning if model_assist_enabled else None)
         self.guardian = GuardianController()
+        self.review_queue = review_queue or ReviewQueue(state_store)
+        self._agent_adapter_resolver = agent_adapter_resolver
 
     def run_read_only(self, *, timeout_seconds: float = 12.0) -> dict:
         started = perf_counter()
@@ -134,22 +147,120 @@ class ProactiveChecks:
         )
         foresight = self.foresight.predict_text_action(text, risk, decision=decision.to_dict())
         guardian = self.guardian.review_text_action(text=text, decision=decision, foresight=foresight)
+        remediation: dict[str, Any] | None = None
+        review_id: str | None = None
         if risk == RiskLevel.R1 and guardian.get("decision") in {"allow", "allow_with_constraints"}:
-            status = "executed_read_only"
+            remediation = self._remediate_read_only(intention)
+            status = "executed_read_only" if remediation.get("status") in {"refreshed", "observed", "probed_fallback"} else "acknowledged"
         elif risk == RiskLevel.R2 and guardian.get("decision") in {"allow", "allow_with_constraints"}:
-            status = "suggested"
+            review = self._create_remediation_review(intention, foresight, guardian)
+            review_id = str(review.get("review_id")) if isinstance(review, dict) else None
+            status = "review_created" if review_id else "suggested"
         elif guardian.get("decision") == "block":
             status = "blocked"
         elif guardian.get("decision") == "ask_user":
             status = "needs_confirmation"
         else:
             status = "suggested"
-        updated = self.agency.update_intention(
-            str(intention.get("intention_id")),
-            {
-                "status": status,
-                "guardian_decision": compact_guardian_decision(guardian),
-                "foresight": compact_foresight(foresight),
-            },
-        )
+        patch: dict[str, Any] = {
+            "status": status,
+            "guardian_decision": compact_guardian_decision(guardian),
+            "foresight": compact_foresight(foresight),
+        }
+        if remediation is not None:
+            patch["remediation"] = remediation
+        if review_id:
+            patch["review_id"] = review_id
+        updated = self.agency.update_intention(str(intention.get("intention_id")), patch)
         return updated or intention
+
+    # --- Remediation worker: turn reviewed intentions into bounded action. ---
+
+    def _remediate_read_only(self, intention: dict) -> dict[str, Any]:
+        gap = intention.get("source_gap") if isinstance(intention.get("source_gap"), dict) else {}
+        action = str(intention.get("suggested_action") or gap.get("suggested_action") or "")
+        try:
+            if action == "refresh_agent_capabilities":
+                return self._refresh_agent_capabilities()
+            if action == "probe_executor_status":
+                return self._refresh_executor_status()
+            if action in {"refresh_probe_group", "refresh_probe"} or action.startswith("refresh_state"):
+                return self._refresh_probe_for_target(gap)
+            if action == "review_core_model_config":
+                return {"action": action, "status": "observed", "core_model": self.reasoning.status()}
+            if action == "check_feishu_intake":
+                feishu = self.state_store.read_json("feishu_ws_state.json")
+                return {"action": action, "status": "observed", "feishu_ws_status": feishu.get("status")}
+        except Exception as exc:
+            return {"action": action, "status": "error", "error": str(exc)}
+        return {"action": action, "status": "no_handler"}
+
+    def _refresh_agent_capabilities(self) -> dict[str, Any]:
+        adapter = self._resolve_agent_adapter()
+        if adapter is not None and hasattr(adapter, "fetch_capabilities"):
+            caps = adapter.fetch_capabilities()
+            if isinstance(caps, dict) and caps:
+                executor = self.state_store.read_json("executor_state.json")
+                snapshot = executor.get("capability_snapshot") if isinstance(executor.get("capability_snapshot"), dict) else {}
+                snapshot = {**snapshot, **caps, "freshness": "fresh", "refreshed_at": utc_now_iso()}
+                executor["capability_snapshot"] = snapshot
+                executor["updated_at"] = utc_now_iso()
+                self.state_store.write_json("executor_state.json", executor)
+                return {"action": "refresh_agent_capabilities", "status": "refreshed", "source": "agent_adapter"}
+        result = OpenClawProbe().run("18789")
+        self.perception.interpret_probe_result(result)
+        return {"action": "refresh_agent_capabilities", "status": "probed_fallback", "probe_status": result.get("status")}
+
+    def _refresh_executor_status(self) -> dict[str, Any]:
+        openclaw = OpenClawProbe().run("18789")
+        self.perception.interpret_probe_result(openclaw)
+        hermes = HermesProbe().run("")
+        self.perception.interpret_probe_result(hermes)
+        return {"action": "probe_executor_status", "status": "refreshed", "openclaw": openclaw.get("status"), "hermes": hermes.get("status")}
+
+    def _refresh_probe_for_target(self, gap: dict) -> dict[str, Any]:
+        source = (str(gap.get("target") or "") + " " + str(gap.get("gap_id") or "")).lower()
+        probe_plan: list[tuple[str, Callable[[], dict[str, Any]]]] = [
+            ("openclaw", lambda: OpenClawProbe().run("18789")),
+            ("hermes", lambda: HermesProbe().run("")),
+            ("git", lambda: GitProbe().run("")),
+            ("network", lambda: NetworkProbe().run("localhost")),
+            ("web", lambda: WebProbe().run("http://127.0.0.1:8000/")),
+            ("mcp", lambda: McpProbe().run("")),
+            ("system", lambda: SystemProbe().run("")),
+        ]
+        for key, call in probe_plan:
+            if key in source:
+                result = call()
+                self.perception.interpret_probe_result(result)
+                return {"action": "refresh_probe_group", "status": "refreshed", "probe": key, "probe_status": result.get("status")}
+        return {"action": "refresh_probe_group", "status": "no_probe_for_source", "source": source.strip()}
+
+    def _resolve_agent_adapter(self) -> Any:
+        if self._agent_adapter_resolver is None:
+            return None
+        try:
+            return self._agent_adapter_resolver()
+        except Exception:
+            return None
+
+    def _create_remediation_review(self, intention: dict, foresight: dict, guardian: dict) -> dict[str, Any]:
+        gap = intention.get("source_gap") if isinstance(intention.get("source_gap"), dict) else {}
+        proposal = {
+            "type": "proactive_remediation",
+            "gap_id": gap.get("gap_id"),
+            "target": gap.get("target"),
+            "observed_status": gap.get("observed_status"),
+            "suggested_action": intention.get("suggested_action") or gap.get("suggested_action"),
+            "action_text": gap.get("action_text"),
+            "risk_guess": str(intention.get("risk_level") or RiskLevel.R2.value),
+            "reversible": "review_required",
+        }
+        return self.review_queue.create(
+            event_id=str(intention.get("intention_id")),
+            task_text=str(gap.get("action_text") or intention.get("suggested_action") or "proactive remediation"),
+            risk_level=str(intention.get("risk_level") or RiskLevel.R2.value),
+            foresight=foresight,
+            guardian_decision=guardian,
+            proposal=proposal,
+        )
