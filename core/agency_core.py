@@ -193,7 +193,73 @@ class AgencyCore:
                 }
             )
 
+        active_commitments = self._active_commitments()
+        if (
+            goals.get("selected_agent_must_be_available")
+            and executor_status not in {"available", "ok", "success"}
+            and active_commitments
+        ):
+            gaps.append(
+                {
+                    "gap_id": "selected_agent_unavailable_blocks_commitments",
+                    "target": "selected_agent",
+                    "observed_status": executor_status,
+                    "risk_level": RiskLevel.R2.value,
+                    "suggested_action": "review_executor_for_active_commitments",
+                    "action_text": (
+                        f"selected agent is {executor_status} while {len(active_commitments)} active commitment(s) "
+                        "depend on it; suggest restoring the executor or pausing affected commitments"
+                    ),
+                    "affected_commitments": [c.get("commitment_id") for c in active_commitments[:5]],
+                }
+            )
+
+        push_failure = self._commitment_push_failure_gap()
+        if push_failure:
+            gaps.append(push_failure)
+
         return self._merge_model_gaps(goals, world_state, gaps)
+
+    def _commitment_push_failure_gap(self) -> dict[str, Any] | None:
+        """Proactively notice that scheduled delivery keeps failing across ticks.
+
+        Reads recent active-loop ticks and counts consecutive commitment_push steps
+        that reported a non-success status. Two or more in a row is surfaced as an
+        R2 review intention (suggest only, never auto-executed).
+        """
+        if not self.state_store:
+            return None
+        state = self.state_store.read_json("active_loop_state.json")
+        ticks = state.get("ticks") if isinstance(state.get("ticks"), list) else []
+        if not ticks:
+            return None
+        failure_states = {"degraded", "error", "timeout", "failed"}
+        consecutive = 0
+        last_status = ""
+        for tick in reversed(ticks):
+            steps = tick.get("steps") if isinstance(tick.get("steps"), list) else []
+            push = next((s for s in steps if isinstance(s, dict) and s.get("name") == "commitment_push"), None)
+            if not push:
+                continue
+            status = str(push.get("result_status") or push.get("status") or "")
+            if status in failure_states:
+                consecutive += 1
+                last_status = status
+            else:
+                break
+        if consecutive < 2:
+            return None
+        return {
+            "gap_id": "commitment_push_repeated_failure",
+            "target": "commitment_push",
+            "observed_status": f"{consecutive}_consecutive_{last_status or 'failures'}",
+            "risk_level": RiskLevel.R2.value,
+            "suggested_action": "review_commitment_push_failures",
+            "action_text": (
+                f"commitment push reported {last_status or 'failure'} for {consecutive} active-loop ticks in a row; "
+                "suggest reviewing the selected agent and delivery channel before relying on proactive delivery"
+            ),
+        }
 
     def sync_intentions(self, world_state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         goals = self._read_json(self.goals_path, {})

@@ -1090,15 +1090,16 @@ class AwarenessLoop:
         return "我现在不能可靠判断这个问题。请补充上下文，或让我先读取当前状态后再回答。"
 
     def _state_update_ack_response(self, text: str) -> str:
-        lowered = (text or "").lower()
-        if self._is_explicit_gsoc_kotlin_profile(text, lowered):
-            return "已记录：你准备参加 GSoC，方向是 Kotlin。后续学习路线和项目建议会默认带上这个背景。"
-        if re.search(r"我是.{0,12}(计算机|cs|computer science).{0,12}(大二|sophomore|二年级)?学生", text or "", re.IGNORECASE):
-            return "已记录：你是计算机专业学生。后续项目建议会优先按你的阶段和作品集产出考虑。"
-        if self._is_explicit_veyra_project_statement(text, lowered):
-            return "已记录：当前项目是 Veyra。后续说“继续”或“昨天那个项目”时，我会优先恢复这个上下文。"
-        if self._is_explicit_agent_governance_project_statement(text, lowered):
-            return "已记录：当前项目是 Agent 治理系统。后续架构问题会优先按治理层上下文处理。"
+        signals = self._extract_profile_signals(text)
+        program = signals.get("program") if isinstance(signals.get("program"), dict) else None
+        if program and program.get("name"):
+            direction = str(program.get("direction") or "").strip()
+            tail = f"，方向是 {direction}" if direction else ""
+            return f"已记录：你准备参加 {program['name']}{tail}。后续学习路线和项目建议会默认带上这个背景。"
+        if signals.get("education"):
+            return f"已记录：你是{signals['education']}。后续项目建议会优先按你的阶段和作品集产出考虑。"
+        if signals.get("project"):
+            return f"已记录：当前项目是 {signals['project']}。后续说“继续”或“昨天那个项目”时，我会优先恢复这个上下文。"
         compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
         if all(marker in compact for marker in ("Veyra架构", "学校作业", "Docker部署")):
             return "已更新当前注意力：优先继续 Docker 部署，同时保留 Veyra 架构和学校作业作为次级上下文。"
@@ -1217,21 +1218,25 @@ class AwarenessLoop:
         profile = scoped.get("profile") if isinstance(scoped.get("profile"), dict) else user_world.get("profile") if isinstance(user_world.get("profile"), dict) else {}
         lowered = (text or "").lower()
         if any(marker in text for marker in ("三个月学习路线", "学习路线", "学习计划")):
-            gsoc = profile.get("gsoc") if isinstance(profile.get("gsoc"), dict) else {}
-            direction = str(gsoc.get("direction") or "").strip()
-            if direction:
+            program = profile.get("program") if isinstance(profile.get("program"), dict) else (
+                profile.get("gsoc") if isinstance(profile.get("gsoc"), dict) else {}
+            )
+            name = str(program.get("name") or program.get("program") or "").strip()
+            direction = str(program.get("direction") or "").strip()
+            if name or direction:
+                anchor = " 和 ".join([part for part in (name, f"{direction} 方向" if direction else "") if part])
                 return (
-                    f"结合你之前提到的 GSoC 和 {direction} 方向，我建议未来三个月按三段走："
-                    "第 1 个月补 Kotlin 语言、协程、Gradle 和目标项目代码阅读；"
-                    "第 2 个月做一个与目标组织相关的小 PR 或 demo；"
-                    "第 3 个月整理 proposal、里程碑和风险清单，并提前让导师看到可运行成果。"
+                    f"结合你之前提到的 {anchor}，我建议未来三个月按三段走："
+                    "第 1 个月补齐核心语言/工具与目标项目代码阅读；"
+                    "第 2 个月做一个与目标方向相关的小 PR 或 demo；"
+                    "第 3 个月整理 proposal、里程碑和风险清单，并提前让导师/评审看到可运行成果。"
                 )
         if any(marker in text for marker in ("暑期项目", "暑假项目")) or "summer project" in lowered:
             education = str(profile.get("education") or "").strip()
             if education:
                 return (
                     f"结合你是{education}，更适合优先找能产出作品集的暑期项目：开源项目贡献、校内实验室工程任务、"
-                    "小型后端/工具链项目、或与 Kotlin/GSoC 方向相关的插件/库。具体项目清单需要再查最新招募信息。"
+                    "小型后端/工具链项目，或与你当前方向相关的插件/库。具体项目清单需要再查最新招募信息。"
                 )
         return ""
 
@@ -1740,7 +1745,9 @@ class AwarenessLoop:
         text = str(event.payload.get("text") or "")
         if not text:
             return
-        lowered = text.lower()
+        signals = self._extract_profile_signals(text)
+        if not signals:
+            return
         user_world = self.state_store.read_json("user_world.json")
         user_id = str(event.source.user_id or "local-user")
         legacy_profile = user_world.setdefault("profile", {})
@@ -1760,40 +1767,33 @@ class AwarenessLoop:
             scoped["profile"] = scoped_profile
         focus = user_world.get("focus") if isinstance(user_world.get("focus"), list) else []
         scoped_focus = scoped.get("focus") if isinstance(scoped.get("focus"), list) else []
-        changed = False
 
-        if self._is_explicit_gsoc_kotlin_profile(text, lowered):
-            value = {"program": "GSoC", "direction": "Kotlin", "source": "user_explicit_message"}
-            legacy_profile["gsoc"] = value
-            scoped_profile["gsoc"] = value
-            user_world["current_goal"] = "gsoc:Kotlin"
-            scoped["current_goal"] = "gsoc:Kotlin"
-            focus = self._append_focus(focus, ["GSoC", "Kotlin"])
-            scoped_focus = self._append_focus(scoped_focus, ["GSoC", "Kotlin"])
-            changed = True
-        if re.search(r"我是.{0,12}(计算机|cs|computer science).{0,12}(大二|sophomore|二年级)?学生", text, re.IGNORECASE):
-            value = "计算机专业大二学生" if "大二" in text else "计算机专业学生"
-            legacy_profile["education"] = value
-            scoped_profile["education"] = value
-            changed = True
-        if self._is_explicit_veyra_project_statement(text, lowered):
-            user_world["current_goal"] = "project:Veyra"
-            user_world["current_project"] = "Veyra"
-            scoped["current_goal"] = "project:Veyra"
-            scoped["current_project"] = "Veyra"
-            focus = self._append_focus(focus, ["Veyra", "project"])
-            scoped_focus = self._append_focus(scoped_focus, ["Veyra", "project"])
-            changed = True
-        if self._is_explicit_agent_governance_project_statement(text, lowered):
-            user_world["current_goal"] = "project:Agent治理系统"
-            user_world["current_project"] = "Agent治理系统"
-            scoped["current_goal"] = "project:Agent治理系统"
-            scoped["current_project"] = "Agent治理系统"
-            focus = self._append_focus(focus, ["Agent治理系统", "governance"])
-            scoped_focus = self._append_focus(scoped_focus, ["Agent治理系统", "governance"])
-            changed = True
-        if not changed:
-            return
+        program = signals.get("program") if isinstance(signals.get("program"), dict) else None
+        if program and program.get("name"):
+            value = {"program": program["name"], "name": program["name"], "direction": program.get("direction", ""), "source": "user_explicit_message"}
+            legacy_profile["program"] = value
+            scoped_profile["program"] = value
+            if str(program["name"]).strip().upper() == "GSOC":
+                legacy_profile["gsoc"] = value
+                scoped_profile["gsoc"] = value
+            goal = f"program:{program['name']}" + (f":{program['direction']}" if program.get("direction") else "")
+            user_world["current_goal"] = goal
+            scoped["current_goal"] = goal
+            focus_tokens = [t for t in (program["name"], program.get("direction")) if t]
+            focus = self._append_focus(focus, focus_tokens)
+            scoped_focus = self._append_focus(scoped_focus, focus_tokens)
+        if signals.get("education"):
+            legacy_profile["education"] = signals["education"]
+            scoped_profile["education"] = signals["education"]
+        if signals.get("project"):
+            project = signals["project"]
+            user_world["current_goal"] = f"project:{project}"
+            user_world["current_project"] = project
+            scoped["current_goal"] = f"project:{project}"
+            scoped["current_project"] = project
+            focus = self._append_focus(focus, [project, "project"])
+            scoped_focus = self._append_focus(scoped_focus, [project, "project"])
+
         user_world["focus"] = focus[-12:]
         scoped["profile"] = scoped_profile
         scoped["focus"] = scoped_focus[-12:]
@@ -1803,53 +1803,92 @@ class AwarenessLoop:
         user_world["updated_at"] = utc_now_iso()
         self.state_store.write_json("user_world.json", user_world)
 
+    # --- Generic user-profile extraction (model-first reasoning still flows through
+    # turn_context; persistence captures *explicit* self-statements generically so it
+    # works for any project/program/identity, not a hardcoded brand list). ---
+
+    _PROJECT_MARKERS_ZH = (
+        "我正在开发", "我现在在开发", "我目前在开发", "我正在做", "我现在在做", "我目前在做",
+        "当前项目是", "我的项目是", "我的项目叫", "我在开发", "正在开发", "我要做", "我想做",
+        "我准备做", "我在做", "正在做", "我在搞", "项目是", "我做的是",
+    )
+    _PROJECT_MARKERS_EN = (
+        "i'm working on", "i am working on", "i'm developing", "i am developing",
+        "i'm building", "i am building", "my project is", "working on",
+    )
+    _PROFILE_OBJECT_STOPWORDS = {
+        "什么", "啥", "这个", "那个", "东西", "项目", "事情", "事", "work", "what", "it", "this",
+    }
+
+    def _extract_profile_signals(self, text: str) -> dict[str, Any]:
+        signals: dict[str, Any] = {}
+        program = self._extract_program_statement(text)
+        if program:
+            signals["program"] = program
+        education = self._extract_education_statement(text)
+        if education:
+            signals["education"] = education
+        # A program/identity statement is not also a "project" statement.
+        if not program:
+            project = self._extract_project_statement(text)
+            if project:
+                signals["project"] = project
+        return signals
+
+    def _extract_project_statement(self, text: str) -> str:
+        lowered = (text or "").lower()
+        for marker in self._PROJECT_MARKERS_EN:
+            idx = lowered.find(marker)
+            if idx >= 0:
+                return self._clean_profile_object(text[idx + len(marker):])
+        for marker in self._PROJECT_MARKERS_ZH:
+            idx = text.find(marker)
+            if idx >= 0:
+                return self._clean_profile_object(text[idx + len(marker):])
+        return ""
+
+    def _clean_profile_object(self, raw: str) -> str:
+        obj = re.split(r"[，,。！!？?、；;\n]", (raw or "").strip(), 1)[0].strip()
+        for quantifier in ("一个", "一款", "一台", "一套", "一项", "个", "the ", "a "):
+            if obj.lower().startswith(quantifier):
+                obj = obj[len(quantifier):].strip()
+                break
+        obj = obj.lstrip("：:。 ").rstrip("的 ").strip()
+        if len(obj) < 2 or obj.lower() in self._PROFILE_OBJECT_STOPWORDS:
+            return ""
+        return obj[:40]
+
+    def _extract_program_statement(self, text: str) -> dict[str, str] | None:
+        text = text or ""
+        name_match = re.search(r"(?:参加|报名|申请)\s*([A-Za-z0-9][\w.\-]{1,19}|[\u4e00-\u9fa5]{2,12})", text)
+        if not name_match:
+            return None
+        name = name_match.group(1).strip("的 ")
+        direction = ""
+        dir_match = re.search(r"(?:方向是|主攻|投)\s*([A-Za-z0-9+#./\u4e00-\u9fa5]{1,20}?)\s*方向", text)
+        if not dir_match:
+            dir_match = re.search(r"方向是\s*([A-Za-z0-9+#./\u4e00-\u9fa5]{1,20})", text)
+        if dir_match:
+            direction = dir_match.group(1).strip("的 ")
+        if not name:
+            return None
+        return {"name": name, "direction": direction}
+
+    def _extract_education_statement(self, text: str) -> str:
+        match = re.search(
+            r"我是\s*([\u4e00-\u9fa5A-Za-z0-9]{0,20}?(?:学生|本科生|研究生|博士生|工程师|开发者|程序员))",
+            text or "",
+        )
+        if not match:
+            return ""
+        return match.group(1).strip()
+
     def _append_focus(self, current: list[Any], values: list[str]) -> list[str]:
         output = [str(item) for item in current if item]
         for value in values:
             if value not in output:
                 output.append(value)
         return output
-
-    def _is_explicit_gsoc_kotlin_profile(self, text: str, lowered: str) -> bool:
-        if "gsoc" not in lowered or "kotlin" not in lowered:
-            return False
-        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "").lower()
-        return any(
-            marker in compact
-            for marker in (
-                "我准备参加",
-                "我要参加",
-                "我想投",
-                "今年想投",
-                "准备参加",
-                "计划参加",
-                "方向是kotlin",
-                "投kotlin方向",
-            )
-        )
-
-    def _is_explicit_veyra_project_statement(self, text: str, lowered: str) -> bool:
-        if "veyra" not in lowered:
-            return False
-        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "").lower()
-        return any(
-            marker in compact
-            for marker in (
-                "我正在开发veyra",
-                "我在开发veyra",
-                "正在开发veyra",
-                "当前项目是veyra",
-                "我的项目是veyra",
-                "项目是veyra",
-                "在做veyra",
-            )
-        )
-
-    def _is_explicit_agent_governance_project_statement(self, text: str, lowered: str) -> bool:
-        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "").lower()
-        if "agent治理系统" not in compact and "agentgovernance" not in compact:
-            return False
-        return any(marker in compact for marker in ("我要做", "我在做", "正在做", "正在开发", "当前项目", "我的项目", "项目是"))
 
     def _poll_if_needed(self, execution: ExecutionResult) -> ExecutionResult:
         if execution.status not in NON_TERMINAL_STATUSES:

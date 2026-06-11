@@ -36,7 +36,9 @@ class ContextPatchBuilder:
             "user_goal": user_message,
             "attention_focus": attention_focus,
             "attachment_metadata": self._attachment_metadata(event),
-            "relevant_world_state": self._relevant_world_state(state, attention_focus),
+            "relevant_world_state": self._relevant_world_state(
+                state, attention_focus, user_id=event.source.user_id if event else None
+            ),
             "executor_state": redact_sensitive(self._state_meta(state["executor_state"], ["selected_agent", "status", "connected", "validation"])),
             "task_state": redact_sensitive(self._state_meta(state["task_state"], ["current_task", "short_term_memory"])),
             "belief_state": {
@@ -51,7 +53,7 @@ class ContextPatchBuilder:
             "foresight": redact_sensitive(foresight or {}),
         }
 
-    def _relevant_world_state(self, state: dict[str, Any], focus: list[str]) -> dict[str, Any]:
+    def _relevant_world_state(self, state: dict[str, Any], focus: list[str], user_id: str | None = None) -> dict[str, Any]:
         local = state["local_world"] if isinstance(state.get("local_world"), dict) else {}
         external = state["external_world"] if isinstance(state.get("external_world"), dict) else {}
         user = state["user_world"] if isinstance(state.get("user_world"), dict) else {}
@@ -62,7 +64,7 @@ class ContextPatchBuilder:
                 selected_probes[key] = probes[key]
         return redact_sensitive(
             {
-                "user": self._state_meta(user, ["current_goal", "preferences", "focus"]),
+                "user": self._scoped_user_meta(user, user_id),
                 "local": {
                     **self._state_meta(local, ["current_project", "last_probe_at"]),
                     "selected_probes": selected_probes,
@@ -72,6 +74,21 @@ class ContextPatchBuilder:
             max_string=900,
             max_list=12,
         )
+
+    def _scoped_user_meta(self, user: dict[str, Any], user_id: str | None) -> dict[str, Any]:
+        meta = self._state_meta(user, ["current_goal", "preferences", "focus"])
+        if not user_id:
+            return meta
+        profiles = user.get("profiles_by_user") if isinstance(user.get("profiles_by_user"), dict) else {}
+        scoped = profiles.get(user_id) if isinstance(profiles.get(user_id), dict) else {}
+        if not scoped:
+            return meta
+        for field in ("current_goal", "current_project", "focus"):
+            if scoped.get(field):
+                meta[field] = scoped[field]
+        if isinstance(scoped.get("profile"), dict) and scoped["profile"]:
+            meta["profile"] = scoped["profile"]
+        return meta
 
     def _state_meta(self, value: dict[str, Any], fields: list[str]) -> dict[str, Any]:
         if not isinstance(value, dict):
