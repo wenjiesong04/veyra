@@ -19,6 +19,7 @@ from core.world_state import WorldStateStore
 from guardian.review_queue import ReviewQueue
 from probes.git_probe import GitProbe
 from probes.hermes_probe import HermesProbe
+from probes.log_probe import LogProbe
 from probes.mcp_probe import McpProbe
 from probes.network_probe import NetworkProbe
 from probes.openclaw_probe import OpenClawProbe
@@ -67,6 +68,9 @@ class ProactiveChecks:
             "web": lambda: WebProbe().run("http://127.0.0.1:8000/"),
             "mcp": lambda: McpProbe().run(""),
         }
+        watched_log = os.getenv("VEYRA_APP_LOG", "").strip()
+        if watched_log:
+            probes["log"] = lambda path=watched_log: LogProbe().run(path)
         results = self._run_probes(probes, timeout_seconds=max(1.0, min(timeout_seconds, 30.0)))
         for result in results.values():
             self.perception.interpret_probe_result(result)
@@ -183,7 +187,7 @@ class ProactiveChecks:
             if action == "refresh_agent_capabilities":
                 return self._refresh_agent_capabilities()
             if action == "probe_executor_status":
-                return self._refresh_executor_status()
+                return self._self_heal_agent(gap)
             if action in {"refresh_probe_group", "refresh_probe"} or action.startswith("refresh_state"):
                 return self._refresh_probe_for_target(gap)
             if action == "review_core_model_config":
@@ -211,12 +215,81 @@ class ProactiveChecks:
         self.perception.interpret_probe_result(result)
         return {"action": "refresh_agent_capabilities", "status": "probed_fallback", "probe_status": result.get("status")}
 
-    def _refresh_executor_status(self) -> dict[str, Any]:
+    def _self_heal_agent(self, gap: dict) -> dict[str, Any]:
+        """Reversible self-heal first; only escalate the irreversible restart to review.
+
+        Reconnect/verify is reversible and runs automatically. A real process restart is
+        irreversible (R4) and is never auto-executed - it is escalated to a review the
+        user can approve, and only when active commitments actually depend on the agent.
+        """
         openclaw = OpenClawProbe().run("18789")
         self.perception.interpret_probe_result(openclaw)
-        hermes = HermesProbe().run("")
-        self.perception.interpret_probe_result(hermes)
-        return {"action": "probe_executor_status", "status": "refreshed", "openclaw": openclaw.get("status"), "hermes": hermes.get("status")}
+        adapter = self._resolve_agent_adapter()
+        conn: dict[str, Any] = {}
+        if adapter is not None and hasattr(adapter, "connection_status"):
+            try:
+                conn = adapter.connection_status() or {}
+            except Exception as exc:
+                conn = {"status": "error", "error": str(exc)}
+        connected = bool(conn.get("connected")) or str(conn.get("status") or "") in {"available", "ok", "success"}
+        if connected:
+            executor = self.state_store.read_json("executor_state.json")
+            executor["status"] = str(conn.get("status") or "available")
+            executor["connected"] = True
+            executor["updated_at"] = utc_now_iso()
+            self.state_store.write_json("executor_state.json", executor)
+            return {"action": "probe_executor_status", "status": "refreshed", "self_heal": "reconnected", "connection": self._compact_conn(conn)}
+        if self.agency._active_commitments() and not self._has_pending_restart_review():
+            review = self._create_restart_review(gap, conn)
+            return {
+                "action": "probe_executor_status",
+                "status": "observed",
+                "self_heal": "reconnect_failed_escalated_to_review",
+                "review_id": str(review.get("review_id")) if isinstance(review, dict) else None,
+            }
+        return {"action": "probe_executor_status", "status": "observed", "self_heal": "reconnect_failed", "connection": self._compact_conn(conn)}
+
+    def _compact_conn(self, conn: dict[str, Any]) -> dict[str, Any]:
+        return {key: conn.get(key) for key in ("status", "connected", "error") if key in conn}
+
+    def _has_pending_restart_review(self) -> bool:
+        try:
+            items = self.review_queue.list("pending")
+        except Exception:
+            return False
+        return any(isinstance(item, dict) and (item.get("proposal") or {}).get("type") == "agent_restart" for item in items)
+
+    def _create_restart_review(self, gap: dict, conn: dict[str, Any]) -> dict[str, Any]:
+        text = "restart selected agent runtime to recover delivery (irreversible, requires approval)"
+        decision = Decision(
+            route=Route.HUMAN_REVIEW,
+            risk_level=RiskLevel.R4,
+            reason="agent self-heal escalation: reversible reconnect failed",
+            requires_confirmation=True,
+            intent="action",
+            complexity="simple",
+            capability="human_review",
+            signals=["agency:self_heal", "risk:R4"],
+            constraints=["irreversible restart requires explicit approval"],
+        )
+        foresight = self.foresight.predict_text_action(text, RiskLevel.R4, decision=decision.to_dict())
+        guardian = self.guardian.review_text_action(text=text, decision=decision, foresight=foresight)
+        proposal = {
+            "type": "agent_restart",
+            "target": gap.get("target") or "selected_agent",
+            "reason": "reversible reconnect failed",
+            "connection": self._compact_conn(conn),
+            "risk_guess": RiskLevel.R4.value,
+            "reversible": "no",
+        }
+        return self.review_queue.create(
+            event_id=f"self_heal_{gap.get('gap_id') or 'selected_agent'}",
+            task_text=text,
+            risk_level=RiskLevel.R4.value,
+            foresight=foresight,
+            guardian_decision=guardian,
+            proposal=proposal,
+        )
 
     def _refresh_probe_for_target(self, gap: dict) -> dict[str, Any]:
         source = (str(gap.get("target") or "") + " " + str(gap.get("gap_id") or "")).lower()

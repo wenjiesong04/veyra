@@ -193,6 +193,60 @@ class AgencyCore:
                 }
             )
 
+        probes = local_world.get("probes") if isinstance(local_world.get("probes"), dict) else {}
+        system_probe = probes.get("system_probe") if isinstance(probes.get("system_probe"), dict) else {}
+        system_details = system_probe.get("details") if isinstance(system_probe.get("details"), dict) else {}
+        pressure = system_details.get("resource_pressure") if isinstance(system_details.get("resource_pressure"), list) else []
+        if pressure:
+            gaps.append(
+                {
+                    "gap_id": "resource_pressure",
+                    "target": "local_system",
+                    "observed_status": ",".join(str(item) for item in pressure),
+                    "risk_level": RiskLevel.R2.value,
+                    "suggested_action": "review_resource_pressure",
+                    "action_text": "local CPU/memory/disk is under pressure; suggest reviewing usage before running heavier work",
+                }
+            )
+
+        log_probe = probes.get("log_probe") if isinstance(probes.get("log_probe"), dict) else {}
+        log_details = log_probe.get("details") if isinstance(log_probe.get("details"), dict) else {}
+        if log_details.get("anomaly"):
+            gaps.append(
+                {
+                    "gap_id": "log_anomaly",
+                    "target": str(log_probe.get("target") or log_details.get("path") or "watched_log"),
+                    "observed_status": f"{log_details.get('error_count')}_error_markers",
+                    "risk_level": RiskLevel.R2.value,
+                    "suggested_action": "review_log_anomaly",
+                    "action_text": "watched log shows repeated errors; suggest reviewing the log before relying on the affected component",
+                }
+            )
+
+        task_state = world_state.get("task_state", {}) if isinstance(world_state.get("task_state"), dict) else {}
+        pending_tasks = task_state.get("pending_agent_tasks") if isinstance(task_state.get("pending_agent_tasks"), list) else []
+        drifting = [
+            task
+            for task in pending_tasks
+            if isinstance(task, dict)
+            and (
+                str(task.get("verification_status") or "") in {"verified_failed", "needs_rollback"}
+                or int(task.get("poll_count") or 0) >= 5
+            )
+        ]
+        if drifting:
+            gaps.append(
+                {
+                    "gap_id": "agent_task_drift",
+                    "target": "agent_tasks",
+                    "observed_status": f"{len(drifting)}_drifting_tasks",
+                    "risk_level": RiskLevel.R2.value,
+                    "suggested_action": "review_agent_task_drift",
+                    "action_text": "one or more delegated Agent tasks failed verification or stalled; suggest reviewing them before retrying",
+                    "affected_tasks": [t.get("task_id") for t in drifting[:5]],
+                }
+            )
+
         active_commitments = self._active_commitments()
         if (
             goals.get("selected_agent_must_be_available")
