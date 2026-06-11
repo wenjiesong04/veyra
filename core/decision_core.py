@@ -137,7 +137,8 @@ class DecisionCore:
         if self._should_trust_rule_understanding(understanding):
             base = self._rule_decide(text, attention_focus, event=event)
             base = self._apply_understanding_guardrails(text, base, understanding)
-            return self.model_driven.enrich(text, self._with_turn_understanding(base, understanding), event=event)
+            enriched = self.model_driven.enrich(text, self._with_turn_understanding(base, understanding), event=event)
+            return self._enforce_preference_lock(text, enriched)
         if use_model_first_pipeline(self.reasoning):
             pipeline = CognitionPipeline(self.reasoning, self.state_store, self.capabilities)
             pipeline_decision = pipeline.run(
@@ -149,13 +150,15 @@ class DecisionCore:
             )
             if pipeline_decision is not None:
                 pipeline_decision = self._apply_understanding_guardrails(text, pipeline_decision, understanding)
-                return self.model_driven.enrich(text, self._with_turn_understanding(pipeline_decision, understanding), event=event)
+                enriched = self.model_driven.enrich(text, self._with_turn_understanding(pipeline_decision, understanding), event=event)
+                return self._enforce_preference_lock(text, enriched)
         base = self._rule_decide(text, attention_focus, event=event)
         base = self._apply_understanding_guardrails(text, base, understanding)
         base = self._with_turn_understanding(base, understanding)
         decision = self._apply_model_assist(text, attention_focus, base, event=event)
         decision = self._apply_understanding_guardrails(text, decision, understanding)
-        return self.model_driven.enrich(text, self._with_turn_understanding(decision, understanding), event=event)
+        enriched = self.model_driven.enrich(text, self._with_turn_understanding(decision, understanding), event=event)
+        return self._enforce_preference_lock(text, enriched)
 
     def _governance_locked_decision(self, text: str, attention_focus: list[str], event: VeyraEvent | None = None) -> Decision | None:
         """Deterministic locks that must never be overridden by model routing."""
@@ -692,6 +695,29 @@ class DecisionCore:
 
     def _is_preference_locked(self, decision: Decision) -> bool:
         return decision.intent == "preference" or "memory:preference" in decision.signals
+
+    def _enforce_preference_lock(self, text: str, decision: Decision) -> Decision:
+        """Deterministic guardrail: explicit user preferences must be remembered.
+
+        The model-first pipeline sometimes routes a clear preference statement as a
+        plain reply but marks it 'forget'. When the text is unambiguously a
+        preference and the route is a low-risk reply, lock intent/memory so the
+        preference is written to long-term memory regardless of model judgment.
+        """
+        if self._is_preference_locked(decision):
+            return decision
+        if decision.route not in {Route.DIRECT_ANSWER, Route.ASK_USER}:
+            return decision
+        if decision.risk_level not in {RiskLevel.R0, RiskLevel.R1}:
+            return decision
+        if not self._is_preference_intent((text or "").lower()):
+            return decision
+        decision.intent = "preference"
+        decision.memory_policy = "long_term"
+        decision.signals = self._dedupe(
+            [*(decision.signals or []), "intent:preference", "memory:preference", "priority:memory_policy"]
+        )
+        return decision
 
     def _attachment_capability_gap(self, event: VeyraEvent | None) -> dict[str, Any] | None:
         if not event:
