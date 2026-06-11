@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import shlex
-from typing import Any
+from typing import Any, Callable
 
 from core.world_state import WorldStateStore
 from rollback_audit.rollback_manager import RollbackManager
@@ -21,6 +21,7 @@ class ActionExecutor:
         safe_browser: SafeBrowser | None = None,
         safe_api: SafeAPI | None = None,
         rollback_manager: RollbackManager | None = None,
+        proactive_executor: Callable[[dict[str, Any], str], dict[str, Any]] | None = None,
     ) -> None:
         self.state_store = state_store
         self.safe_shell = safe_shell or SafeShell(state_store=state_store)
@@ -28,6 +29,9 @@ class ActionExecutor:
         self.safe_browser = safe_browser or SafeBrowser(state_store=state_store)
         self.safe_api = safe_api or SafeAPI(state_store=state_store)
         self.rollback_manager = rollback_manager or RollbackManager(state_store)
+        # Executes approved proactive remediation / agent-restart proposals. Wired
+        # after construction because ProactiveChecks is built later in app assembly.
+        self.proactive_executor = proactive_executor
 
     def execute_review(self, review: dict[str, Any]) -> dict[str, Any]:
         proposal = review.get("proposal")
@@ -36,9 +40,20 @@ class ActionExecutor:
                 "status": "approved_noop",
                 "reason": "Review item has no executable proposal. Approval is recorded for governance only.",
             }
+        approval_id = str(review.get("review_id", ""))
+        proposal_type = str(proposal.get("type") or "")
+        if proposal_type in {"proactive_remediation", "agent_restart"}:
+            if self.proactive_executor is None:
+                return {"status": "not_supported", "reason": f"no proactive executor configured for {proposal_type}", "proposal": proposal}
+            try:
+                result = self.proactive_executor(proposal, approval_id)
+            except Exception as exc:
+                return {"status": "error", "reason": f"proactive remediation failed: {exc}", "proposal": proposal}
+            if not isinstance(result, dict):
+                return {"status": "error", "reason": "proactive executor returned a non-object result"}
+            return {**result, "approved_by": approval_id, "operation": proposal_type}
         action = proposal.get("action", {})
         action_type = action.get("type")
-        approval_id = str(review.get("review_id", ""))
         if action_type == "shell_command":
             command = action.get("command", [])
             if isinstance(command, str):

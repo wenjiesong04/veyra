@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from time import perf_counter
 from typing import Callable, Any
@@ -195,9 +196,101 @@ class ProactiveChecks:
             if action == "check_feishu_intake":
                 feishu = self.state_store.read_json("feishu_ws_state.json")
                 return {"action": action, "status": "observed", "feishu_ws_status": feishu.get("status")}
+            if action == "suggest_diff_review" or action.startswith("review_"):
+                return self._diagnose_for_review(action, gap)
         except Exception as exc:
             return {"action": action, "status": "error", "error": str(exc)}
         return {"action": action, "status": "no_handler"}
+
+    def execute_approved_proposal(self, proposal: dict[str, Any], approved_by: str = "") -> dict[str, Any]:
+        """Called after a user approves a proactive review. Lands the remediation.
+
+        proactive_remediation gathers/refreshes read-only evidence for the gap.
+        agent_restart tries a reversible reconnect first, and only runs a configured
+        restart command (through SafeShell/ToolProxy) when reconnect fails.
+        """
+        proposal_type = str(proposal.get("type") or "")
+        if proposal_type == "agent_restart":
+            return self._execute_agent_restart(approved_by)
+        if proposal_type == "proactive_remediation":
+            intention = {
+                "suggested_action": proposal.get("suggested_action"),
+                "source_gap": {
+                    "gap_id": proposal.get("gap_id"),
+                    "target": proposal.get("target"),
+                    "observed_status": proposal.get("observed_status"),
+                    "suggested_action": proposal.get("suggested_action"),
+                    "action_text": proposal.get("action_text"),
+                },
+            }
+            return self._remediate_read_only(intention)
+        return {"status": "not_supported", "reason": f"unknown proactive proposal type {proposal_type}"}
+
+    def _diagnose_for_review(self, action: str, gap: dict) -> dict[str, Any]:
+        if action == "review_resource_pressure":
+            details = SystemProbe().run("").get("details", {})
+            return {"action": action, "status": "diagnosed", "resources": details.get("resources"), "resource_pressure": details.get("resource_pressure")}
+        if action == "review_log_anomaly":
+            path = os.getenv("VEYRA_APP_LOG", "").strip()
+            if not path:
+                return {"action": action, "status": "diagnosed", "note": "no VEYRA_APP_LOG configured"}
+            details = LogProbe().run(path).get("details", {})
+            return {"action": action, "status": "diagnosed", "log": {"path": details.get("path"), "error_count": details.get("error_count"), "anomaly": details.get("anomaly")}}
+        if action == "review_agent_task_drift":
+            pending = self.state_store.read_json("task_state.json").get("pending_agent_tasks", [])
+            drift = [
+                t for t in pending
+                if isinstance(t, dict) and (str(t.get("verification_status") or "") in {"verified_failed", "needs_rollback"} or int(t.get("poll_count") or 0) >= 5)
+            ]
+            return {"action": action, "status": "diagnosed", "drifting_tasks": drift[:10]}
+        if action == "review_commitment_push_failures":
+            ticks = self.state_store.read_json("active_loop_state.json").get("ticks", [])
+            recent = []
+            for tick in list(ticks)[-10:]:
+                steps = tick.get("steps") if isinstance(tick.get("steps"), list) else []
+                push = next((s for s in steps if isinstance(s, dict) and s.get("name") == "commitment_push"), None)
+                if push:
+                    recent.append({"result_status": push.get("result_status") or push.get("status")})
+            return {"action": action, "status": "diagnosed", "recent_push_steps": recent}
+        if action == "review_executor_for_active_commitments":
+            return {
+                "action": action,
+                "status": "diagnosed",
+                "executor": self.state_store.read_json("executor_state.json").get("status"),
+                "active_commitments": self.agency._active_commitments(),
+            }
+        if action == "suggest_diff_review":
+            git = GitProbe().run("")
+            return {"action": action, "status": "diagnosed", "git": {"status": git.get("status"), "summary": git.get("summary"), "dirty": git.get("dirty")}}
+        return {"action": action, "status": "diagnosed", "note": "surfaced for manual review", "gap": gap}
+
+    def _execute_agent_restart(self, approved_by: str = "") -> dict[str, Any]:
+        adapter = self._resolve_agent_adapter()
+        conn: dict[str, Any] = {}
+        if adapter is not None and hasattr(adapter, "connection_status"):
+            try:
+                conn = adapter.connection_status() or {}
+            except Exception as exc:
+                conn = {"status": "error", "error": str(exc)}
+        if bool(conn.get("connected")) or str(conn.get("status") or "") in {"available", "ok", "success"}:
+            executor = self.state_store.read_json("executor_state.json")
+            executor["status"] = str(conn.get("status") or "available")
+            executor["connected"] = True
+            executor["updated_at"] = utc_now_iso()
+            self.state_store.write_json("executor_state.json", executor)
+            return {"status": "recovered", "method": "reconnect", "connection": self._compact_conn(conn)}
+        command = os.getenv("VEYRA_AGENT_RESTART_CMD", "").strip()
+        if command:
+            from tool_proxy.safe_shell import SafeShell
+
+            result = SafeShell(state_store=self.state_store).run(shlex.split(command), approved_by=approved_by or "agent_restart_review")
+            return {"status": str(result.get("status") or "executed"), "method": "restart_command", "tool_result": result}
+        return {
+            "status": "approved_no_op",
+            "method": "none",
+            "reason": "reconnect failed and no VEYRA_AGENT_RESTART_CMD configured; manual restart required",
+            "connection": self._compact_conn(conn),
+        }
 
     def _refresh_agent_capabilities(self) -> dict[str, Any]:
         adapter = self._resolve_agent_adapter()
