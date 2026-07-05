@@ -8,7 +8,7 @@ Use one desktop shell and one console UI:
 
 - Desktop shell: Tauri v2 under `apps/desktop`.
 - Frontend: the existing React/Vite console, built with `web/vite.desktop.config.ts`.
-- Backend: local FastAPI runtime on `127.0.0.1:8000`.
+- Backend: local FastAPI runtime on `127.0.0.1:8000`, auto-started by the desktop shell.
 - Local setup API: `/setup/status` and `/setup/env` for first-run status and whitelisted local `.env` writes.
 
 The web console build remains separate at `ui/console` with `/console/` asset paths. The desktop build writes relative assets into `apps/desktop/dist`, so a packaged window can load them without depending on the web route.
@@ -30,15 +30,17 @@ Implemented now:
 - `apps/desktop` Tauri app named `Veyra`.
 - `scripts/start_desktop_dev.sh` for local desktop development.
 - `scripts/build_desktop.sh` for target-OS desktop package builds.
+- `desktop_backend.py` as the bundled FastAPI backend entrypoint.
+- `scripts/build_desktop_sidecar.py` builds the PyInstaller sidecar expected by Tauri.
+- Tauri `bundle.externalBin` packages `veyra-backend-<target-triple>` with the app.
 - `web/vite.desktop.config.ts` for desktop-safe relative assets.
 - Local CORS allowlist for Tauri/local dev origins.
-- `/setup/status` reports app/platform/path/agent/Feishu/deployment status.
+- `/setup/status` reports app/platform/path/agent/Feishu/deployment status and desktop backend mode.
 - `/setup/env` writes only whitelisted `.env` keys from local clients and returns redacted values.
 - `scripts/generate_desktop_icons.py` creates macOS/Windows/Linux icons from the processed source image so imperfect source corners are not shown at the display edge.
 
 Not implemented yet:
 
-- Bundled Python backend sidecar.
 - One-click OpenClaw installation.
 - Code signing and notarization.
 - Windows/Linux package validation.
@@ -55,4 +57,4 @@ Target user flow:
 5. User saves optional model, Agent, Feishu, Tool Proxy, and alert settings through the window.
 6. Veyra runs `/health`, `/ops/deployment`, `/agent/status`, and a local `/events/message` acceptance.
 
-The current scaffold reaches steps 1-3 for developer builds when the backend is already running. The next phase should add the backend sidecar and complete the first-run forms.
+The current implementation reaches steps 1-3 for developer and packaged builds. The next phase should complete the first-run forms and OpenClaw install guidance.

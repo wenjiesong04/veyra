@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import sys
+import tempfile
+from os import chdir
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -10,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from routers.local_setup import _merge_env_text, _redact_env_value, _validate_env_updates  # noqa: E402
+from routers.local_setup import _default_env_text, _merge_env_text, _redact_env_value, _validate_env_updates  # noqa: E402
 
 
 def expect(condition: bool, message: str, detail: object = None) -> None:
@@ -40,6 +42,15 @@ def main() -> int:
     expect("UNRELATED=value" in merged, "unmanaged env keys are preserved")
     expect(_redact_env_value("FEISHU_APP_SECRET", "new-secret") == "***", "secrets are redacted")
     expect(_redact_env_value("OPENCLAW_BASE_URL", "http://127.0.0.1:18789").startswith("http"), "non-secret values remain visible")
+    cwd = Path.cwd()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            chdir(tmpdir)
+            fallback = _default_env_text()
+        finally:
+            chdir(cwd)
+    expect("VEYRA_CORE_MODEL_ENABLED=0" in fallback, "fallback env template is available without .env.example")
+    expect("OPENCLAW_BASE_URL=http://127.0.0.1:18789" in fallback, "fallback env template includes default OpenClaw URL")
 
     try:
         _validate_env_updates({"PATH": "/tmp"})

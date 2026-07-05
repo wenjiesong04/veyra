@@ -103,11 +103,10 @@ const workbenchSections: Array<{ id: WorkbenchSection; label: string; icon: Reac
   { id: "logs", label: "Logs", icon: <ScrollText size={15} /> }
 ];
 
-const desktopApiBase =
+const isDesktopRuntime =
   typeof window !== "undefined" &&
-  (window.location.protocol === "tauri:" || window.location.hostname === "tauri.localhost")
-    ? "http://127.0.0.1:8000"
-    : "";
+  (window.location.protocol === "tauri:" || window.location.hostname === "tauri.localhost");
+const desktopApiBase = isDesktopRuntime ? "http://127.0.0.1:8000" : "";
 
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
   const headers = new Headers(options?.headers);
@@ -248,6 +247,7 @@ function App() {
   const [result, setResult] = useState<MessageResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [backendBooting, setBackendBooting] = useState(isDesktopRuntime);
   const [activeSection, setActiveSection] = useState<WorkbenchSection>("awareness");
 
   const refresh = async () => {
@@ -376,8 +376,50 @@ function App() {
   };
 
   useEffect(() => {
-    refresh().catch((caught: Error) => setError(caught.message));
+    let cancelled = false;
+    const load = async (attempt = 0) => {
+      try {
+        await refresh();
+        if (!cancelled) {
+          setError(null);
+          setBackendBooting(false);
+        }
+      } catch (caught) {
+        const message = caught instanceof Error ? caught.message : "Unknown error";
+        if (isDesktopRuntime && attempt < 40) {
+          if (!cancelled) {
+            setBackendBooting(true);
+            setError(`Starting local Veyra runtime... ${message}`);
+          }
+          window.setTimeout(() => {
+            if (!cancelled) void load(attempt + 1);
+          }, 1000);
+          return;
+        }
+        if (!cancelled) {
+          setBackendBooting(false);
+          setError(message);
+        }
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  const manualRefresh = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      await refresh();
+      setBackendBooting(false);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const submit = async () => {
     setLoading(true);
@@ -742,15 +784,15 @@ function App() {
         </div>
         <div className="topbarRight">
           <StatusPill value={runtime?.lifecycle.status ?? "loading"} />
-          <button className="iconButton" onClick={() => refresh()} title="Refresh state" aria-label="Refresh state">
+          <button className="iconButton" onClick={manualRefresh} title="Refresh state" aria-label="Refresh state">
             <RefreshCw size={18} />
           </button>
         </div>
       </header>
 
       {error ? (
-        <div className="alert">
-          <AlertTriangle size={18} />
+        <div className={`alert ${backendBooting ? "booting" : ""}`}>
+          {backendBooting ? <RefreshCw className="spinIcon" size={18} /> : <AlertTriangle size={18} />}
           {error}
         </div>
       ) : null}
@@ -784,7 +826,7 @@ function App() {
             <div className="setupStep">
               <span>App</span>
               <strong>{String(setupDesktop.product_name ?? "Veyra")}</strong>
-              <small>{String(setupDesktop.shell ?? "desktop")}</small>
+              <small>{String(setupDesktop.shell ?? "desktop")} · {String(setupDesktop.backend_mode ?? "local_api")}</small>
             </div>
             <div className="setupStep">
               <span>Platform</span>

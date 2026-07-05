@@ -16,19 +16,13 @@ Build release packages on the target operating system first. Cross-compilation a
 
 ## Development
 
-Start the local Veyra API in one terminal:
+From the repo root:
 
 ```bash
-./scripts/start_local.sh --foreground
+./scripts/start_desktop_dev.sh
 ```
 
-Start the desktop shell in another terminal:
-
-```bash
-cd apps/desktop
-npm install
-npm run dev
-```
+The Tauri shell starts or reuses the local Veyra API automatically at `http://127.0.0.1:8000`.
 
 ## Build
 
@@ -38,15 +32,13 @@ From the repo root:
 ./scripts/build_desktop.sh
 ```
 
-Or from the desktop package:
+The build script creates the React desktop assets, builds a PyInstaller backend sidecar named `veyra-backend-<target-triple>`, and then runs `tauri build`. The resulting app package starts the bundled backend when the user opens `Veyra`.
 
-```bash
-cd apps/desktop
-npm install
-npm run build
-```
+Packaging prerequisites:
 
-The current scaffold expects the local Veyra API at `http://127.0.0.1:8000`. The next packaging phase should add a signed Python backend sidecar so end users can double-click `Veyra` without opening a terminal.
+- Rust/Cargo and Node.js/npm
+- Python dependencies installed with `./scripts/install_local.sh`
+- PyInstaller installed in the active Python environment, for example `python3 -m pip install pyinstaller`
 
 ## Icons
 

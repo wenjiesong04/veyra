@@ -15,16 +15,9 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 2
 fi
 
-python3 - <<'PY'
-from urllib.request import urlopen
-
-try:
-    with urlopen("http://127.0.0.1:8000/health", timeout=1.5) as response:
-        print(f"Veyra API reachable: HTTP {response.status}")
-except Exception:
-    print("Veyra API is not reachable at http://127.0.0.1:8000.")
-    print("Start it first with: ./scripts/start_local.sh --foreground")
-    raise SystemExit(2)
-PY
+if [ ! -f desktop_backend.py ]; then
+  echo "desktop_backend.py is required for Veyra Desktop to auto-start the local API." >&2
+  exit 2
+fi
 
 (cd apps/desktop && npm install && npm run dev)

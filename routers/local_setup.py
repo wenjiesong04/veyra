@@ -77,7 +77,8 @@ def build_local_setup_router(deps: dict[str, Any]) -> APIRouter:
                 "shell": "tauri",
                 "product_name": "Veyra",
                 "supported_platforms": ["macos", "windows", "linux"],
-                "backend_mode": "local_api",
+                "backend_mode": "desktop_sidecar" if os.getenv("VEYRA_DESKTOP") else "local_api",
+                "api_base_url": f"http://{os.getenv('VEYRA_HOST', '127.0.0.1')}:{os.getenv('VEYRA_PORT', '8000')}",
             },
             "platform": {
                 "system": platform.system(),
@@ -143,7 +144,50 @@ def _default_env_text() -> str:
     example = Path(".env.example")
     if example.exists():
         return example.read_text(encoding="utf-8")
-    return "# Veyra local configuration\n"
+    return """# Veyra local configuration
+VEYRA_STATE_ROOT=state
+VEYRA_AGENCY_ROOT=agency
+VEYRA_HOST=127.0.0.1
+VEYRA_PORT=8000
+VEYRA_ACTIVE_LOOP_AUTOSTART=1
+VEYRA_FEISHU_WS_AUTOSTART=1
+VEYRA_CORE_MODEL_ENABLED=0
+VEYRA_CORE_MODEL_PROVIDER=openai_compatible
+VEYRA_CORE_MODEL_BASE_URL=
+VEYRA_CORE_MODEL=
+VEYRA_CORE_MODEL_API_KEY_ENV=VEYRA_CORE_MODEL_API_KEY
+VEYRA_CORE_MODEL_API_KEY=
+VEYRA_CORE_MODEL_DECISION_MODE=auto
+VEYRA_CORE_MODEL_MAX_TOKENS=700
+VEYRA_SELECTED_AGENT=openclaw
+OPENCLAW_BASE_URL=http://127.0.0.1:18789
+OPENCLAW_GATEWAY_TOKEN=
+OPENCLAW_GATEWAY_PASSWORD=
+OPENCLAW_SCOPES=operator.read,operator.write
+OPENCLAW_MEMORY_SCOPES=operator.read,operator.write,operator.admin
+VEYRA_OPENCLAW_USE_LOCAL_CONFIG=1
+VEYRA_OPENCLAW_WORKSPACE_MEMORY_FALLBACK=1
+HERMES_BASE_URL=
+HERMES_API_KEY=
+CUSTOM_AGENT_BASE_URL=
+CUSTOM_AGENT_API_KEY=
+FEISHU_APP_ID=
+FEISHU_APP_SECRET=
+FEISHU_TENANT_ACCESS_TOKEN=
+FEISHU_DEFAULT_RECEIVE_ID=
+FEISHU_VERIFICATION_TOKEN=
+FEISHU_ENCRYPT_KEY=
+VEYRA_CHANNEL_WEBHOOK_URL=
+VEYRA_ALERT_WEBHOOK_URL=
+VEYRA_TOOL_PROXY_BROWSER_ENABLED=0
+VEYRA_TOOL_PROXY_BROWSER_ALLOWED_HOSTS=localhost,127.0.0.1,::1
+VEYRA_TOOL_PROXY_API_ENABLED=0
+VEYRA_TOOL_PROXY_API_ALLOWED_HOSTS=localhost,127.0.0.1,::1
+VEYRA_SEARCH_PROVIDER=auto
+VEYRA_YOUTUBE_CHANNEL_MAP=
+VEYRA_APP_LOG=
+VEYRA_AGENT_RESTART_CMD=
+"""
 
 
 def _merge_env_text(text: str, updates: dict[str, str | int | bool | None]) -> str:

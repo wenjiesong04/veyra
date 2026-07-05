@@ -605,6 +605,22 @@ code {
   font-weight: 700;
 }
 
+.alert.booting {
+  border-color: #cbd8e8;
+  background: #f4f8ff;
+  color: #27425f;
+}
+
+.spinIcon {
+  animation: spin 1.1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .emptyState {
   gap: 8px;
   min-height: 70px;

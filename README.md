@@ -15,9 +15,10 @@ Veyra also has a first-stage desktop shell under `apps/desktop`. The software na
 Current desktop development flow:
 
 ```bash
-./scripts/start_local.sh --foreground
 ./scripts/start_desktop_dev.sh
 ```
+
+The desktop app starts or reuses the local API automatically on `127.0.0.1:8000`.
 
 Build a desktop package on the target operating system:
 
@@ -25,7 +26,7 @@ Build a desktop package on the target operating system:
 ./scripts/build_desktop.sh
 ```
 
-The desktop scaffold currently expects the local API at `http://127.0.0.1:8000`. The next release step is to bundle the Python backend as a signed sidecar so users can double-click `Veyra` without starting the API in a terminal. See [`docs/desktop_release.md`](docs/desktop_release.md).
+The desktop package includes a local backend sidecar, so users can open `Veyra` without starting the API in a terminal. See [`docs/desktop_release.md`](docs/desktop_release.md).
 
 ## Five-Minute Local Start
 
