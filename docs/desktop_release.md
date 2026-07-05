@@ -34,6 +34,7 @@ Implemented now:
 - Local CORS allowlist for Tauri/local dev origins.
 - `/setup/status` reports app/platform/path/agent/Feishu/deployment status.
 - `/setup/env` writes only whitelisted `.env` keys from local clients and returns redacted values.
+- `scripts/generate_desktop_icons.py` creates macOS/Windows/Linux icons from the processed source image so imperfect source corners are not shown at the display edge.
 
 Not implemented yet:
 

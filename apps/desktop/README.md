@@ -47,3 +47,15 @@ npm run build
 ```
 
 The current scaffold expects the local Veyra API at `http://127.0.0.1:8000`. The next packaging phase should add a signed Python backend sidecar so end users can double-click `Veyra` without opening a terminal.
+
+## Icons
+
+`src-tauri/icons/icon-source-safe.png` is the canonical processed source icon. The original hand-cut source is not used by the app package.
+
+Regenerate the packaged app icons from the processed source:
+
+```bash
+python3 scripts/generate_desktop_icons.py
+```
+
+The generator creates macOS, Windows, and Linux icons under `src-tauri/icons/`. The packaged app uses those processed icons, so rough source-image corners are not displayed at the system icon edge.
