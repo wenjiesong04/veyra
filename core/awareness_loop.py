@@ -169,11 +169,20 @@ class AwarenessLoop:
             )
             return self._finalize_event(event, result, started_at, route_trace, context_observability)
         belief_state = self.belief.refresh()
+        preliminary_persona = self.persona_engine.patch_for(
+            text,
+            RiskLevel.R1,
+            channel=event.source.channel,
+            route=None,
+            target_agent=None,
+            decision={},
+        )
         turn_context = self.core_reasoning.turn_context.build(
             user_message=text,
             attention_focus=attention_focus,
             event=event,
             rule_decision={},
+            persona_hint=preliminary_persona,
         )
         context_observability = {
             "context_metrics": turn_context.get("_context_metrics", {}) if isinstance(turn_context, dict) else {},
@@ -362,7 +371,7 @@ class AwarenessLoop:
                 event_id=event.event_id,
                 route=decision.route,
                 status="success",
-                response=self._direct_answer(event, decision, attention_focus),
+                response=self._direct_answer(event, decision, attention_focus, persona_patch=persona_patch),
                 risk_level=decision.risk_level,
                 artifacts={
                     "attention": attention_focus,
@@ -405,7 +414,11 @@ class AwarenessLoop:
             agent_memory_summary = self.agent_adapter.fetch_memory_summary(event.source.session_id)
             if agent_memory_summary.get("summary"):
                 context_patch["agent_memory_summary"] = agent_memory_summary
-            scoped = self.context_scope.apply(context_patch, user_goal=text)
+            scoped = self.context_scope.apply(
+                context_patch,
+                user_goal=text,
+                token_budget_chars=int(persona_patch.get("context_budget_chars") or 6000),
+            )
             context_patch = scoped["context_patch"]
             if scoped.get("omitted_audit"):
                 self.state_store.append_jsonl(
@@ -902,7 +915,7 @@ class AwarenessLoop:
         details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
         return bool(details.get("sample") or details.get("results") or details.get("content") or probe_name in {"web", "log", "file"})
 
-    def _direct_answer(self, event: VeyraEvent, decision: Decision, attention_focus: list[str]) -> str:
+    def _direct_answer(self, event: VeyraEvent, decision: Decision, attention_focus: list[str], *, persona_patch: dict[str, Any]) -> str:
         text = str(event.payload.get("text", ""))
         if decision.intent == "identity" or "source:governance_identity" in decision.signals:
             return "我是 Veyra。OpenClaw 是我可以在需要执行复杂任务时治理和调用的 Agent Runtime，不是当前对话身份。"
@@ -950,7 +963,13 @@ class AwarenessLoop:
             if self._direct_draft_is_usable(text=text, decision=decision, draft=plan_draft, answer_assist=plan_answer):
                 decision.model_assist = {**decision.model_assist, "answer_assist": plan_answer}
                 return plan_draft
-        answer_assist = self.core_reasoning.answer_assist(text=text, attention_focus=attention_focus, decision=decision.to_dict(), event=event)
+        answer_assist = self.core_reasoning.answer_assist(
+            text=text,
+            attention_focus=attention_focus,
+            decision=decision.to_dict(),
+            event=event,
+            persona_patch=persona_patch,
+        )
         draft = str(answer_assist.get("draft_response") or answer_assist.get("response") or "").strip()
         if not draft and plan_draft:
             draft = plan_draft
@@ -1258,7 +1277,11 @@ class AwarenessLoop:
                 if topic:
                     return topic
         user_world = self.state_store.read_json("user_world.json")
-        topic = str(user_world.get("learning_topic") or "").strip()
+        scoped = self._scoped_user_profile(user_world, user_id)
+        topic = str(scoped.get("learning_topic") or "").strip()
+        if topic:
+            return topic
+        topic = str(user_world.get("learning_topic") or "").strip() if user_id in {"", "local-user"} else ""
         if topic:
             return topic
         memory_state = self.state_store.read_json("agent_memory.json")
@@ -1750,8 +1773,9 @@ class AwarenessLoop:
             return
         user_world = self.state_store.read_json("user_world.json")
         user_id = str(event.source.user_id or "local-user")
-        legacy_profile = user_world.setdefault("profile", {})
-        if not isinstance(legacy_profile, dict):
+        mirror_legacy = user_id in {"", "local-user"}
+        legacy_profile = user_world.setdefault("profile", {}) if mirror_legacy else {}
+        if mirror_legacy and not isinstance(legacy_profile, dict):
             legacy_profile = {}
             user_world["profile"] = legacy_profile
         profiles_by_user = user_world.setdefault("profiles_by_user", {})
@@ -1771,30 +1795,36 @@ class AwarenessLoop:
         program = signals.get("program") if isinstance(signals.get("program"), dict) else None
         if program and program.get("name"):
             value = {"program": program["name"], "name": program["name"], "direction": program.get("direction", ""), "source": "user_explicit_message"}
-            legacy_profile["program"] = value
+            if mirror_legacy:
+                legacy_profile["program"] = value
             scoped_profile["program"] = value
             if str(program["name"]).strip().upper() == "GSOC":
-                legacy_profile["gsoc"] = value
+                if mirror_legacy:
+                    legacy_profile["gsoc"] = value
                 scoped_profile["gsoc"] = value
             goal = f"program:{program['name']}" + (f":{program['direction']}" if program.get("direction") else "")
-            user_world["current_goal"] = goal
+            if mirror_legacy:
+                user_world["current_goal"] = goal
             scoped["current_goal"] = goal
             focus_tokens = [t for t in (program["name"], program.get("direction")) if t]
             focus = self._append_focus(focus, focus_tokens)
             scoped_focus = self._append_focus(scoped_focus, focus_tokens)
         if signals.get("education"):
-            legacy_profile["education"] = signals["education"]
+            if mirror_legacy:
+                legacy_profile["education"] = signals["education"]
             scoped_profile["education"] = signals["education"]
         if signals.get("project"):
             project = signals["project"]
-            user_world["current_goal"] = f"project:{project}"
-            user_world["current_project"] = project
+            if mirror_legacy:
+                user_world["current_goal"] = f"project:{project}"
+                user_world["current_project"] = project
             scoped["current_goal"] = f"project:{project}"
             scoped["current_project"] = project
             focus = self._append_focus(focus, [project, "project"])
             scoped_focus = self._append_focus(scoped_focus, [project, "project"])
 
-        user_world["focus"] = focus[-12:]
+        if mirror_legacy:
+            user_world["focus"] = focus[-12:]
         scoped["profile"] = scoped_profile
         scoped["focus"] = scoped_focus[-12:]
         scoped["updated_at"] = utc_now_iso()

@@ -136,16 +136,17 @@ action_executor = ActionExecutor(
     rollback_manager=rollback_manager,
 )
 foresight_engine = ForesightEngine(reasoning=awareness_loop.core_reasoning)
+agency_core = AgencyCore(state_store, reasoning=awareness_loop.core_reasoning)
 proactive_checks = ProactiveChecks(
     state_store,
     reasoning=awareness_loop.core_reasoning,
     review_queue=review_queue,
     agent_adapter_resolver=awareness_loop.agent_registry.selected,
+    agency=agency_core,
 )
 # Close the loop: approved proactive remediation / agent-restart reviews now execute.
 action_executor.proactive_executor = proactive_checks.execute_approved_proposal
 diff_tracker = DiffTracker()
-agency_core = AgencyCore(state_store, reasoning=awareness_loop.core_reasoning)
 safety_validation = SafetyValidation()
 retention_policy = RetentionPolicy(state_store)
 state_refresh = StateRefresh(state_store, reasoning=awareness_loop.core_reasoning, model_assist_enabled=False)

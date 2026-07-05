@@ -92,6 +92,8 @@ def compact_persona_binding(binding: dict[str, Any]) -> dict[str, Any]:
         "target_agent": binding.get("target_agent"),
         "risk_level": binding.get("risk_level"),
         "response_style": binding.get("response_style"),
+        "context_budget_chars": binding.get("context_budget_chars"),
+        "guideline_count": binding.get("guideline_count"),
         "updated_at": binding.get("updated_at"),
     }
 

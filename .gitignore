@@ -32,5 +32,10 @@ __pycache__/
 
 # Env
 .env
+.env.local
+.env.*.local
 .venv/
 venv/
+
+# Local-only backups created by scripts/reset_local_state.sh
+.veyra-local-backups/

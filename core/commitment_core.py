@@ -1157,9 +1157,7 @@ class CommitmentCore:
         ]
         if existing:
             return None
-        location = self._extract_location(user_text) or str(
-            self.state_store.read_json("user_world.json").get("preferences", {}).get("default_location") or ""
-        )
+        location = self._extract_location(user_text) or self._default_location_for_event(event)
         schedule = self._default_daily_schedule(user_text)
         validation = self._validate_weather_daily_payload(
             {"location": location, "topic": "weather"},
@@ -1315,13 +1313,21 @@ class CommitmentCore:
     def _sync_learning_goal_to_user_world(self, goal: dict[str, Any], commitment: dict[str, Any] | None) -> None:
         topic = str(goal.get("topic") or goal.get("title") or "学习计划")
         user_world = self.state_store.read_json("user_world.json")
-        user_world["current_goal"] = f"learning:{topic}"[:180]
-        user_world["goal_id"] = goal.get("goal_id")
-        user_world["goal_kind"] = goal.get("kind")
-        user_world["learning_topic"] = topic
+        user_id = str(goal.get("user_id") or (commitment or {}).get("user_id") or "local-user")
+        scoped = self._scoped_user_world(user_world, user_id)
+        patch = {
+            "current_goal": f"learning:{topic}"[:180],
+            "goal_id": goal.get("goal_id"),
+            "goal_kind": goal.get("kind"),
+            "learning_topic": topic,
+        }
         if commitment:
-            user_world["commitment_id"] = commitment.get("commitment_id")
-            user_world["commitment_kind"] = commitment.get("kind")
+            patch["commitment_id"] = commitment.get("commitment_id")
+            patch["commitment_kind"] = commitment.get("kind")
+        scoped.update(patch)
+        scoped["updated_at"] = utc_now_iso()
+        if self._should_mirror_legacy_user(user_id):
+            user_world.update(patch)
         user_world["updated_at"] = utc_now_iso()
         self.state_store.write_json("user_world.json", user_world)
 
@@ -1688,14 +1694,53 @@ class CommitmentCore:
         topic = str(payload.get("topic") or commitment.get("title") or "")
         goal = f"active_commitment:{commitment.get('kind')}:{topic}"[:180]
         user_world = self.state_store.read_json("user_world.json")
-        user_world["current_goal"] = goal
-        user_world["commitment_id"] = commitment.get("commitment_id")
-        user_world["commitment_kind"] = commitment.get("kind")
-        preferences = user_world.setdefault("preferences", {})
+        user_id = str(commitment.get("user_id") or "local-user")
+        scoped = self._scoped_user_world(user_world, user_id)
+        patch = {
+            "current_goal": goal,
+            "commitment_id": commitment.get("commitment_id"),
+            "commitment_kind": commitment.get("kind"),
+        }
+        scoped.update(patch)
+        preferences = scoped.setdefault("preferences", {})
         if isinstance(preferences, dict) and payload.get("location"):
             preferences["default_location"] = payload.get("location")
+        scoped["updated_at"] = utc_now_iso()
+        if self._should_mirror_legacy_user(user_id):
+            user_world.update(patch)
+            legacy_preferences = user_world.setdefault("preferences", {})
+            if isinstance(legacy_preferences, dict) and payload.get("location"):
+                legacy_preferences["default_location"] = payload.get("location")
         user_world["updated_at"] = utc_now_iso()
         self.state_store.write_json("user_world.json", user_world)
+
+    def _default_location_for_event(self, event: VeyraEvent) -> str:
+        user_world = self.state_store.read_json("user_world.json")
+        user_id = str(event.source.user_id or "local-user")
+        profiles = user_world.get("profiles_by_user") if isinstance(user_world.get("profiles_by_user"), dict) else {}
+        scoped = profiles.get(user_id) if isinstance(profiles.get(user_id), dict) else {}
+        scoped_preferences = scoped.get("preferences") if isinstance(scoped.get("preferences"), dict) else {}
+        location = str(scoped_preferences.get("default_location") or "").strip()
+        if location:
+            return location
+        if self._should_mirror_legacy_user(user_id) or not profiles:
+            preferences = user_world.get("preferences") if isinstance(user_world.get("preferences"), dict) else {}
+            return str(preferences.get("default_location") or "").strip()
+        return ""
+
+    def _scoped_user_world(self, user_world: dict[str, Any], user_id: str) -> dict[str, Any]:
+        profiles = user_world.setdefault("profiles_by_user", {})
+        if not isinstance(profiles, dict):
+            profiles = {}
+            user_world["profiles_by_user"] = profiles
+        scoped = profiles.setdefault(user_id, {})
+        if not isinstance(scoped, dict):
+            scoped = {}
+            profiles[user_id] = scoped
+        return scoped
+
+    def _should_mirror_legacy_user(self, user_id: str) -> bool:
+        return user_id in {"", "local-user"}
 
     def _normalize_schedule(self, schedule: dict[str, Any]) -> dict[str, Any]:
         kind = str(schedule.get("kind") or "daily")

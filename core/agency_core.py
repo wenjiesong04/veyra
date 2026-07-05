@@ -37,6 +37,8 @@ class AgencyCore:
         self.intention_path = self.agency_root / "intention_queue.json"
         self.goals_path = self.agency_root / "goals.json"
         self.triggers_path = self.agency_root / "triggers.yaml"
+        self.preferences_path = self.agency_root / "preferences.json"
+        self.self_policy_path = self.agency_root / "self_policy.yaml"
         self.agency_root.mkdir(parents=True, exist_ok=True)
         if not self.intention_path.exists():
             self.intention_path.write_text("[]", encoding="utf-8")
@@ -53,10 +55,15 @@ class AgencyCore:
         return "agency"
 
     def state(self) -> dict[str, Any]:
+        goals = self._read_json(self.goals_path, {})
+        triggers = self._read_triggers()
         return {
-            "goals": self._read_json(self.goals_path, {}),
+            "agency_root": str(self.agency_root),
+            "intention_path": str(self.intention_path),
+            "config_status": self._config_status(goals=goals, triggers=triggers),
+            "goals": goals,
             "active_commitments": self._active_commitments(),
-            "triggers": self._read_triggers(),
+            "triggers": triggers,
             "intentions": self.read_intentions(),
         }
 
@@ -272,6 +279,7 @@ class AgencyCore:
         if push_failure:
             gaps.append(push_failure)
 
+        gaps = self._apply_trigger_overlays(gaps)
         return self._merge_model_gaps(goals, world_state, gaps)
 
     def _commitment_push_failure_gap(self) -> dict[str, Any] | None:
@@ -387,6 +395,61 @@ class AgencyCore:
         if current:
             triggers.append(current)
         return triggers
+
+    def _apply_trigger_overlays(self, gaps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        triggers = self._read_triggers()
+        if not triggers:
+            return gaps
+        by_name = {str(item.get("name") or ""): item for item in triggers if isinstance(item, dict)}
+        output: list[dict[str, Any]] = []
+        for gap in gaps:
+            if not isinstance(gap, dict):
+                output.append(gap)
+                continue
+            trigger = by_name.get(str(gap.get("gap_id") or ""))
+            action = str((trigger or {}).get("action") or "").strip()
+            if not action:
+                output.append(gap)
+                continue
+            patched = dict(gap)
+            patched["suggested_action"] = action
+            patched["trigger_overlay"] = {"name": trigger.get("name"), "source": str(self.triggers_path)}
+            output.append(patched)
+        return output
+
+    def _config_status(self, *, goals: dict[str, Any], triggers: list[dict[str, str]]) -> dict[str, Any]:
+        goal_keys = sorted(str(key) for key in goals.keys()) if isinstance(goals, dict) else []
+        unused_goal_keys = [key for key in goal_keys if key not in {"selected_agent_must_be_available"}]
+        return {
+            "autonomy_level": {
+                "value": "A3",
+                "status": "fixed_default",
+                "reason": "A0-A5 policy selection is not implemented yet.",
+            },
+            "files": {
+                "goals.json": {
+                    "path": str(self.goals_path),
+                    "status": "active" if self.goals_path.exists() else "missing",
+                    "active_keys": [key for key in goal_keys if key == "selected_agent_must_be_available"],
+                    "legacy_unused_keys": unused_goal_keys,
+                },
+                "triggers.yaml": {
+                    "path": str(self.triggers_path),
+                    "status": "active_overlay" if triggers else "missing_or_empty",
+                    "active_triggers": [str(item.get("name") or "") for item in triggers if item.get("name")],
+                },
+                "preferences.json": {
+                    "path": str(self.preferences_path),
+                    "status": "local_user_defaults" if self.preferences_path.exists() else "missing",
+                    "reason": "Only used as defaults for local-user profile fallback, not as global multi-user truth.",
+                },
+                "self_policy.yaml": {
+                    "path": str(self.self_policy_path),
+                    "status": "legacy_unused" if self.self_policy_path.exists() else "missing",
+                    "reason": "Guardian and ToolProxy policy are code-defined; this file is not an execution input.",
+                },
+            },
+        }
 
     def _active_commitments(self) -> list[dict[str, Any]]:
         if not self.state_store:

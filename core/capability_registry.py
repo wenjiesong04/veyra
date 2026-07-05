@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import os
+from pathlib import Path
+import shutil
 from typing import Any
 
 from core.model_client import redact_sensitive
@@ -115,6 +118,8 @@ class CapabilityRegistry:
         now = utc_now_iso()
 
         capabilities = self._static_capabilities()
+        capabilities.update(self._tool_proxy_capabilities(now))
+        capabilities.update(self._mcp_capabilities(now))
         agent_runtime_available = bool(agent_enabled and (agent_base_url or selected_agent in agents))
         capabilities["selected_agent_runtime"] = Capability(
             capability_id="selected_agent_runtime",
@@ -194,6 +199,16 @@ class CapabilityRegistry:
                 name: capability.to_dict()
                 for name, capability in sorted(capabilities.items())
                 if capability.namespace == "agent" and "." in name
+            },
+            "tool_proxy_capabilities": {
+                name: capability.to_dict()
+                for name, capability in sorted(capabilities.items())
+                if capability.namespace == "tool_proxy"
+            },
+            "mcp_capabilities": {
+                name: capability.to_dict()
+                for name, capability in sorted(capabilities.items())
+                if capability.namespace == "mcp"
             },
             "missing_capabilities": missing,
             "routes": {
@@ -333,6 +348,123 @@ class CapabilityRegistry:
                 updated_at=now,
             )
         return capabilities
+
+    def _tool_proxy_capabilities(self, now: str) -> dict[str, Capability]:
+        ops_config = self.state_store.read_json("ops_config.json")
+        tool_proxy = ops_config.get("tool_proxy") if isinstance(ops_config.get("tool_proxy"), dict) else {}
+        browser_enabled = bool(tool_proxy.get("browser_executor_enabled", False))
+        api_enabled = bool(tool_proxy.get("api_executor_enabled", False))
+        browser_hosts = tool_proxy.get("browser_allowed_hosts") if isinstance(tool_proxy.get("browser_allowed_hosts"), list) else []
+        api_hosts = tool_proxy.get("api_allowed_hosts") if isinstance(tool_proxy.get("api_allowed_hosts"), list) else []
+        return {
+            "safe_shell": Capability(
+                capability_id="safe_shell",
+                available=True,
+                kind="tool_proxy",
+                route="native_tool",
+                executor="safe_shell",
+                description="Governed shell command execution through ToolProxy policy and trace.",
+                status="available",
+                updated_at=now,
+                namespace="tool_proxy",
+            ),
+            "safe_file_read": Capability(
+                capability_id="safe_file_read",
+                available=True,
+                kind="tool_proxy",
+                route="native_tool",
+                executor="safe_file",
+                description="Governed local file reads through ToolProxy policy and trace.",
+                status="available",
+                updated_at=now,
+                namespace="tool_proxy",
+            ),
+            "safe_file_write": Capability(
+                capability_id="safe_file_write",
+                available=True,
+                kind="tool_proxy",
+                route="native_tool",
+                executor="safe_file",
+                description="Governed local file writes with review/snapshot policy.",
+                status="available",
+                updated_at=now,
+                namespace="tool_proxy",
+            ),
+            "safe_browser_open": Capability(
+                capability_id="safe_browser_open",
+                available=browser_enabled,
+                kind="tool_proxy",
+                route="native_tool",
+                executor="safe_browser",
+                description="Guarded browser open action with allowlisted executor hosts.",
+                status="configured" if browser_enabled else "not_configured",
+                reason="" if browser_enabled else "Browser execution is disabled until /tool-proxy/config enables it.",
+                updated_at=now,
+                namespace="tool_proxy",
+            ),
+            "browser": Capability(
+                capability_id="browser",
+                available=browser_enabled,
+                kind="tool_proxy",
+                route="native_tool",
+                executor="safe_browser",
+                description="Generic browser capability backed by SafeBrowser.",
+                status="configured" if browser_enabled else "not_configured",
+                reason=", ".join(str(item) for item in browser_hosts[:6]) if browser_enabled else "SafeBrowser executor is not configured.",
+                updated_at=now,
+                namespace="tool_proxy",
+            ),
+            "safe_api_request": Capability(
+                capability_id="safe_api_request",
+                available=api_enabled,
+                kind="tool_proxy",
+                route="native_tool",
+                executor="safe_api",
+                description="Guarded outbound API request with method and host policy.",
+                status="configured" if api_enabled else "not_configured",
+                reason=", ".join(str(item) for item in api_hosts[:6]) if api_enabled else "SafeAPI executor is disabled until /tool-proxy/config enables it.",
+                updated_at=now,
+                namespace="tool_proxy",
+            ),
+        }
+
+    def _mcp_capabilities(self, now: str) -> dict[str, Capability]:
+        config_files = [
+            Path.cwd() / ".mcp.json",
+            Path.home() / ".config" / "mcp" / "config.json",
+            Path.home() / ".cursor" / "mcp.json",
+        ]
+        existing = [str(path) for path in config_files if path.exists()]
+        env_servers = [key for key in os.environ if key.startswith("MCP_")]
+        cli = shutil.which("mcp") or shutil.which("npx")
+        configured = bool(existing or env_servers)
+        runnable = bool(configured and cli)
+        return {
+            "mcp_runtime": Capability(
+                capability_id="mcp_runtime",
+                available=runnable,
+                kind="external_tool_runtime",
+                route="probe",
+                executor="mcp_probe",
+                description="MCP runtime/configuration visibility through Veyra probes.",
+                status="available" if runnable else "config_detected" if configured else "not_detected",
+                reason="" if runnable else "MCP config exists but no CLI was detected." if configured else "No MCP config files or MCP_* env keys detected.",
+                updated_at=now,
+                namespace="mcp",
+            ),
+            "mcp_config": Capability(
+                capability_id="mcp_config",
+                available=configured,
+                kind="external_tool_config",
+                route="probe",
+                executor="mcp_probe",
+                description="Detected MCP config files or MCP_* environment keys.",
+                status="available" if configured else "not_detected",
+                reason=", ".join(existing[:3]) if existing else "No MCP config detected.",
+                updated_at=now,
+                namespace="mcp",
+            ),
+        }
 
     def _agent_capabilities(self, selected_agent: str, selected_config: dict[str, Any]) -> dict[str, Capability]:
         output: dict[str, Capability] = {}

@@ -2,9 +2,90 @@
 
 Virtual Entity for Yielding Real-time Awareness.
 
-Veyra v0.1 is an awareness-first Agent governance skeleton. It receives events, updates local awareness state, evaluates risk, chooses a route, and either answers directly, runs a read-only probe, blocks unsafe actions, or generates a `VeyraTaskPacket` for the selected Agent Runtime.
+Veyra v0.1 is an awareness-first Agent governance runtime for local personal production. It receives events, updates local awareness state, evaluates risk, chooses a route, and either answers directly, runs a read-only probe, blocks unsafe actions, or generates a `VeyraTaskPacket` for the selected Agent Runtime.
 
-Veyra is now in the Runtime Stabilization phase. The core closed loop is complete; the next work should prioritize real Feishu soak testing, telemetry, context drift control, ToolProxy closed-loop verification, and gradual UI/router decomposition rather than blindly adding more modules.
+Veyra is local-first: clone it from GitHub, configure your own model/OpenClaw/Feishu surfaces, and keep runtime data on your machine under `state/`. It is not a SaaS service and does not require cloud tenancy, accounts, billing, or remote data storage.
+
+Veyra is now in Runtime Stabilization and local release hardening. The core closed loop is complete; the next work should prioritize fresh-clone startup, real Feishu/OpenClaw soak testing, telemetry, context drift control, ToolProxy closed-loop verification, and gradual UI/router decomposition rather than blindly adding more modules.
+
+## Five-Minute Local Start
+
+Requirements:
+
+- Python 3.11+
+- Node.js/npm, only needed to rebuild the local console
+- Optional: local OpenClaw Gateway at `http://127.0.0.1:18789`
+- Optional: your own Feishu app credentials for local WebSocket or callback intake
+
+```bash
+git clone https://github.com/wenjiesong04/veyra.git
+cd veyra
+cp .env.example .env
+./scripts/install_local.sh
+```
+
+Edit `.env` for only the services you use:
+
+```bash
+# Core model, OpenAI-compatible
+VEYRA_CORE_MODEL_ENABLED=1
+VEYRA_CORE_MODEL_BASE_URL=http://127.0.0.1:11434/v1
+VEYRA_CORE_MODEL=your-model
+VEYRA_CORE_MODEL_API_KEY=
+
+# OpenClaw, optional but recommended
+OPENCLAW_BASE_URL=http://127.0.0.1:18789
+OPENCLAW_GATEWAY_TOKEN=
+
+# Feishu, optional
+FEISHU_APP_ID=
+FEISHU_APP_SECRET=
+FEISHU_DEFAULT_RECEIVE_ID=
+```
+
+Start the API in the foreground:
+
+```bash
+./scripts/start_local.sh --foreground
+```
+
+On macOS, run it under the user LaunchAgent instead:
+
+```bash
+./scripts/start_local.sh --launchd
+```
+
+Check the local runtime:
+
+```bash
+./scripts/status_local.sh
+curl -s http://127.0.0.1:8000/agent/status
+```
+
+Open the local control console after the frontend has been built:
+
+```text
+http://127.0.0.1:8000/console/
+```
+
+If you need a clean local runtime state:
+
+```bash
+./scripts/reset_local_state.sh
+```
+
+The reset script backs up `state/` under `.veyra-local-backups/` and recreates the default state files. It refuses to run while the local API is reachable unless `--force` is supplied.
+
+## Local Data Boundary
+
+Release files are code and templates only. User runtime data is local:
+
+- `.env` contains local secrets and is ignored.
+- `state/` contains runtime logs, snapshots, user commitments, channel state, OpenClaw device material, and memory mirrors; it is ignored.
+- `agency/goals.json`, `agency/preferences.json`, `agency/triggers.yaml`, and `agency/self_policy.yaml` are generic defaults, not user history.
+- Real Feishu/OpenClaw validation is environment-specific. Unconfigured services should report `not_configured` instead of pretending to be connected.
+
+See [`docs/local_release_checklist.md`](docs/local_release_checklist.md) before cutting or publishing a local release.
 
 ## Current v0.1 Loop
 
@@ -25,7 +106,7 @@ User/Event
 ## FastAPI
 
 ```bash
-uvicorn main:app --reload
+python3 -B -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 Endpoints:
@@ -172,7 +253,14 @@ The Vite dev server proxies API calls to `http://127.0.0.1:8000`.
 
 ## MVP Self-Test
 
-Run the core governance loop, review approval, Tool Proxy, rollback, Memory Bridge, proactive check, and readiness checks in one command:
+Run the current gate smoke suite:
+
+```bash
+python3 scripts/run_smokes.py --group gate --timeout 90
+python3 -m compileall core interface runtime execution tool_proxy routers main.py scripts
+```
+
+Run the broader core governance loop, review approval, Tool Proxy, rollback, Memory Bridge, proactive check, and readiness checks in one command:
 
 ```bash
 python3 scripts/mvp_self_test.py

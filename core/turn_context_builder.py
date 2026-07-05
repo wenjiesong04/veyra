@@ -32,6 +32,7 @@ class TurnContextBuilder:
         attention_focus: list[str],
         event: VeyraEvent | None = None,
         rule_decision: dict[str, Any] | None = None,
+        persona_hint: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         state = self._scoped_state()
         relevant_claims = self.belief.relevant_claims(attention_focus, limit=4)
@@ -47,7 +48,7 @@ class TurnContextBuilder:
         ]
         payload_metadata = event.payload.get("metadata") if event else {}
         risk_state = state.get("risk_state", {}) if isinstance(state.get("risk_state"), dict) else {}
-        persona = self._persona_summary(state.get("persona_state", {}))
+        persona = self._persona_summary(state.get("persona_state", {}), persona_hint=persona_hint)
         context = redact_sensitive(
             {
                 "active_context": {
@@ -359,14 +360,27 @@ class TurnContextBuilder:
             "core_model_decision_mode": core_model.get("decision_mode"),
         }
 
-    def _persona_summary(self, value: Any) -> dict[str, Any]:
+    def _persona_summary(self, value: Any, *, persona_hint: dict[str, Any] | None = None) -> dict[str, Any]:
         if not isinstance(value, dict):
-            return {}
-        return {
+            value = {}
+        summary = {
             "active_modes": value.get("active_modes", []),
             "last_route": (value.get("last_binding") or {}).get("route") if isinstance(value.get("last_binding"), dict) else None,
             "response_style": (value.get("last_binding") or {}).get("response_style") if isinstance(value.get("last_binding"), dict) else None,
         }
+        if isinstance(persona_hint, dict) and persona_hint:
+            summary.update(
+                {
+                    "active_modes": persona_hint.get("mode") or summary.get("active_modes"),
+                    "route": persona_hint.get("route"),
+                    "response_style": persona_hint.get("response_style") or summary.get("response_style"),
+                    "tool_policy": persona_hint.get("tool_policy") if isinstance(persona_hint.get("tool_policy"), dict) else {},
+                    "token_budget": persona_hint.get("token_budget") if isinstance(persona_hint.get("token_budget"), dict) else {},
+                    "context_budget_chars": persona_hint.get("context_budget_chars"),
+                    "guidelines": persona_hint.get("guidelines", [])[:6] if isinstance(persona_hint.get("guidelines"), list) else [],
+                }
+            )
+        return summary
 
     def _capability_summary(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         capabilities = snapshot.get("capabilities") if isinstance(snapshot.get("capabilities"), dict) else {}
@@ -386,6 +400,13 @@ class TurnContextBuilder:
             "weather_probe",
             "vision",
             "selected_agent_runtime",
+            "safe_shell",
+            "safe_file_read",
+            "safe_file_write",
+            "safe_browser_open",
+            "safe_api_request",
+            "mcp_runtime",
+            "mcp_config",
         }
         for name, payload in capabilities.items():
             if not isinstance(payload, dict):

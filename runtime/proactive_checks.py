@@ -46,13 +46,14 @@ class ProactiveChecks:
         model_assist_enabled: bool = False,
         review_queue: ReviewQueue | None = None,
         agent_adapter_resolver: Optional[Callable[[], Any]] = None,
+        agency: AgencyCore | None = None,
     ) -> None:
         self.state_store = state_store
         self.reasoning = reasoning or CoreReasoning(state_store)
         self.model_assist_enabled = model_assist_enabled
         self.perception = PerceptionLayer(state_store, reasoning=self.reasoning, model_assist_enabled=model_assist_enabled)
         selected_agency_root = os.getenv("VEYRA_AGENCY_ROOT", "agency") if str(agency_root) == "agency" else agency_root
-        self.agency = AgencyCore(state_store, agency_root=selected_agency_root, reasoning=self.reasoning, model_assist_enabled=model_assist_enabled)
+        self.agency = agency or AgencyCore(state_store, agency_root=selected_agency_root, reasoning=self.reasoning, model_assist_enabled=model_assist_enabled)
         self.foresight = ForesightEngine(reasoning=self.reasoning if model_assist_enabled else None)
         self.guardian = GuardianController()
         self.review_queue = review_queue or ReviewQueue(state_store)

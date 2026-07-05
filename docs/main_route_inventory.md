@@ -1,20 +1,21 @@
 # main.py Route Inventory
 
-Runtime Stabilization pass, 2026-05-26.
+Runtime Stabilization and local release hardening pass, 2026-07-05.
 
-Before this pass, `main.py` held the route layer directly. The user-facing target referred to 106 existing routes; this pass adds 7 runtime observability/metrics routes, so the app now exposes 113 API routes total. First-stage split keeps core runtime construction in `main.py`, moves low-risk route surfaces into `routers/`, and leaves business objects unchanged.
+`main.py` still owns runtime object wiring and the highest-coupling route surfaces. Lower-risk surfaces have been split into `routers/`. The current app exposes 136 FastAPI routes total, including OpenAPI/Swagger/Redoc and the console static mount; 131 are callable product/API routes.
 
-Current `main.py` line count: 998.
+Current `main.py` line count: 1164.
 
 ## Router Split
 
 | Router | Domains | Notes |
 | --- | --- | --- |
-| `main.py` | ui, feishu/channel intake, tool_proxy, rollback restore, ActionProposal, mvp/runtime status | Runtime object wiring remains centralized. |
+| `main.py` | ui, feishu/channel intake, tool_proxy, rollback restore, ActionProposal, health, mvp/runtime status | Runtime object wiring remains centralized. |
 | `routers/runtime_observability.py` | runtime, metrics | New trace/soak/telemetry APIs. |
-| `routers/debug_audit.py` | state, debug, audit, rollback diff | Logs, model config, review queue, replay, stale refresh, external watch, belief/persona surfaces. |
-| `routers/ops_runtime.py` | runtime, metrics/ops | Active loop, cron, soak, health, alerts, retention, deployment, runtime matrix. |
+| `routers/debug_audit.py` | state, capabilities, debug, audit, rollback diff | Logs, model config, review queue, replay, stale refresh, external watch, belief/persona/attention surfaces. |
+| `routers/ops_runtime.py` | runtime, metrics/ops | Active loop, cron, soak, health, alerts, retention, deployment, runtime matrix, external-runtime and stale-review hygiene. |
 | `routers/agent_memory.py` | agent, memory | Agent task callbacks/status/config and memory provider routes. |
+| `routers/commitments.py` | commitments | Local user commitments and due-run push controls. |
 
 ## Domain Classification
 
@@ -33,16 +34,21 @@ Current `main.py` line count: 998.
 ### state
 
 - `GET /state`
+- `GET /state/health`
 - `GET /architecture`
 - `GET /definitions`
 - `GET /heartbeat`
 - `GET /agency/intentions`
 - `GET /personas/status`
 - `GET /belief/status`
+- `GET /belief/stale`
+- `GET /attention/active`
 - `POST /belief/refresh`
 - `POST /state/refresh-stale`
 - `POST /external/refresh`
 - `POST /external/watchlist`
+- `GET /capabilities/snapshot`
+- `POST /capabilities/refresh`
 
 ### runtime
 
@@ -78,9 +84,14 @@ Current `main.py` line count: 998.
 - `GET /ops/deployment/config`
 - `GET /ops/runtime-matrix`
 - `POST /ops/runtime-matrix/run`
+- `GET /ops/external-runtime`
+- `POST /ops/external-runtime/probe`
 - `GET /ops/safety/red-team`
 - `GET /ops/retention`
 - `POST /ops/retention/enforce`
+- `GET /ops/reviews/diagnostic`
+- `POST /ops/reviews/{review_id}/resolve`
+- `POST /ops/reviews/{review_id}/archive`
 
 ### debug
 
@@ -96,6 +107,7 @@ Current `main.py` line count: 998.
 - `GET /logs/core-model`
 - `GET /logs/alerts`
 - `GET /mvp/status`
+- `POST /proactive/check`
 
 ### agent
 
@@ -119,6 +131,16 @@ Current `main.py` line count: 998.
 - `GET /memory/providers/diagnostics`
 - `POST /memory/providers/diagnostics`
 - `POST /memory/patch`
+
+### commitments
+
+- `GET /commitments`
+- `POST /commitments`
+- `GET /commitments/{commitment_id}`
+- `POST /commitments/{commitment_id}/confirm`
+- `POST /commitments/{commitment_id}/pause`
+- `POST /commitments/{commitment_id}/cancel`
+- `POST /commitments/run-due`
 
 ### rollback
 

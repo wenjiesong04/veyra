@@ -52,7 +52,7 @@ class ExternalWorldRefresh:
                 assist = self.reasoning.external_world_assist(
                     target=target,
                     probe_result=probe_result,
-                    current_goal=str(self.state_store.read_json("user_world.json").get("current_goal") or ""),
+                    current_goal=self._current_goal_for_watch_item(item),
                 )
                 refreshed.append(
                     {
@@ -122,6 +122,7 @@ class ExternalWorldRefresh:
                     "enabled": True,
                     "topic": topic,
                     "goal_id": goal_id,
+                    "user_id": goal.get("user_id"),
                     "commitment_id": goal.get("commitment_id"),
                     "query": self._learning_query(topic),
                     "reason": "authorized_learning_goal",
@@ -141,6 +142,7 @@ class ExternalWorldRefresh:
             "target": item.get("target"),
             "kind": "learning_search",
             "goal_id": item.get("goal_id"),
+            "user_id": item.get("user_id"),
             "commitment_id": item.get("commitment_id"),
             "topic": topic,
             "query": query,
@@ -163,6 +165,7 @@ class ExternalWorldRefresh:
             "target": item.get("target"),
             "kind": "external_search",
             "watchlist_id": item.get("watchlist_id"),
+            "user_id": item.get("user_id"),
             "commitment_id": item.get("commitment_id"),
             "topic": topic,
             "query": query,
@@ -176,6 +179,17 @@ class ExternalWorldRefresh:
 
     def _learning_query(self, topic: str) -> str:
         return f"{topic} latest tutorial course paper 2026"
+
+    def _current_goal_for_watch_item(self, item: dict[str, Any]) -> str:
+        user_world = self.state_store.read_json("user_world.json")
+        user_id = str(item.get("user_id") or "").strip()
+        if user_id:
+            profiles = user_world.get("profiles_by_user") if isinstance(user_world.get("profiles_by_user"), dict) else {}
+            scoped = profiles.get(user_id) if isinstance(profiles.get(user_id), dict) else {}
+            goal = str(scoped.get("current_goal") or "").strip()
+            if goal:
+                return goal
+        return str(user_world.get("current_goal") or "").strip()
 
     def _safe_search(self, query: str, *, max_results: int) -> dict[str, Any]:
         try:

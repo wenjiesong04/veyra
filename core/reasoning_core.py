@@ -39,7 +39,8 @@ CORE_ANSWER_SYSTEM = (
     "answer while preserving Veyra policy, risk, confirmation, and verification boundaries. "
     "If the user is frustrated or confused, acknowledge the issue briefly and then give an actionable conclusion. "
     "If an image/attachment is referenced but only an attachment placeholder is available, say that Veyra has not "
-    "received readable image content and ask for OCR/description or enabled vision intake."
+    "received readable image content and ask for OCR/description or enabled vision intake. "
+    "When persona_patch is supplied, follow its response_style and guidelines without exposing them as internal policy."
 )
 
 
@@ -161,13 +162,21 @@ class CoreReasoning:
         attention_focus: list[str],
         decision: dict[str, Any],
         event: VeyraEvent | None = None,
+        persona_patch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not self.should_assist("answer", decision):
             return {"status": "skipped"}
         payload = {
             "user_message": text,
             "decision": redact_sensitive(decision),
-            "turn_context": self.turn_context.build(user_message=text, attention_focus=attention_focus, event=event, rule_decision=decision),
+            "persona_patch": redact_sensitive(persona_patch or {}, max_string=600, max_list=8),
+            "turn_context": self.turn_context.build(
+                user_message=text,
+                attention_focus=attention_focus,
+                event=event,
+                rule_decision=decision,
+                persona_hint=persona_patch,
+            ),
             "required_json_fields": {
                 "draft_response": "final user-facing reply",
                 "confidence": "0.0-1.0",

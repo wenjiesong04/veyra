@@ -1,14 +1,16 @@
 # Veyra Development Status
 
-Updated after Runtime Stabilization hardening.
+Updated after Runtime Stabilization and local release hardening.
 
-Veyra has moved from feature-complete MVP into Runtime Stabilization. The core closed loop is complete; current work should make the runtime observable, debuggable, stable under real Feishu traffic, and resistant to context/tool bypass drift. Do not keep adding unrelated modules before the live Feishu soak, telemetry dashboard, context drift, ToolProxy closed-loop, and UI/router split are validated.
+Veyra has moved from feature-complete MVP into local-first release hardening. The target is a GitHub-downloadable personal production runtime: users run Veyra locally, configure their own model/OpenClaw/Feishu surfaces, and keep all runtime data under their local `state/` directory. This is not a SaaS target; multi-user data isolation exists only to keep local channel/user records correct when Feishu or other adapters provide different `user_id` values.
+
+The core closed loop is complete. Current work should make the runtime easy to install, observable, debuggable, stable under real Feishu traffic, and resistant to context/tool bypass drift. Do not keep adding unrelated modules before local release packaging, live Feishu/OpenClaw soak, context drift tuning, ToolProxy closed-loop validation, and UI/router cleanup are validated.
 
 ## Data Reality
 
 The backend and console do not use hardcoded demo fixtures. The UI reads live local API responses from Veyra endpoints such as `/state`, `/runtime`, `/architecture`, `/logs/*`, `/agents`, `/agent/status`, and `/mvp/status`.
 
-Current local `state/` data may contain older self-test records from earlier development. Those records are real runtime outputs from tests, not static mock data. Runtime JSONL logs and snapshots are intentionally excluded from commits unless explicitly requested. Current self-test scripts redirect `VEYRA_STATE_ROOT` and `VEYRA_AGENCY_ROOT` to temporary directories before app import, so new test traffic does not write into the working runtime state or the tracked agency intention queue.
+Current local `state/` data may contain older self-test records from earlier development. Those records are real runtime outputs from tests, not static mock data. Runtime JSONL logs, snapshots, OpenClaw device material, Feishu credentials, and user commitments must stay out of GitHub releases. Current self-test scripts redirect `VEYRA_STATE_ROOT` and `VEYRA_AGENCY_ROOT` to temporary directories before app import, so new test traffic does not write into the working runtime state or the tracked agency template files.
 
 | Data area | Source | Reality |
 | --- | --- | --- |
@@ -33,7 +35,7 @@ Current local `state/` data may contain older self-test records from earlier dev
 | P7 Production operations and safety validation | Implemented, live validation pending | Non-destructive red-team validation, retention summary/enforcement, runtime matrix, bounded/session soak APIs, Ops health, alerts, local/webhook alert dispatch, deployment config validation, and deployment readiness checks exist. `/ops/deployment` and `/ops/runtime-matrix` report not_configured or validation_pending instead of pretending live production readiness. |
 | P8 Continuous awareness entity runtime | Implemented, local self-tested | Scheduled active-loop ticks, multi-channel intake state, multi-Agent certification/invocation, deeper Belief TTL/source trust, and automatic replay candidate scanning with guarded compensation review creation. Live external runtime validation still depends on configured OpenClaw/Hermes/Custom services. |
 | P9 Chat app integration and guarded automation | Implemented, Feishu local OpenAPI self-tested | Feishu channel config, outbound message delivery, URL verification, message callbacks, local WebSocket long-connection intake, OpenClaw config import, runtime cron scheduler, persona channel/Agent binding, and explicit guarded replay auto-execution. Live Feishu validation requires real app credentials and either callback URL or long-connection mode. |
-| P10 Runtime Stabilization | Implemented, live soak pending | Runtime trace recorder, telemetry summary APIs, ContextDriftDetector, ToolProxy guard smoke, and first-stage `main.py` route split are implemented. Real Feishu soak must validate stability under real user traffic. |
+| P10 Runtime Stabilization and local release hardening | Implemented, live soak pending | Runtime trace recorder, telemetry summary APIs, ContextDriftDetector, ToolProxy guard smoke, first-stage route split, local install/start/status/reset scripts, `.env.example`, GitHub smoke workflow, and release-state boundary are implemented. Real Feishu/OpenClaw soak must validate stability under real user traffic. |
 
 ## Eight Architecture Blocks
 
@@ -78,7 +80,8 @@ Current local `state/` data may contain older self-test records from earlier dev
 | Surface | Purpose |
 | --- | --- |
 | `/runtime`, `/state`, `/heartbeat`, `/runtime/active-loop`, `/runtime/active-loop/*`, `/runtime/cron/*`, `/runtime/traces/*`, `/runtime/soak/status` | Runtime identity, state cache, heartbeat, continuous awareness loop control, bounded scheduler control, real-message routing traces, and Feishu soak status |
-| `/architecture`, `/definitions`, `/mvp/status` | Architecture metadata, risk/lifecycle/mode definitions, implementation flags, and validation status |
+| `/architecture`, `/definitions`, `/mvp/status`, `/capabilities/snapshot`, `/capabilities/refresh` | Architecture metadata, risk/lifecycle/mode definitions, implementation flags, validation status, and unified capability discovery |
+| `/commitments`, `/commitments/*` | Local user commitments, explicit confirmation/pause/cancel controls, and due-run push execution |
 | `/events/message`, `/channels`, `/channels/{channel}/config`, `/channels/{channel}/messages`, `/channels/{channel}/send`, `/channels/outbox`, `/channels/sessions`, `/integrations/feishu/events`, `/integrations/feishu/import-openclaw`, `/integrations/feishu/ws/*` | Standard user-message event entry plus local/Feishu multi-channel intake, config, dedupe, session, delivery, callback, OpenClaw config import, WebSocket long connection, and outbox state |
 | `/core/model/status`, `/core/model/config`, `/logs/core-model` | Core model config/status and redacted model reasoning audit |
 | `/memory/providers`, `/memory/providers/diagnostics`, `/memory/summary`, `/memory/patch`, `/belief/status`, `/belief/refresh` | Memory provider discovery, diagnostics, summary reads, filtered writes, and Belief TTL lifecycle management |
@@ -88,7 +91,7 @@ Current local `state/` data may contain older self-test records from earlier dev
 | `/tool-proxy/*`, `/tool-proxy/status`, `/tool-proxy/config` | Safe shell/file/browser/API execution boundary with optional Browser/API executor configuration and host allowlists |
 | `/rollback/*`, `/audit/journal`, `/audit/time-travel`, `/audit/replay/*`, `/audit/replay/runtime/*` | Snapshot, diff, restore, git diff, correlated journal, time-travel summary, replay plans, guarded replay compensation proposals, automatic replay runtime state, and explicit guarded auto-execute |
 | `/personas/status` | Persona mode, channel, risk, route, Agent, token budget, and policy binding audit |
-| `/ops/health`, `/ops/alerts`, `/ops/alerts/dispatch`, `/ops/alerting`, `/ops/deployment`, `/ops/deployment/config`, `/ops/runtime-matrix`, `/ops/runtime-matrix/run`, `/ops/soak`, `/ops/soak/status`, `/ops/soak/start`, `/ops/soak/stop`, `/ops/safety/red-team`, `/ops/retention`, `/ops/retention/enforce` | Operational health, alerts, local/webhook alert dispatch, deployment readiness/config validation, runtime matrix with validation metadata, bounded/session soak, red-team safety, and retention checks/enforcement |
+| `/ops/health`, `/ops/alerts`, `/ops/alerts/dispatch`, `/ops/alerting`, `/ops/deployment`, `/ops/deployment/config`, `/ops/runtime-matrix`, `/ops/runtime-matrix/run`, `/ops/external-runtime`, `/ops/external-runtime/probe`, `/ops/reviews/diagnostic`, `/ops/reviews/*`, `/ops/soak`, `/ops/soak/status`, `/ops/soak/start`, `/ops/soak/stop`, `/ops/safety/red-team`, `/ops/retention`, `/ops/retention/enforce` | Operational health, alerts, local/webhook alert dispatch, deployment readiness/config validation, runtime matrix with validation metadata, external runtime summary, stale-review hygiene, bounded/session soak, red-team safety, and retention checks/enforcement |
 | `/runtime/metrics/summary`, `/runtime/metrics/routes`, `/runtime/metrics/model-cost`, `/runtime/metrics/failures` | Backend-first telemetry dashboard data: route distribution, latency, Core model/Agent/Probe counts, failure list, context size, token-volume estimate, and OpenClaw call share |
 | `/logs/events`, `/logs/actions`, `/logs/tools`, `/logs/policy`, `/logs/execution`, `/logs/rollback`, `/logs/memory` | Audit and trace surfaces |
 | `/console` | Awareness & Agent Control Console |
@@ -114,6 +117,8 @@ The current codebase follows the original design direction:
 
 Remaining live validation gates:
 
+- Fresh GitHub clone acceptance must pass with `.env.example`, `scripts/install_local.sh`, `scripts/start_local.sh`, and `scripts/status_local.sh` without requiring checked-in local state.
+- Local release packages must not include real `.env`, user `state/`, OpenClaw device files, Feishu credentials, or personal commitments.
 - Runtime matrix exists for OpenClaw/Hermes/Custom; live multi-runtime soak validation still requires configured running runtimes.
 - Active loop is bounded and locally self-tested; durable production scheduling still requires running the API process under a supervisor.
 - Feishu live validation requires a real app ID/secret, default chat target or inbound callback, and a reachable callback URL.
@@ -121,4 +126,4 @@ Remaining live validation gates:
 - Browser/API execution has configurable executor hooks and host allowlists; live production allowlists still need environment-specific validation.
 - Replay compensation is implemented as review-backed snapshot restore; automatic runtime scan creates guarded review jobs, and explicit auto-execute can restore snapshots only when both config and request allow R4 restore.
 - Long-running soak now has controlled session APIs; alert delivery supports local audit log and optional configured webhook, with webhook delivery requiring a configured endpoint.
-- Runtime Stabilization still needs a real Feishu soak: configure live Feishu credentials, send real user messages through callback or WebSocket intake, inspect `/runtime/traces/recent`, `/runtime/soak/status`, and `/runtime/metrics/*`, then tune only the runtime behavior that fails under observation.
+- Runtime Stabilization still needs a real Feishu/OpenClaw soak: configure live Feishu credentials, send real user messages through callback or WebSocket intake, inspect `/runtime/traces/recent`, `/runtime/soak/status`, and `/runtime/metrics/*`, then tune only the runtime behavior that fails under observation.

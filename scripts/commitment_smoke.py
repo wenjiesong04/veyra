@@ -151,7 +151,8 @@ def main() -> int:
     expect("commitment_push" in step_names, "active loop includes commitment_push step", step_names)
 
     user_world = store.read_json("user_world.json")
-    expect(bool(user_world.get("current_goal")), "user_world reflects commitment goal", user_world)
+    scoped = (user_world.get("profiles_by_user") or {}).get("cmt-user") if isinstance(user_world.get("profiles_by_user"), dict) else {}
+    expect(bool(scoped.get("current_goal")), "scoped user_world reflects commitment goal", user_world)
 
     print("commitment smoke passed")
     return 0

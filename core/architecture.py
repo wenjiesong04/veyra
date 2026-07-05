@@ -83,7 +83,11 @@ CORE_MODULES: list[dict[str, str]] = [
     {"id": "world_state", "path": "core/world_state.py", "status": "mvp_foundation"},
     {"id": "core_model_client", "path": "core/model_client.py", "status": "p6_model_assisted"},
     {"id": "core_reasoning", "path": "core/reasoning_core.py", "status": "p6_model_assisted"},
+    {"id": "understanding_core", "path": "core/understanding_core.py", "status": "p10_understanding_first"},
+    {"id": "cognition_pipeline", "path": "core/cognition_pipeline.py", "status": "p10_model_first_route_gate"},
+    {"id": "capability_registry", "path": "core/capability_registry.py", "status": "p10_unified_capabilities"},
     {"id": "agency_core", "path": "core/agency_core.py", "status": "p8_proactive_runtime"},
+    {"id": "commitment_core", "path": "core/commitment_core.py", "status": "p10_user_commitment_runtime"},
     {"id": "perception_layer", "path": "core/perception_layer.py", "status": "p6_model_assisted"},
     {"id": "persona_engine", "path": "core/persona_engine.py", "status": "mvp_foundation"},
     {"id": "decision_core", "path": "core/decision_core.py", "status": "p6_model_assisted"},
@@ -93,6 +97,8 @@ CORE_MODULES: list[dict[str, str]] = [
     {"id": "context_patch_builder", "path": "core/context_patch_builder.py", "status": "mvp_foundation"},
     {"id": "agent_orchestrator", "path": "runtime/agent_orchestrator.py", "status": "p8_validated_multi_agent"},
     {"id": "replay_runtime", "path": "rollback_audit/replay_runtime.py", "status": "p9_guarded_auto_execute"},
+    {"id": "context_drift_detector", "path": "core/context_drift_detector.py", "status": "p10_context_guard"},
+    {"id": "runtime_trace_metrics", "path": "runtime/routing_metrics.py", "status": "p10_telemetry"},
 ]
 
 
@@ -230,6 +236,7 @@ IMPLEMENTATION_PHASES: list[dict[str, str]] = [
     {"phase": "P7", "name": "Production operations and safety validation", "status": "implemented", "validation_state": "production_soak_validation_pending"},
     {"phase": "P8", "name": "Continuous awareness entity runtime", "status": "implemented", "validation_state": "bounded_local_self_tested"},
     {"phase": "P9", "name": "Chat app integration and guarded automation", "status": "implemented", "validation_state": "feishu_local_openapi_self_tested"},
+    {"phase": "P10", "name": "Runtime stabilization and local release hardening", "status": "implemented", "validation_state": "real_feishu_soak_pending"},
 ]
 
 
