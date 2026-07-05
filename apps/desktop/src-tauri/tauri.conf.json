@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Veyra",
+  "version": "0.1.0",
+  "identifier": "ai.veyra.desktop",
+  "build": {
+    "beforeDevCommand": "cd ../../web && npm run dev:desktop",
+    "devUrl": "http://127.0.0.1:5174",
+    "beforeBuildCommand": "cd ../../web && npm install && npm run build:desktop",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Veyra",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 980,
+        "minHeight": 680,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Productivity",
+    "shortDescription": "Veyra local awareness and Agent governance runtime",
+    "longDescription": "Veyra is a local-first awareness and Agent governance runtime for personal production use."
+  }
+}

@@ -103,12 +103,19 @@ const workbenchSections: Array<{ id: WorkbenchSection; label: string; icon: Reac
   { id: "logs", label: "Logs", icon: <ScrollText size={15} /> }
 ];
 
+const desktopApiBase =
+  typeof window !== "undefined" &&
+  (window.location.protocol === "tauri:" || window.location.hostname === "tauri.localhost")
+    ? "http://127.0.0.1:8000"
+    : "";
+
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
   const headers = new Headers(options?.headers);
   if (options?.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  const response = await fetch(url, options ? { ...options, headers } : undefined);
+  const target = url.startsWith("http") ? url : `${desktopApiBase}${url}`;
+  const response = await fetch(target, options ? { ...options, headers } : undefined);
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText}`);
   }
@@ -215,6 +222,7 @@ function App() {
   const [soakStatus, setSoakStatus] = useState<Record<string, JsonValue> | null>(null);
   const [runtimeMatrix, setRuntimeMatrix] = useState<Record<string, JsonValue> | null>(null);
   const [deploymentReadiness, setDeploymentReadiness] = useState<Record<string, JsonValue> | null>(null);
+  const [setupStatus, setSetupStatus] = useState<Record<string, JsonValue> | null>(null);
   const [alertingStatus, setAlertingStatus] = useState<Record<string, JsonValue> | null>(null);
   const [runtimeTraceRecent, setRuntimeTraceRecent] = useState<LogResponse>({ items: [] });
   const [runtimeMetricsSummary, setRuntimeMetricsSummary] = useState<Record<string, JsonValue> | null>(null);
@@ -270,6 +278,7 @@ function App() {
       soakData,
       runtimeMatrixData,
       deploymentData,
+      setupData,
       alertingData,
       runtimeTraceData,
       runtimeMetricsSummaryData,
@@ -308,6 +317,7 @@ function App() {
       fetchJson<Record<string, JsonValue>>("/ops/soak/status"),
       fetchJson<Record<string, JsonValue>>("/ops/runtime-matrix"),
       fetchJson<Record<string, JsonValue>>("/ops/deployment"),
+      fetchJson<Record<string, JsonValue>>("/setup/status"),
       fetchJson<Record<string, JsonValue>>("/ops/alerting"),
       fetchJson<LogResponse>("/runtime/traces/recent?limit=20"),
       fetchJson<Record<string, JsonValue>>("/runtime/metrics/summary?limit=1000"),
@@ -346,6 +356,7 @@ function App() {
     setSoakStatus(soakData);
     setRuntimeMatrix(runtimeMatrixData);
     setDeploymentReadiness(deploymentData);
+    setSetupStatus(setupData);
     setAlertingStatus(alertingData);
     setRuntimeTraceRecent(runtimeTraceData);
     setRuntimeMetricsSummary(runtimeMetricsSummaryData);
@@ -717,6 +728,10 @@ function App() {
   const runtimeTelemetryRoutes = Array.isArray(runtimeTelemetryRoutesRaw) ? (runtimeTelemetryRoutesRaw as Array<Record<string, JsonValue>>) : [];
   const runtimeTraceItems = runtimeTraceRecent.items.slice(-6).reverse();
   const runtimeFailureItems = runtimeMetricsFailures.items.slice(-6).reverse();
+  const setupDesktop = asRecord(setupStatus?.desktop);
+  const setupPlatform = asRecord(setupStatus?.platform);
+  const setupPaths = asRecord(setupStatus?.paths);
+  const setupAgent = asRecord(setupStatus?.agent);
 
   return (
     <main className="appShell">
@@ -766,6 +781,26 @@ function App() {
       <section className={`workspaceGrid workbenchPane ${activeSection === "runtime" ? "active" : ""}`}>
         <Section title="Setup Wizard" icon={<Settings size={18} />}>
           <div className="setupGrid">
+            <div className="setupStep">
+              <span>App</span>
+              <strong>{String(setupDesktop.product_name ?? "Veyra")}</strong>
+              <small>{String(setupDesktop.shell ?? "desktop")}</small>
+            </div>
+            <div className="setupStep">
+              <span>Platform</span>
+              <strong>{String(setupPlatform.system ?? "unknown")}</strong>
+              <small>{String(setupPlatform.machine ?? "")}</small>
+            </div>
+            <div className="setupStep">
+              <span>Local config</span>
+              <strong>{setupPaths.env_exists === true ? "configured" : "missing .env"}</strong>
+              <small>{String(setupPaths.env_file ?? "")}</small>
+            </div>
+            <div className="setupStep">
+              <span>Agent install</span>
+              <strong>{setupAgent.connected === true ? "available" : "needs setup"}</strong>
+              <small>{String(setupAgent.status ?? "unknown")}</small>
+            </div>
             <div className="setupStep">
               <span>Selected runtime</span>
               <strong>{selectedAgent}</strong>

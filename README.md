@@ -8,6 +8,25 @@ Veyra is local-first: clone it from GitHub, configure your own model/OpenClaw/Fe
 
 Veyra is now in Runtime Stabilization and local release hardening. The core closed loop is complete; the next work should prioritize fresh-clone startup, real Feishu/OpenClaw soak testing, telemetry, context drift control, ToolProxy closed-loop verification, and gradual UI/router decomposition rather than blindly adding more modules.
 
+## Desktop Local Window
+
+Veyra also has a first-stage desktop shell under `apps/desktop`. The software name is `Veyra` on macOS, Windows, and Linux. The desktop shell uses Tauri and reuses the same React/Vite console, but runs as a local application window instead of asking users to open a browser route manually.
+
+Current desktop development flow:
+
+```bash
+./scripts/start_local.sh --foreground
+./scripts/start_desktop_dev.sh
+```
+
+Build a desktop package on the target operating system:
+
+```bash
+./scripts/build_desktop.sh
+```
+
+The desktop scaffold currently expects the local API at `http://127.0.0.1:8000`. The next release step is to bundle the Python backend as a signed sidecar so users can double-click `Veyra` without starting the API in a terminal. See [`docs/desktop_release.md`](docs/desktop_release.md).
+
 ## Five-Minute Local Start
 
 Requirements:
@@ -156,6 +175,8 @@ Endpoints:
 - `POST /tool-proxy/api/request` review an API request through SafeAPI policy
 - `GET /tool-proxy/status` inspect SafeShell/SafeFile/SafeBrowser/SafeAPI executor availability
 - `POST /tool-proxy/config` enable/disable optional SafeBrowser/SafeAPI executors and host allowlists
+- `GET /setup/status` inspect local desktop/setup status
+- `POST /setup/env` write whitelisted local `.env` values from a local setup UI
 - `GET /logs/policy` read policy trace records
 - `POST /actions/proposals` submit an Agent or Tool action proposal through Guardian review
 - `POST /rollback/snapshot` create a file snapshot
@@ -449,7 +470,7 @@ Without a configured base URL, Veyra still builds the task packet but returns `a
 - `probes`: system, git, port, process, file, log, network, web, MCP, OpenClaw, and Hermes read-only probe envelopes
 - `tool_proxy`: SafeShell, SafeFile, SafeBrowser, and SafeAPI policy gates with trace logging and optional executor hooks
 - `rollback_audit`: snapshot, diff, ActionJournal timeline, replay plan, automatic replay runtime, compensation review jobs, guarded auto-execute, traces
-- `routers`: first-stage FastAPI route split for runtime observability, debug/audit/state, ops/runtime, agent, and memory surfaces; `main.py` remains runtime wiring only
+- `routers`: first-stage FastAPI route split for runtime observability, debug/audit/state, ops/runtime, agent, memory, commitments, and local setup surfaces; `main.py` remains runtime wiring only
 - `memory_bridge`: local/selected/runtime/all provider routing, sensitive-memory filtering, provider diagnostics, and external adapter hooks
 - `skills`: built-in skill registry/runtime for fixed low-risk workflows
 - `personas`: Minimalist, Operator, Engineer, Guardian, Steward

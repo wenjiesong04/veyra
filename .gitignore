@@ -6,6 +6,13 @@ web/node_modules/
 web/*.tsbuildinfo
 web/vite.config.js
 web/vite.config.d.ts
+web/vite.desktop.config.js
+web/vite.desktop.config.d.ts
+
+apps/desktop/node_modules/
+apps/desktop/dist/
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
 
 state/local/openclaw_device.json
 state/openclaw_device.json

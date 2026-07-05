@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -33,6 +34,7 @@ from rollback_audit.replay_runtime import ReplayRuntime
 from routers.agent_memory import build_agent_memory_router
 from routers.commitments import build_commitments_router
 from routers.debug_audit import build_debug_audit_router
+from routers.local_setup import build_local_setup_router
 from routers.ops_runtime import build_ops_runtime_router
 from routers.runtime_observability import build_runtime_observability_router
 from runtime.active_loop import ActiveRuntimeLoop
@@ -58,6 +60,20 @@ from runtime.safety_validation import SafetyValidation
 
 
 app = FastAPI(title="Veyra", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+        "tauri://localhost",
+    ],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 
 def _env_bool(name: str) -> bool | None:
@@ -561,6 +577,18 @@ app.include_router(
                 "active_loop": lambda: active_loop,
                 "runtime_cron": lambda: runtime_cron,
                 "soak_runner": lambda: soak_runner,
+            }
+        )
+    )
+)
+app.include_router(
+    build_local_setup_router(
+        _DynamicDeps(
+            {
+                "state_store": lambda: state_store,
+                "agent_status": lambda: awareness_loop.agent_registry.selected().connection_status(),
+                "feishu_status": lambda: feishu_ws_runner.status(),
+                "deployment_readiness": lambda: _deployment_readiness(),
             }
         )
     )

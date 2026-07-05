@@ -2,7 +2,7 @@
 
 Updated after Runtime Stabilization and local release hardening.
 
-Veyra has moved from feature-complete MVP into local-first release hardening. The target is a GitHub-downloadable personal production runtime: users run Veyra locally, configure their own model/OpenClaw/Feishu surfaces, and keep all runtime data under their local `state/` directory. This is not a SaaS target; multi-user data isolation exists only to keep local channel/user records correct when Feishu or other adapters provide different `user_id` values.
+Veyra has moved from feature-complete MVP into local-first release hardening. The target is a GitHub-downloadable personal production runtime: users run Veyra locally, configure their own model/OpenClaw/Feishu surfaces, and keep all runtime data under their local `state/` directory. This is not a SaaS target; multi-user data isolation exists only to keep local channel/user records correct when Feishu or other adapters provide different `user_id` values. A first-stage Tauri desktop shell now exists under `apps/desktop` with product name `Veyra` for macOS, Windows, and Linux.
 
 The core closed loop is complete. Current work should make the runtime easy to install, observable, debuggable, stable under real Feishu traffic, and resistant to context/tool bypass drift. Do not keep adding unrelated modules before local release packaging, live Feishu/OpenClaw soak, context drift tuning, ToolProxy closed-loop validation, and UI/router cleanup are validated.
 
@@ -35,7 +35,7 @@ Current local `state/` data may contain older self-test records from earlier dev
 | P7 Production operations and safety validation | Implemented, live validation pending | Non-destructive red-team validation, retention summary/enforcement, runtime matrix, bounded/session soak APIs, Ops health, alerts, local/webhook alert dispatch, deployment config validation, and deployment readiness checks exist. `/ops/deployment` and `/ops/runtime-matrix` report not_configured or validation_pending instead of pretending live production readiness. |
 | P8 Continuous awareness entity runtime | Implemented, local self-tested | Scheduled active-loop ticks, multi-channel intake state, multi-Agent certification/invocation, deeper Belief TTL/source trust, and automatic replay candidate scanning with guarded compensation review creation. Live external runtime validation still depends on configured OpenClaw/Hermes/Custom services. |
 | P9 Chat app integration and guarded automation | Implemented, Feishu local OpenAPI self-tested | Feishu channel config, outbound message delivery, URL verification, message callbacks, local WebSocket long-connection intake, OpenClaw config import, runtime cron scheduler, persona channel/Agent binding, and explicit guarded replay auto-execution. Live Feishu validation requires real app credentials and either callback URL or long-connection mode. |
-| P10 Runtime Stabilization and local release hardening | Implemented, live soak pending | Runtime trace recorder, telemetry summary APIs, ContextDriftDetector, ToolProxy guard smoke, first-stage route split, local install/start/status/reset scripts, `.env.example`, GitHub smoke workflow, and release-state boundary are implemented. Real Feishu/OpenClaw soak must validate stability under real user traffic. |
+| P10 Runtime Stabilization and local release hardening | Implemented, live soak pending | Runtime trace recorder, telemetry summary APIs, ContextDriftDetector, ToolProxy guard smoke, first-stage route split, local install/start/status/reset scripts, `.env.example`, GitHub smoke workflow, release-state boundary, first-stage Tauri desktop shell, and local setup API are implemented. Real Feishu/OpenClaw soak must validate stability under real user traffic. |
 
 ## Eight Architecture Blocks
 
@@ -48,7 +48,7 @@ Current local `state/` data may contain older self-test records from earlier dev
 | Skill | Implemented registry/runtime and built-in skill definitions. Skills route through AwarenessLoop and now record execution trace. |
 | Tool Proxy | Implemented SafeShell, SafeFile, SafeBrowser, SafeAPI with Guardian-style policy review, runtime executor config, host allowlists, standard tool trace, and Agent result bypass verification. |
 | Rollback / Audit | Implemented snapshot, diff, restore, rollback log, policy trace, tool trace, execution trace, ActionJournal timeline, time-travel summary, non-destructive replay plans, replay compensation review proposals, automatic replay runtime scan/run state, and explicit guarded auto-execute. |
-| Web Control UI | Implemented React/Vite console served at `/console`, backed by live Veyra APIs and built into `ui/console`. |
+| Web / Desktop Control UI | Implemented React/Vite console served at `/console`, backed by live Veyra APIs and built into `ui/console`. A Tauri desktop shell named `Veyra` reuses the console through a desktop-specific build under `apps/desktop/dist`. |
 
 ## Veyra Core Submodules
 

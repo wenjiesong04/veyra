@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5173",
+    "dev:desktop": "vite --config vite.desktop.config.ts --host 127.0.0.1 --port 5174",
     "build": "tsc -b && vite build",
+    "build:desktop": "tsc -b && vite build --config vite.desktop.config.ts",
     "preview": "vite preview --host 127.0.0.1 --port 4173"
   },
   "dependencies": {

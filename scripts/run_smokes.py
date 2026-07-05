@@ -15,6 +15,7 @@ GATE_SMOKES = [
     "user_world_multitenant_smoke.py",
     "persona_deep_binding_smoke.py",
     "capability_registry_unified_smoke.py",
+    "local_setup_smoke.py",
     "proactive_review_execution_smoke.py",
     "agency_state_source_smoke.py",
     "user_profile_isolation_smoke.py",

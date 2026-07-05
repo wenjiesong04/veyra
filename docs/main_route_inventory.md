@@ -2,9 +2,9 @@
 
 Runtime Stabilization and local release hardening pass, 2026-07-05.
 
-`main.py` still owns runtime object wiring and the highest-coupling route surfaces. Lower-risk surfaces have been split into `routers/`. The current app exposes 136 FastAPI routes total, including OpenAPI/Swagger/Redoc and the console static mount; 131 are callable product/API routes.
+`main.py` still owns runtime object wiring and the highest-coupling route surfaces. Lower-risk surfaces have been split into `routers/`. The current app exposes 138 FastAPI routes total, including OpenAPI/Swagger/Redoc and the console static mount; 133 are callable product/API routes, plus the `/console` static mount.
 
-Current `main.py` line count: 1164.
+Current `main.py` line count: 1192.
 
 ## Router Split
 
@@ -16,6 +16,7 @@ Current `main.py` line count: 1164.
 | `routers/ops_runtime.py` | runtime, metrics/ops | Active loop, cron, soak, health, alerts, retention, deployment, runtime matrix, external-runtime and stale-review hygiene. |
 | `routers/agent_memory.py` | agent, memory | Agent task callbacks/status/config and memory provider routes. |
 | `routers/commitments.py` | commitments | Local user commitments and due-run push controls. |
+| `routers/local_setup.py` | setup | Local desktop/setup status and whitelisted `.env` writes from local clients. |
 
 ## Domain Classification
 
@@ -44,6 +45,11 @@ Current `main.py` line count: 1164.
 - `GET /belief/stale`
 - `GET /attention/active`
 - `POST /belief/refresh`
+
+### setup
+
+- `GET /setup/status`
+- `POST /setup/env`
 - `POST /state/refresh-stale`
 - `POST /external/refresh`
 - `POST /external/watchlist`
