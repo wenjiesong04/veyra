@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import re
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any
+
+from core.action_risk import assess_text_risk
 
 
 class LifecycleStatus(str, Enum):
@@ -122,83 +123,6 @@ RISK_POLICIES: dict[RiskLevel, RiskPolicy] = {
 }
 
 
-FORBIDDEN_ACTION_PATTERNS: tuple[str, ...] = (
-    r"\brm\s+-rf\b",
-    r"\bcurl\b.*\|\s*\bbash\b",
-    r"\bdrop\s+database\b",
-    r"\bdrop\s+table\b",
-    r"\btruncate\s+table\b",
-    r"\bgit\s+push\s+--force\b",
-    r"\b(?:cat|type|less|more)\s+\.env\b.*(?:send|upload|post|外发)",
-    r"\.env\s*外发",
-    r"绕过权限",
-    r"钓鱼邮件?",
-    r"phishing",
-    r"恶意邮件",
-    r"木马",
-    r"勒索软件",
-    r"绕过.*检测",
-    r"窃取.*密码",
-    r"盗取.*账号",
-)
-
-HIGH_RISK_PATTERNS: tuple[str, ...] = (
-    r"\bsudo\b",
-    r"\brestart\b",
-    r"\brollback\b",
-    r"\brestore\b",
-    r"\bdeploy\b",
-    r"\bdelete\b",
-    r"\bgit\s+reset\s+(?:--|–|—)?hard\b",
-    r"\bchmod\s+-R\b",
-    r"\bchown\s+-R\b",
-    r"重启",
-    r"回滚",
-    r"恢复快照",
-    r"部署",
-    r"删除",
-    r"生产",
-    r"付费\s*api",
-)
-
-MEDIUM_RISK_PATTERNS: tuple[str, ...] = (
-    r"修改配置",
-    r"覆盖",
-    r"迁移",
-    r"数据库",
-    r"批量",
-    r"\bconfig\b",
-    r"\boverwrite\b",
-    r"\bmigration\b",
-)
-
-LOW_WRITE_PATTERNS: tuple[str, ...] = (
-    r"写入",
-    r"创建文件",
-    r"修改文件",
-    r"修改.*代码",
-    r"实现.*功能",
-    r"开发",
-    r"\bcommit\b",
-    r"提交",
-    r"\bwrite\b",
-)
-
-READ_ONLY_PATTERNS: tuple[str, ...] = (
-    r"检查",
-    r"查看",
-    r"读取",
-    r"状态",
-    r"端口",
-    r"进程",
-    r"\bcheck\b",
-    r"\bstatus\b",
-    r"\bread\b",
-    r"\bport\b",
-    r"\bprocess\b",
-)
-
-
 def risk_policy(level: RiskLevel | str) -> RiskPolicy:
     return RISK_POLICIES[normalize_risk(level)]
 
@@ -214,22 +138,7 @@ def normalize_risk(level: RiskLevel | str) -> RiskLevel:
 
 
 def classify_text_risk(text: str) -> RiskLevel:
-    lowered = text.lower()
-    if _matches_any(lowered, FORBIDDEN_ACTION_PATTERNS):
-        return RiskLevel.R5
-    if _matches_any(lowered, HIGH_RISK_PATTERNS):
-        return RiskLevel.R4
-    if _matches_any(lowered, MEDIUM_RISK_PATTERNS):
-        return RiskLevel.R3
-    if _matches_any(lowered, LOW_WRITE_PATTERNS):
-        return RiskLevel.R2
-    if _matches_any(lowered, READ_ONLY_PATTERNS):
-        return RiskLevel.R1
-    return RiskLevel.R0
-
-
-def _matches_any(text: str, patterns: tuple[str, ...]) -> bool:
-    return any(re.search(pattern, text) for pattern in patterns)
+    return RiskLevel(assess_text_risk(text).risk_level)
 
 
 def lifecycle_statuses() -> list[str]:

@@ -12,6 +12,7 @@ from core.proactive_intent import ProactiveIntent, WatchlistDraft
 from core.proactive_intent_planner import ProactiveIntentPlanner
 from core.schedule_parser import chinese_hour as parsed_chinese_hour
 from core.schedule_parser import end_of_local_day_iso, has_explicit_schedule_time, parse_schedule_text
+from core.semantic_changeset import build_semantic_change_set, confirmation_message, confirmed_message, declined_message
 from core.proactive_templates import ProactiveTemplateRegistry, watchlist_id_for
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent, utc_now_iso
@@ -50,6 +51,7 @@ class CommitmentCore:
 
     STATE_FILE = "user_commitments.json"
     GOAL_STATE_FILE = "user_goals.json"
+    SEMANTIC_CHANGE_SET_FILE = "semantic_change_sets.json"
     MAX_COMMITMENTS = 200
     MAX_GOALS = 100
     MAX_HISTORY = 50
@@ -277,12 +279,22 @@ class CommitmentCore:
                     "primary_response_override": f"已取消：{cancelled.get('title') or cancelled.get('kind')}",
                 }
 
+        pending_change_set = self._pending_semantic_change_set_for_session(event.source.session_id, user_id=event.source.user_id)
+        if pending_change_set and (semantic_intent.get("operation") == "confirm" or self._is_affirmation(lowered)):
+            return self._confirm_semantic_change_set(pending_change_set, event=event)
+        if pending_change_set and (semantic_intent.get("operation") == "decline" or self._is_decline(lowered)):
+            return self._decline_semantic_change_set(pending_change_set)
+
         # Bare confirmations without a pending offer must not create or confirm commitments.
         if self._is_affirmation(lowered) and not pending:
             return {}
 
         if semantic_intent.get("operation") in {"cancel", "pause", "resume"}:
             return self.apply_control_semantic(semantic_intent, event=event)
+
+        change_set = self.semantic_change_set_for_turn(user_text=user_text, event=event)
+        if change_set:
+            return self._handle_semantic_change_set(change_set, event=event)
 
         if self._looks_like_plain_information_query(user_text, lowered):
             return {}
@@ -545,6 +557,309 @@ class CommitmentCore:
             "template": "cancel_pause_resume",
         }
 
+    def semantic_change_set_for_turn(self, *, user_text: str, event: VeyraEvent) -> dict[str, Any] | None:
+        commitments = self.list_commitments(user_id=event.source.user_id)
+        change_set = build_semantic_change_set(user_text, active_commitments=commitments)
+        return change_set.to_dict() if change_set else None
+
+    def _handle_semantic_change_set(self, change_set: dict[str, Any], *, event: VeyraEvent) -> dict[str, Any]:
+        record = self._record_semantic_change_set(change_set, event=event)
+        execution = record.get("execution_decision") if isinstance(record.get("execution_decision"), dict) else {}
+        if execution.get("mode") == "ask_confirmation":
+            response = confirmation_message(record)
+            return {
+                "status": "semantic_change_proposed",
+                "actions": ["recorded_semantic_change_set", "asked_semantic_change_confirmation"],
+                "semantic_change_set": record,
+                "primary_response_override": response,
+                "followup_messages": [response],
+            }
+        response = confirmation_message(record)
+        return {
+            "status": "semantic_change_recorded",
+            "actions": ["recorded_semantic_change_set"],
+            "semantic_change_set": record,
+            "primary_response_override": response,
+            "followup_messages": [response],
+        }
+
+    def _confirm_semantic_change_set(self, change_set: dict[str, Any], *, event: VeyraEvent) -> dict[str, Any]:
+        actions = change_set.get("proposed_actions") if isinstance(change_set.get("proposed_actions"), list) else []
+        applied = [self._apply_semantic_proposed_action(action, event=event, change_set=change_set) for action in actions if isinstance(action, dict)]
+        applied = [item for item in applied if item]
+        patch = {
+            "status": "confirmed",
+            "confirmed_at": utc_now_iso(),
+            "confirmed_by_event_id": event.event_id,
+            "applied_actions": applied,
+        }
+        updated = self._patch_semantic_change_set(str(change_set.get("changeset_id") or ""), patch) or {**change_set, **patch}
+        response = confirmed_message(applied)
+        self.state_store.append_jsonl(
+            "action_record.jsonl",
+            {
+                "route": "semantic_change_set",
+                "status": "confirmed",
+                "artifacts": {
+                    "changeset_id": updated.get("changeset_id"),
+                    "applied_actions": applied,
+                },
+            },
+        )
+        return {
+            "status": "semantic_change_confirmed",
+            "actions": ["confirmed_semantic_change_set", *[str(item.get("action") or "") for item in applied]],
+            "semantic_change_set": updated,
+            "applied_actions": applied,
+            "primary_response_override": response,
+            "followup_messages": [response],
+        }
+
+    def _decline_semantic_change_set(self, change_set: dict[str, Any]) -> dict[str, Any]:
+        patch = {"status": "declined", "declined_at": utc_now_iso()}
+        updated = self._patch_semantic_change_set(str(change_set.get("changeset_id") or ""), patch) or {**change_set, **patch}
+        response = declined_message(updated)
+        return {
+            "status": "semantic_change_declined",
+            "actions": ["declined_semantic_change_set"],
+            "semantic_change_set": updated,
+            "primary_response_override": response,
+            "followup_messages": [response],
+        }
+
+    def _apply_semantic_proposed_action(self, action: dict[str, Any], *, event: VeyraEvent, change_set: dict[str, Any]) -> dict[str, Any] | None:
+        action_name = str(action.get("action") or "")
+        target = str(action.get("target") or "").strip()
+        if not action_name or not target:
+            return None
+        if action_name == "deprioritize_tracking":
+            commitment_id = str(action.get("commitment_id") or "")
+            target_item = self.get_commitment(commitment_id) if commitment_id else self._existing_topic_commitment(
+                target,
+                user_id=event.source.user_id,
+                kinds={"external_digest", "learning_digest"},
+                statuses={"active", "pending_confirmation"},
+            )
+            if not target_item:
+                return {"action": action_name, "target": target, "status": "not_found"}
+            changed = self.pause_commitment(str(target_item.get("commitment_id") or ""))
+            return {
+                "action": action_name,
+                "target": target,
+                "status": "paused" if changed else "not_found",
+                "commitment_id": (changed or target_item).get("commitment_id"),
+                "commitment_kind": (changed or target_item).get("kind"),
+            }
+        if action_name == "create_learning_tracking":
+            return self._create_learning_tracking_from_semantic(target=target, event=event, change_set=change_set)
+        if action_name == "create_tracking":
+            return self._create_external_tracking_from_semantic(target=target, event=event, change_set=change_set)
+        return {"action": action_name, "target": target, "status": "unsupported"}
+
+    def _create_learning_tracking_from_semantic(self, *, target: str, event: VeyraEvent, change_set: dict[str, Any]) -> dict[str, Any]:
+        existing = self._existing_topic_commitment(
+            target,
+            user_id=event.source.user_id,
+            kinds={"learning_digest"},
+            statuses={"active", "pending_confirmation"},
+        )
+        if existing:
+            return {
+                "action": "create_learning_tracking",
+                "target": target,
+                "status": "already_exists",
+                "commitment_id": existing.get("commitment_id"),
+                "commitment_kind": existing.get("kind"),
+            }
+        goal = self._upsert_user_goal(
+            {
+                "kind": "learning",
+                "status": "active",
+                "title": f"学习目标：{target}",
+                "topic": target,
+                "user_id": event.source.user_id,
+                "channel": event.source.channel,
+                "session_id": event.source.session_id,
+                "source_event_id": event.event_id,
+                "source_changeset_id": change_set.get("changeset_id"),
+                "last_user_text": str(change_set.get("source_text") or "")[:500],
+                "plan": self._learning_plan(target),
+                "permissions": {
+                    "store_progress": "granted_by_semantic_confirmation",
+                    "external_search": "granted_for_digest",
+                    "proactive_push": "granted",
+                },
+            }
+        )
+        commitment = self.create_commitment(
+            {
+                "kind": "learning_digest",
+                "status": "active",
+                "title": f"学习资料摘要：{target}",
+                "user_id": event.source.user_id,
+                "channel": event.source.channel,
+                "session_id": event.source.session_id,
+                "source_event_id": event.event_id,
+                "schedule": self._default_learning_schedule(str(change_set.get("source_text") or target)),
+                "payload": {"topic": target, "phase": "getting_started", "goal_id": goal.get("goal_id"), "source_changeset_id": change_set.get("changeset_id")},
+            }
+        )
+        goal["commitment_id"] = commitment.get("commitment_id")
+        self._replace_user_goal(goal)
+        return {
+            "action": "create_learning_tracking",
+            "target": target,
+            "status": "created",
+            "goal_id": goal.get("goal_id"),
+            "commitment_id": commitment.get("commitment_id"),
+            "commitment_kind": commitment.get("kind"),
+        }
+
+    def _create_external_tracking_from_semantic(self, *, target: str, event: VeyraEvent, change_set: dict[str, Any]) -> dict[str, Any]:
+        existing = self._existing_topic_commitment(
+            target,
+            user_id=event.source.user_id,
+            kinds={"external_digest"},
+            statuses={"active", "pending_confirmation"},
+        )
+        if existing:
+            return {
+                "action": "create_tracking",
+                "target": target,
+                "status": "already_exists",
+                "commitment_id": existing.get("commitment_id"),
+                "commitment_kind": existing.get("kind"),
+            }
+        watchlist = self.record_watchlist_draft(
+            WatchlistDraft(
+                topic=target,
+                query=self.external_tracking_query(
+                    ProactiveIntent(
+                        user_id=event.source.user_id,
+                        session_id=event.source.session_id,
+                        channel_id=event.source.channel,
+                        raw_text=str(change_set.get("source_text") or ""),
+                        intent_type="track_external_topic",
+                        topic=target,
+                        information_sources=["public_web"],
+                        source="semantic_change_set",
+                    )
+                ),
+                sources=["public_web"],
+                refresh_policy={"kind": "authorized_external_refresh", "ttl_seconds": 1800},
+                ranking_policy={"prefer": ["trusted_sources", "freshness", "topic_match"]},
+                dedupe_policy={"key": "url"},
+                ttl=1800,
+                status="active",
+                source_intent_id=str(change_set.get("changeset_id") or ""),
+            )
+        )
+        commitment = self.create_commitment(
+            {
+                "kind": "external_digest",
+                "status": "active",
+                "title": f"外部追踪：{target}",
+                "user_id": event.source.user_id,
+                "channel": event.source.channel,
+                "session_id": event.source.session_id,
+                "source_event_id": event.event_id,
+                "schedule": self._default_learning_schedule(str(change_set.get("source_text") or target)),
+                "payload": {"topic": target, "watchlist_id": watchlist.get("watchlist_id"), "query": watchlist.get("query"), "source_changeset_id": change_set.get("changeset_id")},
+            }
+        )
+        return {
+            "action": "create_tracking",
+            "target": target,
+            "status": "created",
+            "watchlist_id": watchlist.get("watchlist_id"),
+            "commitment_id": commitment.get("commitment_id"),
+            "commitment_kind": commitment.get("kind"),
+        }
+
+    def _existing_topic_commitment(
+        self,
+        topic: str,
+        *,
+        user_id: str,
+        kinds: set[str],
+        statuses: set[str],
+    ) -> dict[str, Any] | None:
+        needle = self._normalize_match_text(topic)
+        for item in reversed(self.list_commitments(user_id=user_id)):
+            if not isinstance(item, dict) or item.get("kind") not in kinds or item.get("status") not in statuses:
+                continue
+            if self._commitment_matches_needle(item, needle):
+                return item
+        return None
+
+    def _record_semantic_change_set(self, change_set: dict[str, Any], *, event: VeyraEvent) -> dict[str, Any]:
+        state = self._read_semantic_change_state()
+        items = state.setdefault("change_sets", [])
+        if not isinstance(items, list):
+            items = []
+        record = {
+            **change_set,
+            "user_id": event.source.user_id,
+            "channel": event.source.channel,
+            "session_id": event.source.session_id,
+            "source_event_id": event.event_id,
+            "created_at": utc_now_iso(),
+            "updated_at": utc_now_iso(),
+        }
+        items.append(record)
+        state["change_sets"] = items[-200:]
+        state["updated_at"] = utc_now_iso()
+        self._write_semantic_change_state(state)
+        self.state_store.append_jsonl(
+            "decision_trace.jsonl",
+            {
+                "route": "semantic_change_set",
+                "status": record.get("status"),
+                "artifacts": {"changeset_id": record.get("changeset_id"), "execution_decision": record.get("execution_decision")},
+            },
+        )
+        return record
+
+    def _pending_semantic_change_set_for_session(self, session_id: str, *, user_id: str | None = None) -> dict[str, Any] | None:
+        state = self._read_semantic_change_state()
+        items = state.get("change_sets") if isinstance(state.get("change_sets"), list) else []
+        for item in reversed(items):
+            if not isinstance(item, dict) or item.get("status") != "pending_confirmation":
+                continue
+            if item.get("session_id") != session_id:
+                continue
+            if user_id and item.get("user_id") != user_id:
+                continue
+            return item
+        return None
+
+    def _patch_semantic_change_set(self, changeset_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
+        if not changeset_id:
+            return None
+        state = self._read_semantic_change_state()
+        items = state.get("change_sets") if isinstance(state.get("change_sets"), list) else []
+        updated: dict[str, Any] | None = None
+        for index, item in enumerate(items):
+            if not isinstance(item, dict) or item.get("changeset_id") != changeset_id:
+                continue
+            item.update(patch)
+            item["updated_at"] = utc_now_iso()
+            items[index] = item
+            updated = item
+            break
+        if updated is None:
+            return None
+        state["change_sets"] = items[-200:]
+        state["updated_at"] = utc_now_iso()
+        self._write_semantic_change_state(state)
+        return updated
+
+    def _read_semantic_change_state(self) -> dict[str, Any]:
+        return self.state_store.read_json(self.SEMANTIC_CHANGE_SET_FILE) or {"change_sets": [], "updated_at": None}
+
+    def _write_semantic_change_state(self, state: dict[str, Any]) -> None:
+        self.state_store.write_json(self.SEMANTIC_CHANGE_SET_FILE, state)
+
     def match_commitments_semantic(
         self,
         semantic_intent: dict[str, Any],
@@ -645,7 +960,7 @@ class CommitmentCore:
 
     def _semantic_all_scope(self, text: str, lowered: str) -> bool:
         compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
-        return any(marker in compact for marker in ("所有", "全部", "全都", "都停止", "都取消")) or any(
+        return any(marker in compact for marker in ("所有", "全部", "全都", "都停止", "都取消", "都停掉")) or any(
             marker in lowered for marker in ("all", "everything")
         )
 
@@ -725,6 +1040,8 @@ class CommitmentCore:
 
     def _has_cancel_command(self, text: str, lowered: str) -> bool:
         compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
+        if any(marker in compact for marker in ("不要取消", "不用取消", "别取消", "先别取消", "不要停止", "不用停止", "别停止")):
+            return False
         return any(marker in lowered for marker in ("cancel", "stop")) or any(
             marker in compact for marker in ("停止", "停掉", "取消", "别再", "不要再", "不用再", "不再关注", "关闭")
         )
@@ -1995,6 +2312,8 @@ class CommitmentCore:
         text = re.sub(r"[\s，,。.!！?？、]+", "", lowered or "")
         if not text:
             return False
+        if any(marker in text for marker in ("先别订阅", "别订阅", "不要订阅", "不用订阅", "不要取消", "不用取消", "别取消")):
+            return False
         if text in AFFIRM_EXACT_MARKERS:
             return True
         if len(text) <= 12 and any(marker in text for marker in AFFIRM_MARKERS):
@@ -2008,4 +2327,7 @@ class CommitmentCore:
         return has_push_action and has_schedule_or_enable
 
     def _is_decline(self, lowered: str) -> bool:
+        text = re.sub(r"[\s，,。.!！?？、]+", "", lowered or "")
+        if any(marker in text for marker in ("不要取消", "不用取消", "别取消", "先别订阅", "别订阅", "不要订阅", "不用订阅")):
+            return False
         return any(marker in lowered for marker in DECLINE_MARKERS)

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from core.definitions import RiskLevel, classify_text_risk
+from core.action_risk import assess_text_risk
+from core.definitions import RiskLevel
 from interface.agent_adapter import ExecutionResult
 
 
@@ -29,6 +30,7 @@ def agent_tool_proxy_contract(task_id: str | None = None) -> dict[str, Any]:
             "review_id or approved_by for R3-R4 actions",
         ],
         "forbidden": ["rm -rf", "curl | bash", "drop database", "drop table", "truncate table", "git push --force", "git reset --hard", "externalize_secrets"],
+        "review_required": ["launchctl kickstart/bootstrap/bootout", "systemctl start/stop/restart", "brew services restart", "kill/pkill/killall"],
     }
 
 
@@ -44,9 +46,10 @@ class AgentToolCompliance:
         warnings: list[str] = []
         max_risk = RiskLevel.R0
         for call in tool_calls:
-            risk = classify_text_risk(call)
+            assessment = assess_text_risk(call)
+            risk = RiskLevel(assessment.risk_level)
             max_risk = self._max_risk(max_risk, risk)
-            finding = {"tool_call": call, "risk_level": risk.value}
+            finding = {"tool_call": call, "risk_level": risk.value, "risk_assessment": assessment.to_dict()}
             if risk == RiskLevel.R5:
                 finding["decision"] = "blocked"
                 finding["reason"] = "forbidden tool call was reported by agent"

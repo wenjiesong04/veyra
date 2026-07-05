@@ -414,6 +414,9 @@ class ProactiveIntentPlanner:
         }.get(intent_type, "ask_confirmation")
 
     def _has_cancel(self, text: str, lowered: str) -> bool:
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
+        if any(marker in compact for marker in ("不要取消", "不用取消", "别取消", "先别取消", "不要停止", "不用停止", "别停止")):
+            return False
         return any(marker in lowered for marker in ("stop", "cancel", "不要再", "不用再", "别再")) or any(
             marker in text for marker in ("停止", "停掉", "取消", "以后都停止", "取消所有", "停止所有")
         )

@@ -8,11 +8,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from core.action_risk import ActionRiskAssessment, assess_action_risk
 from core.architecture import architecture_snapshot
 from core.agency_core import AgencyCore
 from core.awareness_loop import AwarenessLoop
 from core.commitment_core import CommitmentCore
-from core.definitions import RiskLevel, classify_text_risk, normalize_risk
+from core.definitions import RiskLevel, normalize_risk
 from core.foresight_engine import ForesightEngine
 from core.runtime_entity import RuntimeEntity
 from core.world_state import WorldStateStore
@@ -770,19 +771,21 @@ async def action_proposal(request: ActionProposalRequest):
         guessed_risk = normalize_risk(request.risk_guess)
     except ValueError:
         guessed_risk = RiskLevel.R2
-    detected_risk = classify_text_risk(action_text)
+    risk_assessment = assess_action_risk(request.action)
+    detected_risk = RiskLevel(risk_assessment.risk_level)
     risk_order = list(RiskLevel)
     risk_level = detected_risk if risk_order.index(detected_risk) > risk_order.index(guessed_risk) else guessed_risk
     risk = risk_level.value
-    proposal_decision = _proposal_decision(risk_level, action_text, request)
+    proposal_decision = _proposal_decision(risk_level, action_text, request, risk_assessment)
     foresight = foresight_engine.predict_text_action(action_text, risk_level, decision=proposal_decision.to_dict())
     guardian_decision = awareness_loop.guardian.review_text_action(
         text=action_text,
         decision=proposal_decision,
         foresight=foresight,
     )
+    guardian_decision["risk_assessment"] = _effective_risk_assessment(risk_assessment, guessed_risk, risk_level)
     if risk == "R5":
-        tool_trace = _record_action_proposal_trace(request, "blocked", guardian_decision)
+        tool_trace = _record_action_proposal_trace(request, "blocked", guardian_decision, risk_assessment=risk_assessment)
         verification = _verify_action_proposal_result(
             request=request,
             action_text=action_text,
@@ -798,6 +801,7 @@ async def action_proposal(request: ActionProposalRequest):
                 "status": "blocked",
                 "artifacts": {
                     "proposal": request.model_dump(),
+                    "risk_assessment": _effective_risk_assessment(risk_assessment, guessed_risk, risk_level),
                     "guardian_decision": guardian_decision,
                     "tool_trace": tool_trace,
                     "verification": verification,
@@ -808,6 +812,7 @@ async def action_proposal(request: ActionProposalRequest):
             "status": "blocked",
             "decision": "block",
             "risk_level": risk,
+            "risk_assessment": _effective_risk_assessment(risk_assessment, guessed_risk, risk_level),
             "guardian_decision": guardian_decision,
             "tool_trace": tool_trace,
             "verification": verification,
@@ -821,7 +826,7 @@ async def action_proposal(request: ActionProposalRequest):
             guardian_decision=guardian_decision,
             proposal=request.model_dump(),
         )
-        tool_trace = _record_action_proposal_trace(request, "needs_confirmation", guardian_decision, review=review)
+        tool_trace = _record_action_proposal_trace(request, "needs_confirmation", guardian_decision, review=review, risk_assessment=risk_assessment)
         verification = _verify_action_proposal_result(
             request=request,
             action_text=action_text,
@@ -838,6 +843,7 @@ async def action_proposal(request: ActionProposalRequest):
                 "status": "needs_confirmation",
                 "artifacts": {
                     "proposal": request.model_dump(),
+                    "risk_assessment": _effective_risk_assessment(risk_assessment, guessed_risk, risk_level),
                     "guardian_decision": guardian_decision,
                     "review": review,
                     "tool_trace": tool_trace,
@@ -848,6 +854,8 @@ async def action_proposal(request: ActionProposalRequest):
         return {
             "status": "needs_confirmation",
             "decision": "ask_user",
+            "risk_level": risk,
+            "risk_assessment": _effective_risk_assessment(risk_assessment, guessed_risk, risk_level),
             "guardian_decision": guardian_decision,
             "review": review,
             "tool_trace": tool_trace,
@@ -859,7 +867,11 @@ async def action_proposal(request: ActionProposalRequest):
             "proposal": request.model_dump(),
         }
     )
-    tool_trace = execution.get("tool_trace") if isinstance(execution.get("tool_trace"), dict) else _record_action_proposal_trace(request, execution.get("status", "unknown"), guardian_decision)
+    tool_trace = (
+        execution.get("tool_trace")
+        if isinstance(execution.get("tool_trace"), dict)
+        else _record_action_proposal_trace(request, execution.get("status", "unknown"), guardian_decision, risk_assessment=risk_assessment)
+    )
     verification = _verify_action_proposal_result(
         request=request,
         action_text=action_text,
@@ -876,6 +888,7 @@ async def action_proposal(request: ActionProposalRequest):
             "status": execution.get("status", "unknown"),
             "artifacts": {
                 "proposal": request.model_dump(),
+                "risk_assessment": _effective_risk_assessment(risk_assessment, guessed_risk, risk_level),
                 "guardian_decision": guardian_decision,
                 "execution_result": execution,
                 "tool_trace": tool_trace,
@@ -886,6 +899,8 @@ async def action_proposal(request: ActionProposalRequest):
     return {
         "status": execution.get("status", "unknown"),
         "decision": guardian_decision.get("decision", "allow"),
+        "risk_level": risk,
+        "risk_assessment": _effective_risk_assessment(risk_assessment, guessed_risk, risk_level),
         "guardian_decision": guardian_decision,
         "execution_result": execution,
         "tool_trace": tool_trace,
@@ -927,7 +942,12 @@ def _action_text(action: dict[str, Any]) -> str:
     return str(action)
 
 
-def _proposal_decision(risk_level: RiskLevel, action_text: str, request: ActionProposalRequest) -> Decision:
+def _proposal_decision(
+    risk_level: RiskLevel,
+    action_text: str,
+    request: ActionProposalRequest,
+    risk_assessment: ActionRiskAssessment,
+) -> Decision:
     if risk_level == RiskLevel.R5:
         route = Route.BLOCK
         capability = "guardian"
@@ -943,14 +963,26 @@ def _proposal_decision(risk_level: RiskLevel, action_text: str, request: ActionP
     return Decision(
         route=route,
         risk_level=risk_level,
-        reason=request.reason or f"ActionProposal from {request.agent}: {action_text}",
+        reason=request.reason or risk_assessment.reason or f"ActionProposal from {request.agent}: {action_text}",
         requires_confirmation=risk_level in {RiskLevel.R3, RiskLevel.R4, RiskLevel.R5},
         intent="action",
         complexity="simple" if risk_level in {RiskLevel.R0, RiskLevel.R1, RiskLevel.R2} else "moderate",
         capability=capability,
-        signals=[f"risk:{risk_level.value}", f"agent:{request.agent}", "action_proposal"],
+        signals=list(dict.fromkeys([f"risk:{risk_level.value}", f"agent:{request.agent}", "action_proposal", *risk_assessment.signals])),
         constraints=constraints,
     )
+
+
+def _effective_risk_assessment(
+    assessment: ActionRiskAssessment,
+    guessed_risk: RiskLevel,
+    effective_risk: RiskLevel,
+) -> dict[str, Any]:
+    payload = assessment.to_dict()
+    payload["guessed_risk_level"] = guessed_risk.value
+    payload["effective_risk_level"] = effective_risk.value
+    payload["risk_floor_applied"] = effective_risk.value == assessment.risk_level
+    return payload
 
 
 def _record_action_proposal_trace(
@@ -959,6 +991,7 @@ def _record_action_proposal_trace(
     guardian_decision: dict[str, Any],
     *,
     review: dict[str, Any] | None = None,
+    risk_assessment: ActionRiskAssessment | None = None,
 ) -> dict[str, Any]:
     result = {
         "status": status,
@@ -966,6 +999,7 @@ def _record_action_proposal_trace(
         "operation": "action_proposal_guard",
         "review_id": (review or {}).get("review_id"),
         "reason": guardian_decision.get("reason"),
+        "risk_assessment": risk_assessment.to_dict() if risk_assessment else guardian_decision.get("risk_assessment"),
     }
     return action_proposal_tool_trace.record(
         tool="action_proposal",

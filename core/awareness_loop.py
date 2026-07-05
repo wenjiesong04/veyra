@@ -9,6 +9,7 @@ from typing import Any
 from awareness.attention_core import AttentionCore
 from awareness.belief_core import BeliefCore
 from awareness.uncertainty_core import UncertaintyCore
+from core.action_risk import assess_text_risk
 from core.agent_session_router import AgentSessionRouter
 from core.capability_registry import CapabilityRegistry
 from core.context_patch_builder import ContextPatchBuilder
@@ -168,6 +169,20 @@ class AwarenessLoop:
                 },
             )
             return self._finalize_event(event, result, started_at, route_trace, context_observability)
+        early_risk_result = self._early_high_risk_result(event, str(text or ""))
+        if early_risk_result:
+            route_trace.append(
+                {
+                    "phase": "early_risk_gate",
+                    "status": early_risk_result.status,
+                    "route": early_risk_result.route.value,
+                    "risk_level": early_risk_result.risk_level.value,
+                    "reason": early_risk_result.artifacts.get("risk_assessment", {}).get("reason")
+                    if isinstance(early_risk_result.artifacts.get("risk_assessment"), dict)
+                    else None,
+                }
+            )
+            return self._finalize_event(event, early_risk_result, started_at, route_trace, context_observability)
         belief_state = self.belief.refresh()
         preliminary_persona = self.persona_engine.patch_for(
             text,
@@ -606,6 +621,10 @@ class AwarenessLoop:
                     "cancelled",
                     "paused",
                     "resumed",
+                    "semantic_change_proposed",
+                    "semantic_change_recorded",
+                    "semantic_change_confirmed",
+                    "semantic_change_declined",
                 }
             ):
                 result.primary_response = primary_override
@@ -647,6 +666,79 @@ class AwarenessLoop:
         assist = decision.get("model_assist") if isinstance(decision.get("model_assist"), dict) else {}
         plan = assist.get("decision_plan") if isinstance(assist.get("decision_plan"), dict) else {}
         return str(plan.get("execution_tier") or assist.get("execution_tier") or "").strip()
+
+    def _early_high_risk_result(self, event: VeyraEvent, text: str) -> LoopResult | None:
+        assessment = assess_text_risk(text)
+        try:
+            risk_level = RiskLevel(assessment.risk_level)
+        except ValueError:
+            return None
+        if risk_level not in {RiskLevel.R4, RiskLevel.R5}:
+            return None
+
+        route = Route.BLOCK if risk_level == RiskLevel.R5 else Route.HUMAN_REVIEW
+        decision = Decision(
+            route=route,
+            risk_level=risk_level,
+            reason=assessment.reason,
+            requires_confirmation=risk_level != RiskLevel.R5,
+            intent="action",
+            complexity="moderate",
+            capability="guardian" if risk_level == RiskLevel.R5 else "human_review",
+            needs_user_confirmation=risk_level == RiskLevel.R4,
+            reasoning_mode="execution",
+            required_capabilities=["guardian"] if risk_level == RiskLevel.R5 else ["human_review"],
+            signals=list(dict.fromkeys(["early_risk_gate", *assessment.signals])),
+            constraints=["do not call model before safety floor", "request explicit confirmation" if risk_level == RiskLevel.R4 else "block unsafe action"],
+        )
+        foresight = ForesightEngine().predict_text_action(text, risk_level, decision=decision.to_dict())
+        guardian_decision = self.guardian.review_text_action(text=text, decision=decision, foresight=foresight)
+        guardian_decision["risk_assessment"] = assessment.to_dict()
+        artifacts = {
+            "decision": decision.to_dict(),
+            "guardian": guardian_decision,
+            "foresight": foresight,
+            "risk_assessment": assessment.to_dict(),
+            "safety_gate": {
+                "phase": "pre_model",
+                "reason": "R4/R5 risk floor is applied before model-assisted understanding",
+            },
+        }
+        if guardian_decision["decision"] == GuardianDecision.BLOCK.value or risk_level == RiskLevel.R5:
+            self.runtime_entity.set_status(LifecycleStatus.BLOCKED.value)
+            return LoopResult(
+                event_id=event.event_id,
+                route=Route.BLOCK,
+                status="blocked",
+                response=str(guardian_decision.get("reason") or "该动作被安全策略阻断。"),
+                risk_level=risk_level,
+                artifacts=artifacts,
+            )
+
+        self.runtime_entity.set_status(LifecycleStatus.WAITING_CONFIRMATION.value)
+        review = self.review_queue.create(
+            event_id=event.event_id,
+            task_text=text,
+            risk_level=risk_level.value,
+            foresight=foresight,
+            guardian_decision=guardian_decision,
+            proposal={
+                "agent": "veyra_core",
+                "action": {"type": "natural_language_action", "text": text},
+                "risk_guess": risk_level.value,
+                "reversible": str(foresight.get("reversible") or "unknown"),
+                "reason": assessment.reason,
+            },
+        )
+        artifacts["review"] = review
+        return LoopResult(
+            event_id=event.event_id,
+            route=Route.HUMAN_REVIEW,
+            status="needs_confirmation",
+            response="该动作需要用户确认后才能执行。",
+            risk_level=risk_level,
+            artifacts=artifacts,
+        )
 
     def _confirmation_proposal(self, text: str, decision: Decision) -> dict[str, object] | None:
         if decision.route != Route.ROLLBACK:

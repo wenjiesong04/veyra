@@ -1,14 +1,14 @@
 from pathlib import Path
 from urllib.parse import urlparse
 
-from core.definitions import GuardianDecision, RiskLevel, classify_text_risk, risk_policy
+from core.action_risk import ActionRiskAssessment, assess_command_risk
+from core.definitions import GuardianDecision, RiskLevel, risk_policy
 
 
 class ToolPolicy:
     def review_command(self, command: list[str] | str) -> dict:
-        text = " ".join(command) if isinstance(command, list) else command
-        risk_level = classify_text_risk(text)
-        return self._decision(risk_level, reason="shell command policy review")
+        assessment = assess_command_risk(command)
+        return self._decision(RiskLevel(assessment.risk_level), reason=assessment.reason, assessment=assessment)
 
     def review_file_read(self, path: str) -> dict:
         target = Path(path)
@@ -43,14 +43,16 @@ class ToolPolicy:
             return self._decision(RiskLevel.R4, reason="state-changing API request requires confirmation")
         return self._decision(RiskLevel.R1, reason="read-only API request")
 
-    def _decision(self, risk_level: RiskLevel, reason: str) -> dict:
+    def _decision(self, risk_level: RiskLevel, reason: str, assessment: ActionRiskAssessment | None = None) -> dict:
         policy = risk_policy(risk_level)
+        risk_assessment = assessment.to_dict() if assessment else None
         if policy.default_decision == GuardianDecision.BLOCK:
             return {
                 "decision": GuardianDecision.BLOCK.value,
                 "risk_level": risk_level.value,
                 "reason": reason,
                 "policy": policy.to_dict(),
+                **({"risk_assessment": risk_assessment} if risk_assessment else {}),
                 "required_preconditions": ["do not execute"],
                 "forbidden": ["rm -rf", "curl | bash", "drop database", "drop table", "truncate table", "git push --force", "externalize_secrets"],
             }
@@ -60,6 +62,7 @@ class ToolPolicy:
                 "risk_level": risk_level.value,
                 "reason": reason,
                 "policy": policy.to_dict(),
+                **({"risk_assessment": risk_assessment} if risk_assessment else {}),
                 "required_preconditions": ["explain impact", "confirm target", "record rollback path"],
                 "forbidden": ["rm -rf", "curl | bash", "drop database", "drop table", "truncate table", "git push --force", "externalize_secrets"],
             }
@@ -68,6 +71,7 @@ class ToolPolicy:
             "risk_level": risk_level.value,
             "reason": reason,
             "policy": policy.to_dict(),
+            **({"risk_assessment": risk_assessment} if risk_assessment else {}),
             "required_preconditions": ["read-only first"] if risk_level == RiskLevel.R1 else ["record evidence"],
             "forbidden": ["rm -rf", "curl | bash", "drop database", "drop table", "truncate table", "git push --force", "externalize_secrets"],
         }

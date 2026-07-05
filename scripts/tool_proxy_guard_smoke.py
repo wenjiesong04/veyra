@@ -126,6 +126,71 @@ def main() -> int:
     expect(restart.get("review", {}).get("review_id"), "restart review created", restart)
     expect(restart.get("tool_trace", {}).get("trace_id"), "restart trace", restart)
 
+    launchctl_restart = proposal(
+        {
+            "proposal_id": "guard_launchctl_restart",
+            "agent": "guard-smoke",
+            "action": {"type": "shell_command", "command": ["launchctl", "kickstart", "-k", "gui/501/ai.veyra.api"]},
+            "risk_guess": "R2",
+            "reversible": "partial",
+            "reason": "Agent requests service restart through launchctl.",
+        }
+    )
+    expect(launchctl_restart.get("status") == "needs_confirmation", "launchctl kickstart requires human review", launchctl_restart)
+    expect(launchctl_restart.get("risk_level") == "R4", "launchctl kickstart risk raised to R4", launchctl_restart)
+    expect(
+        launchctl_restart.get("risk_assessment", {}).get("category") == "service_control",
+        "launchctl kickstart classified as service control",
+        launchctl_restart,
+    )
+    expect(launchctl_restart.get("review", {}).get("review_id"), "launchctl restart review created", launchctl_restart)
+
+    systemctl_restart = proposal(
+        {
+            "proposal_id": "guard_systemctl_restart",
+            "agent": "guard-smoke",
+            "action": {"type": "shell_command", "command": ["systemctl", "restart", "nginx"]},
+            "risk_guess": "R1",
+            "reversible": "partial",
+            "reason": "Agent requests service restart through systemctl.",
+        }
+    )
+    expect(systemctl_restart.get("status") == "needs_confirmation", "systemctl restart requires human review", systemctl_restart)
+    expect(systemctl_restart.get("risk_level") == "R4", "systemctl restart risk raised to R4", systemctl_restart)
+
+    kill_process = proposal(
+        {
+            "proposal_id": "guard_kill_process",
+            "agent": "guard-smoke",
+            "action": {"type": "shell_command", "command": ["kill", "-9", "123"]},
+            "risk_guess": "R1",
+            "reversible": "partial",
+            "reason": "Agent requests process termination.",
+        }
+    )
+    expect(kill_process.get("status") == "needs_confirmation", "process kill requires human review", kill_process)
+    expect(kill_process.get("risk_level") == "R4", "process kill risk raised to R4", kill_process)
+
+    direct_launchctl = post_json("/tool-proxy/shell", {"command": ["launchctl", "kickstart", "-k", "gui/501/ai.veyra.api"]})
+    expect(direct_launchctl.get("status") == "needs_confirmation", "direct ToolProxy launchctl requires human review", direct_launchctl)
+    expect(direct_launchctl.get("review", {}).get("review_id"), "direct ToolProxy launchctl review created", direct_launchctl)
+
+    natural_restart = post_json(
+        "/events/message",
+        {
+            "text": "帮我重启 Veyra 服务。",
+            "channel": "api",
+            "user_id": "guard-smoke-user",
+            "session_id": "guard-smoke-session",
+            "message_id": "guard-natural-restart",
+        },
+    )
+    expect(natural_restart.get("route") == "human_review", "natural restart enters human review", natural_restart)
+    expect(natural_restart.get("risk_level") == "R4", "natural restart risk raised to R4 before model", natural_restart)
+    artifacts = natural_restart.get("artifacts") if isinstance(natural_restart.get("artifacts"), dict) else {}
+    expect((artifacts.get("safety_gate") or {}).get("phase") == "pre_model", "natural restart uses pre-model safety gate", natural_restart)
+    expect((artifacts.get("review") or {}).get("review_id"), "natural restart review created", natural_restart)
+
     force_push = proposal(
         {
             "proposal_id": "guard_force_push",
@@ -167,14 +232,14 @@ def main() -> int:
 
     tool_logs = get_json("/logs/tools")
     traces = [item for item in tool_logs.get("items", []) if item.get("trace_id")]
-    expect(len(traces) >= 8, "all scenarios emitted tool traces", traces)
+    expect(len(traces) >= 12, "all scenarios emitted tool traces", traces)
     audit = get_json("/audit/journal?limit=200")
     proposals = [
         item
         for item in audit.get("items", [])
         if str(item.get("event_id") or "").startswith("guard_") or str(item.get("trace_id") or "").startswith("guard_")
     ]
-    expect(len(proposals) >= 8, "all scenarios entered audit", proposals)
+    expect(len(proposals) >= 12, "all scenarios entered audit", proposals)
 
     print("Tool Proxy guard smoke passed.")
     return 0
