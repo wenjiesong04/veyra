@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import html
 import os
 import re
@@ -54,8 +55,10 @@ class SearchProbe:
             }
         url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
         http_timeout = self._float_env("VEYRA_SEARCH_HTTP_TIMEOUT", 8.0)
+        provider = os.getenv("VEYRA_SEARCH_PROVIDER", "auto").strip().lower()
+        headers = self._search_headers()
         try:
-            body = self.fetcher(url) if self.fetcher else fetch_text(url, timeout=http_timeout, headers={"User-Agent": "Veyra-SearchProbe/0.1"})
+            body = self.fetcher(url) if self.fetcher else fetch_text(url, timeout=http_timeout, headers=headers)
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
             return probe_payload(
                 probe="search_probe",
@@ -67,6 +70,26 @@ class SearchProbe:
                 details={"query": query, "source_url": url, "error": str(exc), "timeout_seconds": http_timeout, "openclaw_attempt": openclaw_attempt},
             )
         results = self._parse_results(body, limit=max_results)
+        fallback_attempt: dict[str, Any] | None = None
+        if not results and provider not in {"duckduckgo", "ddg"}:
+            yahoo_result = self._run_yahoo_search(query, max_results=max_results, timeout=http_timeout, headers=headers)
+            fallback_attempt = {
+                "status": yahoo_result.get("status"),
+                "summary": yahoo_result.get("summary"),
+                "provider": "yahoo_html",
+            }
+            if yahoo_result.get("status") == "ok":
+                self._store_cache(cache_key, yahoo_result)
+                return yahoo_result
+            bing_result = self._run_bing_search(query, max_results=max_results, timeout=http_timeout, headers=headers)
+            fallback_attempt = {
+                "status": bing_result.get("status"),
+                "summary": bing_result.get("summary"),
+                "provider": "bing_html",
+            }
+            if bing_result.get("status") == "ok":
+                self._store_cache(cache_key, bing_result)
+                return bing_result
         status = "ok" if results else "empty"
         summary = f"Search returned {len(results)} result(s) for {query}." if results else f"Search returned no parseable results for {query}."
         payload = probe_payload(
@@ -76,7 +99,14 @@ class SearchProbe:
             summary=summary,
             confidence=0.7 if results else 0.45,
             ttl_seconds=1800,
-            details={"query": query, "source_url": url, "results": results, "timeout_seconds": http_timeout, "openclaw_attempt": openclaw_attempt},
+            details={
+                "query": query,
+                "source_url": url,
+                "results": results,
+                "timeout_seconds": http_timeout,
+                "openclaw_attempt": openclaw_attempt,
+                "fallback_attempt": fallback_attempt,
+            },
             claims=[
                 {
                     "key": f"search:{query}",
@@ -89,6 +119,84 @@ class SearchProbe:
         )
         self._store_cache(cache_key, payload)
         return payload
+
+    def _run_yahoo_search(self, query: str, *, max_results: int, timeout: float, headers: dict[str, str]) -> dict[str, Any]:
+        url = f"https://search.yahoo.com/search?p={quote_plus(query)}"
+        try:
+            body = self.fetcher(url) if self.fetcher else fetch_text(url, timeout=timeout, headers=headers)
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+            return probe_payload(
+                probe="search_probe",
+                target=query,
+                status="unavailable",
+                summary=f"Yahoo search unavailable for {query}: {exc}",
+                confidence=0.35,
+                ttl_seconds=300,
+                details={"query": query, "source_url": url, "provider": "yahoo_html", "error": str(exc), "timeout_seconds": timeout},
+            )
+        results = self._parse_yahoo_results(body, limit=max_results)
+        status = "ok" if results else "empty"
+        summary = f"Yahoo search returned {len(results)} result(s) for {query}." if results else f"Yahoo search returned no parseable results for {query}."
+        return probe_payload(
+            probe="search_probe",
+            target=query,
+            status=status,
+            summary=summary,
+            confidence=0.72 if results else 0.45,
+            ttl_seconds=1800,
+            details={"query": query, "source_url": url, "provider": "yahoo_html", "results": results, "timeout_seconds": timeout},
+            claims=[
+                {
+                    "key": f"search:{query}",
+                    "claim": summary,
+                    "confidence": 0.72 if results else 0.45,
+                    "source": "yahoo_html_search",
+                    "ttl_seconds": 1800,
+                }
+            ],
+        )
+
+    def _run_bing_search(self, query: str, *, max_results: int, timeout: float, headers: dict[str, str]) -> dict[str, Any]:
+        url = f"https://www.bing.com/search?q={quote_plus(query)}"
+        try:
+            body = self.fetcher(url) if self.fetcher else fetch_text(url, timeout=timeout, headers=headers)
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+            return probe_payload(
+                probe="search_probe",
+                target=query,
+                status="unavailable",
+                summary=f"Bing search unavailable for {query}: {exc}",
+                confidence=0.35,
+                ttl_seconds=300,
+                details={"query": query, "source_url": url, "provider": "bing_html", "error": str(exc), "timeout_seconds": timeout},
+            )
+        results = self._parse_bing_results(body, limit=max_results)
+        status = "ok" if results else "empty"
+        summary = f"Bing search returned {len(results)} result(s) for {query}." if results else f"Bing search returned no parseable results for {query}."
+        return probe_payload(
+            probe="search_probe",
+            target=query,
+            status=status,
+            summary=summary,
+            confidence=0.72 if results else 0.45,
+            ttl_seconds=1800,
+            details={"query": query, "source_url": url, "provider": "bing_html", "results": results, "timeout_seconds": timeout},
+            claims=[
+                {
+                    "key": f"search:{query}",
+                    "claim": summary,
+                    "confidence": 0.72 if results else 0.45,
+                    "source": "bing_html_search",
+                    "ttl_seconds": 1800,
+                }
+            ],
+        )
+
+    def _search_headers(self) -> dict[str, str]:
+        return {
+            "User-Agent": "Veyra-SearchProbe/0.1",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
 
     def _openclaw_search_enabled(self) -> bool:
         provider = os.getenv("VEYRA_SEARCH_PROVIDER", "auto").strip().lower()
@@ -279,6 +387,55 @@ class SearchProbe:
                 break
         return results
 
+    def _parse_yahoo_results(self, body: str, *, limit: int) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        pattern = re.compile(
+            r"<a[^>]+href=\"(?P<href>[^\"]+)\"[^>]*>(?P<body>(?:(?!</a>).)*?<h3[^>]*>.*?</h3>.*?)</a>(?P<after>.{0,1800})",
+            re.IGNORECASE | re.DOTALL,
+        )
+        for match in pattern.finditer(body or ""):
+            title_match = re.search(r"<h3[^>]*>(?P<title>.*?)</h3>", match.group("body"), re.IGNORECASE | re.DOTALL)
+            if not title_match:
+                continue
+            title = self._clean_html(title_match.group("title"))
+            url = self._clean_url(match.group("href"))
+            if not title or not url:
+                continue
+            after = match.group("after") or ""
+            snippet_match = re.search(r"<p[^>]*>(?P<snippet>.*?)</p>", after, re.IGNORECASE | re.DOTALL)
+            snippet = self._clean_html(snippet_match.group("snippet")) if snippet_match else ""
+            if self._is_search_placeholder(title=title, url=url, snippet=snippet):
+                continue
+            if any(item["url"] == url for item in results):
+                continue
+            results.append({"title": title, "url": url, "snippet": snippet, "source": self._host(url)})
+            if len(results) >= limit:
+                break
+        return results
+
+    def _parse_bing_results(self, body: str, *, limit: int) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        pattern = re.compile(
+            r"<h2[^>]*>\s*<a[^>]+href=\"(?P<href>[^\"]+)\"[^>]*>(?P<title>.*?)</a>\s*</h2>(?P<after>.{0,1800})",
+            re.IGNORECASE | re.DOTALL,
+        )
+        for match in pattern.finditer(body or ""):
+            title = self._clean_html(match.group("title"))
+            url = self._clean_url(match.group("href"))
+            if not title or not url:
+                continue
+            after = match.group("after") or ""
+            snippet_match = re.search(r"<p[^>]*>(?P<snippet>.*?)</p>", after, re.IGNORECASE | re.DOTALL)
+            snippet = self._clean_html(snippet_match.group("snippet")) if snippet_match else ""
+            if self._is_search_placeholder(title=title, url=url, snippet=snippet):
+                continue
+            if any(item["url"] == url for item in results):
+                continue
+            results.append({"title": title, "url": url, "snippet": snippet, "source": self._host(url)})
+            if len(results) >= limit:
+                break
+        return results
+
     def _snippet_after(self, body: str, offset: int) -> str:
         window = body[offset : offset + 1200]
         match = re.search(r'class="result__snippet"[^>]*>(?P<snippet>.*?)</a>', window, re.IGNORECASE | re.DOTALL)
@@ -295,7 +452,33 @@ class SearchProbe:
             target = parse_qs(parsed.query).get("uddg", [""])[0]
             if target:
                 url = unquote(target)
+        if parsed.netloc.lower().endswith("bing.com") and parsed.path.startswith("/ck/"):
+            target = parse_qs(parsed.query).get("u", [""])[0]
+            decoded = self._decode_bing_target(target)
+            if decoded:
+                url = decoded
+        if parsed.netloc.lower().endswith("r.search.yahoo.com"):
+            match = re.search(r"/RU=(?P<target>.*?)/(?:RK|RS)=", parsed.path)
+            if match:
+                url = unquote(match.group("target"))
         return url if url.startswith(("http://", "https://")) else ""
+
+    def _decode_bing_target(self, value: str) -> str:
+        raw = unquote(value or "").strip()
+        candidates = [raw]
+        if raw.startswith("a1"):
+            candidates.append(raw[2:])
+        for candidate in candidates:
+            if not candidate:
+                continue
+            padding = "=" * (-len(candidate) % 4)
+            try:
+                decoded = base64.urlsafe_b64decode((candidate + padding).encode("ascii")).decode("utf-8", errors="replace")
+            except (ValueError, OSError):
+                continue
+            if decoded.startswith(("http://", "https://")):
+                return decoded
+        return ""
 
     def _host(self, url: str) -> str:
         return urlparse(url).netloc.lower()

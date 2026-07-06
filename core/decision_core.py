@@ -116,6 +116,13 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
         "capability": "web_search",
         "markers": ("最新", "新闻", "latest", "recent", "today's", "今天的"),
     },
+    {
+        "name": "external_recruiting_lookup",
+        "probe": "search_probe",
+        "capability": "web_search",
+        "markers": ("秋招", "春招", "校招", "招聘", "招聘信息", "网申", "内推", "求职", "岗位信息", "公司信息", "公司名单"),
+        "anti_markers": ("修复", "解决", "改代码", "修改代码", "新增", "添加", "开发", "重构", "fix", "repair", "implement"),
+    },
 )
 
 VOLATILE_MARKERS = ("现在", "当前", "今天", "最近", "状态", "最新", "没响应", "不响应", "没回应", "today", "now", "current", "status", "latest")

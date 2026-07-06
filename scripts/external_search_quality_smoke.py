@@ -112,6 +112,64 @@ def placeholder_filter_smoke() -> None:
     expect(results == [], "placeholder result list is empty", result)
 
 
+def bing_fallback_smoke() -> None:
+    def fetcher(url: str) -> str:
+        if "duckduckgo.com" in url:
+            return """
+            <html>
+              <form id="challenge-form" action="//duckduckgo.com/anomaly.js?sv=html"></form>
+            </html>
+            """
+        return """
+        <html>
+          <ol id="b_results">
+            <li class="b_algo">
+              <h2><a href="https://example.com/campus-2026">2026 秋招公司信息汇总</a></h2>
+              <p>公司、岗位和网申入口汇总。</p>
+            </li>
+          </ol>
+        </html>
+        """
+
+    result = SearchProbe(fetcher=fetcher).run("2026 秋招 校招 公司 招聘 信息 网申 岗位", max_results=3)
+    details = result.get("details") if isinstance(result.get("details"), dict) else {}
+    results = details.get("results") if isinstance(details.get("results"), list) else []
+    expect(result.get("status") == "ok", "bing fallback recovers from duckduckgo anomaly", result)
+    expect(details.get("provider") == "bing_html", "fallback result records provider", result)
+    expect(results and results[0].get("url") == "https://example.com/campus-2026", "fallback keeps result URL", result)
+
+
+def yahoo_fallback_smoke() -> None:
+    def fetcher(url: str) -> str:
+        if "duckduckgo.com" in url:
+            return """
+            <html>
+              <form id="challenge-form" action="//duckduckgo.com/anomaly.js?sv=html"></form>
+            </html>
+            """
+        return """
+        <html>
+          <ol class="reg searchCenterMiddle">
+            <li>
+              <div class="compTitle">
+                <a href="https://job.example.com/campus2026">
+                  <h3><span>2026 届秋招公司信息汇总</span></h3>
+                </a>
+              </div>
+              <div class="compText"><p>公司、岗位和网申入口汇总。</p></div>
+            </li>
+          </ol>
+        </html>
+        """
+
+    result = SearchProbe(fetcher=fetcher).run("2026届秋招 公司招聘 网申入口", max_results=3)
+    details = result.get("details") if isinstance(result.get("details"), dict) else {}
+    results = details.get("results") if isinstance(details.get("results"), list) else []
+    expect(result.get("status") == "ok", "yahoo fallback recovers from duckduckgo anomaly", result)
+    expect(details.get("provider") == "yahoo_html", "yahoo fallback records provider", result)
+    expect(results and results[0].get("title") == "2026 届秋招公司信息汇总", "yahoo fallback keeps result title", result)
+
+
 def quality_and_dedupe_smoke() -> None:
     with TemporaryDirectory(prefix="veyra-external-search-quality-") as tmp:
         store = WorldStateStore(Path(tmp) / "state")
@@ -181,6 +239,8 @@ def failure_smoke() -> None:
 def main() -> int:
     cache_smoke()
     placeholder_filter_smoke()
+    yahoo_fallback_smoke()
+    bing_fallback_smoke()
     quality_and_dedupe_smoke()
     failure_smoke()
     print("external search quality smoke passed")

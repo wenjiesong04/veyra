@@ -1205,6 +1205,7 @@ class AwarenessLoop:
             "无法访问互联网",
             "请稍后再试",
             "我现在无法",
+            "你想问哪个对象、现象或决定",
         )
         return any(marker in lowered for marker in markers)
 
@@ -1245,8 +1246,21 @@ class AwarenessLoop:
         if self._bare_clarification_question(text):
             return "你想问哪件事的原因？补一句具体对象，我就能直接解释。"
         if decision.intent in {"information", "unknown"}:
+            if self._plain_explanation_question(text):
+                return (
+                    "这是一个普通解释问题，不需要当前状态或外部证据，也不是要你补“对象、现象或决定”。"
+                    f"但当前核心模型请求失败，我暂时不能给出可靠完整解释；模型恢复后可以直接回答「{snippet}」。"
+                )
             return "我需要你补一点具体上下文：你想问哪个对象、现象或决定？"
         return "我在。你可以直接说要继续哪个问题。"
+
+    def _plain_explanation_question(self, text: str) -> bool:
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "").lower()
+        if self._bare_clarification_question(text):
+            return False
+        explanation_markers = ("为什么", "为何", "为啥", "是什么", "怎么", "如何", "解释", "说明", "why", "what", "how")
+        volatile_markers = ("现在", "当前", "今天", "最新", "状态", "还在", "有没有", "current", "latest", "status", "now")
+        return any(marker in compact for marker in explanation_markers) and not any(marker in compact for marker in volatile_markers)
 
     def _project_identity_direct_response(self, text: str) -> str:
         lowered = (text or "").lower()
@@ -1406,6 +1420,7 @@ class AwarenessLoop:
             "log_probe",
             "network",
             "network_probe",
+            "search_probe",
         }
         if decision.route != Route.PROBE or not probe_name or probe_name not in fast_probes:
             return None
@@ -1587,12 +1602,18 @@ class AwarenessLoop:
         return self.commitment_core.followup_messages_for_turn(commitment_turn)
 
     def _conversation_followup_result(self, event: VeyraEvent, text: str, attention_focus: list[str]) -> LoopResult | None:
+        clarification_rejection = self._clarification_rejection_result(event, text, attention_focus)
+        if clarification_rejection:
+            return clarification_rejection
         generic = self._generic_previous_turn_followup_result(event, text, attention_focus)
         if generic:
             return generic
         slots = self._conversation_slots_for_event(event)
         last_tool = slots.get("last_tool_result") if isinstance(slots.get("last_tool_result"), dict) else {}
         if last_tool.get("type") == "search":
+            retry = self._search_followup_retry_result(event, text, attention_focus, last_tool)
+            if retry:
+                return retry
             response = self._answer_search_followup(text, last_tool)
             if response:
                 return LoopResult(
@@ -1635,6 +1656,163 @@ class AwarenessLoop:
                 },
             )
         return None
+
+    def _search_followup_retry_result(
+        self,
+        event: VeyraEvent,
+        text: str,
+        attention_focus: list[str],
+        last_tool: dict[str, Any],
+    ) -> LoopResult | None:
+        compact = re.sub(r"[\s，,。！？!?、~～]+", "", text or "").lower()
+        retry_markers = {"没有这些", "没有", "都没有", "不是这些", "没这些", "换一批", "再找", "继续找", "重新搜", "重新找"}
+        if compact not in retry_markers:
+            return None
+        previous_query = str(last_tool.get("query") or "").strip()
+        if not previous_query:
+            return None
+        query = self._broaden_search_query(previous_query)
+        decision = Decision(
+            route=Route.PROBE,
+            risk_level=RiskLevel.R1,
+            reason="user rejected previous search results; retry with broadened query",
+            selected_probe="search_probe",
+            intent="information",
+            complexity="simple",
+            capability="probe",
+            freshness_required=True,
+            needs_probe=True,
+            memory_policy="forget",
+            reasoning_mode="evidence",
+            required_capabilities=["web_search"],
+            capability_request={"capability": "web_search", "probe": "search_probe", "reason": "retry external lookup"},
+            signals=["followup:search_retry", "freshness:external_lookup", "capability:web_search"],
+            constraints=["retry search with a broader query", "do not fall back to generic clarification"],
+            model_assist={
+                "status": "skipped",
+                "reason": "search_followup_retry",
+                "recommended_route": Route.PROBE.value,
+                "probe_params": {"query": query},
+            },
+        )
+        decision = self.decision_core.model_driven.enrich(query, decision, event=event)
+        result = self._run_probe(event, decision, attention_focus)
+        result.artifacts["conversation_followup"] = {
+            "type": "search_retry",
+            "previous_query": previous_query[:240],
+            "query": query[:240],
+        }
+        return result
+
+    def _broaden_search_query(self, query: str) -> str:
+        compact = re.sub(r"[\s，,。！？!?、]+", "", query or "")
+        if "秋招" in compact or "校招" in compact or "招聘" in compact:
+            year_match = re.search(r"20\d{2}", query or "")
+            year = year_match.group(0) if year_match else "2026"
+            return f"{year} 秋招 校招 公司 招聘 信息 网申 岗位"
+        return f"{query} 相关信息".strip()
+
+    def _clarification_rejection_result(self, event: VeyraEvent, text: str, attention_focus: list[str]) -> LoopResult | None:
+        compact = re.sub(r"[\s，,。！？!?、~～]+", "", text or "").lower()
+        if compact not in {"没有这些", "没有", "都没有", "不是这些", "没这些"}:
+            return None
+        previous = self._last_outbound_message(event)
+        previous_text = str(previous.get("message") or "")
+        if "你想问哪个对象、现象或决定" not in previous_text:
+            return None
+        original = self._previous_inbound_message(event)
+        original_text = str(original.get("text") or "").strip()
+        if not self._looks_like_external_lookup_request(original_text):
+            return LoopResult(
+                event_id=event.event_id,
+                route=Route.ASK_USER,
+                status="needs_user_input",
+                response="明白，你不是在补具体对象。那请直接说你要我查哪类信息，我会按泛化检索处理。",
+                risk_level=RiskLevel.R0,
+                artifacts={
+                    "conversation_followup": {
+                        "type": "clarification_rejection",
+                        "source": "channel_outbox",
+                        "previous_prompt": "generic_context_gap",
+                    },
+                    "attention": attention_focus,
+                    "execution_tier": TIER_L0_DIRECT_ANSWER,
+                },
+            )
+        decision = Decision(
+            route=Route.PROBE,
+            risk_level=RiskLevel.R1,
+            reason="user rejected generic clarification; resume previous external lookup request",
+            selected_probe="search_probe",
+            intent="information",
+            complexity="simple",
+            capability="probe",
+            freshness_required=True,
+            needs_probe=True,
+            memory_policy="forget",
+            reasoning_mode="evidence",
+            required_capabilities=["web_search"],
+            capability_request={"capability": "web_search", "probe": "search_probe", "reason": "external information lookup"},
+            signals=["followup:clarification_rejection", "freshness:external_lookup", "capability:web_search"],
+            constraints=["use the previous user request as the search query", "do not ask the same generic clarification again"],
+            model_assist={
+                "status": "skipped",
+                "reason": "clarification_rejection_resumes_external_lookup",
+                "recommended_route": Route.PROBE.value,
+                "probe_params": {"query": original_text},
+            },
+        )
+        decision = self.decision_core.model_driven.enrich(original_text, decision, event=event)
+        result = self._run_probe(event, decision, attention_focus)
+        result.artifacts["conversation_followup"] = {
+            "type": "clarification_rejection",
+            "source": "channel_outbox",
+            "previous_user_text": original_text[:280],
+        }
+        return result
+
+    def _previous_inbound_message(self, event: VeyraEvent) -> dict[str, Any]:
+        channel_state = self.state_store.read_json("channel_state.json")
+        inbox = channel_state.get("inbox") if isinstance(channel_state.get("inbox"), list) else []
+        for item in reversed(inbox):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("session_id") or "") != event.source.session_id:
+                continue
+            if str(item.get("event_id") or "") == event.event_id:
+                continue
+            text = str(item.get("text") or "").strip()
+            if text:
+                return dict(item)
+        return {}
+
+    def _looks_like_external_lookup_request(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
+        lookup_markers = ("找", "搜索", "搜", "查", "查询", "信息", "资料", "名单", "list", "search", "lookup", "find")
+        external_markers = (
+            "秋招",
+            "春招",
+            "校招",
+            "招聘",
+            "网申",
+            "内推",
+            "求职",
+            "岗位",
+            "公司",
+            "新闻",
+            "最新",
+            "2026",
+            "2027",
+            "company",
+            "companies",
+            "recruit",
+            "hiring",
+            "jobs",
+        )
+        return any(marker in compact or marker in lowered for marker in lookup_markers) and any(
+            marker in compact or marker in lowered for marker in external_markers
+        )
 
     def _generic_previous_turn_followup_result(self, event: VeyraEvent, text: str, attention_focus: list[str]) -> LoopResult | None:
         followup = self._classify_previous_turn_followup(text)
@@ -2037,6 +2215,9 @@ class AwarenessLoop:
     def _search_query_from_text(self, text: str) -> str:
         query = " ".join(str(text or "").split())
         query = re.sub(r"^(帮我|麻烦你|请你)?(找一下|搜索一下|搜一下|查一下|查询|找|搜索|搜)\s*", "", query)
+        query = re.sub(r"^(一些|有关|关于)\s*", "", query)
+        query = query.replace("秋招的公司", "秋招 公司").replace("校招的公司", "校招 公司")
+        query = query.replace("公司的信息", "公司 信息").replace("公司信息", "公司 信息")
         query = query.replace("的最新", " 最新").replace("的视频", " 视频").replace("视频", " 视频")
         query = re.sub(r"\s+", " ", query).strip(" ，,。！？!?")
         return query or str(text or "").strip()

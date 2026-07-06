@@ -452,7 +452,7 @@ def _expectation_failures(record: dict[str, Any]) -> list[str]:
     if case_id == "ordinary_explanation":
         if route != "direct_answer":
             failures.append(f"expected direct_answer, got {route}")
-        if not record["model_used"]:
+        if not record["model_used"] and not _model_transport_unavailable(record):
             failures.append("expected Core Model use for natural answer")
         if record["agent_used"]:
             failures.append("ordinary question entered AgentRoute")
@@ -462,6 +462,8 @@ def _expectation_failures(record: dict[str, Any]) -> list[str]:
             failures.append(f"expected memory_policy=forget, got {record['memory_policy']}")
         if "Core Cognition Model 当前未配置" in response:
             failures.append("fell back to fixed unconfigured-model response")
+        if _generic_context_gap_response(response):
+            failures.append("fell back to generic context-gap clarification")
     elif case_id == "fresh_time":
         if route != "probe":
             failures.append(f"expected probe route, got {route}")
@@ -575,6 +577,22 @@ def _expectation_failures(record: dict[str, Any]) -> list[str]:
         if "将为您提供" in response or "已开启" in response:
             failures.append("daily weather primary response implies activation before confirmation")
     return failures
+
+
+def _model_transport_unavailable(record: dict[str, Any]) -> bool:
+    trace = record.get("model_trace") if isinstance(record.get("model_trace"), dict) else {}
+    calls = trace.get("calls") if isinstance(trace.get("calls"), list) else []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        text = json.dumps(call, ensure_ascii=False)
+        if "http_error" in text and any(marker in text for marker in ("429", "Too Many Requests", "401", "Unauthorized", "timeout")):
+            return True
+    return False
+
+
+def _generic_context_gap_response(response: str) -> bool:
+    return "你想问哪个对象、现象或决定" in (response or "")
 
 
 if __name__ == "__main__":

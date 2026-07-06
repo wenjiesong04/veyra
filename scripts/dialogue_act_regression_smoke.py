@@ -71,6 +71,35 @@ class DebugAgentAdapter(AgentAdapter):
         return None
 
 
+class FakeSearchProbe:
+    def run(self, query: str, *, max_results: int = 5) -> dict[str, Any]:
+        results = [
+            {
+                "title": "2026 秋招公司信息汇总",
+                "url": "https://example.com/campus-2026",
+                "snippet": "公司、岗位和网申入口汇总。",
+            }
+        ]
+        return {
+            "probe": "search_probe",
+            "target": query,
+            "status": "ok",
+            "summary": f"Search returned {len(results)} result(s) for {query}.",
+            "confidence": 0.8,
+            "ttl_seconds": 1800,
+            "details": {"query": query, "results": results, "provider": "fake_search_probe"},
+            "claims": [
+                {
+                    "key": f"search:{query}",
+                    "claim": f"Search returned {len(results)} result(s) for {query}.",
+                    "confidence": 0.8,
+                    "source": "fake_search_probe",
+                    "ttl_seconds": 1800,
+                }
+            ],
+        }
+
+
 MINIMAL_CASES: list[dict[str, Any]] = [
     {"id": "greeting_hi", "text": "hi", "expect": {"dialogue_act": "greeting", "route": "direct_answer", "operation": "reply", "no_agent": True, "no_probe": True}},
     {"id": "greeting_zh", "text": "你好", "expect": {"dialogue_act": "greeting", "route": "direct_answer", "operation": "reply", "no_agent": True, "no_probe": True}},
@@ -92,6 +121,9 @@ MINIMAL_CASES: list[dict[str, Any]] = [
     {"id": "openclaw_diagnostic", "text": "帮我检查 OpenClaw 为什么没响应", "expect": {"dialogue_act": "probe_or_agent_task", "route": "probe", "operation": "probe", "requires_probe": True, "no_agent": True}},
     {"id": "port_probe", "text": "检查 18789 端口是不是被占用了", "expect": {"dialogue_act": "probe_route", "route": "probe", "operation": "probe", "target": "18789", "requires_probe": True, "no_agent": True}},
     {"id": "git_probe", "text": "当前项目 git 有没有脏文件", "expect": {"dialogue_act": "probe_route", "route": "probe", "operation": "probe", "target": "git", "requires_probe": True, "no_agent": True}},
+    {"id": "campus_recruitment_search", "text": "帮我找一些2026秋招的公司的信息", "expect": {"dialogue_act": "external_lookup", "route": "probe", "operation": "probe", "target": "search_probe", "requires_probe": True, "no_agent": True}},
+    {"id": "clarification_rejection_resume_search", "text": "没有这些", "seed_generic_clarification": True, "expect": {"dialogue_act": "external_lookup_followup", "route": "probe", "operation": "probe", "target": "search_probe", "requires_probe": True, "no_agent": True}},
+    {"id": "search_empty_rejection_retry", "text": "没有这些", "seed_empty_search": True, "expect": {"dialogue_act": "external_lookup_retry", "route": "probe", "operation": "probe", "target": "search_probe", "requires_probe": True, "no_agent": True}},
     {"id": "openclaw_fix_agent", "text": "帮我修复 OpenClaw 没响应的问题", "expect": {"dialogue_act": "agent_task", "route": "agent", "operation": "agent_task", "requires_agent": True}},
     {"id": "dialogue_router_agent", "text": "给 Veyra 加一个 DialogueActRouter", "expect": {"dialogue_act": "agent_task", "route": "agent", "operation": "agent_task", "requires_agent": True}},
     {"id": "delete_all_tasks", "text": "删除所有任务", "seed_commitments": True, "expect": {"dialogue_act": "dangerous_control", "route_any": ["human_review", "block", "ask_user"], "operation": "dangerous_control", "requires_confirmation": True, "must_preserve": {"PyTorch": "active"}, "must_not_execute": ["delete_all_tasks"], "no_agent": True}},
@@ -186,6 +218,7 @@ def _run_cases(*, state_store: WorldStateStore, cases: list[dict[str, Any]], mod
     debug_agent = DebugAgentAdapter(executor=selected_agent)
     loop.agent_registry._adapters[selected_agent] = debug_agent
     loop.agent_adapter = debug_agent
+    loop.probes["search_probe"] = FakeSearchProbe()
     normalizer = EventNormalizer()
 
     results: list[dict[str, Any]] = []
@@ -195,6 +228,10 @@ def _run_cases(*, state_store: WorldStateStore, cases: list[dict[str, Any]], mod
             _seed_commitments(commitment_core)
         if case.get("seed_previous"):
             _seed_previous_turn(state_store)
+        if case.get("seed_generic_clarification"):
+            _seed_generic_clarification_turn(state_store)
+        if case.get("seed_empty_search"):
+            _seed_empty_search_turn(state_store)
 
         before_status = _topic_statuses(state_store)
         before_agent_calls = len(debug_agent.sent_packets)
@@ -314,6 +351,63 @@ def _seed_previous_turn(state_store: WorldStateStore) -> None:
                 SESSION_ID: {
                     "last_topic": "Veyra",
                     "last_intent": "information",
+                    "updated_at": utc_now_iso(),
+                }
+            }
+        },
+    )
+
+
+def _seed_generic_clarification_turn(state_store: WorldStateStore) -> None:
+    channel_state = state_store.read_json("channel_state.json")
+    inbox = channel_state.get("inbox") if isinstance(channel_state.get("inbox"), list) else []
+    outbox = channel_state.get("outbox") if isinstance(channel_state.get("outbox"), list) else []
+    inbox.append(
+        {
+            "message_id": "dialogue-act-search-user",
+            "event_id": "dialogue-act-search-event",
+            "channel": "smoke",
+            "user_id": USER_ID,
+            "session_id": SESSION_ID,
+            "text": "帮我找一些2026秋招的公司的信息",
+            "metadata": {},
+            "received_at": utc_now_iso(),
+        }
+    )
+    outbox.append(
+        {
+            "channel": "smoke",
+            "user_id": USER_ID,
+            "session_id": SESSION_ID,
+            "message": "我需要你补一点具体上下文：你想问哪个对象、现象或决定？",
+            "metadata": {"route": "direct_answer", "status": "success"},
+            "status": "queued",
+            "created_at": utc_now_iso(),
+            "delivery": "local_outbox",
+        }
+    )
+    channel_state["inbox"] = inbox[-20:]
+    channel_state["outbox"] = outbox[-20:]
+    state_store.write_json("channel_state.json", channel_state)
+
+
+def _seed_empty_search_turn(state_store: WorldStateStore) -> None:
+    state_store.write_json(
+        "task_state.json",
+        {
+            "conversation_slots": {
+                SESSION_ID: {
+                    "last_intent": "information",
+                    "last_topic": "一些2026秋招的公司的信息",
+                    "last_search_query": "一些2026秋招的公司的信息",
+                    "last_tool_result": {
+                        "type": "search",
+                        "status": "empty",
+                        "query": "一些2026秋招的公司的信息",
+                        "summary": "Search returned no parseable results for 一些2026秋招的公司的信息.",
+                        "observed_at": utc_now_iso(),
+                        "results": [],
+                    },
                     "updated_at": utc_now_iso(),
                 }
             }
@@ -460,6 +554,8 @@ def _target(case: dict[str, Any], commitment: dict[str, Any], changeset: dict[st
         return "18789"
     if probe.get("probe") == "git":
         return "git"
+    if probe.get("probe") == "search_probe":
+        return "search_probe"
     capability = decision.get("capability_request") if isinstance(decision.get("capability_request"), dict) else {}
     return str(capability.get("capability") or "")
 
