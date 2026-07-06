@@ -1040,6 +1040,8 @@ class AwarenessLoop:
         return str(raw.get("summary") or verified.get("message") or "Probe completed.")
 
     def _probe_needs_answer_model(self, probe_name: str, raw: dict[str, object]) -> bool:
+        if probe_name == "search_probe":
+            return False
         details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
         return bool(details.get("sample") or details.get("results") or details.get("content") or probe_name in {"web", "log", "file"})
 

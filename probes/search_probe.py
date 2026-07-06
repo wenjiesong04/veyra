@@ -41,10 +41,17 @@ class SearchProbe:
         cached = self._cached(cache_key)
         if cached:
             return cached
+        provider = os.getenv("VEYRA_SEARCH_PROVIDER", "auto").strip().lower()
+        http_timeout = self._float_env("VEYRA_SEARCH_HTTP_TIMEOUT", 8.0)
+        headers = self._search_headers()
+        if self._prefer_yahoo_first(query, provider=provider):
+            yahoo_result = self._run_yahoo_search(query, max_results=max_results, timeout=http_timeout, headers=headers)
+            if yahoo_result.get("status") == "ok" or provider in {"yahoo", "yahoo_html"}:
+                self._store_cache(cache_key, yahoo_result)
+                return yahoo_result
         openclaw_attempt: dict[str, Any] | None = None
         if self.fetcher is None and self._openclaw_search_enabled():
             openclaw_result = self._run_openclaw_search(query, max_results=max_results)
-            provider = os.getenv("VEYRA_SEARCH_PROVIDER", "auto").strip().lower()
             if openclaw_result.get("status") == "ok" or provider in {"openclaw", "openclaw_cli"}:
                 self._store_cache(cache_key, openclaw_result)
                 return openclaw_result
@@ -54,9 +61,6 @@ class SearchProbe:
                 "provider": "openclaw_cli",
             }
         url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
-        http_timeout = self._float_env("VEYRA_SEARCH_HTTP_TIMEOUT", 8.0)
-        provider = os.getenv("VEYRA_SEARCH_PROVIDER", "auto").strip().lower()
-        headers = self._search_headers()
         try:
             body = self.fetcher(url) if self.fetcher else fetch_text(url, timeout=http_timeout, headers=headers)
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
@@ -119,6 +123,11 @@ class SearchProbe:
         )
         self._store_cache(cache_key, payload)
         return payload
+
+    def _prefer_yahoo_first(self, query: str, *, provider: str) -> bool:
+        if provider not in {"auto", "public", "yahoo", "yahoo_html"}:
+            return False
+        return bool(re.search(r"[\u4e00-\u9fff]", query or ""))
 
     def _run_yahoo_search(self, query: str, *, max_results: int, timeout: float, headers: dict[str, str]) -> dict[str, Any]:
         url = f"https://search.yahoo.com/search?p={quote_plus(query)}"
