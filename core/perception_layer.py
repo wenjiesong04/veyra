@@ -149,7 +149,17 @@ class PerceptionLayer:
         if probe_result.get("model_assist") is False or details.get("model_assist") is False or details.get("perception_model_assist") is False:
             return False
         probe_name = str(probe_result.get("probe") or "")
-        if probe_name in {"time_probe", "system_probe", "port_probe", "git_probe", "process_probe", "network_probe"} and not probe_result.get("anomaly"):
+        if probe_name in {
+            "time_probe",
+            "system_probe",
+            "port_probe",
+            "git_probe",
+            "process_probe",
+            "network_probe",
+            "openclaw_probe",
+            "hermes_probe",
+            "mcp_probe",
+        } and not probe_result.get("anomaly"):
             return False
         return probe_name in {"web_probe", "log_probe", "file_probe", "openclaw_probe", "hermes_probe", "mcp_probe"} or bool(probe_result.get("anomaly"))
 

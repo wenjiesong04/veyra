@@ -71,10 +71,15 @@ for path in paths:
         print(f"connected: {payload.get('connected')}")
         print(f"validation: {validation.get('status')}")
     elif path == "/integrations/feishu/ws/status":
+        print(f"status: {payload.get('status')}")
         print(f"configured: {payload.get('configured')}")
         print(f"thread_alive: {payload.get('thread_alive')}")
+        print(f"last_connected_at: {payload.get('last_connected_at')}")
+        print(f"connected_host: {payload.get('connected_host')}")
         print(f"last_event_at: {payload.get('last_event_at')}")
+        print(f"last_event_after_start: {payload.get('last_event_after_start')}")
         print(f"last_error: {payload.get('last_error')}")
+        print(f"tls: {payload.get('tls')}")
     elif path == "/runtime/metrics/summary":
         print(f"window_size: {payload.get('window_size')}")
         print(f"routes: {payload.get('route_distribution')}")

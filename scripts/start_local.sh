@@ -42,7 +42,19 @@ fi
 if [ -x .venv/bin/python ]; then
   PYTHON_BIN="$ROOT/.venv/bin/python"
 else
-  PYTHON_BIN="${PYTHON:-python3}"
+  PYTHON_BIN="${PYTHON:-$(command -v python3)}"
+  if [ -z "$PYTHON_BIN" ]; then
+    echo "python3 was not found on PATH. Set PYTHON=/absolute/path/to/python." >&2
+    exit 2
+  fi
+  if [[ "$PYTHON_BIN" != /* ]]; then
+    RESOLVED_PYTHON_BIN="$(command -v "$PYTHON_BIN" || true)"
+    if [ -z "$RESOLVED_PYTHON_BIN" ]; then
+      echo "Python executable not found: $PYTHON_BIN" >&2
+      exit 2
+    fi
+    PYTHON_BIN="$RESOLVED_PYTHON_BIN"
+  fi
 fi
 
 echo "==> Ensuring local state exists"

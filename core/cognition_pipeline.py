@@ -10,13 +10,14 @@ from core.capability_registry import CapabilityRegistry
 from core.definitions import RiskLevel, normalize_risk
 from core.memory_policy_runtime import normalize_memory_policy
 from core.model_client import redact_sensitive
+from core.prompt_loader import load_prompt
 from core.reasoning_core import CoreReasoning, safe_model_risk
 from core.understanding_core import TurnUnderstanding, UnderstandingCore
 from core.world_state import WorldStateStore
 from interface.event_schema import Decision, Route, VeyraEvent
 
 
-EXECUTION_PLAN_SYSTEM = (
+EXECUTION_PLAN_SYSTEM_FALLBACK = (
     "You are Veyra Core's awareness decision judge. You receive a situation assessment, awareness_snapshot, "
     "expanded context, evidence_sufficiency, and available_capabilities. Return strict JSON only. "
     "First decide what evidence or reasoning is actually needed, then choose the smallest safe route. "
@@ -32,6 +33,8 @@ EXECUTION_PLAN_SYSTEM = (
     "obtained by safe observation. block only for clearly unacceptable or policy-forbidden requests. "
     "Your main output contract is decision + capability_request + risk + reply_strategy."
 )
+
+EXECUTION_PLAN_SYSTEM = load_prompt("core/execution_plan.md", EXECUTION_PLAN_SYSTEM_FALLBACK)
 
 
 @dataclass(slots=True)
@@ -375,6 +378,16 @@ class CognitionPipeline:
             if "weather_probe" not in plan.required_capabilities:
                 plan.required_capabilities.append("weather_probe")
             plan.reason = f"{plan.reason}; adapter_contract:weather_probe".strip("; ")
+        runtime_probe = self._runtime_probe_for_turn(text=text, understanding=understanding, sufficiency=sufficiency)
+        if runtime_probe:
+            plan.recommended_route = "probe"
+            plan.probe = runtime_probe
+            plan.answer_source = "probe"
+            plan.freshness_required = True
+            capability = self._capability_for_probe_name(runtime_probe)
+            if capability and capability not in plan.required_capabilities:
+                plan.required_capabilities.append(capability)
+            plan.reason = f"{plan.reason}; adapter_contract:{runtime_probe}".strip("; ")
         evidence_probe = self._probe_for_evidence_gap(text=text, understanding=understanding, plan=plan, sufficiency=sufficiency)
         if evidence_probe:
             plan.recommended_route = "probe"
@@ -562,6 +575,26 @@ class CognitionPipeline:
         # by the understanding model's evidence_kind, not by a fixed keyword set.
         return understanding.evidence_kind == "weather" and not self._has_real_world_state_evidence(sufficiency)
 
+    def _runtime_probe_for_turn(
+        self,
+        *,
+        text: str,
+        understanding: TurnUnderstanding,
+        sufficiency: dict[str, Any],
+    ) -> str:
+        if self._has_real_world_state_evidence(sufficiency):
+            return ""
+        if self._runtime_repair_requested(text):
+            return ""
+        platform = self._runtime_platform_for_turn(text=text, understanding=understanding)
+        if not platform:
+            return ""
+        if understanding.evidence_kind in {"runtime", "local", "local_status"} or understanding.task_type == "local_status":
+            return platform
+        if self._runtime_status_or_failure_question(text):
+            return platform
+        return ""
+
     def _probe_for_evidence_gap(
         self,
         *,
@@ -632,9 +665,68 @@ class CognitionPipeline:
         # intent; we no longer keyword-match the raw text to force an agent handoff.
         if self._is_strategic_discussion(understanding) and not self._explicitly_asks_execution_or_runtime(text, understanding):
             return False
+        if (
+            self._runtime_platform_for_turn(text=text, understanding=understanding)
+            and self._runtime_status_or_failure_question(text)
+            and not self._runtime_repair_requested(text)
+        ):
+            return False
+        if self._runtime_repair_requested(text) and self._runtime_platform_for_turn(text=text, understanding=understanding):
+            return True
+        if self._project_code_addition_requested(text):
+            return True
         if understanding.intent == "implementation":
             return True
         return understanding.task_type in {"workspace_task", "code_task"}
+
+    def _runtime_platform_for_turn(self, *, text: str, understanding: TurnUnderstanding) -> str:
+        entities = understanding.entities if isinstance(understanding.entities, dict) else {}
+        platform = str(entities.get("platform") or entities.get("runtime") or entities.get("service") or "").strip().lower()
+        if platform in {"openclaw", "hermes", "mcp"}:
+            return platform
+        lowered = (text or "").lower()
+        for candidate in ("openclaw", "hermes", "mcp"):
+            if candidate in lowered:
+                return candidate
+        return ""
+
+    def _runtime_status_or_failure_question(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        compact = "".join(str(text or "").split())
+        return any(
+            marker in compact
+            for marker in (
+                "检查",
+                "查看",
+                "看看",
+                "状态",
+                "在线",
+                "运行",
+                "没响应",
+                "不响应",
+                "没回应",
+                "无法响应",
+                "连不上",
+                "断了",
+            )
+        ) or any(marker in lowered for marker in ("check", "status", "online", "running", "not responding", "down", "failed"))
+
+    def _runtime_repair_requested(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        return any(marker in text for marker in ("修复", "解决", "改代码", "修改代码", "实现修复")) or any(
+            marker in lowered for marker in ("fix", "repair", "resolve")
+        )
+
+    def _project_code_addition_requested(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        compact = "".join(str(text or "").split())
+        asks_addition = any(marker in compact for marker in ("加一个", "新增", "添加", "实现一个", "加上")) or any(
+            marker in lowered for marker in ("add a", "add an", "implement a", "create a")
+        )
+        names_project_or_code = any(marker in lowered for marker in ("veyra", "router", "module", "component", "ui")) or any(
+            marker in compact for marker in ("模块", "组件", "功能", "页面", "路由", "代码")
+        )
+        return asks_addition and names_project_or_code
 
     def _is_strategic_discussion(self, understanding: TurnUnderstanding) -> bool:
         return understanding.is_strategic_discussion()

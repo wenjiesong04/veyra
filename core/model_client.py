@@ -8,9 +8,11 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from core.env_loader import runtime_env_status
 from core.world_state import WorldStateStore
 
 
@@ -207,6 +209,8 @@ class CoreModelClient:
 
     def status(self) -> dict[str, Any]:
         config = self.config()
+        env_status = runtime_env_status()
+        last_transport = self._last_transport_status()
         missing: list[str] = []
         if not config.enabled:
             missing.append("enabled")
@@ -214,29 +218,45 @@ class CoreModelClient:
             missing.append("base_url")
         if not config.model:
             missing.append("model")
+        api_key_required = self._api_key_required(config)
+        if api_key_required and not config.api_key:
+            missing.append("api_key")
         return {
             "enabled": config.enabled,
-            "configured": config.configured(),
+            "configured": config.configured() and not (api_key_required and not config.api_key),
             "provider": config.provider,
             "base_url": config.base_url,
             "model": config.model,
             "api_key_env": config.api_key_env,
             "api_key_set": bool(config.api_key),
+            "api_key_required": api_key_required,
             "decision_mode": config.decision_mode,
             "max_tokens": config.max_tokens,
             "ca_bundle": _public_ca_bundle_path(self._ca_bundle_path(config)),
             "proxy": _proxy_summary(),
             "retries": config.retries,
-            "status": "configured" if config.configured() else "unconfigured",
+            "status": "configured" if config.configured() and not (api_key_required and not config.api_key) else "unconfigured",
             "missing": missing,
+            "active_env_file": redact_sensitive(str(env_status.get("active_env_file") or "")),
+            "env_loaded": env_status.get("loaded"),
+            "env_loaded_key_count": env_status.get("loaded_key_count"),
+            "last_transport_status": last_transport,
         }
 
     def complete_json(self, *, system: str, user: str, purpose: str) -> dict[str, Any]:
+        started_at = time.perf_counter()
+
+        def finish(result: dict[str, Any]) -> dict[str, Any]:
+            result.setdefault("duration_ms", int((time.perf_counter() - started_at) * 1000))
+            return result
+
         config = self.config()
         if not config.configured():
-            return {"status": "unconfigured", "reason": "core model is not configured"}
+            return finish({"status": "unconfigured", "reason": "core model is not configured"})
         if config.provider != "openai_compatible":
-            return {"status": "unsupported_provider", "provider": config.provider}
+            return finish({"status": "unsupported_provider", "provider": config.provider})
+        if self._api_key_required(config) and not config.api_key:
+            return finish({"status": "auth_missing", "purpose": purpose, "reason": f"{config.api_key_env} is not set for remote core model"})
 
         payload = {
             "model": config.model,
@@ -263,31 +283,31 @@ class CoreModelClient:
                     body = response.read().decode("utf-8")
                 break
             except HTTPError as exc:
-                return {"status": "http_error", "purpose": purpose, "status_code": exc.code, "error": str(exc), "ca_bundle": _public_ca_bundle_path(ca_bundle)}
+                return finish({"status": "http_error", "purpose": purpose, "status_code": exc.code, "error": str(exc), "ca_bundle": _public_ca_bundle_path(ca_bundle)})
             except (URLError, TimeoutError, OSError, ssl.SSLError) as exc:
                 last_error = exc
                 if attempt >= config.retries:
-                    return {
+                    return finish({
                         "status": "error",
                         "purpose": purpose,
                         "error": str(exc),
                         "ca_bundle": _public_ca_bundle_path(ca_bundle),
                         "proxy": _proxy_summary(),
                         "attempts": attempt + 1,
-                    }
+                    })
                 time.sleep(min(0.25 * (attempt + 1), 1.0))
         else:
-            return {"status": "error", "purpose": purpose, "error": str(last_error or "unknown model transport error")}
+            return finish({"status": "error", "purpose": purpose, "error": str(last_error or "unknown model transport error")})
 
         try:
             raw = json.loads(body or "{}")
         except json.JSONDecodeError:
-            return {"status": "invalid_response", "purpose": purpose, "raw_text": body[:1000]}
+            return finish({"status": "invalid_response", "purpose": purpose, "raw_text": body[:1000]})
 
         content = self._content_from_response(raw)
         parsed = _parse_json_object(content)
         if parsed is None:
-            return {"status": "invalid_json", "purpose": purpose, "raw_text": content[:1000]}
+            return finish({"status": "invalid_json", "purpose": purpose, "raw_text": content[:1000]})
         model_status = parsed.get("status")
         parsed["status"] = "model_assisted"
         if model_status and model_status != "model_assisted":
@@ -298,12 +318,38 @@ class CoreModelClient:
             "model": config.model,
             "ca_bundle": _public_ca_bundle_path(ca_bundle),
         }
-        return parsed
+        return finish(parsed)
+
+    def _last_transport_status(self) -> dict[str, Any]:
+        for item in reversed(self.state_store.read_jsonl("core_model_trace.jsonl", limit=50)):
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            status = str(item.get("status") or result.get("status") or "")
+            if not status:
+                continue
+            status_code = result.get("status_code")
+            transport_status = "auth_error" if status_code in {401, 403} else status
+            return {
+                "purpose": item.get("purpose"),
+                "status": transport_status,
+                "raw_status": status,
+                "status_code": status_code,
+                "error": redact_sensitive(str(result.get("error") or "")),
+                "duration_ms": result.get("duration_ms") or item.get("duration_ms"),
+                "timestamp": item.get("timestamp"),
+            }
+        return {}
 
     def _chat_completions_url(self, config: CoreModelConfig) -> str:
         if config.base_url.endswith("/chat/completions"):
             return config.base_url
         return f"{config.base_url}/chat/completions"
+
+    def _api_key_required(self, config: CoreModelConfig) -> bool:
+        if config.provider != "openai_compatible" or not config.base_url:
+            return False
+        parsed = urlparse(config.base_url)
+        host = (parsed.hostname or "").lower()
+        return host not in {"", "localhost", "127.0.0.1", "::1"}
 
     def _ssl_context(self, config: CoreModelConfig) -> tuple[ssl.SSLContext, str]:
         ca_bundle = self._ca_bundle_path(config)

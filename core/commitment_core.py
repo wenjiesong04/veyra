@@ -289,10 +289,13 @@ class CommitmentCore:
         if self._is_affirmation(lowered) and not pending:
             return {}
 
+        change_set = self.semantic_change_set_for_turn(user_text=user_text, event=event)
+        if change_set and self._semantic_change_should_precede_control(semantic_intent, change_set):
+            return self._handle_semantic_change_set(change_set, event=event)
+
         if semantic_intent.get("operation") in {"cancel", "pause", "resume"}:
             return self.apply_control_semantic(semantic_intent, event=event)
 
-        change_set = self.semantic_change_set_for_turn(user_text=user_text, event=event)
         if change_set:
             return self._handle_semantic_change_set(change_set, event=event)
 
@@ -561,6 +564,23 @@ class CommitmentCore:
         commitments = self.list_commitments(user_id=event.source.user_id)
         change_set = build_semantic_change_set(user_text, active_commitments=commitments)
         return change_set.to_dict() if change_set else None
+
+    def _semantic_change_should_precede_control(self, semantic_intent: dict[str, Any], change_set: dict[str, Any]) -> bool:
+        """Prefer the semantic changeset when a turn implies more than one state change.
+
+        Direct single controls such as "取消 PyTorch 追踪" should still execute.
+        Compound or tentative turns such as "取消 PyTorch，改成 TensorFlow" must
+        be confirmed as a change set so the second operation is not dropped.
+        """
+        operation = str(semantic_intent.get("operation") or "")
+        if operation not in {"cancel", "pause", "resume"}:
+            return False
+        actions = change_set.get("proposed_actions") if isinstance(change_set.get("proposed_actions"), list) else []
+        changes = change_set.get("changes") if isinstance(change_set.get("changes"), list) else []
+        if len(actions) > 1 or len(changes) > 1:
+            return True
+        event = change_set.get("semantic_event") if isinstance(change_set.get("semantic_event"), dict) else {}
+        return str(event.get("modality") or "") in {"tentative", "hypothetical"}
 
     def _handle_semantic_change_set(self, change_set: dict[str, Any], *, event: VeyraEvent) -> dict[str, Any]:
         record = self._record_semantic_change_set(change_set, event=event)

@@ -147,7 +147,7 @@ LOW_WRITE_COMMANDS = {
 def _assess_natural_language(lowered: str, raw: str) -> ActionRiskAssessment:
     checks: tuple[tuple[str, str, str, tuple[str, ...], float], ...] = (
         ("R5", r"\brm\s+-rf\b|\bcurl\b.*\|\s*\bbash\b|\bdrop\s+(database|table)\b|\btruncate\s+table\b|\bgit\s+push\s+(-f|--force)\b", "forbidden destructive action", ("text:forbidden",), 0.9),
-        ("R5", r"\.env\s*(外发|上传|发送|upload|send|post)|窃取.*密码|盗取.*账号|绕过.*检测|钓鱼邮件?|phishing|勒索软件", "credential exfiltration or abuse request", ("text:abuse",), 0.9),
+        ("R5", r"\.env\b.{0,24}(外发|上传|发送|发给|传给|给.+看|upload|send|post)|窃取.*密码|盗取.*账号|绕过.*检测|钓鱼邮件?|phishing|勒索软件", "credential exfiltration or abuse request", ("text:abuse",), 0.9),
         ("R4", r"\bsudo\b|\brestart\b|\brollback\b|\brestore\b|\bdeploy\b|\bdelete\b|\bgit\s+reset\s+(--|–|—)?hard\b|\bchmod\s+-r\b|\bchown\s+-r\b", "high-impact operation requires review", ("text:high_impact",), 0.82),
         ("R4", r"重启|回滚|恢复快照|部署|删除|生产|付费\s*api|停止.*服务|启动.*服务", "high-impact operation requires review", ("text:high_impact",), 0.82),
         ("R3", r"修改配置|覆盖|迁移|数据库|批量|\bconfig\b|\boverwrite\b|\bmigration\b", "stateful or broad change requires review", ("text:medium_change",), 0.74),

@@ -13,6 +13,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from core.env_loader import load_runtime_env  # noqa: E402
+
+load_runtime_env()
+
 from core.awareness_loop import AwarenessLoop  # noqa: E402
 from core.commitment_core import CommitmentCore  # noqa: E402
 from core.model_client import redact_sensitive  # noqa: E402
@@ -35,7 +39,7 @@ class DebugAgentAdapter(AgentAdapter):
         return ExecutionResult(
             task_id=task_packet.task_id,
             executor=self.executor,
-            status="submitted",
+            status="success",
             result="Debug agent spy captured VeyraTaskPacket; no external Agent Runtime was executed.",
             raw={"debug_agent_spy": True, "task_packet": packet},
         )
@@ -44,8 +48,8 @@ class DebugAgentAdapter(AgentAdapter):
         return ExecutionResult(
             task_id=task_id,
             executor=self.executor,
-            status="submitted",
-            result="Debug agent spy keeps task in submitted state.",
+            status="success",
+            result="Debug agent spy keeps task local and successful.",
             raw={"debug_agent_spy": True},
         )
 

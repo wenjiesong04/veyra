@@ -121,8 +121,12 @@ def main() -> int:
             "thread_alive": ws_alive,
             "configured": ws_configured,
             "started_at": ws_status.get("started_at"),
+            "last_connected_at": ws_status.get("last_connected_at"),
+            "connected_host": ws_status.get("connected_host"),
             "last_event_at": ws_status.get("last_event_at"),
             "last_event_after_start": last_event_after_start,
+            "last_error": ws_status.get("last_error"),
+            "tls": ws_status.get("tls") if isinstance(ws_status.get("tls"), dict) else {},
             "diagnostics": ws_status.get("diagnostics") if isinstance(ws_status.get("diagnostics"), list) else [],
         },
         "channel_status": {

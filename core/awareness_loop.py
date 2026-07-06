@@ -15,7 +15,7 @@ from core.capability_registry import CapabilityRegistry
 from core.context_patch_builder import ContextPatchBuilder
 from core.compact_external_lookup import CompactExternalLookup
 from core.context_scope import ContextScopeFilter
-from core.execution_tier import TIER_L1_COMPACT_EXTERNAL, TIER_L5_PROACTIVE, classify_execution_tier
+from core.execution_tier import TIER_L0_DIRECT_ANSWER, TIER_L1_COMPACT_EXTERNAL, TIER_L5_PROACTIVE, classify_execution_tier
 from core.definitions import GuardianDecision, LifecycleStatus, RiskLevel
 from core.decision_core import DecisionCore
 from core.foresight_engine import ForesightEngine
@@ -148,6 +148,29 @@ class AwarenessLoop:
         followup_result = self._conversation_followup_result(event, str(text or ""), attention_focus)
         if followup_result:
             return self._finalize_event(event, followup_result, started_at, route_trace, context_observability)
+        low_latency_response = self._low_latency_short_response(str(text or ""))
+        if low_latency_response:
+            low_latency_route = Route(str(low_latency_response.get("route") or Route.DIRECT_ANSWER.value))
+            route_trace.append(
+                {
+                    "phase": "low_latency_short_reply",
+                    "status": "handled",
+                    "reason": low_latency_response.get("reason"),
+                }
+            )
+            result = LoopResult(
+                event_id=event.event_id,
+                route=low_latency_route,
+                status=str(low_latency_response.get("status") or "success"),
+                response=str(low_latency_response.get("response") or ""),
+                risk_level=RiskLevel.R0,
+                artifacts={
+                    "low_latency_short_reply": low_latency_response,
+                    "attention": attention_focus,
+                    "execution_tier": TIER_L0_DIRECT_ANSWER,
+                },
+            )
+            return self._finalize_event(event, result, started_at, route_trace, context_observability)
         early_response = self._early_awareness_response(event, str(text or ""), attention_focus)
         if early_response:
             route_trace.append(
@@ -183,6 +206,19 @@ class AwarenessLoop:
                 }
             )
             return self._finalize_event(event, early_risk_result, started_at, route_trace, context_observability)
+        early_probe_result = self._early_deterministic_probe_result(event, str(text or ""), attention_focus)
+        if early_probe_result:
+            route_trace.append(
+                {
+                    "phase": "early_probe",
+                    "status": early_probe_result.status,
+                    "route": early_probe_result.route.value,
+                    "probe": early_probe_result.artifacts.get("probe_result", {}).get("probe")
+                    if isinstance(early_probe_result.artifacts.get("probe_result"), dict)
+                    else None,
+                }
+            )
+            return self._finalize_event(event, early_probe_result, started_at, route_trace, context_observability)
         belief_state = self.belief.refresh()
         preliminary_persona = self.persona_engine.patch_for(
             text,
@@ -1032,6 +1068,9 @@ class AwarenessLoop:
             if topic:
                 return f"记得。你现在在学习「{topic}」。我会把它作为当前学习目标来组织后续建议。"
             return "我现在没有找到明确的学习目标记录；你可以直接告诉我要学习的主题，我会记录到 Veyra memory。"
+        project_identity = self._project_identity_direct_response(text)
+        if project_identity:
+            return project_identity
         understanding = decision.model_assist.get("turn_understanding") if isinstance(decision.model_assist, dict) else {}
         if isinstance(understanding, dict) and str(understanding.get("source") or "") == "rule_fallback":
             if str(understanding.get("suggested_mode") or "") in {
@@ -1191,14 +1230,102 @@ class AwarenessLoop:
                 "再套回答模板，导致它没有先判断用户真实目标、当前状态是否新鲜、缺什么证据、该不该让 Agent 做更深分析。"
                 "应该把入口改成 situation assessment，再决定证据、Agent 提案或直答。"
             )
+        casual = self._casual_direct_fallback(text)
+        if casual:
+            return casual
         gaps = answer_assist.get("context_gaps") if isinstance(answer_assist.get("context_gaps"), list) else []
         if gaps:
             gap_text = "；".join(str(item) for item in gaps[:2] if item)
             if gap_text:
-                return f"我现在缺少可靠信息：{gap_text}。请补充目标或约束后我再回答。"
+                if self._direct_degraded_needs_evidence(decision):
+                    return f"我现在缺少可靠信息：{gap_text}。请补充目标或约束后我再回答。"
+                return f"我还需要一点上下文：{gap_text}。你补一句具体对象，我就能接着回答。"
+        if self._direct_degraded_needs_evidence(decision):
+            return f"这个问题需要先获取当前状态或新鲜证据，不能只凭旧上下文判断「{snippet}」。"
+        if self._bare_clarification_question(text):
+            return "你想问哪件事的原因？补一句具体对象，我就能直接解释。"
         if decision.intent in {"information", "unknown"}:
-            return f"我现在不能可靠判断「{snippet}」。请补充更明确的目标，或让我先读取当前状态后再回答。"
-        return "我现在不能可靠判断这个问题。请补充上下文，或让我先读取当前状态后再回答。"
+            return "我需要你补一点具体上下文：你想问哪个对象、现象或决定？"
+        return "我在。你可以直接说要继续哪个问题。"
+
+    def _project_identity_direct_response(self, text: str) -> str:
+        lowered = (text or "").lower()
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
+        if any(marker in compact for marker in ("你是谁", "你能做什么", "你现在能做什么", "现在可以用吗")):
+            return (
+                "我是 Veyra，一个 awareness + governance harness。"
+                "我负责理解对话、维护世界状态、选择直答/probe/skill/Agent/阻断路径，并在执行前做风险和权限边界控制。"
+            )
+        if "Veyra和OpenClaw有什么区别" in compact or ("veyra" in lowered and "openclaw" in lowered and any(marker in compact for marker in ("区别", "不同"))):
+            return (
+                "Veyra 是控制层：理解用户意图、读取世界状态、做证据和风险判断，并决定是否调用执行体。"
+                "OpenClaw 是可插拔 Agent Runtime：只有当任务需要代码、调试或多步执行时，Veyra 才会按策略把 TaskPacket 下发给它。"
+            )
+        if compact in {"Veyra是什么", "Veyra是啥"} or ("veyra" in lowered and any(marker in compact for marker in ("是什么", "是啥"))):
+            return (
+                "Veyra 不是普通聊天机器人，也不是单个 Agent。"
+                "它更像一个带感知、世界状态和治理边界的 harness：先判断当前对话需要什么，再选择直答、只读 probe、skill、Agent 或安全阻断。"
+            )
+        return ""
+
+    def _casual_direct_fallback(self, text: str) -> str:
+        compact = re.sub(r"[\s，,。！？!?、~～]+", "", text or "").lower()
+        if not compact:
+            return "我在。你可以直接说要我看什么。"
+        greetings = {"hi", "hello", "hey", "哈喽", "你好", "嗨", "在吗", "在不在"}
+        thanks = {"谢谢", "谢了", "thanks", "thankyou", "thx"}
+        if compact in greetings:
+            return "Hi，我在。"
+        if compact in thanks:
+            return "不客气。"
+        return ""
+
+    def _low_latency_short_response(self, text: str) -> dict[str, object]:
+        compact = re.sub(r"[\s，,。！？!?、~～]+", "", text or "").lower()
+        if not compact:
+            return {"reason": "empty_short_message", "response": "我在。你可以直接说要我看什么。"}
+        casual = self._casual_direct_fallback(text)
+        if casual:
+            return {"reason": "casual_short_message", "response": casual}
+        if compact in {"ok", "okay", "收到", "好的", "好", "嗯", "嗯嗯", "行", "可以"}:
+            return {"reason": "ack_short_message", "response": "收到。"}
+        if self._bare_clarification_question(text):
+            return {
+                "reason": "bare_clarification_question",
+                "route": Route.ASK_USER.value,
+                "status": "needs_user_input",
+                "response": "你想问哪件事的原因？补一句具体对象，我就能直接解释。",
+            }
+        if compact in {"太慢了", "回应太慢了", "响应太慢了", "回得太慢了", "慢死了"} or (
+            len(compact) <= 12 and "慢" in compact and any(marker in compact for marker in ("回", "响应", "回应"))
+        ):
+            return {
+                "reason": "latency_complaint",
+                "response": "确实慢。短消息我会直接轻量回复；需要查状态或执行任务时，我会先说明正在处理什么。",
+            }
+        return {}
+
+    def _bare_clarification_question(self, text: str) -> bool:
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "").lower()
+        return compact in {"为什么", "why", "为啥", "怎么了", "怎么回事", "what", "是什么"}
+
+    def _direct_degraded_needs_evidence(self, decision: Decision) -> bool:
+        if decision.freshness_required or decision.needs_probe:
+            return True
+        request = decision.capability_request if isinstance(decision.capability_request, dict) else {}
+        evidence_kind = str(request.get("evidence_kind") or request.get("freshness_need") or "")
+        capability = str(request.get("capability") or "")
+        return evidence_kind in {"local", "runtime", "external", "file", "attachment", "weather", "time", "search", "web"} or capability in {
+            "web_search",
+            "weather_probe",
+            "time_probe",
+            "system_probe",
+            "file_probe",
+            "log_probe",
+            "process_probe",
+            "port_probe",
+            "vision",
+        }
 
     def _state_update_ack_response(self, text: str) -> str:
         signals = self._extract_profile_signals(text)
@@ -1227,6 +1354,9 @@ class AwarenessLoop:
                 }
         if self._is_tracking_memory_question(text):
             return {"reason": "tracking_memory_question", "response": self._tracking_memory_response()}
+        project_identity = self._project_identity_direct_response(text)
+        if project_identity:
+            return {"reason": "project_identity_direct", "response": project_identity}
         if self._is_project_continuation_question(text):
             project_response = self._project_context_response(event)
             if project_response:
@@ -1244,6 +1374,53 @@ class AwarenessLoop:
         return any(marker in text for marker in ("架构", "认知", "prompt", "提示词", "智障")) or any(
             marker in lowered for marker in ("architecture", "cognition", "prompt")
         )
+
+    def _early_deterministic_probe_result(
+        self,
+        event: VeyraEvent,
+        text: str,
+        attention_focus: list[str],
+    ) -> LoopResult | None:
+        decision = self.decision_core._rule_decide(text, attention_focus, event=event)
+        probe_name = str(decision.selected_probe or "").strip()
+        fast_probes = {
+            "time",
+            "time_probe",
+            "port",
+            "port_probe",
+            "git",
+            "git_probe",
+            "process",
+            "process_probe",
+            "system",
+            "system_probe",
+            "openclaw",
+            "openclaw_probe",
+            "hermes",
+            "hermes_probe",
+            "mcp",
+            "mcp_probe",
+            "file",
+            "file_probe",
+            "log",
+            "log_probe",
+            "network",
+            "network_probe",
+        }
+        if decision.route != Route.PROBE or not probe_name or probe_name not in fast_probes:
+            return None
+        if decision.risk_level not in {RiskLevel.R0, RiskLevel.R1}:
+            return None
+        if not (decision.freshness_required or decision.needs_probe):
+            return None
+        decision.model_assist = {
+            **(decision.model_assist if isinstance(decision.model_assist, dict) else {}),
+            "status": "skipped",
+            "reason": "adapter_contract_fast_probe",
+            "recommended_route": Route.PROBE.value,
+        }
+        decision = self.decision_core.model_driven.enrich(text, decision, event=event)
+        return self._run_probe(event, decision, attention_focus)
 
     def _is_proactive_weather_request(self, text: str) -> bool:
         lowered = (text or "").lower()
@@ -1410,6 +1587,9 @@ class AwarenessLoop:
         return self.commitment_core.followup_messages_for_turn(commitment_turn)
 
     def _conversation_followup_result(self, event: VeyraEvent, text: str, attention_focus: list[str]) -> LoopResult | None:
+        generic = self._generic_previous_turn_followup_result(event, text, attention_focus)
+        if generic:
+            return generic
         slots = self._conversation_slots_for_event(event)
         last_tool = slots.get("last_tool_result") if isinstance(slots.get("last_tool_result"), dict) else {}
         if last_tool.get("type") == "search":
@@ -1455,6 +1635,88 @@ class AwarenessLoop:
                 },
             )
         return None
+
+    def _generic_previous_turn_followup_result(self, event: VeyraEvent, text: str, attention_focus: list[str]) -> LoopResult | None:
+        followup = self._classify_previous_turn_followup(text)
+        if not followup:
+            return None
+        previous = self._last_outbound_message(event)
+        if not previous:
+            return None
+        response = self._previous_turn_followup_response(kind=followup["kind"], previous=previous)
+        if not response:
+            return None
+        return LoopResult(
+            event_id=event.event_id,
+            route=Route.DIRECT_ANSWER,
+            status="success",
+            response=response,
+            risk_level=RiskLevel.R0,
+            artifacts={
+                "conversation_followup": {
+                    "type": "previous_turn_reference",
+                    "kind": followup["kind"],
+                    "operation": followup["operation"],
+                    "source": "channel_outbox",
+                },
+                "attention": attention_focus,
+                "execution_tier": TIER_L0_DIRECT_ANSWER,
+            },
+        )
+
+    def _classify_previous_turn_followup(self, text: str) -> dict[str, str]:
+        compact = re.sub(r"[\s，,。！？!?、~～]+", "", text or "").lower()
+        if not compact:
+            return {}
+        if compact in {"为什么", "为啥", "why", "为什么这么说", "你为什么这么回答", "为什么这么回答", "怎么这么回答"}:
+            return {"kind": "why", "operation": "explain_previous"}
+        if compact in {"这是什么意思", "什么意思", "这个是什么意思", "啥意思", "这是啥意思"}:
+            return {"kind": "meaning", "operation": "explain_previous"}
+        if compact in {"继续", "然后呢", "接着说", "继续说", "继续说下去", "接着刚才"}:
+            return {"kind": "continue", "operation": "continue_previous"}
+        if compact in {"具体点", "展开说", "详细点", "说具体点"}:
+            return {"kind": "expand", "operation": "expand_previous"}
+        if compact in {"简单说", "简单点", "简短点", "一句话说"}:
+            return {"kind": "simplify", "operation": "simplify_previous"}
+        return {}
+
+    def _last_outbound_message(self, event: VeyraEvent) -> dict[str, Any]:
+        channel_state = self.state_store.read_json("channel_state.json")
+        outbox = channel_state.get("outbox") if isinstance(channel_state.get("outbox"), list) else []
+        for item in reversed(outbox):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("session_id") or "") != event.source.session_id:
+                continue
+            message = str(item.get("message") or item.get("response") or "").strip()
+            if message:
+                return {
+                    "message": message,
+                    "route": (item.get("metadata") if isinstance(item.get("metadata"), dict) else {}).get("route"),
+                    "created_at": item.get("created_at"),
+                }
+        return {}
+
+    def _previous_turn_followup_response(self, *, kind: str, previous: dict[str, Any]) -> str:
+        message = re.sub(r"\s+", " ", str(previous.get("message") or "").strip())
+        if not message:
+            return ""
+        snippet = message[:180] + ("..." if len(message) > 180 else "")
+        if kind == "why":
+            return (
+                "我是在接着上一轮回答的判断来解释："
+                f"{snippet} 这个判断的核心依据是上一轮上下文，而不是把你的短句当成新任务。"
+                "如果你指的是其中某个具体结论，我可以继续拆它的依据。"
+            )
+        if kind == "meaning":
+            return f"上一轮的意思是：{snippet} 换句话说，我是在说明这个概念/判断在当前上下文里的作用。"
+        if kind == "continue":
+            return f"接着上一轮说：{snippet} 下一步要先明确你想继续讨论概念、查当前状态，还是让我下发具体执行任务。"
+        if kind == "expand":
+            return f"更具体地说，上一轮这句话的重点是：{snippet} 关键边界是先判断是否需要新鲜证据，再决定直答、probe 或 Agent。"
+        if kind == "simplify":
+            return f"简单说：{snippet}"
+        return ""
 
     def _compact_search_probe_result(self, compact: dict[str, Any]) -> dict[str, Any]:
         candidates = [

@@ -14,6 +14,7 @@ from core.agency_core import AgencyCore
 from core.awareness_loop import AwarenessLoop
 from core.commitment_core import CommitmentCore
 from core.definitions import RiskLevel, normalize_risk
+from core.env_loader import load_runtime_env
 from core.foresight_engine import ForesightEngine
 from core.runtime_entity import RuntimeEntity
 from core.world_state import WorldStateStore
@@ -96,6 +97,8 @@ def _env_hosts(name: str) -> list[str] | None:
     hosts = [item.strip().lower() for item in raw.split(",") if item.strip()]
     return hosts or None
 
+
+load_runtime_env()
 state_store = WorldStateStore()
 runtime_entity = RuntimeEntity(state_store=state_store)
 commitment_core = CommitmentCore(state_store)

@@ -57,7 +57,7 @@ def main() -> int:
             model_assist={"draft_response": "好的，我将使用OpenClaw来处理您的请求。"},
         )
         loop.core_reasoning.answer_assist = lambda **_: {"status": "model_assisted", "draft_response": "这是最终回答。"}  # type: ignore[method-assign]
-        response = loop._direct_answer(event, decision, [])
+        response = loop._direct_answer(event, decision, [], persona_patch={})
         cases.append(
             _result(
                 "direct_answer_prefers_answer_assist",
@@ -67,7 +67,7 @@ def main() -> int:
         )
 
         loop.core_reasoning.answer_assist = lambda **_: {"status": "skipped"}  # type: ignore[method-assign]
-        response = loop._direct_answer(event, decision, [])
+        response = loop._direct_answer(event, decision, [], persona_patch={})
         no_decision_draft_leak = "OpenClaw" not in response and response != "好的，我将使用OpenClaw来处理您的请求。"
         cases.append(
             _result(
@@ -79,12 +79,12 @@ def main() -> int:
 
         low_quality_draft = "我现在无法稳定访问认知模型，所以请稍后再试。"
         loop.core_reasoning.answer_assist = lambda **_: {"status": "model_assisted", "draft_response": low_quality_draft}  # type: ignore[method-assign]
-        response = loop._direct_answer(event, decision, [])
+        response = loop._direct_answer(event, decision, [], persona_patch={})
         rejects_low_quality = response != low_quality_draft and "探针" in response
         cases.append(
             _result(
                 "direct_answer_rejects_low_quality_template",
-                rejects_low_quality,
+                response != low_quality_draft and "无法稳定访问认知模型" not in response,
                 f"response={response}",
             )
         )
@@ -333,8 +333,8 @@ def main() -> int:
         followups = confirm_result.get("followup_messages") or []
         cases.append(
             _result(
-                "commitment_confirmation_uses_followup_not_primary_override",
-                any("已开启" in str(item) for item in followups),
+                "commitment_confirmation_renders_primary_outcome",
+                "已开启" in str(confirm_result.get("response") or "") and not any("已开启" in str(item) for item in followups),
                 f"response={confirm_result.get('response')}, followups={followups}",
             )
         )

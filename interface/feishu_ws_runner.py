@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import threading
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from core.model_client import redact_sensitive
 from core.world_state import WorldStateStore
@@ -33,8 +35,13 @@ class FeishuWsRunner:
         if status in {"running", "starting"} and not alive:
             status = "stale"
             diagnostics.append("Feishu websocket state is running but the worker thread is not alive.")
+        if alive and status in {"starting", "connecting"}:
+            diagnostics.append("Feishu websocket worker is alive but has not completed the websocket connection.")
         if alive and started_at and not last_event_after_start:
             diagnostics.append("No Feishu events have been received since this websocket runner started.")
+        last_error = str(state.get("last_error") or "")
+        if "CERTIFICATE_VERIFY_FAILED" in last_error:
+            diagnostics.append("Feishu websocket TLS verification failed; configure FEISHU_CA_BUNDLE or the system trust store.")
         return {
             **state,
             "status": status,
@@ -110,16 +117,20 @@ class FeishuWsRunner:
     def _run(self, app_id: str, app_secret: str, config: dict[str, Any]) -> None:
         try:
             import lark_oapi as lark
+            import lark_oapi.ws.client as lark_ws_client
             from lark_oapi.api.im.v1 import P2ImMessageReceiveV1  # noqa: F401
         except Exception as exc:
             self._write_state({**self._read_state(), "status": "dependency_missing", "last_error": str(exc), "updated_at": utc_now_iso()})
             return
 
+        ssl_context, tls_info = self._ssl_context(config)
+        self._install_lark_ws_hooks(lark_ws_client, ssl_context=ssl_context, tls_info=tls_info)
+
         def handle_message(data: Any) -> None:
             event = self._event_from_sdk_payload(lark, data)
             result = self.adapter.handle_message_event(event, header={"event_type": "im.message.receive_v1"}, source="websocket")
             state = self._read_state()
-            state.update({"status": "running", "last_event_at": utc_now_iso(), "last_result": redact_sensitive(result, max_string=1800), "updated_at": utc_now_iso()})
+            state.update({"status": "running", "last_event_at": utc_now_iso(), "last_result": redact_sensitive(result, max_string=1800), "last_error": None, "tls": tls_info, "updated_at": utc_now_iso()})
             self._write_state(state)
 
         try:
@@ -130,14 +141,17 @@ class FeishuWsRunner:
             client = lark.ws.Client(
                 app_id=app_id,
                 app_secret=app_secret,
+                log_level=lark.LogLevel.WARNING,
                 event_handler=handler,
                 domain=str(config.get("base_url") or "https://open.feishu.cn"),
                 auto_reconnect=True,
             )
-            self._write_state({**self._read_state(), "status": "running", "updated_at": utc_now_iso()})
+            client.on_reconnecting = lambda: self._mark_ws_reconnecting(tls_info)
+            client.on_reconnected = lambda: self._mark_ws_connected(client, tls_info)
+            self._write_state({**self._read_state(), "status": "connecting", "tls": tls_info, "updated_at": utc_now_iso()})
             client.start()
         except Exception as exc:
-            self._write_state({**self._read_state(), "status": "error", "last_error": str(exc), "error_type": type(exc).__name__, "updated_at": utc_now_iso()})
+            self._write_state({**self._read_state(), "status": "error", "last_error": redact_sensitive(str(exc)), "error_type": type(exc).__name__, "tls": tls_info, "updated_at": utc_now_iso()})
 
     def _event_from_sdk_payload(self, lark: Any, data: Any) -> dict[str, Any]:
         try:
@@ -168,6 +182,127 @@ class FeishuWsRunner:
         if env_name and os.getenv(env_name):
             return str(os.getenv(env_name) or "")
         return str(config.get(key) or "")
+
+    def _ssl_context(self, config: dict[str, Any]) -> tuple[ssl.SSLContext, dict[str, Any]]:
+        if self._env_bool("FEISHU_WS_TLS_VERIFY") is False:
+            return ssl._create_unverified_context(), {"verify": False, "mode": "disabled_by_env"}
+
+        ca_bundle = self._ca_bundle_path(config)
+        if ca_bundle:
+            return ssl.create_default_context(cafile=ca_bundle), {"verify": True, "mode": "ca_bundle", "ca_bundle": self._public_path(ca_bundle)}
+
+        try:
+            import truststore
+
+            return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT), {"verify": True, "mode": "system_truststore"}
+        except Exception as exc:
+            return ssl.create_default_context(), {"verify": True, "mode": "python_default", "truststore_error": redact_sensitive(str(exc), max_string=240)}
+
+    def _ca_bundle_path(self, config: dict[str, Any]) -> str:
+        ca_env = str(config.get("ca_bundle_env") or "FEISHU_CA_BUNDLE")
+        candidates = [
+            config.get("ca_bundle"),
+            os.getenv(ca_env, ""),
+            os.getenv("LARK_CA_BUNDLE", ""),
+            os.getenv("REQUESTS_CA_BUNDLE", ""),
+            os.getenv("SSL_CERT_FILE", ""),
+            os.getenv("CURL_CA_BUNDLE", ""),
+        ]
+        for candidate in candidates:
+            path = str(candidate or "").strip()
+            if path and Path(path).expanduser().exists():
+                return str(Path(path).expanduser())
+        return ""
+
+    def _install_lark_ws_hooks(self, lark_ws_client: Any, *, ssl_context: ssl.SSLContext, tls_info: dict[str, Any]) -> None:
+        base_kwargs = getattr(lark_ws_client, "_veyra_base_ws_connect_kwargs", None)
+        if base_kwargs is None:
+            base_kwargs = lark_ws_client._ws_connect_kwargs
+            setattr(lark_ws_client, "_veyra_base_ws_connect_kwargs", base_kwargs)
+        setattr(lark_ws_client, "_veyra_ws_ssl_context", ssl_context)
+        setattr(lark_ws_client, "_veyra_runner", self)
+        setattr(lark_ws_client, "_veyra_tls_info", tls_info)
+
+        def ws_connect_kwargs() -> dict[str, Any]:
+            kwargs = dict(base_kwargs() or {})
+            context = getattr(lark_ws_client, "_veyra_ws_ssl_context", None)
+            if context is not None:
+                kwargs["ssl"] = context
+            return kwargs
+
+        lark_ws_client._ws_connect_kwargs = ws_connect_kwargs
+
+        if getattr(lark_ws_client.Client, "_veyra_connect_observed", False):
+            return
+        original_connect = lark_ws_client.Client._connect
+
+        async def observed_connect(client: Any) -> None:
+            runner = getattr(lark_ws_client, "_veyra_runner", None)
+            active_tls_info = getattr(lark_ws_client, "_veyra_tls_info", tls_info)
+            try:
+                await original_connect(client)
+            except Exception as exc:
+                if runner is not None:
+                    runner._mark_ws_connect_failed(exc, active_tls_info)
+                raise
+            if runner is not None:
+                runner._mark_ws_connected(client, active_tls_info)
+
+        lark_ws_client.Client._connect = observed_connect
+        setattr(lark_ws_client.Client, "_veyra_connect_observed", True)
+
+    def _mark_ws_reconnecting(self, tls_info: dict[str, Any]) -> None:
+        state = self._read_state()
+        state.update({"status": "reconnecting", "tls": tls_info, "last_reconnect_at": utc_now_iso(), "updated_at": utc_now_iso()})
+        self._write_state(state)
+
+    def _mark_ws_connected(self, client: Any, tls_info: dict[str, Any]) -> None:
+        conn_url = str(getattr(client, "_conn_url", "") or "")
+        state = self._read_state()
+        state.update(
+            {
+                "status": "running",
+                "last_connected_at": utc_now_iso(),
+                "last_error": None,
+                "error_type": None,
+                "connected_host": urlparse(conn_url).hostname or "",
+                "tls": tls_info,
+                "updated_at": utc_now_iso(),
+            }
+        )
+        self._write_state(state)
+
+    def _mark_ws_connect_failed(self, exc: Exception, tls_info: dict[str, Any]) -> None:
+        state = self._read_state()
+        state.update(
+            {
+                "status": "connect_error",
+                "last_connect_error_at": utc_now_iso(),
+                "last_error": redact_sensitive(str(exc), max_string=600),
+                "error_type": type(exc).__name__,
+                "tls": tls_info,
+                "updated_at": utc_now_iso(),
+            }
+        )
+        self._write_state(state)
+
+    def _env_bool(self, name: str) -> bool | None:
+        value = os.getenv(name)
+        if value is None:
+            return None
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+        return None
+
+    def _public_path(self, path: str) -> str:
+        if not path:
+            return ""
+        if "certifi" in path.lower():
+            return "<certifi>"
+        return redact_sensitive(path)
 
     def _domain_to_base_url(self, domain: str) -> str:
         lowered = domain.lower()

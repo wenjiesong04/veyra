@@ -48,6 +48,14 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
         "markers": ("进程", "process"),
     },
     {
+        "name": "openclaw_runtime_status",
+        "probe": "openclaw",
+        "capability": "openclaw_probe",
+        "markers": ("openclaw",),
+        "requires_volatile_marker": True,
+        "anti_markers": ("修复", "解决", "改代码", "修改代码", "fix", "repair"),
+    },
+    {
         "name": "local_service_failure",
         "probe": "process",
         "capability": "process_probe",
@@ -55,6 +63,7 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
             "无法响应",
             "不响应",
             "没回应",
+            "没响应",
             "没有回应",
             "服务挂",
             "服务挂了",
@@ -65,6 +74,7 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
             "service down",
             "service failed",
         ),
+        "anti_markers": ("修复", "解决", "改代码", "修改代码", "fix", "repair"),
     },
     {
         "name": "local_system_status",
@@ -78,6 +88,7 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
         "capability": "openclaw_probe",
         "markers": ("openclaw",),
         "requires_volatile_marker": True,
+        "anti_markers": ("修复", "解决", "改代码", "修改代码", "fix", "repair"),
     },
     {
         "name": "hermes_runtime_status",
@@ -107,7 +118,7 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
     },
 )
 
-VOLATILE_MARKERS = ("现在", "当前", "今天", "最近", "状态", "最新", "today", "now", "current", "status", "latest")
+VOLATILE_MARKERS = ("现在", "当前", "今天", "最近", "状态", "最新", "没响应", "不响应", "没回应", "today", "now", "current", "status", "latest")
 IDENTITY_MARKERS = ("你是谁", "你是", "你现在是", "身份", "who are you", "are you")
 GOVERNANCE_ENTITIES = ("veyra", "openclaw", "hermes", "runtime", "agent")
 PREFERENCE_SCOPE_MARKERS = ("以后", "今后", "下次", "记住", "默认", "总是", "一直", "from now on", "remember", "always", "prefer")
@@ -134,10 +145,13 @@ class DecisionCore:
         locked = self._governance_locked_decision(text, attention_focus, event=event)
         if locked:
             return self.model_driven.enrich(text, self._with_turn_understanding(locked, understanding), event=event)
+        contract_base = self._rule_decide(text, attention_focus, event=event)
+        contract_base = self._apply_understanding_guardrails(text, contract_base, understanding)
+        if self._adapter_contract_route_is_deterministic(contract_base):
+            enriched = self.model_driven.enrich(text, self._with_turn_understanding(contract_base, understanding), event=event)
+            return self._enforce_preference_lock(text, enriched)
         if self._should_trust_rule_understanding(understanding):
-            base = self._rule_decide(text, attention_focus, event=event)
-            base = self._apply_understanding_guardrails(text, base, understanding)
-            enriched = self.model_driven.enrich(text, self._with_turn_understanding(base, understanding), event=event)
+            enriched = self.model_driven.enrich(text, self._with_turn_understanding(contract_base, understanding), event=event)
             return self._enforce_preference_lock(text, enriched)
         if use_model_first_pipeline(self.reasoning):
             pipeline = CognitionPipeline(self.reasoning, self.state_store, self.capabilities)
@@ -318,6 +332,18 @@ class DecisionCore:
             "runtime_evidence",
             "governed_execution",
         }
+
+    def _adapter_contract_route_is_deterministic(self, decision: Decision) -> bool:
+        """Skip model planning when the receiver is fixed by Veyra's adapter contract."""
+        if decision.route in {Route.BLOCK, Route.HUMAN_REVIEW, Route.ROLLBACK}:
+            return True
+        if decision.route == Route.PROBE and decision.selected_probe and (decision.freshness_required or decision.needs_probe):
+            return True
+        if decision.route == Route.SKILL and decision.selected_probe:
+            return True
+        if decision.route == Route.AGENT and decision.needs_agent and decision.capability == "selected_agent_runtime":
+            return True
+        return False
 
     def _rule_decide(self, text: str, attention_focus: list[str], event: VeyraEvent | None = None) -> Decision:
         lowered = text.lower()
@@ -705,18 +731,29 @@ class DecisionCore:
         preference is written to long-term memory regardless of model judgment.
         """
         if self._is_preference_locked(decision):
-            return decision
+            return self._lock_preference_memory(decision)
         if decision.route not in {Route.DIRECT_ANSWER, Route.ASK_USER}:
             return decision
         if decision.risk_level not in {RiskLevel.R0, RiskLevel.R1}:
             return decision
         if not self._is_preference_intent((text or "").lower()):
             return decision
+        return self._lock_preference_memory(decision)
+
+    def _lock_preference_memory(self, decision: Decision) -> Decision:
         decision.intent = "preference"
         decision.memory_policy = "long_term"
         decision.signals = self._dedupe(
             [*(decision.signals or []), "intent:preference", "memory:preference", "priority:memory_policy"]
         )
+        assist = dict(decision.model_assist or {})
+        if assist:
+            assist["memory_policy"] = "long_term"
+            plan = assist.get("decision_plan") if isinstance(assist.get("decision_plan"), dict) else {}
+            if plan:
+                plan["intent"] = "preference"
+                assist["decision_plan"] = plan
+            decision.model_assist = assist
         return decision
 
     def _attachment_capability_gap(self, event: VeyraEvent | None) -> dict[str, Any] | None:
@@ -778,6 +815,10 @@ class DecisionCore:
             "agent 执行",
         ]
         if any(marker in lowered for marker in execution_markers + explicit_agent_markers):
+            return True
+        if any(marker in lowered for marker in ("加一个", "新增", "添加")) and any(
+            marker in lowered for marker in ("veyra", "router", "模块", "功能", "页面", "ui", "代码")
+        ):
             return True
         if complexity == "complex" and any(marker in lowered for marker in ("执行", "修改", "实现", "代码", "部署", "debug", "implement")):
             return True

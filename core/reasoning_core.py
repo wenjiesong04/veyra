@@ -5,12 +5,13 @@ from typing import Any
 
 from core.definitions import RiskLevel, normalize_risk
 from core.model_client import CoreModelClient, _env_value, redact_sensitive
+from core.prompt_loader import load_prompt
 from core.turn_context_builder import TurnContextBuilder
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent
 
 
-CORE_DECISION_SYSTEM = (
+CORE_DECISION_SYSTEM_FALLBACK = (
     "You are Veyra Core's understanding-informed awareness planner, not an external agent runtime. "
     "Return strict JSON only. Veyra is an Awareness-driven Cognition and Governance Runtime. "
     "Your job is to preserve user understanding, reason about evidence, and produce structured decision output; you do not execute tools. "
@@ -28,7 +29,7 @@ CORE_DECISION_SYSTEM = (
     "You cannot approve execution, lower risk, bypass Guardian, or ignore allowed_routes."
 )
 
-CORE_ANSWER_SYSTEM = (
+CORE_ANSWER_SYSTEM_FALLBACK = (
     "You are Veyra Core's user reply composer. Reply naturally in the user's language, using the supplied "
     "decision, evidence, memory, and turn context. Return strict JSON only, but draft_response must be final "
     "text that can be sent to the user. Do not leak internal JSON, route labels, policy patches, or task packet "
@@ -42,6 +43,9 @@ CORE_ANSWER_SYSTEM = (
     "received readable image content and ask for OCR/description or enabled vision intake. "
     "When persona_patch is supplied, follow its response_style and guidelines without exposing them as internal policy."
 )
+
+CORE_DECISION_SYSTEM = load_prompt("core/decision.md", CORE_DECISION_SYSTEM_FALLBACK)
+CORE_ANSWER_SYSTEM = load_prompt("core/answer.md", CORE_ANSWER_SYSTEM_FALLBACK)
 
 
 class CoreReasoning:
@@ -203,6 +207,32 @@ class CoreReasoning:
         decision: dict[str, Any],
         event: VeyraEvent | None = None,
     ) -> dict[str, Any]:
+        probe_name = str(probe_result.get("probe") or decision.get("selected_probe") or "").strip()
+        if probe_name in {
+            "time",
+            "time_probe",
+            "openclaw",
+            "openclaw_probe",
+            "hermes",
+            "hermes_probe",
+            "mcp",
+            "mcp_probe",
+            "port",
+            "port_probe",
+            "git",
+            "git_probe",
+            "process",
+            "process_probe",
+            "system",
+            "system_probe",
+            "file",
+            "file_probe",
+            "log",
+            "log_probe",
+            "network",
+            "network_probe",
+        }:
+            return {"status": "skipped", "reason": "structured_local_probe_uses_direct_renderer"}
         if not self.should_assist("probe_answer", {"route": "probe", "risk_level": "R1", "intent": decision.get("intent", "")}):
             return {"status": "skipped"}
         payload = {
@@ -444,6 +474,7 @@ class CoreReasoning:
             {
                 "purpose": purpose,
                 "status": result.get("status"),
+                "duration_ms": result.get("duration_ms"),
                 "request_summary": redact_sensitive(request_summary),
                 "result": redact_sensitive(result, max_string=1600),
             },

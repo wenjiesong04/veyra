@@ -135,6 +135,20 @@ def build_semantic_change_set(
             )
         )
 
+    preferred_topic = _extract_preferred_topic(raw, lowered)
+    if preferred_topic and preferred_topic not in {change.entity for change in changes}:
+        entities.append(EntityMention(preferred_topic, "preference_signal"))
+        changes.append(
+            StateChange(
+                entity=preferred_topic,
+                state_field="project_relevance",
+                operation="increase",
+                direction="up",
+                confidence=0.68,
+                reason="user expressed a soft preference signal without asking to create tracking",
+            )
+        )
+
     tentative_learning = _extract_tentative_learning_topic(raw, lowered)
     if tentative_learning and tentative_learning not in {change.entity for change in changes}:
         entities.append(EntityMention(tentative_learning, "learning_candidate"))
@@ -352,7 +366,7 @@ def _looks_like_direct_single_action(compact: str, lowered: str) -> bool:
     direct = any(token in compact for token in ("帮我取消", "取消", "停止", "暂停", "恢复", "帮我关注", "给我订阅", "每天推送")) or any(
         token in lowered for token in ("cancel", "stop", "pause", "resume", "subscribe", "track ")
     )
-    shift = any(token in compact for token in ("换成", "转向", "不如", "没那么重要", "值得关注", "可能", "或许", "考虑"))
+    shift = any(token in compact for token in ("换成", "改成", "转向", "不如", "没那么重要", "值得关注", "可能", "或许", "考虑"))
     return bool(direct and not shift)
 
 
@@ -362,10 +376,11 @@ def _has_negated_action(compact: str) -> bool:
 
 def _extract_shift_pair(text: str) -> tuple[str, str]:
     patterns = (
+        rf"(?:取消|停止|停掉|不看|不再关注|别再关注)\s*(?P<old>{ENTITY_PATTERN}|[^，,。！？!?]{{2,24}}?)\s*(?:追踪|跟踪|关注|订阅|新闻|任务|计划)?[，,、\s]*(?:改成|换成|转向|改为)\s*(?P<new>{ENTITY_PATTERN}|[^，,。！？!?]{{2,24}})",
         rf"从\s*(?P<old>{ENTITY_PATTERN}|[^，,。！？!?]{{2,24}}?)\s*(?:转向|换成|迁到|改用|切到)\s*(?P<new>{ENTITY_PATTERN}|[^，,。！？!?]{{2,24}})",
         rf"(?P<old>{ENTITY_PATTERN})\s*(?:已经)?(?:不如|没有|没)\s*(?P<new>{ENTITY_PATTERN})",
         rf"用\s*(?P<old>{ENTITY_PATTERN})\s*(?:已经)?(?:不如|没有|没)\s*(?P<new>{ENTITY_PATTERN})",
-        rf"(?P<old>{ENTITY_PATTERN})\s*(?:换成|转向|改用|切到)\s*(?P<new>{ENTITY_PATTERN})",
+        rf"(?P<old>{ENTITY_PATTERN})\s*(?:换成|改成|转向|改用|切到|改为)\s*(?P<new>{ENTITY_PATTERN})",
     )
     for pattern in patterns:
         match = re.search(pattern, text or "", flags=re.IGNORECASE)
@@ -398,8 +413,25 @@ def _extract_tentative_learning_topic(text: str, lowered: str) -> str:
 
 def _extract_decreased_topic(text: str, lowered: str) -> str:
     patterns = (
+        rf"(?:不想继续|不太想继续|可能不想继续|不准备继续|不想再|不用继续)\s*(?:关注|追踪|跟踪|看)?\s*(?P<topic>{ENTITY_PATTERN})",
         rf"(?P<topic>{ENTITY_PATTERN}).{{0,12}}(?:没那么重要|不重要|不太适合|不合适|没必要|不用作为主线)",
         r"(?P<topic>[^，,。！？!?]{2,32}).{0,12}(?:没那么重要|不重要|不太适合|不合适|没必要|不用作为主线)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return _clean_entity(match.group("topic"))
+    return ""
+
+
+def _extract_preferred_topic(text: str, lowered: str) -> str:
+    if not any(token in text for token in ("更适合", "更合适", "更重要", "更优先")) and not any(
+        token in lowered for token in ("better fit", "more suitable", "prefer")
+    ):
+        return ""
+    patterns = (
+        rf"(?P<topic>{ENTITY_PATTERN}).{{0,8}}(?:可能)?(?:更适合|更合适|更重要|更优先)",
+        r"(?P<topic>[^，,。！？!?]{2,32}).{0,8}(?:可能)?(?:更适合|更合适|更重要|更优先)",
     )
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
