@@ -84,10 +84,20 @@ class RoutingMetrics:
         return {"status": "success", "items": [self._public_trace(item) for item in failures[-limit:]]}
 
     def _traces(self, limit: int) -> list[dict[str, Any]]:
-        traces = self.state_store.read_jsonl(self.trace_filename, limit=limit)
+        read_limit = max(limit * 4, 1000)
+        records = self.state_store.read_jsonl(self.trace_filename, limit=read_limit)
+        traces = [item for item in records if self._is_route_trace(item)]
         if not traces and self.trace_filename != "runtime_trace.jsonl":
-            return self.state_store.read_jsonl("runtime_trace.jsonl", limit=limit)
-        return traces
+            records = self.state_store.read_jsonl("runtime_trace.jsonl", limit=read_limit)
+            traces = [item for item in records if self._is_route_trace(item)]
+        return traces[-limit:]
+
+    def _is_route_trace(self, item: dict[str, Any]) -> bool:
+        # decision_trace.jsonl also contains proactive-intent and semantic
+        # change-set audit records. RuntimeTraceRecorder route events always
+        # carry final_route; excluding the other schemas prevents them from
+        # becoming artificial "unknown" routes and runtime failures.
+        return bool(str(item.get("final_route") or "").strip())
 
     def _avg(self, values: list[int]) -> int:
         return int(sum(values) / len(values)) if values else 0

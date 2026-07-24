@@ -248,7 +248,10 @@ def main() -> int:
                 status="success",
                 result="restarted",
                 tool_calls=["sudo restart openclaw"],
-                raw={"action_proposals": [{"status": "approved", "review_id": "rev_1"}]},
+                raw={
+                    "action_proposals": [{"status": "approved", "review_id": "rev_1"}],
+                    "tool_proxy_traces": [{"trace_id": "trace_1", "status": "ok"}],
+                },
             )
         )
         expect(proxied["status"] == "verified_success", "verifier accepts approved high-risk agent tool call", proxied)
@@ -260,7 +263,13 @@ def main() -> int:
         adapter = FakePollingAdapter(
             [
                 ExecutionResult(task_id="fake_1", executor="fake", status="running", result="running"),
-                ExecutionResult(task_id="fake_1", executor="fake", status="success", result="done", raw={"evidence": True}),
+                ExecutionResult(
+                    task_id="fake_1",
+                    executor="fake",
+                    status="success",
+                    result="done",
+                    raw={"evidence": [{"source": "p6_fake_poll"}]},
+                ),
             ]
         )
         final = adapter.poll_task("fake_1", timeout_seconds=1, interval_seconds=0.01)
@@ -621,7 +630,13 @@ def main() -> int:
 
         callback = client.post(
             "/agent/results",
-            json={"task_id": "callback_1", "executor": "fake", "status": "success", "result": "callback done", "raw": {"session_id": "p6"}},
+            json={
+                "task_id": "callback_1",
+                "executor": "fake",
+                "status": "success",
+                "result": "callback done",
+                "raw": {"session_id": "p6", "evidence": [{"source": "p6_callback"}]},
+            },
         )
         expect(callback.status_code == 200 and callback.json()["status"] == "verified_success", "agent result callback", callback.text)
 

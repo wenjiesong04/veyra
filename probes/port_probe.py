@@ -22,8 +22,30 @@ class PortProbe:
         )
 
     def _extract_port(self, text: str) -> int | None:
-        match = re.search(r"\b([1-9][0-9]{1,4})\b", text)
-        if not match:
-            return None
-        port = int(match.group(1))
+        # Prefer an explicit host:port target before looking for a standalone
+        # number. Otherwise ``127.0.0.1:8000`` is incorrectly interpreted as
+        # port 127, the first numeric token in the IPv4 address.
+        host_port = re.search(
+            r"(?:\[[0-9A-Fa-f:.]+\]|localhost|(?:[0-9]{1,3}\.){3}[0-9]{1,3}|[A-Za-z][A-Za-z0-9.-]*):([0-9]{1,5})(?![0-9])",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if host_port:
+            return self._valid_port(host_port.group(1))
+
+        labelled = re.search(
+            r"(?:\bport\b|端口)\s*(?:[:=#]|is|是|为)?\s*([0-9]{1,5})(?![0-9])",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if labelled:
+            return self._valid_port(labelled.group(1))
+
+        # Do not treat an IPv4 octet as a standalone port when an address is
+        # present without an explicit port.
+        standalone = re.search(r"(?<![0-9.:])([1-9][0-9]{1,4})(?![0-9.:])", text)
+        return self._valid_port(standalone.group(1)) if standalone else None
+
+    def _valid_port(self, value: str) -> int | None:
+        port = int(value)
         return port if 0 < port <= 65535 else None

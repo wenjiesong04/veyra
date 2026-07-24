@@ -274,11 +274,14 @@ class ProactiveChecks:
             except Exception as exc:
                 conn = {"status": "error", "error": str(exc)}
         if bool(conn.get("connected")) or str(conn.get("status") or "") in {"available", "ok", "success"}:
-            executor = self.state_store.read_json("executor_state.json")
-            executor["status"] = str(conn.get("status") or "available")
-            executor["connected"] = True
-            executor["updated_at"] = utc_now_iso()
-            self.state_store.write_json("executor_state.json", executor)
+            self.state_store.patch_json(
+                "executor_state.json",
+                {
+                    "status": str(conn.get("status") or "available"),
+                    "connected": True,
+                    "updated_at": utc_now_iso(),
+                },
+            )
             return {"status": "recovered", "method": "reconnect", "connection": self._compact_conn(conn)}
         command = os.getenv("VEYRA_AGENT_RESTART_CMD", "").strip()
         if command:
@@ -298,12 +301,21 @@ class ProactiveChecks:
         if adapter is not None and hasattr(adapter, "fetch_capabilities"):
             caps = adapter.fetch_capabilities()
             if isinstance(caps, dict) and caps:
-                executor = self.state_store.read_json("executor_state.json")
-                snapshot = executor.get("capability_snapshot") if isinstance(executor.get("capability_snapshot"), dict) else {}
-                snapshot = {**snapshot, **caps, "freshness": "fresh", "refreshed_at": utc_now_iso()}
-                executor["capability_snapshot"] = snapshot
-                executor["updated_at"] = utc_now_iso()
-                self.state_store.write_json("executor_state.json", executor)
+                def update_capabilities(executor: dict[str, Any]) -> None:
+                    snapshot = (
+                        executor.get("capability_snapshot")
+                        if isinstance(executor.get("capability_snapshot"), dict)
+                        else {}
+                    )
+                    executor["capability_snapshot"] = {
+                        **snapshot,
+                        **caps,
+                        "freshness": "fresh",
+                        "refreshed_at": utc_now_iso(),
+                    }
+                    executor["updated_at"] = utc_now_iso()
+
+                self.state_store.mutate_json("executor_state.json", update_capabilities)
                 return {"action": "refresh_agent_capabilities", "status": "refreshed", "source": "agent_adapter"}
         result = OpenClawProbe().run("18789")
         self.perception.interpret_probe_result(result)
@@ -327,11 +339,14 @@ class ProactiveChecks:
                 conn = {"status": "error", "error": str(exc)}
         connected = bool(conn.get("connected")) or str(conn.get("status") or "") in {"available", "ok", "success"}
         if connected:
-            executor = self.state_store.read_json("executor_state.json")
-            executor["status"] = str(conn.get("status") or "available")
-            executor["connected"] = True
-            executor["updated_at"] = utc_now_iso()
-            self.state_store.write_json("executor_state.json", executor)
+            self.state_store.patch_json(
+                "executor_state.json",
+                {
+                    "status": str(conn.get("status") or "available"),
+                    "connected": True,
+                    "updated_at": utc_now_iso(),
+                },
+            )
             return {"action": "probe_executor_status", "status": "refreshed", "self_heal": "reconnected", "connection": self._compact_conn(conn)}
         if self.agency._active_commitments() and not self._has_pending_restart_review():
             review = self._create_restart_review(gap, conn)

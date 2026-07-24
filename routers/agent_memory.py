@@ -70,6 +70,53 @@ class AgentResultRequest(BaseModel):
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
+def _task_context_for_callback(loop: Any, task_id: str) -> tuple[dict[str, Any], bool]:
+    getter = getattr(loop.task_tracker, "get_context", None)
+    if callable(getter):
+        try:
+            resolved = getter(task_id, authoritative_only=True)
+        except TypeError:
+            try:
+                resolved = getter(task_id)
+            except Exception:
+                resolved = None
+        except Exception:
+            resolved = None
+        if isinstance(resolved, dict):
+            nested = resolved.get("task_context")
+            if isinstance(nested, dict):
+                return (
+                    (dict(nested), True)
+                    if str(nested.get("authority") or "") == "veyra_registered"
+                    else ({}, False)
+                )
+            if resolved and str(resolved.get("authority") or "") in {"", "veyra_registered"}:
+                return dict(resolved), True
+    state = loop.state_store.read_json("task_state.json")
+    pending = state.get("pending_agent_tasks") if isinstance(state.get("pending_agent_tasks"), list) else []
+    for item in pending:
+        if isinstance(item, dict) and str(item.get("task_id") or "") == task_id:
+            embedded = item.get("task_context") if isinstance(item.get("task_context"), dict) else {}
+            if embedded:
+                if str(embedded.get("authority") or "") != "veyra_registered":
+                    return {}, False
+                return dict(embedded), True
+            return dict(item), True
+    return {}, False
+
+
+def _memory_provider_for_callback(task_context: dict[str, Any], execution: ExecutionResult) -> str:
+    task_packet = task_context.get("task_packet") if isinstance(task_context.get("task_packet"), dict) else {}
+    provider = str(
+        task_context.get("memory_provider")
+        or task_context.get("target_agent")
+        or task_packet.get("target_agent")
+        or execution.executor
+        or "selected"
+    ).strip()
+    return "selected" if provider in {"", "external", "unknown"} else provider
+
+
 def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
     router = APIRouter()
 
@@ -104,6 +151,7 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
     @router.post("/agent/results")
     async def agent_result_callback(request: AgentResultRequest) -> dict[str, Any]:
         loop = deps["awareness_loop"]
+        task_context, context_found = _task_context_for_callback(loop, request.task_id)
         execution = ExecutionResult(
             task_id=request.task_id,
             executor=request.executor,
@@ -124,20 +172,38 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
                 "status": verified["status"],
                 "execution_result": execution.to_dict(),
                 "verification": verified,
+                "callback_context": {
+                    "context_found": context_found,
+                    "session_id": task_context.get("session_id"),
+                    "correlation_id": task_context.get("correlation_id")
+                    or task_context.get("event_id")
+                    or task_context.get("task_packet_id"),
+                    "memory_policy": task_context.get("memory_policy"),
+                },
             }
         )
         task_update = loop.task_tracker.apply_result(execution=execution, verification=verified, event_id=f"callback_{execution.task_id}")
-        memory_write = None
-        if verified.get("needs_memory_patch"):
-            memory_write = loop.memory_bridge.write_patch(
-                {
-                    "session_id": str(request.raw.get("session_id") or "agent-callback"),
-                    "task": str(request.raw.get("task") or request.task_id),
-                    "executor": execution.executor,
-                    "status": execution.status,
-                    "result": execution.result,
-                }
+        provider = _memory_provider_for_callback(task_context, execution)
+        memory_runtime = getattr(loop, "memory_policy_runtime", None)
+        if memory_runtime is None or not hasattr(memory_runtime, "apply_agent_result"):
+            memory_policy_execution = {
+                "status": "skipped",
+                "policy": str(task_context.get("memory_policy") or "forget"),
+                "reason": "memory policy runtime unavailable",
+            }
+        else:
+            memory_policy_execution = memory_runtime.apply_agent_result(
+                task_context=task_context,
+                execution=execution,
+                verification=verified,
+                context_found=context_found,
+                long_term_writer=lambda patch: loop.memory_bridge.write_patch(patch, provider=provider),
             )
+        memory_write = (
+            memory_policy_execution.get("write")
+            if isinstance(memory_policy_execution.get("write"), dict)
+            else None
+        )
         return {
             "status": verified["status"],
             "execution_result": execution.to_dict(),
@@ -145,6 +211,16 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
             "execution_trace": trace,
             "task_update": task_update,
             "memory_write": memory_write,
+            "memory_policy_execution": memory_policy_execution,
+            "callback_context": {
+                "context_found": context_found,
+                "session_id": task_context.get("session_id"),
+                "correlation_id": task_context.get("correlation_id")
+                or task_context.get("event_id")
+                or task_context.get("task_packet_id"),
+                "memory_policy": task_context.get("memory_policy") or "forget",
+                "provider": provider,
+            },
         }
 
     @router.post("/agent/tasks/{task_id}/stop")

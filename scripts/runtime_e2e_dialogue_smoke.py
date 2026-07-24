@@ -109,7 +109,9 @@ def main() -> int:
     suffix = uuid4().hex[:8]
     user_id = f"runtime-e2e-user-{suffix}"
     session_id = f"dialogue-{suffix}"
-    store = WorldStateStore()
+    # The live API is the sole writer for the production state root. This smoke
+    # only observes the resulting state and must not contend for its writer lease.
+    store = WorldStateStore(read_only=True)
 
     learning = post_message("现在我要开始学习深度学习了，你能帮我吗？", user_id=user_id, session_id=session_id, index=1)
     learning_artifact = artifact(learning)
@@ -148,9 +150,14 @@ def main() -> int:
 
     cancel = post_message("以后都停止推送", user_id=user_id, session_id=session_id, index=6)
     active_after_cancel = commitments(store, user_id, status="active")
-    due_for_user = [item for item in CommitmentCore(store).due_commitments(limit=200) if item.get("user_id") == user_id]
+    commitment_reader = CommitmentCore(store)
+    pushable_after_cancel = [
+        item
+        for item in commitments(store, user_id)
+        if commitment_reader.pushable_reason(item)[0]
+    ]
     expect(not active_after_cancel, "all active proactive commitments are cancelled", {"cancel": cancel, "commitments": commitments(store, user_id)})
-    expect(not due_for_user, "cancelled commitments are absent from due commitments", due_for_user)
+    expect(not pushable_after_cancel, "cancelled commitments are not pushable", pushable_after_cancel)
 
     counts_before_identity = proactive_counts(store)
     identity = post_message("你现在是 Veyra 还是 OpenClaw？", user_id=user_id, session_id=session_id, index=7)

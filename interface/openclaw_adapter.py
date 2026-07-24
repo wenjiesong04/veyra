@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import base64
+import copy
 import hashlib
 import re
 import threading
@@ -40,6 +41,21 @@ class OpenClawGatewayError(RuntimeError):
         self.status = status
         self.message = message
         self.details = details or {}
+
+
+def _ensure_crypto_available() -> bool:
+    """Recover if cryptography becomes available after this module was imported."""
+    global Ed25519PrivateKey, serialization
+    if Ed25519PrivateKey is not None and serialization is not None:
+        return True
+    try:
+        from cryptography.hazmat.primitives import serialization as loaded_serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as loaded_ed25519
+    except ImportError:
+        return False
+    Ed25519PrivateKey = loaded_ed25519  # type: ignore[assignment]
+    serialization = loaded_serialization  # type: ignore[assignment]
+    return True
 
 
 class OpenClawAdapter(AgentAdapter):
@@ -81,6 +97,10 @@ class OpenClawAdapter(AgentAdapter):
         self.protocol_max = max(self.protocol_min, configured_max)
         self._run_cache: dict[str, dict[str, Any]] = {}
         self._run_cache_lock = threading.Lock()
+        self._capabilities_cache: dict[str, Any] = {}
+        self._capabilities_cache_at = 0.0
+        self._capabilities_cache_ttl = max(0.0, min(self._float_env("OPENCLAW_CAPABILITIES_CACHE_TTL", 5.0), 30.0))
+        self._capabilities_cache_lock = threading.Lock()
 
     def send_task(self, task_packet: VeyraTaskPacket) -> ExecutionResult:
         validation_errors = validate_task_packet_payload(task_packet.to_dict())
@@ -99,6 +119,7 @@ class OpenClawAdapter(AgentAdapter):
         # session id (e.g. feishu:ou_xxx:oc_xxx) must never be the OpenClaw sessionKey, and
         # the fixed "main" key must not be shared across independent tasks.
         session_key = str(getattr(task_packet, "agent_execution_session_id", "") or "").strip() or self.session_key
+        task_context = self._task_context_for_packet(task_packet, session_key)
         try:
             raw = self._send_chat(prompt, session_key=session_key)
         except OpenClawGatewayError as exc:
@@ -108,20 +129,43 @@ class OpenClawAdapter(AgentAdapter):
                 status=exc.status,
                 result=f"OpenClaw gateway request failed: {exc.message}",
                 logs=prompt,
-            raw=self._redact_payload({"task_packet": task_packet.to_dict(), "gateway_url": self.gateway_url, "error": exc.details}),
+                raw=self._redact_payload(
+                    {
+                        "task_context": task_context,
+                        "gateway_url": self.gateway_url,
+                        "error": exc.details,
+                    }
+                ),
             )
         final = raw.get("final_event") or {}
         text = self._message_text(final.get("message"))
         run_id = str(raw.get("run_id") or raw.get("chat_send", {}).get("runId") or task_packet.task_id)
+        execution_raw = {**raw, "task_context": task_context}
+        agent_response = self._structured_agent_response(text)
+        if agent_response:
+            execution_raw["agent_response"] = agent_response
+        changed_files = self._string_items(agent_response.get("changed_files")) if agent_response else []
+        tool_calls = self._string_items(agent_response.get("tool_calls")) if agent_response else []
         if final.get("state") == "final":
             execution = ExecutionResult(
                 task_id=run_id,
                 executor="openclaw",
                 status="success",
                 result=text or "OpenClaw finished with no text.",
-                raw=self._redact_payload(raw),
+                changed_files=changed_files,
+                tool_calls=tool_calls,
+                raw=self._redact_payload(execution_raw),
             )
-            self._remember_chat_run(run_id, final_event=final, status="success", result=text)
+            self._remember_chat_run(
+                run_id,
+                final_event=final,
+                status="success",
+                result=text,
+                task_context=task_context,
+                agent_response=agent_response,
+                changed_files=changed_files,
+                tool_calls=tool_calls,
+            )
             return execution
         if final.get("state") == "error":
             execution = ExecutionResult(
@@ -129,20 +173,32 @@ class OpenClawAdapter(AgentAdapter):
                 executor="openclaw",
                 status="error",
                 result=str(final.get("errorMessage") or "OpenClaw task failed."),
-                raw=self._redact_payload(raw),
+                raw=self._redact_payload(execution_raw),
             )
-            self._remember_chat_run(run_id, final_event=final, status="error", result=execution.result)
+            self._remember_chat_run(
+                run_id,
+                final_event=final,
+                status="error",
+                result=execution.result,
+                task_context=task_context,
+            )
             return execution
-        self._remember_chat_run(run_id, final_event=final, status="submitted", result=f"Task submitted to OpenClaw. run_id={run_id}")
+        self._remember_chat_run(
+            run_id,
+            final_event=final,
+            status="submitted",
+            result=f"Task submitted to OpenClaw. run_id={run_id}",
+            task_context=task_context,
+        )
         return ExecutionResult(
             task_id=run_id,
             executor="openclaw",
             status="submitted",
             result=f"Task submitted to OpenClaw. run_id={run_id}",
-            raw=self._redact_payload(raw),
+            raw=self._redact_payload(execution_raw),
         )
 
-    def fetch_capabilities(self) -> dict[str, Any]:
+    def fetch_capabilities(self, *, force_refresh: bool = False) -> dict[str, Any]:
         if not self.gateway_url:
             return normalize_capabilities(
                 {
@@ -157,10 +213,14 @@ class OpenClawAdapter(AgentAdapter):
                 runtime="openclaw",
                 base_url=None,
             )
+        if not force_refresh:
+            cached = self._cached_capabilities()
+            if cached:
+                return cached
         try:
-            return normalize_capabilities(self._gateway_snapshot(), runtime="openclaw", base_url=self.gateway_url)
+            capabilities = normalize_capabilities(self._gateway_snapshot(), runtime="openclaw", base_url=self.gateway_url)
         except OpenClawGatewayError as exc:
-            return normalize_capabilities(
+            capabilities = normalize_capabilities(
                 {
                     "runtime": "openclaw",
                     "status": exc.status,
@@ -173,6 +233,13 @@ class OpenClawAdapter(AgentAdapter):
                 runtime="openclaw",
                 base_url=self.gateway_url,
             )
+        self._remember_capabilities(capabilities)
+        return copy.deepcopy(capabilities)
+
+    def invalidate_capabilities_cache(self) -> None:
+        with self._capabilities_cache_lock:
+            self._capabilities_cache = {}
+            self._capabilities_cache_at = 0.0
 
     def fetch_memory_summary(self, session_id: str) -> dict[str, Any]:
         if not self.gateway_url:
@@ -407,9 +474,9 @@ class OpenClawAdapter(AgentAdapter):
         except OpenClawGatewayError:
             return False
 
-    def connection_status(self) -> dict[str, Any]:
+    def connection_status(self, *, force_refresh: bool = False) -> dict[str, Any]:
         try:
-            capabilities = self.fetch_capabilities()
+            capabilities = self.fetch_capabilities(force_refresh=force_refresh)
         except Exception as exc:
             capabilities = normalize_capabilities(
                 {
@@ -432,6 +499,7 @@ class OpenClawAdapter(AgentAdapter):
             "base_url": self.gateway_url,
             "protocol": "openclaw_gateway_ws",
             "contract_version": AGENT_CONTRACT_VERSION,
+            "auth_diagnostics": self._auth_diagnostics(),
             "validation": {
                 "implemented": True,
                 "configured": configured,
@@ -442,6 +510,21 @@ class OpenClawAdapter(AgentAdapter):
             },
             "capabilities": capabilities,
         }
+
+    def _cached_capabilities(self) -> dict[str, Any]:
+        if self._capabilities_cache_ttl <= 0:
+            return {}
+        with self._capabilities_cache_lock:
+            if not self._capabilities_cache:
+                return {}
+            if (time.monotonic() - self._capabilities_cache_at) > self._capabilities_cache_ttl:
+                return {}
+            return copy.deepcopy(self._capabilities_cache)
+
+    def _remember_capabilities(self, capabilities: dict[str, Any]) -> None:
+        with self._capabilities_cache_lock:
+            self._capabilities_cache = copy.deepcopy(capabilities)
+            self._capabilities_cache_at = time.monotonic()
 
     def _send_chat(self, message: str, *, session_key: str | None = None) -> dict[str, Any]:
         events: list[dict[str, Any]] = []
@@ -500,7 +583,11 @@ class OpenClawAdapter(AgentAdapter):
                 "task_status": True,
                 "task_poll": "agent.wait+chat.history",
                 "stop_task": True,
-                "tool_proxy_enforced": True,
+                # Veyra advertises the Tool Proxy contract in every task packet, but
+                # OpenClaw does not currently provide a proven pre-tool enforcement hook.
+                "tool_proxy_enforced": False,
+                "tool_proxy_contract_advertised": True,
+                "tool_proxy_enforcement_status": "validation_pending",
             },
             "health": self._health_summary(health),
             "gateway_status": self._status_summary(status),
@@ -657,6 +744,18 @@ class OpenClawAdapter(AgentAdapter):
                     final_event=execution.raw.get("final_event") if isinstance(execution.raw.get("final_event"), dict) else {},
                     status=execution.status,
                     result=execution.result,
+                    task_context=(
+                        execution.raw.get("task_context")
+                        if isinstance(execution.raw.get("task_context"), dict)
+                        else None
+                    ),
+                    agent_response=(
+                        execution.raw.get("agent_response")
+                        if isinstance(execution.raw.get("agent_response"), dict)
+                        else None
+                    ),
+                    changed_files=execution.changed_files,
+                    tool_calls=execution.tool_calls,
                 )
                 return execution
             return execution
@@ -673,6 +772,18 @@ class OpenClawAdapter(AgentAdapter):
                 final_event=final_event,
                 status=execution.status,
                 result=execution.result,
+                task_context=(
+                    execution.raw.get("task_context")
+                    if isinstance(execution.raw.get("task_context"), dict)
+                    else None
+                ),
+                agent_response=(
+                    execution.raw.get("agent_response")
+                    if isinstance(execution.raw.get("agent_response"), dict)
+                    else None
+                ),
+                changed_files=execution.changed_files,
+                tool_calls=execution.tool_calls,
             )
             return execution
 
@@ -690,11 +801,14 @@ class OpenClawAdapter(AgentAdapter):
             raise OpenClawGatewayError("method_unavailable", "OpenClaw gateway does not expose agent.wait")
         return payload if isinstance(payload, dict) else {"runId": run_id, "status": "timeout"}
 
-    def _fetch_chat_history(self, *, limit: int = 8) -> dict[str, Any]:
+    def _fetch_chat_history(self, *, session_key: str, limit: int = 8) -> dict[str, Any]:
+        active_session_key = str(session_key or "").strip()
+        if not active_session_key:
+            return {}
         payload = self._gateway_request(
             "chat.history",
             {
-                "sessionKey": self.session_key,
+                "sessionKey": active_session_key,
                 "limit": max(1, min(int(limit), 50)),
             },
         )
@@ -709,7 +823,12 @@ class OpenClawAdapter(AgentAdapter):
                 executor="openclaw",
                 status="running",
                 result=f"OpenClaw chat run {task_id} is still in progress.",
-                raw=self._redact_payload({"agent_wait": wait_payload, "poll_method": "agent.wait"}),
+                raw=self._redact_payload(
+                    self._execution_raw_for_run(
+                        task_id,
+                        {"agent_wait": wait_payload, "poll_method": "agent.wait"},
+                    )
+                ),
             )
         if normalized == "error":
             error_text = str(wait_payload.get("error") or wait_payload.get("stopReason") or "OpenClaw task failed.")
@@ -718,34 +837,56 @@ class OpenClawAdapter(AgentAdapter):
                 executor="openclaw",
                 status="error",
                 result=error_text,
-                raw=self._redact_payload({"agent_wait": wait_payload, "poll_method": "agent.wait"}),
+                raw=self._redact_payload(
+                    self._execution_raw_for_run(
+                        task_id,
+                        {"agent_wait": wait_payload, "poll_method": "agent.wait"},
+                        result_text=error_text,
+                    )
+                ),
             )
 
         result_text = self._result_text_for_run(task_id, wait_payload)
+        execution_raw = self._execution_raw_for_run(
+            task_id,
+            {"agent_wait": wait_payload, "poll_method": "agent.wait"},
+            result_text=result_text,
+        )
+        agent_response = execution_raw.get("agent_response") if isinstance(execution_raw.get("agent_response"), dict) else {}
         return ExecutionResult(
             task_id=task_id,
             executor="openclaw",
             status="success",
             result=result_text or "OpenClaw finished with no text.",
-            raw=self._redact_payload({"agent_wait": wait_payload, "poll_method": "agent.wait"}),
+            changed_files=self._string_items(agent_response.get("changed_files")),
+            tool_calls=self._string_items(agent_response.get("tool_calls")),
+            raw=self._redact_payload(execution_raw),
         )
 
     def _execution_from_chat_event(self, task_id: str, final_event: dict[str, Any]) -> ExecutionResult:
         text = self._message_text(final_event.get("message"))
+        execution_raw = self._execution_raw_for_run(
+            task_id,
+            {"final_event": final_event, "poll_method": "chat.events"},
+            result_text=text,
+        )
         if final_event.get("state") == "error":
             return ExecutionResult(
                 task_id=task_id,
                 executor="openclaw",
                 status="error",
                 result=str(final_event.get("errorMessage") or "OpenClaw task failed."),
-                raw=self._redact_payload({"final_event": final_event, "poll_method": "chat.events"}),
+                raw=self._redact_payload(execution_raw),
             )
+        agent_response = execution_raw.get("agent_response") if isinstance(execution_raw.get("agent_response"), dict) else {}
         return ExecutionResult(
             task_id=task_id,
             executor="openclaw",
             status="success",
             result=text or "OpenClaw finished with no text.",
-            raw=self._redact_payload({"final_event": final_event, "poll_method": "chat.events"}),
+            changed_files=self._string_items(agent_response.get("changed_files")),
+            tool_calls=self._string_items(agent_response.get("tool_calls")),
+            raw=self._redact_payload(execution_raw),
         )
 
     def _listen_for_chat_run(self, run_id: str, timeout_seconds: float) -> dict[str, Any]:
@@ -763,7 +904,12 @@ class OpenClawAdapter(AgentAdapter):
                 executor="openclaw",
                 status=exc.status,
                 result=f"OpenClaw task status request failed: {exc.message}",
-                raw=self._redact_payload({"error": exc.details, "poll_method": "status.snapshot"}),
+                raw=self._redact_payload(
+                    self._execution_raw_for_run(
+                        task_id,
+                        {"error": exc.details, "poll_method": "status.snapshot"},
+                    )
+                ),
             )
         known_task = self._find_task(status, task_id)
         if known_task:
@@ -774,7 +920,13 @@ class OpenClawAdapter(AgentAdapter):
                 executor="openclaw",
                 status=normalized,
                 result=str(known_task.get("result") or known_task.get("message") or f"OpenClaw task {task_id} is {normalized}."),
-                raw=self._redact_payload({"task": known_task, "status": status, "poll_method": "status.snapshot"}),
+                raw=self._redact_payload(
+                    self._execution_raw_for_run(
+                        task_id,
+                        {"task": known_task, "status": status, "poll_method": "status.snapshot"},
+                        result_text=str(known_task.get("result") or known_task.get("message") or ""),
+                    )
+                ),
             )
         tasks = status.get("tasks") if isinstance(status.get("tasks"), dict) else {}
         active = tasks.get("active")
@@ -784,7 +936,12 @@ class OpenClawAdapter(AgentAdapter):
                 executor="openclaw",
                 status="running",
                 result=f"OpenClaw has {active} active task(s); task {task_id} has not reached a final event yet.",
-                raw=self._redact_payload({"status": status, "poll_method": "status.snapshot"}),
+                raw=self._redact_payload(
+                    self._execution_raw_for_run(
+                        task_id,
+                        {"status": status, "poll_method": "status.snapshot"},
+                    )
+                ),
             )
         if self._is_chat_run_id(task_id):
             return ExecutionResult(
@@ -792,18 +949,29 @@ class OpenClawAdapter(AgentAdapter):
                 executor="openclaw",
                 status="running",
                 result=f"OpenClaw chat run {task_id} is still in progress; gateway status snapshot has no per-run detail.",
-                raw=self._redact_payload({"status": status, "poll_method": "status.snapshot"}),
+                raw=self._redact_payload(
+                    self._execution_raw_for_run(
+                        task_id,
+                        {"status": status, "poll_method": "status.snapshot"},
+                    )
+                ),
             )
         return ExecutionResult(
             task_id=task_id,
             executor="openclaw",
             status="submitted",
             result=f"OpenClaw task {task_id} is not present in the current status snapshot.",
-            raw=self._redact_payload({"status": status, "poll_method": "status.snapshot"}),
+            raw=self._redact_payload(
+                self._execution_raw_for_run(
+                    task_id,
+                    {"status": status, "poll_method": "status.snapshot"},
+                )
+            ),
         )
 
     def _result_text_for_run(self, task_id: str, wait_payload: dict[str, Any]) -> str:
-        cached = self._run_cache.get(task_id) if isinstance(self._run_cache.get(task_id), dict) else {}
+        with self._run_cache_lock:
+            cached = dict(self._run_cache.get(task_id) or {})
         cached_text = str(cached.get("result") or "").strip()
         if cached_text and not cached_text.startswith("Task submitted to OpenClaw."):
             return cached_text
@@ -811,8 +979,14 @@ class OpenClawAdapter(AgentAdapter):
         text = self._message_text(final_event.get("message"))
         if text:
             return text
+        task_context = cached.get("task_context") if isinstance(cached.get("task_context"), dict) else {}
+        session_key = str(task_context.get("agent_execution_session_id") or task_context.get("session_key") or "").strip()
+        if not session_key:
+            # Never fall back to the shared "main" history for a task whose isolated
+            # execution session cannot be resolved.
+            return ""
         try:
-            history = self._fetch_chat_history(limit=12)
+            history = self._fetch_chat_history(session_key=session_key, limit=12)
         except OpenClawGatewayError:
             history = {}
         return self._latest_assistant_text(history)
@@ -837,6 +1011,10 @@ class OpenClawAdapter(AgentAdapter):
         final_event: dict[str, Any] | None = None,
         status: str,
         result: str,
+        task_context: dict[str, Any] | None = None,
+        agent_response: dict[str, Any] | None = None,
+        changed_files: list[str] | None = None,
+        tool_calls: list[str] | None = None,
     ) -> None:
         with self._run_cache_lock:
             current = self._run_cache.get(run_id) if isinstance(self._run_cache.get(run_id), dict) else {}
@@ -846,8 +1024,32 @@ class OpenClawAdapter(AgentAdapter):
                 "status": status,
                 "result": result,
                 "final_event": final_event or current.get("final_event") or {},
+                "task_context": task_context or current.get("task_context") or {},
+                "agent_response": agent_response or current.get("agent_response") or {},
+                "changed_files": changed_files if changed_files is not None else current.get("changed_files") or [],
+                "tool_calls": tool_calls if tool_calls is not None else current.get("tool_calls") or [],
                 "updated_at": time.time(),
             }
+
+    def _execution_raw_for_run(
+        self,
+        task_id: str,
+        payload: dict[str, Any],
+        *,
+        result_text: str = "",
+    ) -> dict[str, Any]:
+        with self._run_cache_lock:
+            cached = dict(self._run_cache.get(task_id) or {})
+        raw = dict(payload)
+        task_context = cached.get("task_context")
+        if isinstance(task_context, dict) and task_context:
+            raw["task_context"] = task_context
+        agent_response = self._structured_agent_response(result_text)
+        if not agent_response and isinstance(cached.get("agent_response"), dict):
+            agent_response = cached["agent_response"]
+        if agent_response:
+            raw["agent_response"] = agent_response
+        return raw
 
     def _cached_execution(self, task_id: str) -> ExecutionResult | None:
         with self._run_cache_lock:
@@ -858,12 +1060,19 @@ class OpenClawAdapter(AgentAdapter):
         if status not in {"success", "error"}:
             return None
         final_event = cached.get("final_event") if isinstance(cached.get("final_event"), dict) else {}
+        execution_raw = self._execution_raw_for_run(
+            task_id,
+            {"cached_run": cached, "poll_method": "run_cache"},
+            result_text=str(cached.get("result") or ""),
+        )
         return ExecutionResult(
             task_id=task_id,
             executor="openclaw",
             status=status,
             result=str(cached.get("result") or self._message_text(final_event.get("message")) or ""),
-            raw=self._redact_payload({"cached_run": cached, "poll_method": "run_cache"}),
+            changed_files=self._string_items(cached.get("changed_files")),
+            tool_calls=self._string_items(cached.get("tool_calls")),
+            raw=self._redact_payload(execution_raw),
         )
 
     def _status_wait_ms(self) -> int:
@@ -961,7 +1170,7 @@ class OpenClawAdapter(AgentAdapter):
         return ""
 
     def _device_identity(self) -> dict[str, Any] | None:
-        if Ed25519PrivateKey is None or serialization is None:
+        if not _ensure_crypto_available():
             return None
         # This file contains local signing material and must remain gitignored.
         # Only short summaries of device-auth state may leave the adapter boundary.
@@ -994,7 +1203,7 @@ class OpenClawAdapter(AgentAdapter):
         }
 
     def _device_payload(self, device_identity: dict[str, Any] | None, nonce: str, *, scopes: list[str] | None = None) -> dict[str, Any] | None:
-        if not device_identity or Ed25519PrivateKey is None or not nonce:
+        if not device_identity or not _ensure_crypto_available() or Ed25519PrivateKey is None or not nonce:
             return None
         client = self._connect_client()
         signed_at = int(time.time() * 1000)
@@ -1021,6 +1230,18 @@ class OpenClawAdapter(AgentAdapter):
             "signature": self._b64url(signature),
             "signedAt": signed_at,
             "nonce": nonce,
+        }
+
+    def _auth_diagnostics(self) -> dict[str, Any]:
+        crypto_available = _ensure_crypto_available()
+        identity = self._device_identity() if crypto_available else None
+        return {
+            "crypto_available": bool(crypto_available),
+            "device_store": str(self.device_store),
+            "device_store_exists": self.device_store.exists(),
+            "device_identity_loaded": bool(identity and identity.get("deviceId") and identity.get("privateKey")),
+            "device_token_available": bool(identity and identity.get("token")),
+            "gateway_token_configured": bool(self.api_key),
         }
 
     def _store_device_token(self, hello: dict[str, Any], device_identity: dict[str, Any] | None) -> None:
@@ -1130,19 +1351,66 @@ class OpenClawAdapter(AgentAdapter):
         groups = tools.get("groups") if isinstance(tools.get("groups"), list) else []
         tool_count = 0
         group_ids: list[str] = []
+        items: list[dict[str, Any]] = []
         for group in groups:
             if not isinstance(group, dict):
                 continue
-            group_ids.append(str(group.get("id") or "unknown"))
+            group_id = str(group.get("id") or group.get("name") or "unknown")[:120]
+            group_ids.append(group_id)
             entries = group.get("tools") if isinstance(group.get("tools"), list) else []
             tool_count += len(entries)
-        return {"group_count": len(group_ids), "tool_count": tool_count, "groups": group_ids}
+            for entry in entries:
+                if len(items) >= 120:
+                    break
+                if isinstance(entry, str):
+                    tool_id = entry
+                    enabled = True
+                elif isinstance(entry, dict):
+                    tool_id = str(entry.get("id") or entry.get("name") or entry.get("tool") or "")
+                    enabled = entry.get("disabled") is not True and entry.get("enabled") is not False
+                else:
+                    continue
+                if tool_id:
+                    items.append({"id": tool_id[:160], "group": group_id, "enabled": enabled})
+        return {
+            "group_count": len(group_ids),
+            "tool_count": tool_count,
+            "groups": group_ids[:60],
+            "items": items,
+            "truncated": tool_count > len(items),
+        }
 
     def _skills_summary(self, skills: dict[str, Any]) -> dict[str, Any]:
         items = skills.get("skills") if isinstance(skills.get("skills"), list) else []
         enabled = [item for item in items if isinstance(item, dict) and item.get("disabled") is not True]
         eligible = [item for item in items if isinstance(item, dict) and item.get("eligible") is True]
-        return {"skill_count": len(items), "enabled_count": len(enabled), "eligible_count": len(eligible)}
+        catalog: list[dict[str, Any]] = []
+        for item in items[:120]:
+            if isinstance(item, str):
+                skill_id = item
+                disabled = False
+                is_eligible = None
+            elif isinstance(item, dict):
+                skill_id = str(item.get("id") or item.get("name") or item.get("skill") or "")
+                disabled = item.get("disabled") is True
+                is_eligible = item.get("eligible")
+            else:
+                continue
+            if skill_id:
+                catalog.append(
+                    {
+                        "id": skill_id[:160],
+                        "enabled": not disabled,
+                        "eligible": is_eligible if isinstance(is_eligible, bool) else None,
+                    }
+                )
+        return {
+            "skill_count": len(items),
+            "enabled_count": len(enabled),
+            "eligible_count": len(eligible),
+            "items": catalog,
+            "truncated": len(items) > len(catalog),
+        }
 
     def _find_task(self, payload: Any, task_id: str) -> dict[str, Any] | None:
         if isinstance(payload, dict):
@@ -1184,14 +1452,82 @@ class OpenClawAdapter(AgentAdapter):
 
     def _unconfigured_result(self, task_packet: VeyraTaskPacket) -> ExecutionResult:
         prompt = self.render_prompt(task_packet)
+        session_key = str(getattr(task_packet, "agent_execution_session_id", "") or "").strip() or self.session_key
         return ExecutionResult(
             task_id=task_packet.task_id,
             executor="openclaw",
             status="adapter_unconfigured",
             result="OpenClaw adapter is not connected. Configure OPENCLAW_GATEWAY_URL or OPENCLAW_BASE_URL before submitting real tasks.",
             logs=prompt,
-            raw={"contract_version": AGENT_CONTRACT_VERSION, "task_packet": task_packet.to_dict(), "configured": False},
+            raw={
+                "contract_version": AGENT_CONTRACT_VERSION,
+                "task_context": self._task_context_for_packet(task_packet, session_key),
+                "configured": False,
+            },
         )
+
+    def _task_context_for_packet(self, task_packet: VeyraTaskPacket, session_key: str) -> dict[str, Any]:
+        return {
+            "task_packet_id": task_packet.task_id,
+            "correlation_id": task_packet.task_id,
+            "session_id": task_packet.session_id,
+            "agent_execution_session_id": session_key,
+            "agent_session_policy": task_packet.agent_session_policy,
+            "memory_policy": task_packet.memory_policy,
+            "verification_policy": task_packet.verification_policy,
+            "rollback_requirement": task_packet.rollback_requirement,
+            "user_goal": self._safe_task_summary(task_packet.user_goal or task_packet.user_message),
+            "registered_at": self._utc_now(),
+        }
+
+    @staticmethod
+    def _structured_agent_response(text: str) -> dict[str, Any]:
+        raw = str(text or "").strip()
+        if not raw:
+            return {}
+        candidates = [raw]
+        fenced = re.fullmatch(r"```(?:json)?\s*(\{.*\})\s*```", raw, flags=re.IGNORECASE | re.DOTALL)
+        if fenced:
+            candidates.insert(0, fenced.group(1))
+        first = raw.find("{")
+        last = raw.rfind("}")
+        if first >= 0 and last > first:
+            candidates.append(raw[first : last + 1])
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        return {}
+
+    @staticmethod
+    def _string_items(value: Any) -> list[str]:
+        if not isinstance(value, (list, tuple)):
+            return []
+        items: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                text = item.strip()
+            elif isinstance(item, dict):
+                text = json.dumps(item, ensure_ascii=False, sort_keys=True)
+            else:
+                text = str(item).strip()
+            if text:
+                items.append(text)
+        return items
+
+    @staticmethod
+    def _safe_task_summary(value: Any) -> str:
+        text = str(value or "").replace("\n", " ").strip()
+        text = re.sub(r"/Users/[^\s,;:)]+", "<local_path>", text)
+        text = re.sub(
+            r"(?i)(api[_-]?key|token|secret|password)=([A-Za-z0-9._~+/=-]+)",
+            r"\1=<redacted>",
+            text,
+        )
+        return text[:500]
 
     @staticmethod
     def _gateway_url(raw_url: str) -> str:

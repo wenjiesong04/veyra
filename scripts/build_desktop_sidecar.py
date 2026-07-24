@@ -59,6 +59,8 @@ def main() -> int:
         "--collect-submodules",
         "websockets",
         "--collect-submodules",
+        "cryptography",
+        "--collect-submodules",
         "lark_oapi",
     ]
     cmd.extend(add_data_args(ROOT / ".env.example", "."))

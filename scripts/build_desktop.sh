@@ -15,6 +15,11 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 2
 fi
 
+if [ -f "$HOME/.cargo/env" ]; then
+  # shellcheck disable=SC1091
+  source "$HOME/.cargo/env"
+fi
+
 if ! command -v cargo >/dev/null 2>&1; then
   echo "Rust/Cargo is required to build Veyra Desktop." >&2
   echo "Install Rust from https://www.rust-lang.org/tools/install, then rerun this script." >&2
@@ -28,10 +33,10 @@ if ! command -v rustc >/dev/null 2>&1; then
 fi
 
 echo "==> Building desktop console assets"
-(cd web && npm install && npm run build:desktop)
+(cd web && npm ci && npm run build:desktop)
 
 echo "==> Building local backend sidecar"
 "$PYTHON_BIN" scripts/build_desktop_sidecar.py
 
 echo "==> Building Veyra desktop package"
-(cd apps/desktop && npm install && npm run build)
+(cd apps/desktop && npm ci && npm run build)

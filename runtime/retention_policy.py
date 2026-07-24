@@ -64,6 +64,17 @@ class RetentionPolicy:
         files: list[dict[str, Any]] = []
         changed = 0
         for name, limit in active_limits.items():
+            if limit <= 0:
+                files.append(
+                    {
+                        "file": name,
+                        "entries": len(self._read_lines(self.state_store.path_for(name))),
+                        "limit": limit,
+                        "status": "disabled",
+                        "pruned_entries": 0,
+                    }
+                )
+                continue
             rotation = self.state_store.rotate_jsonl(name, limit=limit, dry_run=dry_run)
             files.append(rotation)
             if rotation.get("status") in {"would_rotate", "rotated"}:

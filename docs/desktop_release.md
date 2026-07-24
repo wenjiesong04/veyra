@@ -37,14 +37,17 @@ Implemented now:
 - Local CORS allowlist for Tauri/local dev origins.
 - `/setup/status` reports app/platform/path/agent/Feishu/deployment status and desktop backend mode.
 - `/setup/env` writes only whitelisted `.env` keys from local clients and returns redacted values.
+- The first-run wizard can install the explicitly pinned OpenClaw CLI version, optionally start the Gateway without blocking the API event loop, and recheck connectivity.
+- Secret fields use password inputs; the Core model key is written to the same fixed environment variable referenced by the saved model configuration.
+- Non-loopback API exposure requires `VEYRA_LOCAL_API_TOKEN`; setup/status and other control-plane reads are not public.
 - `scripts/generate_desktop_icons.py` creates macOS/Windows/Linux icons from the processed source image so imperfect source corners are not shown at the display edge.
 
-Not implemented yet:
+Validation still pending:
 
-- One-click OpenClaw installation.
 - Code signing and notarization.
 - Windows/Linux package validation.
-- First-run UI forms for every setup value.
+- Native cross-process state-writer locking on Windows; current status is explicitly `validation_pending`.
+- Full first-run coverage for every advanced Tool Proxy and alert value.
 
 ## First-Run Flow
 
@@ -57,4 +60,4 @@ Target user flow:
 5. User saves optional model, Agent, Feishu, Tool Proxy, and alert settings through the window.
 6. Veyra runs `/health`, `/ops/deployment`, `/agent/status`, and a local `/events/message` acceptance.
 
-The current implementation reaches steps 1-3 for developer and packaged builds. The next phase should complete the first-run forms and OpenClaw install guidance.
+The current implementation reaches steps 1-6 at code level. Release acceptance still requires target-OS signed package tests plus real OpenClaw and Feishu credentials.

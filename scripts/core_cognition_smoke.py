@@ -70,7 +70,10 @@ SMOKE_CASES: list[dict[str, Any]] = [
     {
         "id": "ordinary_explanation",
         "message": "为什么天空是蓝色的？",
-        "expectation": "Core Model natural answer; no OpenClaw; no probe; memory_policy=forget.",
+        "expectation": (
+            "Direct answer with no OpenClaw/probe and memory_policy=forget; "
+            "--live-model additionally validates the configured Core Model transport."
+        ),
     },
     {
         "id": "fresh_time",
@@ -141,6 +144,31 @@ SMOKE_CASES: list[dict[str, Any]] = [
 ]
 
 
+class IsolatedModelClient:
+    """Fail-fast model boundary for the deterministic smoke mode."""
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "enabled": False,
+            "configured": False,
+            "status": "isolated_for_smoke",
+            "decision_mode": "auto",
+            "validation": {
+                "status": "not_exercised",
+                "validated": False,
+                "reason": "pass --live-model to exercise the configured model transport",
+            },
+        }
+
+    def complete_json(self, *, system: str, user: str, purpose: str) -> dict[str, Any]:
+        del system, user
+        return {
+            "status": "disabled_for_smoke",
+            "purpose": purpose,
+            "reason": "pass --live-model to exercise the configured model transport",
+        }
+
+
 def main() -> int:
     args = parse_args()
     output = run_smoke(args)
@@ -153,6 +181,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-root", default="state", help="State root to copy config from, or use directly with --live-state.")
     parser.add_argument("--live-state", action="store_true", help="Write smoke logs to --state-root instead of an isolated temp state.")
     parser.add_argument("--live-agent", action="store_true", help="Call the selected real AgentAdapter instead of the debug spy.")
+    parser.add_argument(
+        "--live-model",
+        action="store_true",
+        help="Call the configured Core Model. The default isolates model transport so the regression gate is deterministic.",
+    )
     parser.add_argument("--case", action="append", dest="case_ids", help="Run only the selected case id. Can be repeated.")
     return parser.parse_args()
 
@@ -166,12 +199,24 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             exclusive_writer=True,
             writer_owner="core-cognition-live-smoke",
         )
-        return _run_cases(state_store=state_store, cases=selected_cases, live_agent=args.live_agent, isolated=False)
+        return _run_cases(
+            state_store=state_store,
+            cases=selected_cases,
+            live_agent=args.live_agent,
+            live_model=args.live_model,
+            isolated=False,
+        )
 
     with TemporaryDirectory(prefix="veyra-core-smoke-") as raw_tmp:
         state_store = WorldStateStore(Path(raw_tmp) / "state")
         _copy_config(source_root, state_store)
-        return _run_cases(state_store=state_store, cases=selected_cases, live_agent=args.live_agent, isolated=True)
+        return _run_cases(
+            state_store=state_store,
+            cases=selected_cases,
+            live_agent=args.live_agent,
+            live_model=args.live_model,
+            isolated=True,
+        )
 
 
 def _copy_config(source_root: Path, state_store: WorldStateStore) -> None:
@@ -184,10 +229,19 @@ def _copy_config(source_root: Path, state_store: WorldStateStore) -> None:
         state_store.write_json(filename, payload)
 
 
-def _run_cases(*, state_store: WorldStateStore, cases: list[dict[str, Any]], live_agent: bool, isolated: bool) -> dict[str, Any]:
+def _run_cases(
+    *,
+    state_store: WorldStateStore,
+    cases: list[dict[str, Any]],
+    live_agent: bool,
+    live_model: bool,
+    isolated: bool,
+) -> dict[str, Any]:
     runtime = RuntimeEntity(state_store=state_store)
     commitment_core = CommitmentCore(state_store)
     loop = AwarenessLoop(state_store=state_store, runtime_entity=runtime, commitment_core=commitment_core)
+    if not live_model:
+        loop.core_reasoning.client = IsolatedModelClient()  # type: ignore[assignment]
     commitment_core.memory_bridge = loop.memory_bridge
     normalizer = EventNormalizer()
     debug_agent: DebugAgentAdapter | None = None
@@ -229,6 +283,7 @@ def _run_cases(*, state_store: WorldStateStore, cases: list[dict[str, Any]], liv
             debug_agent=debug_agent,
             model_traces=model_traces,
             latency_ms=latency_ms,
+            live_model=live_model,
         )
         record["failures"] = _expectation_failures(record)
         results.append(record)
@@ -238,6 +293,8 @@ def _run_cases(*, state_store: WorldStateStore, cases: list[dict[str, Any]], liv
         "schema": "veyra.core_cognition_smoke.v1",
         "isolated_state": isolated,
         "live_agent": live_agent,
+        "live_model": live_model,
+        "model_mode": "live" if live_model else "isolated",
         "model_status": redact_sensitive(loop.core_reasoning.status()),
         "summary": {"total": len(results), "passed": len(results) - failed, "failed": failed},
         "cases": results,
@@ -253,6 +310,7 @@ def _record_case(
     debug_agent: DebugAgentAdapter | None,
     model_traces: list[dict[str, Any]],
     latency_ms: int,
+    live_model: bool,
 ) -> dict[str, Any]:
     artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), dict) else {}
     decision = _decision_from_artifacts(artifacts)
@@ -294,6 +352,7 @@ def _record_case(
         "risk_level": result.get("risk_level"),
         "context_size": turn_context_summary.get("json_chars"),
         "latency_ms": latency_ms,
+        "live_model": live_model,
         "model_used": bool(decision_model_used or answer_model_used or probe_model_used),
         "model_trace": _summarize_model_trace(model_traces),
         "agent_used": bool(agent_called or task_packet),
@@ -457,8 +516,10 @@ def _expectation_failures(record: dict[str, Any]) -> list[str]:
     if case_id == "ordinary_explanation":
         if route != "direct_answer":
             failures.append(f"expected direct_answer, got {route}")
-        if not record["model_used"] and not _model_transport_unavailable(record):
+        if record.get("live_model") and not record["model_used"] and not _model_transport_unavailable(record):
             failures.append("expected Core Model use for natural answer")
+        if not record.get("live_model") and (record.get("model_trace") or {}).get("attempted"):
+            failures.append("isolated smoke unexpectedly attempted Core Model transport")
         if record["agent_used"]:
             failures.append("ordinary question entered AgentRoute")
         if record["probe_used"]:

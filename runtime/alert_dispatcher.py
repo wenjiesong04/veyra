@@ -41,14 +41,17 @@ class AlertDispatcher:
         }
 
     def configure(self, patch: dict[str, Any]) -> dict[str, Any]:
-        config = self.state_store.read_json("ops_config.json")
-        alerting = config.setdefault("alerting", {})
-        for key in ("enabled", "local_log", "webhook_enabled", "webhook_url", "webhook_url_env", "min_severity"):
-            if key in patch and patch[key] is not None:
-                alerting[key] = patch[key]
-        if alerting.get("min_severity") not in SEVERITY_ORDER:
-            alerting["min_severity"] = "warning"
-        self.state_store.write_json("ops_config.json", config)
+        def configure_alerting(config: dict[str, Any]) -> None:
+            alerting = config.setdefault("alerting", {})
+            if not isinstance(alerting, dict):
+                config["alerting"] = alerting = {}
+            for key in ("enabled", "local_log", "webhook_enabled", "webhook_url", "webhook_url_env", "min_severity"):
+                if key in patch and patch[key] is not None:
+                    alerting[key] = patch[key]
+            if alerting.get("min_severity") not in SEVERITY_ORDER:
+                alerting["min_severity"] = "warning"
+
+        self.state_store.mutate_json("ops_config.json", configure_alerting)
         return self.status()
 
     def dispatch(self, min_severity: str | None = None) -> dict[str, Any]:

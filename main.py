@@ -2,11 +2,12 @@ import os
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from core.action_risk import ActionRiskAssessment, assess_action_risk
 from core.architecture import architecture_snapshot
@@ -26,6 +27,7 @@ from interface.event_schema import Decision, Route, utc_now_iso
 from interface.feishu_adapter import FeishuAdapter
 from interface.feishu_ws_runner import FeishuWsRunner
 from interface.intake_gateway import IntakeGateway
+from interface.local_control_guard import LocalControlPolicy
 from pydantic import Field
 from rollback_audit.rollback_manager import RollbackManager
 from rollback_audit.diff_tracker import DiffTracker
@@ -61,18 +63,12 @@ from tool_proxy.safe_shell import SafeShell
 from runtime.safety_validation import SafetyValidation
 
 
+load_runtime_env()
+local_control_policy = LocalControlPolicy()
 app = FastAPI(title="Veyra", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://tauri.localhost",
-        "https://tauri.localhost",
-        "tauri://localhost",
-    ],
+    allow_origins=sorted(local_control_policy.allowed_origins),
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -98,7 +94,6 @@ def _env_hosts(name: str) -> list[str] | None:
     return hosts or None
 
 
-load_runtime_env()
 state_store = WorldStateStore(exclusive_writer=True, writer_owner="veyra-api")
 runtime_entity = RuntimeEntity(state_store=state_store)
 commitment_core = CommitmentCore(state_store)
@@ -156,7 +151,14 @@ action_executor = ActionExecutor(
     rollback_manager=rollback_manager,
 )
 foresight_engine = ForesightEngine(reasoning=awareness_loop.core_reasoning)
-agency_core = AgencyCore(state_store, reasoning=awareness_loop.core_reasoning)
+# The autonomous loop is intentionally deterministic/read-only by default.
+# Inject the same model-assist setting exposed by ProactiveChecks; otherwise the
+# shared AgencyCore silently enables periodic model calls despite that setting.
+agency_core = AgencyCore(
+    state_store,
+    reasoning=awareness_loop.core_reasoning,
+    model_assist_enabled=False,
+)
 proactive_checks = ProactiveChecks(
     state_store,
     reasoning=awareness_loop.core_reasoning,
@@ -206,6 +208,29 @@ replay_runtime = ReplayRuntime(
     foresight_engine=foresight_engine,
     action_executor=action_executor,
 )
+
+
+def _schedule_agent_recovery(payload: dict[str, Any]) -> dict[str, Any]:
+    scan = replay_runtime.scan(limit=200)
+    reviews = replay_runtime.run_pending(
+        auto_create_reviews=True,
+        auto_execute=False,
+        limit=20,
+    )
+    return {
+        "status": "review_scheduled" if reviews.get("processed_count") else "candidate_recorded",
+        "task_id": payload.get("task_id"),
+        "scan": {
+            "candidate_count": scan.get("candidate_count"),
+            "created_count": scan.get("created_count"),
+        },
+        "reviews": {
+            "processed_count": reviews.get("processed_count"),
+        },
+    }
+
+
+awareness_loop.task_tracker.set_recovery_hook(_schedule_agent_recovery)
 active_loop = ActiveRuntimeLoop(
     state_store=state_store,
     runtime_entity=runtime_entity,
@@ -228,6 +253,26 @@ agent_orchestrator = AgentOrchestrator(
     execution_trace=awareness_loop.execution_trace,
     verifier=awareness_loop.verifier,
 )
+
+
+@app.middleware("http")
+async def guard_local_control_plane(request: Request, call_next):
+    decision = local_control_policy.authorize(
+        method=request.method,
+        path=request.url.path,
+        headers=request.headers,
+    )
+    if not decision.allowed:
+        return JSONResponse(
+            status_code=decision.status_code,
+            content={
+                "status": "blocked",
+                "code": decision.code,
+                "reason": decision.reason,
+                "control_plane": local_control_policy.status(),
+            },
+        )
+    return await call_next(request)
 
 
 @app.on_event("startup")
@@ -601,7 +646,8 @@ app.include_router(
 
 @app.post("/events/message")
 async def message(request: MessageRequest):
-    receipt = intake_gateway.receive_message(
+    receipt = await run_in_threadpool(
+        intake_gateway.receive_message,
         text=request.text,
         channel=request.channel,
         user_id=request.user_id,
@@ -640,7 +686,8 @@ async def configure_channel(channel: str, request: ChannelConfigRequest):
 
 @app.post("/channels/{channel}/messages")
 async def channel_message(channel: str, request: MessageRequest):
-    return intake_gateway.receive_message(
+    return await run_in_threadpool(
+        intake_gateway.receive_message,
         text=request.text,
         channel=channel,
         user_id=request.user_id,
@@ -1095,10 +1142,91 @@ def _action_trace_target(action: dict[str, Any]) -> Any:
     return action
 
 
+def _mvp_validation_snapshot(agent_status_data: dict[str, Any]) -> dict[str, Any]:
+    capabilities = agent_status_data.get("capabilities") if isinstance(agent_status_data.get("capabilities"), dict) else {}
+    features = capabilities.get("features") if isinstance(capabilities.get("features"), dict) else {}
+    proxy_validation = features.get("tool_proxy_validation") if isinstance(features.get("tool_proxy_validation"), dict) else {}
+    proxy_enforced = features.get("tool_proxy_enforced") is True and proxy_validation.get("status") == "validated"
+
+    memory_status = awareness_loop.memory_bridge.provider_status()
+    memory_validations = memory_status.get("validation") if isinstance(memory_status.get("validation"), dict) else {}
+    selected_memory = memory_validations.get("selected") if isinstance(memory_validations.get("selected"), dict) else {}
+    model_status = awareness_loop.core_reasoning.status()
+    model_validation = model_status.get("validation") if isinstance(model_status.get("validation"), dict) else {}
+    matrix_status = runtime_matrix.status()
+    feishu_status_data = feishu_ws_runner.status()
+    feishu_connected = bool(feishu_status_data.get("thread_alive"))
+    feishu_fresh = bool(feishu_status_data.get("last_event_after_start"))
+    control_status = local_control_policy.status()
+
+    return {
+        "agent_runtime": {
+            "implementation": "implemented",
+            "status": "validated" if agent_status_data.get("connected") else "validation_pending",
+            "validated": bool(agent_status_data.get("connected")),
+            "runtime_status": agent_status_data.get("status"),
+        },
+        "agent_tool_proxy_enforcement": {
+            "implementation": "implemented",
+            "status": "validated" if proxy_enforced else "validation_pending",
+            "validated": proxy_enforced,
+            "runtime_claim": features.get("tool_proxy_enforced"),
+            "evidence": proxy_validation,
+            "note": "Agent connection alone never proves Tool Proxy enforcement.",
+        },
+        "local_tool_proxy": {
+            "implementation": "implemented",
+            "status": "configured",
+            "validated": False,
+            "executors": _tool_proxy_status(),
+        },
+        "memory_selected_provider": {
+            "implementation": "implemented",
+            "status": selected_memory.get("status", "validation_pending"),
+            "validated": bool(selected_memory.get("validated")),
+            "validation": selected_memory,
+            "fallback": "local",
+        },
+        "runtime_matrix": {
+            "implementation": "implemented",
+            "status": matrix_status.get("status", "not_run"),
+            "validated": matrix_status.get("status") == "ready",
+            "freshness": matrix_status.get("freshness"),
+            "observed_at": matrix_status.get("observed_at") or matrix_status.get("run_at"),
+            "expires_at": matrix_status.get("expires_at"),
+        },
+        "core_model_transport": {
+            "implementation": "implemented",
+            "status": model_validation.get("status", "validation_pending"),
+            "validated": bool(model_validation.get("validated")),
+            "validation": model_validation,
+        },
+        "feishu_websocket": {
+            "implementation": "implemented",
+            "status": "validated"
+            if feishu_connected and feishu_fresh
+            else "waiting_for_event"
+            if feishu_connected
+            else str(feishu_status_data.get("status") or "not_configured"),
+            "validated": feishu_connected and feishu_fresh,
+            "thread_alive": feishu_connected,
+            "last_event_after_start": feishu_status_data.get("last_event_after_start"),
+        },
+        "local_control_security": {
+            "implementation": "implemented",
+            "status": control_status.get("status"),
+            "validated": control_status.get("status") in {"local_only", "token_required"},
+            "configuration": control_status,
+        },
+    }
+
+
 @app.get("/mvp/status")
 async def mvp_status():
     agent_status_data = awareness_loop.agent_registry.selected().connection_status()
     runtime_validation = _runtime_validation_summary(agent_status_data)
+    capability_validation = _mvp_validation_snapshot(agent_status_data)
+    ops_health = ops_monitor.health()
     implemented_loops = {
         "direct_answer": True,
         "multi_channel_intake": True,
@@ -1179,16 +1307,26 @@ async def mvp_status():
         "route_layer_split_phase1": True,
         "web_console": console_dir.exists(),
     }
+    if ops_health.get("status") in {"critical", "degraded"}:
+        overall_status = "degraded"
+    elif capability_validation["agent_tool_proxy_enforcement"]["validated"]:
+        overall_status = "ready_for_soak"
+    else:
+        overall_status = "validation_pending"
     return {
         "mvp": "core_governance",
-        "status": "implemented",
+        "status": overall_status,
+        "implementation_status": "implemented",
         "core_loops": implemented_loops,
+        "core_loop_semantics": "implementation_flags_only",
+        "capability_validation": capability_validation,
         "validation": {
             "codebase": "implemented",
             "local_self_tests": "available",
             "runtime_validation": runtime_validation,
-            "production_validation": "pending_live_environment" if runtime_validation["status"] != "validated" else "ready_for_soak",
+            "production_validation": "ready_for_soak" if overall_status == "ready_for_soak" else "pending_live_environment",
             "data_reality": "live_local_api_no_mock_fixtures",
+            "health": ops_health,
         },
         "core_model": awareness_loop.core_reasoning.status(),
         "agent_runtime": {

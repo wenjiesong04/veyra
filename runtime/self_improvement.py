@@ -46,14 +46,15 @@ class SelfImprovementProposalRegistry:
         return proposal
 
     def _record(self, proposal: dict[str, Any]) -> None:
-        state = self.state_store.read_json(self.STATE_FILE)
-        proposals = state.setdefault("proposals", [])
-        if not isinstance(proposals, list):
-            proposals = []
-        proposals.append(proposal)
-        state["proposals"] = proposals[-200:]
-        state["updated_at"] = utc_now_iso()
-        self.state_store.write_json(self.STATE_FILE, state)
+        def append_proposal(state: dict[str, Any]) -> None:
+            proposals = state.setdefault("proposals", [])
+            if not isinstance(proposals, list):
+                proposals = []
+            proposals.append(proposal)
+            state["proposals"] = proposals[-200:]
+            state["updated_at"] = utc_now_iso()
+
+        self.state_store.mutate_json(self.STATE_FILE, append_proposal)
         self.state_store.write_text(
             f"proposals/{proposal['proposal_id']}.json",
             json.dumps(proposal, ensure_ascii=False, indent=2),

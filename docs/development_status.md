@@ -2,9 +2,9 @@
 
 Updated after Runtime Stabilization and local release hardening.
 
-Veyra has moved from feature-complete MVP into local-first release hardening. The target is a GitHub-downloadable personal production runtime: users run Veyra locally, configure their own model/OpenClaw/Feishu surfaces, and keep all runtime data under their local `state/` directory. This is not a SaaS target; multi-user data isolation exists only to keep local channel/user records correct when Feishu or other adapters provide different `user_id` values. A first-stage Tauri desktop shell now exists under `apps/desktop` with product name `Veyra` for macOS, Windows, and Linux.
+Veyra has moved from feature-complete MVP into local-first release hardening. The target is a GitHub-downloadable personal production runtime: users run Veyra locally and configure their own model/OpenClaw/Feishu surfaces. Configuration, state, and audit data are local by default; enabled integrations still receive the request data needed to operate. This is not a SaaS target. Per-user and per-session isolation is enforced for channel, task, commitment, watchlist, and callback state. A first-stage Tauri desktop shell now exists under `apps/desktop` with product name `Veyra` for macOS, Windows, and Linux.
 
-The core closed loop is complete. Current work should make the runtime easy to install, observable, debuggable, stable under real Feishu traffic, and resistant to context/tool bypass drift. Do not keep adding unrelated modules before local release packaging, live Feishu/OpenClaw soak, context drift tuning, ToolProxy closed-loop validation, and UI/router cleanup are validated.
+The code-level awareness/governance loop is implemented. Runtime surfaces now distinguish implementation, configuration, observed validation, degradation, and stale evidence. External OpenClaw Tool Proxy enforcement and native Memory remain validation-pending until their real protocol surfaces produce fresh evidence.
 
 ## Data Reality
 
@@ -28,7 +28,7 @@ Current local `state/` data may contain older self-test records from earlier dev
 | P0 Foundation definitions | Completed | Lifecycle, operational modes, risk levels R0-R5, Guardian decisions, architecture metadata |
 | P1 State and probe hardening | Completed | Belief/Uncertainty TTL, probe envelope, perception state patches |
 | P2 Decision / Guardian / Tool Proxy policy depth | Completed | Decision trace, Guardian policy patch, SafeShell/File/Browser/API policy trace |
-| P3 Agent adapter execution contracts | Completed | `veyra.agent_adapter.v1`, OpenClaw WebSocket adapter, Hermes/Custom HTTP adapter, compatibility negotiation |
+| P3 Agent adapter execution contracts | Completed | `veyra.agent_adapter.v2`, isolated execution sessions, authoritative task correlation, OpenClaw WebSocket adapter, Hermes/Custom HTTP adapter, compatibility negotiation |
 | P4 Rollback / Audit / Verifier depth | Completed | Verifier verdicts, execution trace, tool trace, rollback checksum/diff/restore evidence |
 | P5 Web Control Console completeness | Completed | Console surfaces for setup, awareness, runtime, review, persona, state/logs, tool proxy, rollback/audit |
 | P6 End-to-end runtime hardening | Implemented, live validation pending | Task polling/stop/refresh, Agent result callback, ActionProposal hardening, Agent Tool Proxy contract verification, Core model-assisted reasoning, model-ranked memory, ExternalWorld refresh, Agency intentions, stale refresh, real probe envelopes, external-memory bridge slots, and provider diagnostics. API validation fields now separate implemented/configured/validated state. |
@@ -44,9 +44,9 @@ Current local `state/` data may contain older self-test records from earlier dev
 | Veyra Core | Implemented core loop plus scheduled active awareness ticks, model-assisted reasoning for intent/route, foresight, memory relevance, ExternalWorld interpretation, perception, and agency gaps. P4 adds evidence-backed verification. |
 | Interface Adapter / Agent Adapter | Implemented Intake/EventNormalizer, local multi-channel routing/dedupe/outbox, Feishu OpenAPI channel delivery/callback, AgentRegistry, certification matrix, and multi-Agent invocation. OpenClaw, Hermes, and Custom adapters share the v1 task/result/capability contract. |
 | Probe Tools | Implemented system, git, port, process, file, network, web, log, MCP, OpenClaw, Hermes probe modules with standardized result envelopes where wired. |
-| Memory Bridge | Implemented local memory bridge for summary reads, model-assisted relevance ranking, filtered patch writes, provider routing (`local` / `selected` / runtime names / `all`), external adapter hooks, provider diagnostics, and freshness/source-trust metadata. Production external memory semantics still need live runtime validation. |
+| Memory Bridge | Local Memory is implemented. External providers become `validated` only after an explicit capability or a fresh write/read roundtrip; normalized defaults and Agent connection state are not evidence. Short-term callback memory is TTL-bound and long-term writes require authoritative original task context plus verified completion. |
 | Skill | Implemented registry/runtime and built-in skill definitions. Skills route through AwarenessLoop and now record execution trace. |
-| Tool Proxy | Implemented SafeShell, SafeFile, SafeBrowser, SafeAPI with Guardian-style policy review, runtime executor config, host allowlists, standard tool trace, and Agent result bypass verification. |
+| Tool Proxy | SafeShell, SafeFile, SafeBrowser, and SafeAPI are implemented with policy review and standard traces. Verifier fails closed on missing Agent tool evidence. OpenClaw-side enforcement remains `validation_pending` until a real pre-tool/tool-event hook is available and live-tested. |
 | Rollback / Audit | Implemented snapshot, diff, restore, rollback log, policy trace, tool trace, execution trace, ActionJournal timeline, time-travel summary, non-destructive replay plans, replay compensation review proposals, automatic replay runtime scan/run state, and explicit guarded auto-execute. |
 | Web / Desktop Control UI | Implemented React/Vite console served at `/console`, backed by live Veyra APIs and built into `ui/console`. A Tauri desktop shell named `Veyra` reuses the console through a desktop-specific build under `apps/desktop/dist`. |
 

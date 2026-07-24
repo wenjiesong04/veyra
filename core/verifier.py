@@ -42,12 +42,10 @@ class Verifier:
         evidence = self._execution_evidence(execution_result)
         status = execution_result.status
         changed_files = bool(execution_result.changed_files)
-        has_tool_calls = bool(execution_result.tool_calls)
-        has_raw = bool(execution_result.raw)
-        has_result = bool(execution_result.result.strip())
-        has_evidence = has_result or changed_files or has_tool_calls or has_raw
         tool_proxy_compliance = self.agent_tool_compliance.review_execution(execution_result)
         evidence["tool_proxy_compliance"] = tool_proxy_compliance
+        structured_evidence = self._structured_execution_evidence(execution_result, tool_proxy_compliance)
+        evidence["structured_evidence"] = structured_evidence
         evidence_mismatch = self._evidence_mismatch(execution_result)
         if evidence_mismatch:
             evidence["evidence_mismatch"] = evidence_mismatch
@@ -95,23 +93,53 @@ class Verifier:
                 "risk_level": tool_proxy_compliance.get("max_risk"),
             }
 
-        if status == "success" and has_evidence:
+        if status == "success" and tool_proxy_compliance["status"] == "warning":
+            return {
+                "status": "needs_more_probe",
+                "verdict": "tool_proxy_trace_missing",
+                "confidence": 0.32,
+                "evidence": evidence,
+                "next_action": "require_action_proposal_or_tool_trace",
+                "needs_rollback": bool(changed_files),
+                "needs_memory_patch": False,
+                "risk_level": tool_proxy_compliance.get("max_risk"),
+            }
+        if status == "success" and changed_files and not execution_result.tool_calls:
+            return {
+                "status": "needs_more_probe",
+                "verdict": "changed_files_without_tool_execution_trace",
+                "confidence": 0.28,
+                "evidence": evidence,
+                "next_action": "require_tool_trace_and_verify_changed_files",
+                "needs_rollback": True,
+                "needs_memory_patch": False,
+            }
+
+        if status == "success" and structured_evidence["sufficient"]:
             return {
                 "status": "verified_success",
-                "verdict": "execution_success_supported_by_evidence"
-                if tool_proxy_compliance["status"] != "warning"
-                else "execution_success_with_tool_proxy_warning",
-                "confidence": 0.68 if tool_proxy_compliance["status"] == "warning" else (0.82 if changed_files or has_tool_calls else 0.74),
+                "verdict": "execution_success_supported_by_structured_evidence",
+                "confidence": 0.84 if tool_proxy_compliance.get("enforcement_observed") else 0.72,
                 "evidence": evidence,
                 "next_action": "update_state_and_memory",
                 "needs_rollback": False,
                 "needs_memory_patch": True,
             }
+        if status == "success" and structured_evidence["agent_plan_only"]:
+            return {
+                "status": "partially_success",
+                "verdict": "agent_plan_returned_without_execution_evidence",
+                "confidence": 0.58,
+                "evidence": evidence,
+                "next_action": "present_plan_without_claiming_execution",
+                "needs_rollback": False,
+                "needs_memory_patch": False,
+            }
         if status == "success":
             return {
                 "status": "needs_more_probe",
-                "verdict": "execution_success_without_evidence",
-                "confidence": 0.42,
+                "verdict": "execution_success_without_structured_evidence",
+                "confidence": 0.3,
                 "evidence": evidence,
                 "next_action": "collect_post_execution_evidence",
                 "needs_rollback": False,
@@ -178,7 +206,105 @@ class Verifier:
             "changed_files": execution_result.changed_files,
             "tool_calls": execution_result.tool_calls,
             "raw_keys": sorted(execution_result.raw.keys()) if isinstance(execution_result.raw, dict) else [],
+            "result_text_is_evidence": False,
+            "raw_presence_is_evidence": False,
         }
+
+    def _structured_execution_evidence(
+        self,
+        execution_result: ExecutionResult,
+        tool_proxy_compliance: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Identify outcome evidence without treating arbitrary text/raw presence as proof."""
+        raw = execution_result.raw if isinstance(execution_result.raw, dict) else {}
+        sources: list[str] = []
+
+        for key in ("evidence", "evidence_used", "verification_evidence", "post_execution_evidence"):
+            if self._is_evidence_container(raw.get(key)):
+                sources.append(f"raw.{key}")
+
+        probe_result = raw.get("probe_result")
+        if isinstance(probe_result, dict) and any(probe_result.get(key) for key in ("source", "probe", "observed_at", "details")):
+            sources.append("raw.probe_result")
+
+        verification = raw.get("verification")
+        if isinstance(verification, dict) and str(verification.get("status") or "").startswith("verified"):
+            sources.append("raw.verification")
+
+        execution = raw.get("execution_result")
+        if self._has_observed_execution_payload(execution):
+            sources.append("raw.execution_result")
+
+        agent_response = raw.get("agent_response")
+        if isinstance(agent_response, dict):
+            if self._is_evidence_container(agent_response.get("evidence_used")):
+                sources.append("raw.agent_response.evidence_used")
+
+        proxy_evidence = tool_proxy_compliance.get("proxy_evidence")
+        if (
+            isinstance(proxy_evidence, dict)
+            and proxy_evidence.get("tool_trace")
+            and tool_proxy_compliance.get("status") == "compliant"
+        ):
+            sources.append("raw.tool_proxy_traces")
+
+        raw_change_evidence = any(
+            self._is_evidence_container(raw.get(key))
+            for key in ("diff", "snapshot", "checksums", "file_verification")
+        )
+        if execution_result.changed_files and raw_change_evidence:
+            sources.append("changed_files_with_verification")
+
+        unique_sources = list(dict.fromkeys(sources))
+        agent_plan_only = bool(
+            isinstance(agent_response, dict)
+            and (
+                agent_response.get("answer_or_plan")
+                or self._is_evidence_container(agent_response.get("proposed_actions"))
+            )
+            and not execution_result.tool_calls
+            and not execution_result.changed_files
+            and not unique_sources
+        )
+        return {
+            "sufficient": bool(unique_sources),
+            "sources": unique_sources,
+            "agent_plan_only": agent_plan_only,
+            "result_text_only": bool(execution_result.result.strip()) and not unique_sources,
+            "raw_metadata_only": bool(raw) and not unique_sources,
+        }
+
+    def _is_evidence_container(self, value: Any) -> bool:
+        if isinstance(value, dict):
+            return bool(value)
+        if isinstance(value, (list, tuple)):
+            return any(
+                isinstance(item, dict) and bool(item)
+                or isinstance(item, str) and bool(item.strip())
+                for item in value
+            )
+        return False
+
+    def _has_observed_execution_payload(self, value: Any) -> bool:
+        if not isinstance(value, dict) or not value:
+            return False
+        observation_keys = {
+            "path",
+            "content",
+            "operation",
+            "exit_code",
+            "returncode",
+            "stdout",
+            "stderr",
+            "snapshot",
+            "snapshot_id",
+            "checksum",
+            "source_checksum",
+            "target_checksum",
+            "changed",
+            "tool_trace",
+        }
+        return any(key in value and value.get(key) is not None for key in observation_keys)
 
     def _has_failure_marker(self, execution_result: ExecutionResult) -> bool:
         text = str(execution_result.result or "").strip().lower()

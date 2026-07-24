@@ -464,7 +464,11 @@ class AwarenessLoop:
                     "agent_context": decision.model_assist.get("agent_context", {}),
                     "turn_understanding": decision.model_assist.get("turn_understanding", {}),
                 }
-            agent_memory_summary = self.agent_adapter.fetch_memory_summary(event.source.session_id)
+            agent_memory_summary = (
+                memory_summary.get("external_summary")
+                if isinstance(memory_summary.get("external_summary"), dict)
+                else {}
+            )
             if agent_memory_summary.get("summary"):
                 context_patch["agent_memory_summary"] = agent_memory_summary
             scoped = self.context_scope.apply(
@@ -509,15 +513,6 @@ class AwarenessLoop:
             verified = self.verifier.verify_execution_result(execution)
             interpreted = self.result_interpreter.interpret_execution(execution, verified)
             synthesized_response = self.response_synthesizer.agent_response(interpreted, verified)
-            pending_task = self.task_tracker.register(
-                event_id=event.event_id,
-                route=decision.route.value,
-                execution=execution,
-                verification=verified,
-                session_id=event.source.session_id,
-                channel=event.source.channel,
-                user_id=event.source.user_id,
-            )
             self._schedule_agent_follow_up(event=event, decision=decision, execution=execution)
             memory_write = None
             if verified.get("needs_memory_patch") and decision.memory_policy == "long_term":
@@ -529,6 +524,10 @@ class AwarenessLoop:
                         "status": execution.status,
                         "result": execution.result,
                         "memory_policy": decision.memory_policy,
+                        "trust": "verified",
+                        "verification_status": verified.get("status"),
+                        "task_id": execution.task_id,
+                        "correlation_id": event.event_id,
                     }
                 )
             artifacts = {
@@ -537,7 +536,7 @@ class AwarenessLoop:
                 "interpreted_result": interpreted,
                 "verification": verified,
                 "memory_write": memory_write,
-                "pending_task": pending_task,
+                "pending_task": None,
                 "decision": decision.to_dict(),
                 "controller": controller_plan.to_dict(),
                 "guardian": guardian_decision,
@@ -566,6 +565,24 @@ class AwarenessLoop:
                     "verification": verified,
                 }
             )
+            pending_task = self.task_tracker.register(
+                event_id=event.event_id,
+                route=decision.route.value,
+                execution=execution,
+                verification=verified,
+                session_id=event.source.session_id,
+                channel=event.source.channel,
+                user_id=event.source.user_id,
+                correlation_id=event.event_id,
+                task_packet_id=packet.task_id,
+                agent_execution_session_id=packet.agent_execution_session_id,
+                agent_session_policy=packet.agent_session_policy,
+                memory_policy=packet.memory_policy,
+                verification_policy=packet.verification_policy,
+                rollback_requirement=packet.rollback_requirement,
+                user_goal=packet.user_goal,
+            )
+            artifacts["pending_task"] = pending_task
             result = LoopResult(
                 event_id=event.event_id,
                 route=decision.route,
@@ -1054,7 +1071,7 @@ class AwarenessLoop:
         if decision.intent == "preference" or "memory:preference" in decision.signals:
             return "记住了。之后我会尽量更直接，除非问题本身需要先说明风险、证据或执行边界。"
         if self._is_tracking_memory_question(text):
-            return self._tracking_memory_response()
+            return self._tracking_memory_response(event)
         if self._is_project_continuation_question(text):
             project_response = self._project_context_response(event)
             if project_response:
@@ -1371,13 +1388,30 @@ class AwarenessLoop:
                     "response": "继续 Docker 部署上下文。我会优先围绕部署状态、进程、端口和服务可用性推进。",
                 }
         if self._is_tracking_memory_question(text):
-            return {"reason": "tracking_memory_question", "response": self._tracking_memory_response()}
+            return {"reason": "tracking_memory_question", "response": self._tracking_memory_response(event)}
+        if self._is_learning_memory_question(text):
+            topic = self._current_learning_topic(event.source.user_id)
+            response = (
+                f"记得。你现在在学习「{topic}」。我会把它作为当前学习目标来组织后续建议。"
+                if topic
+                else "我现在没有找到明确的学习目标记录；你可以直接告诉我要学习的主题，我会记录到 Veyra memory。"
+            )
+            return {"reason": "state_grounded_learning_memory", "response": response}
+        commitment_control = self._early_commitment_control_response(event, text)
+        if commitment_control:
+            return commitment_control
+        learning_goal = self._early_learning_goal_response(event, text)
+        if learning_goal:
+            return learning_goal
         state_answer = self._state_answer_for_turn(event, text)
         if state_answer:
             return state_answer
         semantic_change = self._early_semantic_change_response(event, text)
         if semantic_change:
             return semantic_change
+        tracking_request = self._early_tracking_request_response(event, text)
+        if tracking_request:
+            return tracking_request
         project_identity = self._project_identity_direct_response(text)
         if project_identity:
             return {"reason": "project_identity_direct", "response": project_identity}
@@ -1392,6 +1426,61 @@ class AwarenessLoop:
         if state_ack:
             return {"reason": "state_update_ack", "response": state_ack}
         return {}
+
+    def _early_learning_goal_response(self, event: VeyraEvent, text: str) -> dict[str, Any]:
+        if not self.commitment_core:
+            return {}
+        result = self.commitment_core.process_explicit_learning_goal(user_text=text, event=event)
+        if not result:
+            return {}
+        messages = self.commitment_core.followup_messages_for_turn(result)
+        response = str(messages[0] if messages else result.get("primary_response_override") or "").strip()
+        if not response:
+            return {}
+        return {
+            "reason": "explicit_learning_goal",
+            "response": response,
+            "commitment_turn": result,
+        }
+
+    def _early_commitment_control_response(self, event: VeyraEvent, text: str) -> dict[str, Any]:
+        if not self.commitment_core:
+            return {}
+        semantic = self.commitment_core.semantic_intent_for_turn(user_text=text, event=event)
+        if semantic.get("operation") not in {"confirm", "decline", "cancel", "pause", "resume"}:
+            return {}
+        result = self.commitment_core.process_turn(
+            event=event,
+            user_text=text,
+            assistant_response="",
+            route=Route.DIRECT_ANSWER.value,
+            status="success",
+        )
+        if not result:
+            return {}
+        messages = self.commitment_core.followup_messages_for_turn(result)
+        response = str(result.get("primary_response_override") or (messages[0] if messages else "")).strip()
+        if not response:
+            return {}
+        return {
+            "reason": "commitment_semantic_control",
+            "response": response,
+            "commitment_turn": result,
+        }
+
+    def _early_tracking_request_response(self, event: VeyraEvent, text: str) -> dict[str, Any]:
+        if not self.commitment_core:
+            return {}
+        result = self.commitment_core.process_explicit_tracking_request(user_text=text, event=event)
+        if not result:
+            return {}
+        intent = result.get("intent") if isinstance(result.get("intent"), dict) else {}
+        topic = str(intent.get("topic") or "这个主题").strip()
+        return {
+            "reason": "explicit_tracking_request",
+            "response": f"已理解：你希望持续关注「{topic}」的更新。",
+            "commitment_turn": result,
+        }
 
     def _early_semantic_change_response(self, event: VeyraEvent, text: str) -> dict[str, Any]:
         if not self.commitment_core:
@@ -1441,7 +1530,7 @@ class AwarenessLoop:
 
     def _state_answer_for_turn(self, event: VeyraEvent, text: str) -> dict[str, Any]:
         if self._is_local_state_overview_question(text) or self._is_state_workload_question(text):
-            contract = self._local_state_answer_contract(text)
+            contract = self._local_state_answer_contract(text, event)
             return {
                 "reason": "state_grounded_local_answer",
                 "response": contract["answer_text"],
@@ -1479,16 +1568,42 @@ class AwarenessLoop:
 
     def _is_state_workload_question(self, text: str) -> bool:
         compact = re.sub(r"[\s，,。！？!?、]+", "", text or "").lower()
-        markers = ("未完成任务", "待处理任务", "关注主题", "可用执行器", "正在做什么", "还有哪些任务")
+        markers = (
+            "未完成任务",
+            "待处理任务",
+            "关注主题",
+            "可用执行器",
+            "正在做什么",
+            "还有哪些任务",
+            "有哪些正在进行的任务",
+            "有哪些进行中的任务",
+            "正在进行的任务或提醒",
+            "进行中的任务或提醒",
+            "有哪些任务或提醒",
+            "有什么任务或提醒",
+            "activetasks",
+            "pendingreminders",
+        )
         return any(marker in compact for marker in markers)
 
     def _is_commitment_state_question(self, text: str) -> bool:
         compact = re.sub(r"[\s，,。！？!?、]+", "", text or "").lower()
-        state_markers = ("还在", "状态", "运行", "取消了吗", "暂停了吗", "有没有")
+        state_markers = (
+            "还在",
+            "状态",
+            "运行",
+            "取消了吗",
+            "暂停了吗",
+            "有没有",
+            "有哪些",
+            "有什么",
+            "现在有",
+            "当前有",
+        )
         subject_markers = ("追踪", "关注", "提醒", "推送", "订阅", "主动任务", "commitment", "tracking")
         return any(marker in compact for marker in state_markers) and any(marker in compact for marker in subject_markers)
 
-    def _local_state_answer_contract(self, text: str) -> dict[str, Any]:
+    def _local_state_answer_contract(self, text: str, event: VeyraEvent) -> dict[str, Any]:
         names = [
             "task_state.json",
             "attention_state.json",
@@ -1511,16 +1626,24 @@ class AwarenessLoop:
 
         tasks: list[str] = []
         current_task = task_state.get("current_task")
-        if isinstance(current_task, dict) and str(current_task.get("status") or "") not in {
+        if (
+            isinstance(current_task, dict)
+            and self._state_item_visible_to_event(current_task, event)
+            and str(current_task.get("status") or "") not in {
             "success",
             "completed",
             "cancelled",
             "failed",
-        }:
+            }
+        ):
             tasks.append(str(current_task.get("title") or current_task.get("task") or current_task.get("task_id") or "当前任务"))
         pending_tasks = task_state.get("pending_agent_tasks") if isinstance(task_state.get("pending_agent_tasks"), list) else []
         for item in pending_tasks:
-            if not isinstance(item, dict) or str(item.get("status") or "") not in NON_TERMINAL_STATUSES:
+            if (
+                not isinstance(item, dict)
+                or not self._state_item_visible_to_event(item, event)
+                or str(item.get("status") or "") not in NON_TERMINAL_STATUSES
+            ):
                 continue
             tasks.append(str(item.get("title") or item.get("task_id") or "Agent 任务"))
 
@@ -1528,17 +1651,26 @@ class AwarenessLoop:
         active_commitments = [
             item
             for item in commitments
-            if isinstance(item, dict) and str(item.get("status") or "") in {"active", "pending_confirmation"}
+            if (
+                isinstance(item, dict)
+                and self._state_item_visible_to_event(item, event)
+                and str(item.get("status") or "") in {"active", "pending_confirmation"}
+            )
         ]
         for item in active_commitments:
             tasks.append(str(item.get("title") or item.get("kind") or item.get("commitment_id") or "主动任务"))
 
         topics: list[str] = []
         focus = attention.get("focus") if isinstance(attention.get("focus"), list) else []
-        topics.extend(str(item) for item in focus if item)
+        if event.source.user_id in {"", "local-user"}:
+            topics.extend(str(item) for item in focus if item)
         watchlist = external.get("watchlist") if isinstance(external.get("watchlist"), list) else []
         for item in watchlist:
-            if not isinstance(item, dict) or str(item.get("status") or "") in {"cancelled", "paused"}:
+            if (
+                not isinstance(item, dict)
+                or not self._state_item_visible_to_event(item, event)
+                or str(item.get("status") or "") in {"cancelled", "paused"}
+            ):
                 continue
             topic = str(item.get("topic") or item.get("query") or "").strip()
             if topic:
@@ -1582,6 +1714,18 @@ class AwarenessLoop:
             "degraded_reason": None,
         }
 
+    def _state_item_visible_to_event(self, item: dict[str, Any], event: VeyraEvent) -> bool:
+        context = item.get("task_context") if isinstance(item.get("task_context"), dict) else {}
+        item_user = str(item.get("user_id") or context.get("user_id") or "").strip()
+        item_session = str(item.get("session_id") or context.get("session_id") or "").strip()
+        if item_user and item_user != event.source.user_id:
+            return False
+        if item_session and item_session != event.source.session_id:
+            return False
+        if item_user or item_session:
+            return True
+        return event.source.user_id in {"", "local-user"}
+
     def _latest_timestamp(self, items: list[Any]) -> str | None:
         values: list[str] = []
         for item in items:
@@ -1606,6 +1750,11 @@ class AwarenessLoop:
     ) -> LoopResult | None:
         decision = self.decision_core._rule_decide(text, attention_focus, event=event)
         probe_name = str(decision.selected_probe or "").strip()
+        # Creator/latest-video lookups have a stricter L1 evidence path (official
+        # feed first, verified search fallback). Do not let the generic fast
+        # search probe bypass that contract.
+        if classify_execution_tier(text, decision) == TIER_L1_COMPACT_EXTERNAL:
+            return None
         fast_probes = {
             "time",
             "time_probe",
@@ -1666,12 +1815,12 @@ class AwarenessLoop:
             or "what did i ask you to track" in lowered
         )
 
-    def _tracking_memory_response(self) -> str:
+    def _tracking_memory_response(self, event: VeyraEvent) -> str:
         topics: list[str] = []
         external = self.state_store.read_json("external_world.json")
         watchlist = external.get("watchlist") if isinstance(external.get("watchlist"), list) else []
         for item in watchlist:
-            if not isinstance(item, dict):
+            if not isinstance(item, dict) or not self._state_item_visible_to_event(item, event):
                 continue
             topic = str(item.get("topic") or item.get("query") or item.get("target") or "").strip()
             status = str(item.get("status") or "")
@@ -1680,7 +1829,11 @@ class AwarenessLoop:
         commitments = self.state_store.read_json("user_commitments.json").get("commitments", [])
         if isinstance(commitments, list):
             for item in commitments:
-                if not isinstance(item, dict) or item.get("kind") not in {"external_digest", "learning_digest"}:
+                if (
+                    not isinstance(item, dict)
+                    or not self._state_item_visible_to_event(item, event)
+                    or item.get("kind") not in {"external_digest", "learning_digest"}
+                ):
                     continue
                 if item.get("status") in {"cancelled", "paused"}:
                     continue
@@ -2320,22 +2473,25 @@ class AwarenessLoop:
         }
 
     def _render_final_user_messages(self, event: VeyraEvent, result: LoopResult) -> None:
-        result.response = self._render_user_message(event, result, str(result.response or ""))
+        result.response = self._render_user_message(event, result, str(result.response or ""), primary=True)
         rendered_followups = []
         seen_messages = {str(result.response or "").strip()} if str(result.response or "").strip() else set()
         for message in result.followup_messages or []:
-            rendered = self._render_user_message(event, result, str(message or ""))
+            rendered = self._render_user_message(event, result, str(message or ""), primary=False)
             if rendered and rendered not in seen_messages:
                 rendered_followups.append(rendered)
                 seen_messages.add(rendered)
         result.followup_messages = rendered_followups
 
-    def _render_user_message(self, event: VeyraEvent, result: LoopResult, message: str) -> str:
+    def _render_user_message(self, event: VeyraEvent, result: LoopResult, message: str, *, primary: bool) -> str:
         text = str(message or "").strip()
         raw = result.artifacts.get("probe_result") if isinstance(result.artifacts.get("probe_result"), dict) else {}
-        if raw.get("probe") == "weather_probe":
+        # The probe renderer owns only the primary evidence answer. Commitment
+        # confirmations and other follow-ups must retain their own text instead
+        # of being rewritten into a duplicate search/weather response.
+        if primary and raw.get("probe") == "weather_probe":
             return self._weather_user_response(raw)
-        if raw.get("probe") == "search_probe":
+        if primary and raw.get("probe") == "search_probe":
             return self._search_user_response(raw)
         forbidden = (
             "No geocoding result",

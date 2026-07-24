@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "cd ../../web && npm run dev:desktop",
     "devUrl": "http://127.0.0.1:5174",
-    "beforeBuildCommand": "cd ../../web && npm install && npm run build:desktop",
+    "beforeBuildCommand": "cd ../../web && npm ci && npm run build:desktop",
     "frontendDist": "../dist"
   },
   "app": {
@@ -23,7 +23,8 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:8000; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self'",
+      "devCsp": "default-src 'self' http://127.0.0.1:5174; connect-src 'self' http://127.0.0.1:8000 http://127.0.0.1:5174 ws://127.0.0.1:5174; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self'"
     }
   },
   "bundle": {

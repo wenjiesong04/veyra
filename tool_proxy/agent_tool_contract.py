@@ -37,11 +37,20 @@ def agent_tool_proxy_contract(task_id: str | None = None) -> dict[str, Any]:
 class AgentToolCompliance:
     def review_execution(self, execution_result: ExecutionResult) -> dict[str, Any]:
         tool_calls = [str(item) for item in execution_result.tool_calls]
-        if not tool_calls:
-            return {"status": "compliant", "reason": "no tool calls reported", "max_risk": RiskLevel.R0.value, "warnings": []}
-
         raw = execution_result.raw if isinstance(execution_result.raw, dict) else {}
         proxy_evidence = self._proxy_evidence(raw)
+        if not tool_calls:
+            return {
+                "status": "not_observed",
+                "reason": "agent reported no tool calls; Tool Proxy enforcement cannot be inferred",
+                "max_risk": RiskLevel.R0.value,
+                "findings": [],
+                "warnings": ["empty tool-call evidence does not prove Tool Proxy enforcement"],
+                "proxy_evidence": proxy_evidence,
+                "tool_calls_reported": False,
+                "enforcement_observed": False,
+            }
+
         findings: list[dict[str, Any]] = []
         warnings: list[str] = []
         max_risk = RiskLevel.R0
@@ -83,6 +92,13 @@ class AgentToolCompliance:
             "findings": findings,
             "warnings": warnings,
             "proxy_evidence": proxy_evidence,
+            "tool_calls_reported": True,
+            "enforcement_observed": bool(
+                proxy_evidence["tool_trace"]
+                or proxy_evidence["proposal"]
+                or proxy_evidence["policy_trace"]
+                or proxy_evidence["review"]
+            ),
         }
 
     def _proxy_evidence(self, raw: dict[str, Any]) -> dict[str, bool]:
@@ -90,9 +106,13 @@ class AgentToolCompliance:
         tool_proxy_traces = raw.get("tool_proxy_traces") or raw.get("tool_traces")
         review_id = raw.get("review_id") or raw.get("approved_by")
         policy_trace = raw.get("policy_trace")
-        has_proposal = isinstance(action_proposals, list) and bool(action_proposals)
-        has_tool_trace = isinstance(tool_proxy_traces, list) and bool(tool_proxy_traces)
-        has_policy_trace = isinstance(policy_trace, dict) or (isinstance(policy_trace, list) and bool(policy_trace))
+        has_proposal = self._has_nonempty_dict_items(action_proposals)
+        has_tool_trace = self._has_nonempty_dict_items(tool_proxy_traces)
+        has_policy_trace = (
+            isinstance(policy_trace, dict)
+            and bool(policy_trace)
+            or self._has_nonempty_dict_items(policy_trace)
+        )
         has_review = bool(review_id) or self._has_approved_proposal(action_proposals)
         return {
             "proposal": has_proposal,
@@ -101,6 +121,12 @@ class AgentToolCompliance:
             "review": has_review,
             "trace": has_proposal or has_tool_trace or has_policy_trace or has_review,
         }
+
+    def _has_nonempty_dict_items(self, value: Any) -> bool:
+        return isinstance(value, list) and any(
+            isinstance(item, dict) and bool(item)
+            for item in value
+        )
 
     def _has_approved_proposal(self, proposals: Any) -> bool:
         if not isinstance(proposals, list):

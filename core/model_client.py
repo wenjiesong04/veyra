@@ -6,6 +6,7 @@ import re
 import ssl
 import time
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -221,9 +222,11 @@ class CoreModelClient:
         api_key_required = self._api_key_required(config)
         if api_key_required and not config.api_key:
             missing.append("api_key")
+        effective_configured = config.configured() and not (api_key_required and not config.api_key)
+        transport_validation = self._transport_validation(last_transport, configured=effective_configured)
         return {
             "enabled": config.enabled,
-            "configured": config.configured() and not (api_key_required and not config.api_key),
+            "configured": effective_configured,
             "provider": config.provider,
             "base_url": config.base_url,
             "model": config.model,
@@ -235,12 +238,45 @@ class CoreModelClient:
             "ca_bundle": _public_ca_bundle_path(self._ca_bundle_path(config)),
             "proxy": _proxy_summary(),
             "retries": config.retries,
-            "status": "configured" if config.configured() and not (api_key_required and not config.api_key) else "unconfigured",
+            "status": "configured" if effective_configured else "unconfigured",
+            "validation": transport_validation,
             "missing": missing,
             "active_env_file": redact_sensitive(str(env_status.get("active_env_file") or "")),
             "env_loaded": env_status.get("loaded"),
             "env_loaded_key_count": env_status.get("loaded_key_count"),
             "last_transport_status": last_transport,
+        }
+
+    def _transport_validation(self, last_transport: dict[str, Any], *, configured: bool) -> dict[str, Any]:
+        if not configured:
+            return {"status": "not_configured", "validated": False, "reason": "model transport is not configured"}
+        if not last_transport:
+            return {"status": "validation_pending", "validated": False, "reason": "no model transport attempt has been observed"}
+        raw_status = str(last_transport.get("status") or "unknown")
+        successful = raw_status in {"model_assisted", "ok", "success"}
+        timestamp = str(last_transport.get("timestamp") or "")
+        age_seconds: float | None = None
+        if timestamp:
+            try:
+                parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                age_seconds = max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+            except ValueError:
+                age_seconds = None
+        if successful:
+            status = "validated" if age_seconds is None or age_seconds <= 900 else "stale"
+            reason = "recent model transport succeeded" if status == "validated" else "last successful model transport is stale"
+        else:
+            status = "degraded" if age_seconds is None or age_seconds <= 900 else "stale"
+            reason = "recent model transport failed" if status == "degraded" else "last failed model transport is stale"
+        return {
+            "status": status,
+            "validated": status == "validated",
+            "transport_status": raw_status,
+            "observed_at": timestamp or None,
+            "age_seconds": int(age_seconds) if age_seconds is not None else None,
+            "reason": reason,
         }
 
     def complete_json(self, *, system: str, user: str, purpose: str) -> dict[str, Any]:

@@ -143,7 +143,22 @@ class AgentOrchestrator:
                     "artifacts": {"multi_agent_invocation": True, "target_agent": name},
                 }
             )
-            pending = self.task_tracker.register(event_id=event.event_id, route=Route.AGENT.value, execution=execution, verification=verification)
+            pending = self.task_tracker.register(
+                event_id=event.event_id,
+                route=Route.AGENT.value,
+                execution=execution,
+                verification=verification,
+                session_id=event.source.session_id,
+                channel=event.source.channel,
+                user_id=event.source.user_id,
+                correlation_id=event.event_id,
+                task_packet_id=packet.task_id,
+                agent_execution_session_id=packet.agent_execution_session_id,
+                agent_session_policy=packet.agent_session_policy,
+                memory_policy=packet.memory_policy,
+                verification_policy=packet.verification_policy,
+                rollback_requirement=packet.rollback_requirement,
+            )
             results.append(
                 {
                     "name": name,

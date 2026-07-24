@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import os
 from urllib import error as urlerror
@@ -269,8 +270,14 @@ class FeishuAdapter:
     def _verify_token(self, received: Any) -> bool:
         expected = self._configured_token()
         if not expected:
-            return True
-        return str(received or "") == expected
+            public_callbacks = str(os.getenv("VEYRA_ALLOW_PUBLIC_PROVIDER_CALLBACKS", "")).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            return not public_callbacks
+        return hmac.compare_digest(str(received or ""), expected)
 
     def _configured_token(self) -> str:
         state = self.state_store.read_json("channel_state.json")

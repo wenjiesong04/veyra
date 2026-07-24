@@ -134,43 +134,66 @@ class SoakRunner:
             run_payload = iteration["runs"][0] if iteration.get("runs") else {}
             if iteration.get("status") == "failed":
                 final_status = "failed"
+            elif stop_event.is_set():
+                final_status = "stopped"
             with self._lock:
-                state = self._read_state()
-                if state.get("run_id") != run_id:
+                recorded = False
+
+                def append_iteration(state: dict[str, Any]) -> None:
+                    nonlocal recorded
+                    if state.get("run_id") != run_id:
+                        return
+                    runs = state.get("runs") if isinstance(state.get("runs"), list) else []
+                    runs.append(
+                        {
+                            "iteration": index + 1,
+                            "status": iteration.get("status"),
+                            "checked_at": utc_now_iso(),
+                            "result": run_payload,
+                        }
+                    )
+                    state.update(
+                        {
+                            "status": "running" if final_status == "completed" else final_status,
+                            "updated_at": utc_now_iso(),
+                            "completed_iterations": index + 1,
+                            "runs": runs[-200:],
+                        }
+                    )
+                    recorded = True
+
+                self.retention_policy.state_store.mutate_json(
+                    "ops_soak_state.json",
+                    append_iteration,
+                )
+                if not recorded:
                     return
-                runs = state.get("runs") if isinstance(state.get("runs"), list) else []
-                runs.append(
-                    {
-                        "iteration": index + 1,
-                        "status": iteration.get("status"),
-                        "checked_at": utc_now_iso(),
-                        "result": run_payload,
-                    }
-                )
-                self._write_state(
-                    {
-                        **state,
-                        "status": "running" if final_status == "completed" else final_status,
-                        "updated_at": utc_now_iso(),
-                        "completed_iterations": index + 1,
-                        "runs": runs[-200:],
-                    }
-                )
             if final_status == "failed":
                 break
             if index < iterations - 1 and stop_event.wait(interval_seconds):
                 final_status = "stopped"
                 break
         with self._lock:
-            state = self._read_state()
-            if state.get("run_id") == run_id:
-                final_state = {
-                    **state,
-                    "status": final_status,
-                    "updated_at": utc_now_iso(),
-                    "finished_at": utc_now_iso(),
-                }
-                self._write_state(final_state)
+            final_state: dict[str, Any] = {}
+
+            def finish_session(state: dict[str, Any]) -> None:
+                nonlocal final_state
+                if state.get("run_id") != run_id:
+                    return
+                state.update(
+                    {
+                        "status": final_status,
+                        "updated_at": utc_now_iso(),
+                        "finished_at": utc_now_iso(),
+                    }
+                )
+                final_state = dict(state)
+
+            self.retention_policy.state_store.mutate_json(
+                "ops_soak_state.json",
+                finish_session,
+            )
+            if final_state:
                 self.retention_policy.state_store.append_jsonl(
                     "action_record.jsonl",
                     {"route": "ops_soak_session", "status": final_status, "artifacts": {"run_id": run_id, "completed_iterations": final_state.get("completed_iterations")}},
@@ -184,8 +207,10 @@ class SoakRunner:
         self.retention_policy.state_store.write_json("ops_soak_state.json", payload)
 
     def _patch_state(self, patch: dict[str, Any]) -> None:
-        state = self._read_state()
-        self._write_state({**state, **patch, "updated_at": utc_now_iso()})
+        self.retention_policy.state_store.patch_json(
+            "ops_soak_state.json",
+            {**patch, "updated_at": utc_now_iso()},
+        )
 
     def _external_runtime_status(self) -> dict[str, Any]:
         if not self.external_runtime_probe:

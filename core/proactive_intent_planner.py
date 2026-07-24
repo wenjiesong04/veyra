@@ -40,6 +40,19 @@ class ProactiveIntentPlanner:
         if control:
             self._trace(control, {"status": "control_fallback"})
             return control
+        if self._is_state_inventory_question(user_text):
+            answer_only = self._intent(
+                event=event,
+                user_text=user_text,
+                intent_type="unknown",
+                desired_outcome="answer the current state without creating proactive work",
+                proposed_next_action="answer_only",
+                requires_user_authorization=False,
+                confidence=0.95,
+                entities={"guardrail": "state_inventory_question"},
+            )
+            self._trace(answer_only, {"status": "state_inventory_guardrail"})
+            return answer_only
 
         model = self._model_plan(user_text=user_text, event=event, memory_summary=memory_summary or {})
         if model and model.confidence >= 0.45:
@@ -49,6 +62,24 @@ class ProactiveIntentPlanner:
         fallback = self._fallback_plan(user_text=user_text, event=event)
         self._trace(fallback, {"status": "fallback", "model_status": model.source if model else "unavailable"})
         return fallback
+
+    def rule_plan(self, *, user_text: str, event: VeyraEvent) -> ProactiveIntent:
+        """Return the deterministic plan used to guard explicit control intents."""
+        control = self._control_fallback(user_text=user_text, event=event)
+        if control:
+            return control
+        if self._is_state_inventory_question(user_text):
+            return self._intent(
+                event=event,
+                user_text=user_text,
+                intent_type="unknown",
+                desired_outcome="answer the current state without creating proactive work",
+                proposed_next_action="answer_only",
+                requires_user_authorization=False,
+                confidence=0.95,
+                entities={"guardrail": "state_inventory_question"},
+            )
+        return self._fallback_plan(user_text=user_text, event=event)
 
     def record_intent(self, intent: ProactiveIntent) -> dict[str, Any]:
         item = intent.to_dict()
@@ -441,6 +472,31 @@ class ProactiveIntentPlanner:
 
     def _is_reminder(self, text: str) -> bool:
         return any(marker in text for marker in ("提醒我", "提醒", "记得", "背单词")) or "remind" in text.lower()
+
+    def _is_state_inventory_question(self, text: str) -> bool:
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "").lower()
+        if any(marker in compact for marker in ("提醒我", "帮我提醒", "请提醒", "设置提醒", "创建提醒", "remindme")):
+            return False
+        questionish = any(
+            marker in compact
+            for marker in (
+                "有哪些",
+                "有什么",
+                "有没有",
+                "还在吗",
+                "状态",
+                "现在有",
+                "当前有",
+                "whattasks",
+                "whichtasks",
+                "pendingreminders",
+            )
+        )
+        state_subject = any(
+            marker in compact
+            for marker in ("任务", "提醒", "推送", "订阅", "关注", "追踪", "commitment", "tracking")
+        )
+        return questionish and state_subject
 
     def _is_local_monitor(self, text: str) -> bool:
         lowered = text.lower()

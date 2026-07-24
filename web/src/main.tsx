@@ -28,6 +28,8 @@ import {
   TerminalSquare,
   XCircle
 } from "lucide-react";
+import { fetchJson, isDesktopRuntime, desktopApiBase } from "./api";
+import { SetupWizard } from "./SetupWizard";
 import "./styles.css";
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -103,24 +105,6 @@ const workbenchSections: Array<{ id: WorkbenchSection; label: string; icon: Reac
   { id: "logs", label: "Logs", icon: <ScrollText size={15} /> }
 ];
 
-const isDesktopRuntime =
-  typeof window !== "undefined" &&
-  (window.location.protocol === "tauri:" || window.location.hostname === "tauri.localhost");
-const desktopApiBase = isDesktopRuntime ? "http://127.0.0.1:8000" : "";
-
-async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
-  const headers = new Headers(options?.headers);
-  if (options?.body && !headers.has("Content-Type")) {
-    headers.set("Content-Type", "application/json");
-  }
-  const target = url.startsWith("http") ? url : `${desktopApiBase}${url}`;
-  const response = await fetch(target, options ? { ...options, headers } : undefined);
-  if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText}`);
-  }
-  return response.json() as Promise<T>;
-}
-
 function StatusPill({ value }: { value: string }) {
   const tone = value === "R5" || value === "blocked" ? "danger" : value === "R1" || value === "success" ? "good" : "neutral";
   return <span className={`pill ${tone}`}>{value}</span>;
@@ -157,6 +141,14 @@ function JsonBlock({ value }: { value: unknown }) {
 
 function asRecord(value: JsonValue | undefined): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function editableOpenClawUrl(value: string): string {
+  const raw = value.trim();
+  if (!raw) return "http://127.0.0.1:18789";
+  if (raw.startsWith("ws://")) return `http://${raw.slice(5)}`;
+  if (raw.startsWith("wss://")) return `https://${raw.slice(6)}`;
+  return raw;
 }
 
 function compactJson(value: JsonValue | undefined, fallback = "-") {
@@ -248,7 +240,20 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [backendBooting, setBackendBooting] = useState(isDesktopRuntime);
+  const [showSetupWizard, setShowSetupWizard] = useState(true);
   const [activeSection, setActiveSection] = useState<WorkbenchSection>("awareness");
+
+  const applySetupStatus = (setup: Record<string, JsonValue>) => {
+    setSetupStatus(setup);
+    const wizard = asRecord(setup.wizard);
+    if (wizard.should_show === true) {
+      setShowSetupWizard(true);
+      return;
+    }
+    if (wizard.completed === true) {
+      setShowSetupWizard(false);
+    }
+  };
 
   const refresh = async () => {
     const [
@@ -356,7 +361,7 @@ function App() {
     setSoakStatus(soakData);
     setRuntimeMatrix(runtimeMatrixData);
     setDeploymentReadiness(deploymentData);
-    setSetupStatus(setupData);
+    applySetupStatus(setupData);
     setAlertingStatus(alertingData);
     setRuntimeTraceRecent(runtimeTraceData);
     setRuntimeMetricsSummary(runtimeMetricsSummaryData);
@@ -374,6 +379,32 @@ function App() {
     setCoreModelKeyEnv(String(coreModelData.api_key_env ?? "VEYRA_CORE_MODEL_API_KEY"));
     setCoreModelDecisionMode(String(coreModelData.decision_mode ?? "auto"));
   };
+
+  useEffect(() => {
+    let cancelled = false;
+    const probeSetup = async (attempt = 0) => {
+      try {
+        const setup = await fetchJson<Record<string, JsonValue>>("/setup/status");
+        if (!cancelled) {
+          applySetupStatus(setup);
+        }
+      } catch {
+        if (!cancelled && attempt < 40) {
+          window.setTimeout(() => {
+            if (!cancelled) void probeSetup(attempt + 1);
+          }, 1000);
+          return;
+        }
+        if (!cancelled) {
+          setShowSetupWizard(true);
+        }
+      }
+    };
+    void probeSetup();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -543,14 +574,33 @@ function App() {
 
   const saveSelectedAgentUrl = async () => {
     const selected = String(agentRegistry?.selected_agent ?? runtime?.identity.selected_agent ?? "openclaw");
+    const normalizedBaseUrl = selected === "openclaw" ? editableOpenClawUrl(agentBaseUrl) : agentBaseUrl.trim();
     setLoading(true);
     setError(null);
     try {
+      if (selected === "openclaw") {
+        await fetchJson("/setup/env", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            values: {
+              VEYRA_SELECTED_AGENT: "openclaw",
+              OPENCLAW_BASE_URL: normalizedBaseUrl,
+              VEYRA_OPENCLAW_USE_LOCAL_CONFIG: 1
+            }
+          })
+        });
+      }
       await fetchJson(`/agents/${selected}/config`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ base_url: agentBaseUrl })
+        body: JSON.stringify(
+          selected === "openclaw"
+            ? { kind: "openclaw", base_url: normalizedBaseUrl, api_key_env: "OPENCLAW_GATEWAY_TOKEN", enabled: true }
+            : { base_url: normalizedBaseUrl }
+        )
       });
+      setAgentBaseUrl(normalizedBaseUrl);
       await refresh();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Unknown error");
@@ -774,9 +824,27 @@ function App() {
   const setupPlatform = asRecord(setupStatus?.platform);
   const setupPaths = asRecord(setupStatus?.paths);
   const setupAgent = asRecord(setupStatus?.agent);
+  const setupFeishu = asRecord(setupStatus?.feishu_setup);
+  const feishuReadiness = String(setupFeishu.readiness ?? "not_configured");
+  const feishuReadinessLabel =
+    feishuReadiness === "receiving"
+      ? "receiving"
+      : feishuReadiness === "waiting_for_event"
+        ? "waiting for message"
+        : feishuReadiness === "configured_not_running"
+          ? "configured"
+          : "not configured";
 
   return (
     <main className="appShell">
+      <SetupWizard
+        open={showSetupWizard}
+        onClose={() => setShowSetupWizard(false)}
+        onComplete={refresh}
+        setupStatus={setupStatus}
+        coreModelStatus={coreModelStatus}
+        agentStatus={agentStatus}
+      />
       <header className="topbar">
         <div>
           <div className="eyebrow">Awareness & Agent Control Console</div>
@@ -821,7 +889,15 @@ function App() {
         <div className="workbenchBody">
 
       <section className={`workspaceGrid workbenchPane ${activeSection === "runtime" ? "active" : ""}`}>
-        <Section title="Setup Wizard" icon={<Settings size={18} />}>
+        <Section
+          title="Setup Wizard"
+          icon={<Settings size={18} />}
+          action={
+            <button className="ghostButton compactButton" type="button" onClick={() => setShowSetupWizard(true)}>
+              Open setup wizard
+            </button>
+          }
+        >
           <div className="setupGrid">
             <div className="setupStep">
               <span>App</span>
@@ -842,6 +918,11 @@ function App() {
               <span>Agent install</span>
               <strong>{setupAgent.connected === true ? "available" : "needs setup"}</strong>
               <small>{String(setupAgent.status ?? "unknown")}</small>
+            </div>
+            <div className="setupStep">
+              <span>Feishu intake</span>
+              <strong>{feishuReadinessLabel}</strong>
+              <small>{String(setupFeishu.status ?? "unknown")}</small>
             </div>
             <div className="setupStep">
               <span>Selected runtime</span>

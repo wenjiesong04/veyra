@@ -389,6 +389,57 @@ class CommitmentCore:
             result["intent"] = intent_record
         return result if result.get("status") != "idle" else {}
 
+    def process_explicit_learning_goal(self, *, user_text: str, event: VeyraEvent) -> dict[str, Any]:
+        """Handle an unambiguous learning start before model-driven routing."""
+        lowered = (user_text or "").lower()
+        if self._is_learning_memory_question(user_text):
+            return {}
+        if not any(marker in lowered for marker in LEARNING_MARKERS):
+            return {}
+        if not self._looks_like_learning_goal_request(user_text):
+            return {}
+
+        intent = self.intent_planner.rule_plan(user_text=user_text, event=event)
+        if intent.intent_type not in {"learning_plan", "goal_start"}:
+            return {}
+        intent_record = self.intent_planner.record_intent(intent)
+        templated = self.template_registry.apply(
+            intent=intent,
+            core=self,
+            event=event,
+            user_text=user_text,
+            assistant_response="",
+            route="direct_answer",
+        )
+        if not templated:
+            return {}
+        templated["intent"] = intent_record
+        templated["semantic_source"] = "explicit_learning_guardrail"
+        return templated
+
+    def process_explicit_tracking_request(self, *, user_text: str, event: VeyraEvent) -> dict[str, Any]:
+        """Create a tracking draft deterministically when the request is explicit."""
+        lowered = (user_text or "").lower()
+        if self._looks_like_plain_information_query(user_text, lowered):
+            return {}
+        intent = self.intent_planner.rule_plan(user_text=user_text, event=event)
+        if intent.intent_type != "track_external_topic":
+            return {}
+        intent_record = self.intent_planner.record_intent(intent)
+        templated = self.template_registry.apply(
+            intent=intent,
+            core=self,
+            event=event,
+            user_text=user_text,
+            assistant_response="",
+            route="direct_answer",
+        )
+        if not templated:
+            return {}
+        templated["intent"] = intent_record
+        templated["semantic_source"] = "explicit_tracking_guardrail"
+        return templated
+
     def semantic_intent_for_turn(self, *, user_text: str, event: VeyraEvent) -> dict[str, Any]:
         """Narrow semantic guardrail for commitment state/control turns.
 
@@ -965,8 +1016,26 @@ class CommitmentCore:
                 "状态",
                 "查一下",
                 "现在是否",
+                "有哪些",
+                "有什么",
+                "现在有",
+                "当前有",
             )
-        ) or any(marker in lowered for marker in ("still", "status", "cancelled", "canceled", "is it", "did you", "has it"))
+        ) or any(
+            marker in lowered
+            for marker in (
+                "still",
+                "status",
+                "cancelled",
+                "canceled",
+                "is it",
+                "did you",
+                "has it",
+                "what tasks",
+                "which tasks",
+                "pending reminders",
+            )
+        )
         stateish = any(
             marker in compact
             for marker in (
@@ -1374,6 +1443,8 @@ class CommitmentCore:
             "source_intent_id": payload.get("source_intent_id"),
             "commitment_id": (commitment or {}).get("commitment_id"),
             "goal_id": (goal or {}).get("goal_id"),
+            "user_id": (commitment or {}).get("user_id") or (goal or {}).get("user_id"),
+            "session_id": (commitment or {}).get("session_id"),
             "created_at": utc_now_iso(),
             "updated_at": utc_now_iso(),
         }

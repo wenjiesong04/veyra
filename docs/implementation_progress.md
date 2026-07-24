@@ -169,7 +169,7 @@ P2 已将 Tool Proxy 接入统一策略审查：
 
 ## Agent Adapter Contract
 
-P3 已定义 `veyra.agent_adapter.v1`：
+P3 当前定义 `veyra.agent_adapter.v2`：
 
 - `VeyraTaskPacket`: 保持结构化 JSON，同时提供 rendered prompt fallback。
 - `ExecutionResult`: 统一 `task_id`、`executor`、`status`、`result`、`logs`、`changed_files`、`tool_calls`、`raw`。

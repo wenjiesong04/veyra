@@ -21,6 +21,9 @@ os.environ["VEYRA_STATE_DIR"] = str(TEST_STATE_ROOT)
 os.environ["VEYRA_STATE_ROOT"] = str(TEST_STATE_ROOT)
 os.environ["VEYRA_AGENCY_DIR"] = str(TEST_AGENCY_ROOT)
 os.environ["VEYRA_AGENCY_ROOT"] = str(TEST_AGENCY_ROOT)
+os.environ["VEYRA_CORE_MODEL_ENABLED"] = "0"
+os.environ["VEYRA_ACTIVE_LOOP_AUTOSTART"] = "0"
+os.environ["VEYRA_FEISHU_WS_AUTOSTART"] = "0"
 TEST_AGENCY_ROOT.mkdir(parents=True, exist_ok=True)
 (TEST_AGENCY_ROOT / "goals.json").write_text("{}", encoding="utf-8")
 (TEST_AGENCY_ROOT / "intention_queue.json").write_text("[]", encoding="utf-8")
@@ -58,6 +61,13 @@ def main() -> int:
     learning_body = learning_turn.json()
     learning_artifact = (learning_body.get("artifacts") or {}).get("commitment") or {}
     expect(learning_artifact.get("status") == "goal_recorded", "learning goal recorded", learning_artifact)
+    expect(
+        learning_body.get("route") == "direct_answer"
+        and learning_artifact.get("semantic_source") == "explicit_learning_guardrail"
+        and not (learning_body.get("artifacts") or {}).get("execution_result"),
+        "explicit learning start bypasses model and Agent routing",
+        learning_body,
+    )
     expect("学习目标" in message_text(learning_body) and "同意开启" in message_text(learning_body), "learning response includes plan and opt-in", learning_body)
 
     goals = store.read_json("user_goals.json").get("goals", [])
@@ -83,12 +93,35 @@ def main() -> int:
         "learning confirmation activates commitment",
         confirm_learning.json().get("artifacts"),
     )
+    expect(
+        confirm_learning.json().get("route") == "direct_answer"
+        and not (confirm_learning.json().get("artifacts") or {}).get("decision")
+        and not (confirm_learning.json().get("artifacts") or {}).get("execution_result"),
+        "commitment confirmation bypasses model routing",
+        confirm_learning.json(),
+    )
     learning_list = client.get("/commitments", params={"session_id": learn_session, "status": "active"})
     expect(learning_list.status_code == 200 and learning_list.json().get("count", 0) >= 1, "active learning commitment exists", learning_list.json())
     learn_id = learning_list.json()["commitments"][0]["commitment_id"]
     goals = store.read_json("user_goals.json").get("goals", [])
     learning_goal = next((goal for goal in goals if isinstance(goal, dict) and goal.get("topic") == "深度学习"), {})
     expect((learning_goal.get("permissions") or {}).get("proactive_push") == "granted", "confirmed learning updates goal permissions", learning_goal)
+    recall_learning = client.post(
+        "/events/message",
+        json={
+            "text": "你记得我现在在学什么吗？",
+            "channel": "self-test",
+            "user_id": "cmt-user",
+            "session_id": "cmt-learn",
+        },
+    ).json()
+    expect(
+        recall_learning.get("route") == "direct_answer"
+        and "深度学习" in str(recall_learning.get("response") or "")
+        and not (recall_learning.get("artifacts") or {}).get("execution_result"),
+        "learning recall is answered from Veyra state without Agent routing",
+        recall_learning,
+    )
 
     weather = client.post(
         "/events/message",

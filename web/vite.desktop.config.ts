@@ -30,7 +30,10 @@ export default defineConfig({
       "/setup": "http://127.0.0.1:8000",
       "/channels": "http://127.0.0.1:8000",
       "/integrations": "http://127.0.0.1:8000",
-      "/tool-proxy": "http://127.0.0.1:8000"
+      "/tool-proxy": "http://127.0.0.1:8000",
+      "/memory": "http://127.0.0.1:8000",
+      "/mvp": "http://127.0.0.1:8000",
+      "/proactive": "http://127.0.0.1:8000"
     }
   }
 });

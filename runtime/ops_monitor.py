@@ -171,6 +171,36 @@ class OpsMonitor:
                     "details": {"status": status.get("status"), "missing": status.get("missing"), "api_key_set": status.get("api_key_set")},
                 }
             ]
+        validation = status.get("validation") if isinstance(status.get("validation"), dict) else {}
+        validation_status = str(validation.get("status") or "")
+        if validation_status == "degraded":
+            transport_status = str(validation.get("transport_status") or status.get("last_transport_status", {}).get("status") or "unknown")
+            severity = "critical" if transport_status in {"auth_error"} else "warning"
+            return [
+                {
+                    "component": "model",
+                    "severity": severity,
+                    "code": "core_model_transport_degraded",
+                    "message": f"Core model is configured, but the latest transport result is {transport_status}.",
+                    "details": {
+                        "validation": validation,
+                        "last_transport_status": status.get("last_transport_status"),
+                    },
+                }
+            ]
+        if validation_status in {"validation_pending", "stale"}:
+            return [
+                {
+                    "component": "model",
+                    "severity": "info",
+                    "code": f"core_model_{validation_status}",
+                    "message": "Core model transport has not been validated recently.",
+                    "details": {
+                        "validation": validation,
+                        "last_transport_status": status.get("last_transport_status"),
+                    },
+                }
+            ]
         return []
 
     def _feishu_alerts(self) -> list[dict[str, Any]]:

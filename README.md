@@ -4,9 +4,9 @@ Virtual Entity for Yielding Real-time Awareness.
 
 Veyra v0.1 is an awareness-first Agent governance runtime for local personal production. It receives events, updates local awareness state, evaluates risk, chooses a route, and either answers directly, runs a read-only probe, blocks unsafe actions, or generates a `VeyraTaskPacket` for the selected Agent Runtime.
 
-Veyra is local-first: clone it from GitHub, configure your own model/OpenClaw/Feishu surfaces, and keep runtime data on your machine under `state/`. It is not a SaaS service and does not require cloud tenancy, accounts, billing, or remote data storage.
+Veyra is local-first: configuration, runtime state, and audit data stay on your machine under `.env`, `state/`, and `agency/`. When you enable a model, OpenClaw, Feishu, or another integration, Veyra sends the data required to serve that request to the configured provider. It is not a SaaS service and does not require Veyra cloud tenancy, accounts, or billing.
 
-Veyra is now in Runtime Stabilization and local release hardening. The core closed loop is complete; the next work should prioritize fresh-clone startup, real Feishu/OpenClaw soak testing, telemetry, context drift control, ToolProxy closed-loop verification, and gradual UI/router decomposition rather than blindly adding more modules.
+Veyra is now in Runtime Stabilization and local release hardening. The code-level awareness/governance loop is implemented, while external capabilities report `not_configured`, `validation_pending`, `validated`, `degraded`, or `stale` from observed evidence. The next work should prioritize fresh-clone and signed-package acceptance, real Feishu/OpenClaw soak testing, native Memory validation, and an OpenClaw pre-tool hook that makes Tool Proxy enforcement non-bypassable.
 
 ## Desktop Local Window
 
@@ -81,6 +81,8 @@ Check the local runtime:
 ./scripts/status_local.sh
 curl -s http://127.0.0.1:8000/agent/status
 ```
+
+Keep the API bound to loopback for the zero-configuration desktop flow. If `VEYRA_HOST` is set to a non-loopback address, configure `VEYRA_LOCAL_API_TOKEN`; only `/` and `/health` remain public, while setup, state, logs, and control endpoints require the token. Public provider callbacks are disabled unless explicitly enabled and independently verified.
 
 Open the local control console after the frontend has been built:
 
@@ -199,7 +201,7 @@ Endpoints:
 - `POST /agent/tasks/refresh` refresh all pending selected Agent tasks
 - `POST /agent/tasks/{task_id}/stop` request selected Agent task stop
 - `POST /agent/results` receive an Agent result callback and update verification state
-- `GET /agent/contract` inspect the AgentAdapter v1 contract
+- `GET /agent/contract` inspect the AgentAdapter v2 contract
 - `GET /memory/summary` read local Memory Bridge summary
 - `GET /memory/providers` list available MemoryBridge providers
 - `GET /memory/providers/diagnostics` run read-only MemoryBridge provider diagnostics
@@ -438,7 +440,7 @@ The Core model is inside Veyra Core, not inside the selected Agent Runtime. It i
 
 The same capability can also be attached while configuring a selected runtime with `POST /agents/{name}/config` by setting `use_model_for_core`, `model_base_url`, `model_api_key_env`, and `model`. Top-level `/core/model/config` takes precedence when explicitly enabled.
 
-Agent tool governance is part of the task contract. Veyra adds `policy_patch.tool_proxy_contract` to every Agent task packet. R3-R4 tool actions must go through `/actions/proposals` and return approval evidence; R5 actions are blocked. The Verifier rejects or downgrades Agent success claims when high-risk `tool_calls` lack ActionProposal, review, policy, or Tool Proxy trace evidence.
+Agent tool governance is part of the task contract. Veyra adds `policy_patch.tool_proxy_contract` to every Agent task packet. R3-R4 tool actions must go through `/actions/proposals` and return approval evidence; R5 actions are blocked. The Verifier rejects or downgrades Agent success claims when high-risk `tool_calls` lack ActionProposal, review, policy, or Tool Proxy trace evidence. Until OpenClaw exposes a validated pre-tool/tool-event hook, `/agent/status` must report external Agent Tool Proxy enforcement as `validation_pending`, not as enforced.
 
 Runtime observability now records each message route into `runtime_trace.jsonl` with redacted source identifiers, latency, final route, model/probe/agent usage, context size, drift warnings, memory policy, failure reason, and OpenClaw involvement. The telemetry APIs are backend-first so the console can consume them later without another route redesign.
 

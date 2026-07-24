@@ -26,6 +26,7 @@ def line_count(path: Path) -> int:
 
 def test_action_record_auto_retention() -> None:
     from core.world_state import WorldStateStore  # noqa: E402
+    from runtime.retention_policy import RetentionPolicy  # noqa: E402
 
     previous_limit = os.environ.get("VEYRA_ACTION_RECORD_RETENTION_LIMIT")
     try:
@@ -41,6 +42,14 @@ def test_action_record_auto_retention() -> None:
             expect(bool(archives), "action_record auto-retention archives old rows", archives)
             expect("ops_retention_auto_enforce" in action_text, "action_record auto-retention writes audit", action_text)
             expect(len(archives) == 1, "action_record auto-retention rotates a batch, not one file per row", archives)
+        with TemporaryDirectory(prefix="veyra-disabled-retention-") as tmp:
+            store = WorldStateStore(Path(tmp) / "state")
+            store.append_jsonl("event_log.jsonl", {"route": "retention_disabled_seed", "status": "success"})
+            policy = RetentionPolicy(store)
+            disabled = policy.enforce(limits={"event_log.jsonl": 0})
+            event_row = next(item for item in disabled["files"] if item["file"] == "event_log.jsonl")
+            expect(event_row["status"] == "disabled", "zero retention limit has disabled semantics", event_row)
+            expect(line_count(store.path_for("event_log.jsonl")) == 1, "disabled retention preserves log rows")
     finally:
         if previous_limit is None:
             os.environ.pop("VEYRA_ACTION_RECORD_RETENTION_LIMIT", None)

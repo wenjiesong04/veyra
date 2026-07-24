@@ -49,6 +49,9 @@ Current `main.py` line count: 1192.
 ### setup
 
 - `GET /setup/status`
+- `GET /setup/openclaw`
+- `POST /setup/openclaw/install`
+- `POST /setup/complete`
 - `POST /setup/env`
 - `POST /state/refresh-stale`
 - `POST /external/refresh`

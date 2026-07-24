@@ -43,9 +43,13 @@ class RollbackManager:
                 "checksum": self._sha256(source),
                 "size_bytes": source.stat().st_size,
             }
-        state = self.state_store.read_json("rollback_state.json") or {"snapshots": []}
-        state.setdefault("snapshots", []).append(snapshot)
-        self.state_store.write_json("rollback_state.json", state)
+        def append_snapshot(state: dict[str, Any]) -> None:
+            snapshots = state.setdefault("snapshots", [])
+            if not isinstance(snapshots, list):
+                state["snapshots"] = snapshots = []
+            snapshots.append(snapshot)
+
+        self.state_store.mutate_json("rollback_state.json", append_snapshot)
         self.state_store.append_jsonl("rollback_log.jsonl", {"action": "snapshot", "snapshot": snapshot})
         return snapshot
 

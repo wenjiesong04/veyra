@@ -23,7 +23,23 @@ GATE_SMOKES = [
     "commitment_smoke.py",
     "cognition_pipeline_smoke.py",
     "tool_proxy_guard_smoke.py",
+    "state_integrity_smoke.py",
+    "state_truth_isolation_smoke.py",
+    "runtime_truth_smoke.py",
+    "model_transport_truth_smoke.py",
+    "local_control_guard_smoke.py",
+    "state_refresh_fairness_smoke.py",
+    "openclaw_capability_identity_smoke.py",
+    "agent_governance_transaction_smoke.py",
+    "memory_integrity_smoke.py",
+    "state_mutation_concurrency_smoke.py",
 ]
+
+SMOKE_TIMEOUT_OVERRIDES = {
+    # This intentionally exercises eight sequential turns against the live
+    # configured model and evidence providers.
+    "runtime_e2e_dialogue_smoke.py": 360.0,
+}
 
 
 def smoke_files(group: str) -> list[Path]:
@@ -58,18 +74,19 @@ def main() -> int:
     failures: list[tuple[Path, str]] = []
     for index, path in enumerate(selected, start=1):
         label = str(path.relative_to(ROOT))
-        print(f"[{index}/{len(selected)}] {label}")
+        timeout = max(args.timeout, SMOKE_TIMEOUT_OVERRIDES.get(path.name, 0.0))
+        print(f"[{index}/{len(selected)}] {label} (timeout={timeout:.0f}s)")
         try:
             result = subprocess.run(
                 [sys.executable, str(path)],
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
-                timeout=args.timeout,
+                timeout=timeout,
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            failures.append((path, f"timeout after {args.timeout:.1f}s\n{exc.stdout or ''}\n{exc.stderr or ''}"))
+            failures.append((path, f"timeout after {timeout:.1f}s\n{exc.stdout or ''}\n{exc.stderr or ''}"))
             print(f"FAIL {label}: timeout", file=sys.stderr)
             continue
         if result.stdout:

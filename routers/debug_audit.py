@@ -74,6 +74,9 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
         loop = deps["awareness_loop"]
         adapter = loop.agent_registry.selected()
         selected_agent = loop.agent_registry.selected_name()
+        invalidate = getattr(adapter, "invalidate_capabilities_cache", None)
+        if callable(invalidate):
+            invalidate()
         snapshot = adapter.fetch_capabilities()
         snapshot.update(
             {
@@ -114,12 +117,16 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
         if "max_tokens" in patch and not 128 <= int(patch["max_tokens"]) <= 2000:
             raise HTTPException(status_code=422, detail="max_tokens must be between 128 and 2000")
         state_store = deps["state_store"]
-        config = state_store.read_json("agent_config.json")
-        core_model = config.setdefault("core_model", {})
-        if clear_direct_api_key:
-            core_model.pop("api_key", None)
-        core_model.update(patch)
-        state_store.write_json("agent_config.json", config)
+
+        def update_core_model(config: dict[str, Any]) -> None:
+            core_model = config.setdefault("core_model", {})
+            if not isinstance(core_model, dict):
+                config["core_model"] = core_model = {}
+            if clear_direct_api_key:
+                core_model.pop("api_key", None)
+            core_model.update(patch)
+
+        state_store.mutate_json("agent_config.json", update_core_model)
         return deps["awareness_loop"].core_reasoning.status()
 
     @router.get("/architecture")
@@ -299,19 +306,23 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     @router.post("/external/watchlist")
     async def add_external_watch(request: ExternalWatchRequest) -> dict[str, Any]:
         state_store = deps["state_store"]
-        external = state_store.read_json("external_world.json")
-        watchlist = external.setdefault("watchlist", [])
-        if not isinstance(watchlist, list):
-            watchlist = []
-            external["watchlist"] = watchlist
         item = request.model_dump()
-        existing = [entry for entry in watchlist if isinstance(entry, dict) and entry.get("target") == request.target]
-        if existing:
-            existing[0].update(item)
-        else:
-            watchlist.append(item)
-        state_store.write_json("external_world.json", external)
-        return external
+
+        def update_watchlist(external: dict[str, Any]) -> None:
+            watchlist = external.setdefault("watchlist", [])
+            if not isinstance(watchlist, list):
+                external["watchlist"] = watchlist = []
+            existing = [
+                entry
+                for entry in watchlist
+                if isinstance(entry, dict) and entry.get("target") == request.target
+            ]
+            if existing:
+                existing[0].update(item)
+            else:
+                watchlist.append(item)
+
+        return state_store.mutate_json("external_world.json", update_watchlist)
 
     @router.get("/agency/intentions")
     async def agency_intentions() -> dict[str, Any]:

@@ -64,7 +64,11 @@ def main() -> int:
             expect(target.get("source") == "session_id", "Feishu target source is explicit", target)
 
             def fake_openclaw_search(command: list[str], timeout: float) -> str:
-                expect(command[:4] == ["openclaw", "infer", "web", "search"], "OpenClaw search command is used", command)
+                expect(
+                    Path(command[0]).name == "openclaw" and command[1:4] == ["infer", "web", "search"],
+                    "OpenClaw search command is used",
+                    command,
+                )
                 expect(timeout > 0, "OpenClaw search timeout is positive", timeout)
                 return (
                     '{"results":[{"title":"PyTorch release notes",'

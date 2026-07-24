@@ -70,6 +70,7 @@ STATE_FILE_LAYOUT: dict[str, str] = {
     "risk_state.json": f"{STATE_RUNTIME}/risk_state.json",
     "risk_policy.json": f"{STATE_CONFIG}/risk_policy.json",
     "active_loop_state.json": f"{STATE_RUNTIME}/active_loop_state.json",
+    "state_refresh_state.json": f"{STATE_RUNTIME}/state_refresh_state.json",
     "runtime_cron_state.json": f"{STATE_RUNTIME}/runtime_cron_state.json",
     "self_improvement_proposals.json": f"{STATE_RUNTIME}/self_improvement_proposals.json",
     "rollback_state.json": f"{STATE_RUNTIME}/rollback_state.json",
@@ -77,6 +78,7 @@ STATE_FILE_LAYOUT: dict[str, str] = {
     "ops_soak_state.json": f"{STATE_RUNTIME}/ops_soak_state.json",
     "agent_config.json": f"{STATE_CONFIG}/agent_config.json",
     "ops_config.json": f"{STATE_CONFIG}/ops_config.json",
+    "setup_wizard.json": f"{STATE_CONFIG}/setup_wizard.json",
     "state_schema.json": f"{STATE_CONFIG}/state_schema.json",
     **{name: f"{STATE_LOGS}/{name}" for name in JSONL_FILES},
     "heartbeat.md": "heartbeat.md",
@@ -105,15 +107,17 @@ STATE_METADATA: dict[str, dict[str, Any]] = {
     "replay_runtime_state.json": {"source": "replay_runtime", "ttl_seconds": 3600, "confidence": 0.72},
     "ops_soak_state.json": {"source": "ops_soak_runner", "ttl_seconds": 3600, "confidence": 0.7},
     "active_loop_state.json": {"source": "active_runtime_loop", "ttl_seconds": 600, "confidence": 0.78},
+    "state_refresh_state.json": {"source": "state_refresh", "ttl_seconds": 0, "confidence": 0.9},
     "runtime_cron_state.json": {"source": "runtime_cron", "ttl_seconds": 3600, "confidence": 0.78},
     "self_improvement_proposals.json": {"source": "self_improvement_registry", "ttl_seconds": 86400, "confidence": 0.72},
     "feishu_ws_state.json": {"source": "feishu_ws_runner", "ttl_seconds": 600, "confidence": 0.65},
     "ops_runtime_matrix.json": {"source": "runtime_matrix", "ttl_seconds": 1800, "confidence": 0.74},
     "ops_config.json": {"source": "ops_config", "ttl_seconds": 0, "confidence": 0.8},
+    "setup_wizard.json": {"source": "local_setup", "ttl_seconds": 0, "confidence": 0.9},
     "risk_policy.json": {"source": "guardian_policy", "ttl_seconds": 0, "confidence": 0.9},
 }
 
-CONFIG_STATE_FILES = {"agent_config.json", "ops_config.json", "risk_policy.json", "state_schema.json"}
+CONFIG_STATE_FILES = {"agent_config.json", "ops_config.json", "risk_policy.json", "setup_wizard.json", "state_schema.json"}
 DURABLE_STATE_FILES = CONFIG_STATE_FILES | {"agent_memory.json"}
 
 _ROOT_LOCKS_GUARD = threading.Lock()
@@ -431,6 +435,12 @@ class WorldStateStore:
                 "interval_seconds": 300,
                 "ticks": [],
             },
+            "state_refresh_state.json": {
+                "cursor": 0,
+                "supported_count": 0,
+                "unsupported_count": 0,
+                "last_selected": [],
+            },
             "runtime_cron_state.json": {
                 "status": "configured",
                 "jobs": {
@@ -469,6 +479,7 @@ class WorldStateStore:
                     "health_required": True,
                 },
             },
+            "setup_wizard.json": {"completed": False},
         }
         defaults = {name: self._with_state_metadata(name, payload, touch_updated_at=True) for name, payload in defaults.items()}
         for name, payload in defaults.items():
@@ -641,12 +652,22 @@ class WorldStateStore:
             payload = working if mutated is None else mutated
             if not isinstance(payload, dict):
                 raise TypeError(f"mutator for {name} must return a dict or None")
+            if self._mutation_business_payload(name, payload) == self._mutation_business_payload(name, previous):
+                return copy.deepcopy(previous)
             prepared = self._prepare_json_write(name, payload, previous, allow_stale_revision=True)
             self._write_json_atomic(self.path_for(name), prepared)
             return copy.deepcopy(prepared)
 
     def patch_json(self, name: str, patch: dict[str, Any]) -> dict[str, Any]:
         return self.mutate_json(name, lambda current: {**current, **patch})
+
+    @staticmethod
+    def _mutation_business_payload(name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Compare a mutation without store-managed revision/freshness fields."""
+        ignored = {"_state_revision", "updated_at"}
+        if name in CONFIG_STATE_FILES:
+            ignored.update({"config_revision", "loaded_at", "source_hash"})
+        return {key: value for key, value in payload.items() if key not in ignored}
 
     def _prepare_json_write(
         self,
@@ -858,6 +879,7 @@ class WorldStateStore:
             "ops_soak_state": self.read_json("ops_soak_state.json"),
             "ops_runtime_matrix": self.read_json("ops_runtime_matrix.json"),
             "active_loop_state": self.read_json("active_loop_state.json"),
+            "state_refresh_state": self.read_json("state_refresh_state.json"),
             "runtime_cron_state": self.read_json("runtime_cron_state.json"),
             "self_improvement_proposals": self.read_json("self_improvement_proposals.json"),
             "feishu_ws_state": self.read_json("feishu_ws_state.json"),

@@ -40,7 +40,24 @@ class MemoryPolicyRuntime:
             return {"status": "skipped", "policy": policy, "reason": "turn marked forget"}
         if policy == "short_term":
             return self._write_short_term(event, decision, result)
-        if result.status not in {"success", "verified_success", "partially_success"}:
+        verification = (
+            result.artifacts.get("verification")
+            if isinstance(result.artifacts.get("verification"), dict)
+            else {}
+        )
+        user_attested_preference = (
+            result.route.value == "direct_answer"
+            and result.status == "success"
+            and (decision.intent == "preference" or "memory:preference" in decision.signals)
+        )
+        if verification.get("status") != "verified_success" and not user_attested_preference:
+            return {
+                "status": "skipped",
+                "policy": policy,
+                "reason": "durable memory requires verified_success or an explicit user-attested preference",
+                "verification_status": verification.get("status") or "missing",
+            }
+        if result.status not in {"success", "verified_success"}:
             return {"status": "skipped", "policy": policy, "reason": f"result status {result.status} is not stable enough for long-term memory"}
         patch = {
             "session_id": event.source.session_id,
@@ -50,7 +67,8 @@ class MemoryPolicyRuntime:
             "risk_level": result.risk_level.value,
             "result": redact_sensitive(result.response, max_string=1200),
             "freshness": "fresh",
-            "trust": "verified",
+            "trust": "user_attested" if user_attested_preference else "verified",
+            "verification_status": verification.get("status") or "user_attested_preference",
             "memory_policy": policy,
         }
         if decision.intent == "preference" or "memory:preference" in decision.signals:
@@ -64,7 +82,99 @@ class MemoryPolicyRuntime:
                 }
             )
         written = self.long_term_writer(patch)
+        if not isinstance(written, dict):
+            written = {"status": "submitted"}
         return {"status": written.get("status", "unknown"), "policy": policy, "write": written}
+
+    def apply_agent_result(
+        self,
+        *,
+        task_context: dict[str, Any],
+        execution: Any,
+        verification: dict[str, Any],
+        context_found: bool,
+        long_term_writer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Apply the original task's memory policy to an asynchronous Agent result."""
+
+        policy = normalize_memory_policy(task_context.get("memory_policy"), default="forget")
+        task_id = str(getattr(execution, "task_id", "") or task_context.get("task_id") or "")
+        session_id = str(task_context.get("session_id") or "")
+        correlation_id = str(
+            task_context.get("correlation_id")
+            or task_context.get("event_id")
+            or task_context.get("task_packet_id")
+            or task_id
+        )
+        base = {
+            "policy": policy,
+            "task_id": task_id,
+            "session_id": session_id,
+            "correlation_id": correlation_id,
+            "context_authority": str(task_context.get("authority") or "missing"),
+            "verification_status": str(verification.get("status") or "missing"),
+        }
+        if not context_found or str(task_context.get("authority") or "") != "veyra_registered":
+            return {
+                **base,
+                "status": "skipped",
+                "reason": "authoritative original task context missing; callback payload cannot authorize memory",
+            }
+        if policy == "forget":
+            return {**base, "status": "skipped", "reason": "original task marked forget"}
+        if policy == "short_term":
+            return self._write_agent_short_term(
+                task_context=task_context,
+                execution=execution,
+                verification=verification,
+                base=base,
+            )
+        if verification.get("status") != "verified_success" or not bool(verification.get("needs_memory_patch")):
+            return {
+                **base,
+                "status": "skipped",
+                "reason": "durable Agent memory requires verifier-approved memory patch",
+            }
+        if str(getattr(execution, "status", "") or "") != "success":
+            return {
+                **base,
+                "status": "skipped",
+                "reason": "durable Agent memory requires a terminal successful execution",
+            }
+        if not session_id:
+            return {**base, "status": "skipped", "reason": "original task session is missing"}
+        task_packet = task_context.get("task_packet") if isinstance(task_context.get("task_packet"), dict) else {}
+        task = str(
+            task_context.get("user_goal")
+            or task_context.get("task")
+            or task_packet.get("user_goal")
+            or task_packet.get("user_message")
+            or task_id
+        )
+        patch = {
+            "session_id": session_id,
+            "task": task[:1200],
+            "task_id": task_id,
+            "correlation_id": correlation_id,
+            "agent_execution_session_id": str(
+                task_context.get("agent_execution_session_id")
+                or task_packet.get("agent_execution_session_id")
+                or ""
+            ),
+            "executor": str(getattr(execution, "executor", "") or task_context.get("executor") or ""),
+            "status": str(getattr(execution, "status", "") or ""),
+            "result": redact_sensitive(str(getattr(execution, "result", "") or ""), max_string=1200),
+            "freshness": "fresh",
+            "trust": "verified",
+            "verification_status": "verified_success",
+            "verification_verdict": str(verification.get("verdict") or ""),
+            "memory_policy": policy,
+        }
+        writer = long_term_writer or self.long_term_writer
+        written = writer(patch)
+        if not isinstance(written, dict):
+            written = {"status": "submitted"}
+        return {**base, "status": str(written.get("status") or "unknown"), "write": written}
 
     def _write_short_term(self, event: VeyraEvent, decision: Decision, result: LoopResult) -> dict[str, Any]:
         expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
@@ -96,8 +206,45 @@ class MemoryPolicyRuntime:
         self.state_store.mutate_json("task_state.json", update_short_term)
         return {"status": "written", "policy": "short_term", "item": item}
 
-    @staticmethod
-    def _is_expired(item: dict[str, Any], now: datetime) -> bool:
+    def _write_agent_short_term(
+        self,
+        *,
+        task_context: dict[str, Any],
+        execution: Any,
+        verification: dict[str, Any],
+        base: dict[str, Any],
+    ) -> dict[str, Any]:
+        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+        item = {
+            "event_id": str(task_context.get("event_id") or base["correlation_id"]),
+            "task_id": base["task_id"],
+            "session_id": base["session_id"],
+            "correlation_id": base["correlation_id"],
+            "route": str(task_context.get("route") or "agent"),
+            "status": str(getattr(execution, "status", "") or ""),
+            "verification_status": str(verification.get("status") or "missing"),
+            "summary": redact_sensitive(str(getattr(execution, "result", "") or ""), max_string=800),
+            "created_at": utc_now_iso(),
+            "expires_at": expires_at,
+            "memory_class": "soft",
+            "memory_namespace": "agent_callback_short_term",
+        }
+
+        def update_short_term(state: dict[str, Any]) -> dict[str, Any]:
+            short_term = state.get("short_term_memory") if isinstance(state.get("short_term_memory"), list) else []
+            now = datetime.now(timezone.utc)
+            active = [
+                candidate
+                for candidate in short_term
+                if isinstance(candidate, dict) and not self._is_expired(candidate, now)
+            ]
+            state["short_term_memory"] = (active + [item])[-50:]
+            return state
+
+        self.state_store.mutate_json("task_state.json", update_short_term)
+        return {**base, "status": "written", "item": item}
+
+    def _is_expired(self, item: dict[str, Any], now: datetime) -> bool:
         value = str(item.get("expires_at") or "")
         if not value:
             return False

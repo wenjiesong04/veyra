@@ -135,7 +135,19 @@ class ActiveRuntimeLoop:
                 break
         state = self._read_state()
         if state.get("loop_id") == loop_id and state.get("status") in {"running", "stopping"}:
-            self._write_state({**state, "status": "stopped", "enabled": False, "updated_at": utc_now_iso(), "stopped_at": utc_now_iso()})
+            def stop_matching_loop(current: dict[str, Any]) -> None:
+                if current.get("loop_id") != loop_id or current.get("status") not in {"running", "stopping"}:
+                    return
+                current.update(
+                    {
+                        "status": "stopped",
+                        "enabled": False,
+                        "updated_at": utc_now_iso(),
+                        "stopped_at": utc_now_iso(),
+                    }
+                )
+
+            self.state_store.mutate_json("active_loop_state.json", stop_matching_loop)
 
     def _step(self, name: str, call: Callable[[], Any]) -> dict[str, Any]:
         started = perf_counter()
@@ -229,10 +241,19 @@ class ActiveRuntimeLoop:
 
     def _append_tick(self, tick: dict[str, Any]) -> None:
         with self._lock:
-            state = self._read_state()
-            ticks = state.get("ticks") if isinstance(state.get("ticks"), list) else []
-            ticks.append(tick)
-            self._write_state({**state, "status": "running" if state.get("enabled") else state.get("status", "stopped"), "updated_at": utc_now_iso(), "last_tick": tick, "ticks": ticks[-100:]})
+            def append_tick(state: dict[str, Any]) -> None:
+                ticks = state.get("ticks") if isinstance(state.get("ticks"), list) else []
+                ticks.append(tick)
+                state.update(
+                    {
+                        "status": "running" if state.get("enabled") else state.get("status", "stopped"),
+                        "updated_at": utc_now_iso(),
+                        "last_tick": tick,
+                        "ticks": ticks[-100:],
+                    }
+                )
+
+            self.state_store.mutate_json("active_loop_state.json", append_tick)
 
     def _read_state(self) -> dict[str, Any]:
         return self.state_store.read_json("active_loop_state.json") or {"status": "stopped", "enabled": False, "ticks": []}
@@ -241,4 +262,7 @@ class ActiveRuntimeLoop:
         self.state_store.write_json("active_loop_state.json", payload)
 
     def _patch_state(self, patch: dict[str, Any]) -> None:
-        self._write_state({**self._read_state(), **patch, "updated_at": utc_now_iso()})
+        self.state_store.patch_json(
+            "active_loop_state.json",
+            {**patch, "updated_at": utc_now_iso()},
+        )

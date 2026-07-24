@@ -24,6 +24,7 @@ class DeploymentConfigValidator:
             *self._core_model_checks(agent_config),
             *self._alerting_checks(ops_config),
             *self._tool_proxy_checks(ops_config),
+            *self._local_api_security_checks(),
             *self._state_checks(),
         ]
         failed = [item for item in checks if item["status"] == "fail"]
@@ -152,6 +153,38 @@ class DeploymentConfigValidator:
         return [
             self._check("state_root_exists", "pass" if root.exists() else "fail", "State root exists.", {"path": str(root)}),
             self._check("state_root_writable", "pass" if writable else "fail", "State root is writable.", {"path": str(root)}),
+        ]
+
+    def _local_api_security_checks(self) -> list[dict[str, Any]]:
+        host = str(os.getenv("VEYRA_HOST", "127.0.0.1")).strip().lower()
+        exposed = host not in {"127.0.0.1", "localhost", "::1"}
+        token_configured = bool(str(os.getenv("VEYRA_LOCAL_API_TOKEN", "")).strip())
+        public_callbacks = str(os.getenv("VEYRA_ALLOW_PUBLIC_PROVIDER_CALLBACKS", "")).strip().lower() in {"1", "true", "yes", "on"}
+        feishu_verification_configured = bool(str(os.getenv("FEISHU_VERIFICATION_TOKEN", "")).strip())
+        return [
+            self._check(
+                "local_api_network_boundary",
+                "pass" if not exposed or token_configured else "fail",
+                "Network-exposed control-plane writes require VEYRA_LOCAL_API_TOKEN."
+                if exposed
+                else "Control plane is bound to a loopback address.",
+                {
+                    "bind_host": host,
+                    "network_exposed": exposed,
+                    "token_configured": token_configured,
+                },
+            ),
+            self._check(
+                "public_provider_callback_verification",
+                "pass" if not public_callbacks or feishu_verification_configured else "fail",
+                "Public provider callbacks require FEISHU_VERIFICATION_TOKEN."
+                if public_callbacks
+                else "Public provider callbacks are disabled.",
+                {
+                    "public_callbacks": public_callbacks,
+                    "feishu_verification_configured": feishu_verification_configured,
+                },
+            ),
         ]
 
     def _check(self, name: str, status: str, message: str, details: dict[str, Any]) -> dict[str, Any]:

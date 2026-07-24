@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
 from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
@@ -45,46 +46,58 @@ class Cron:
         interval_seconds: float | None = None,
         include_runtime_matrix: bool | None = None,
     ) -> dict[str, Any]:
-        state = self._read_state()
-        jobs = state.setdefault("jobs", {})
-        job = jobs.setdefault(job_id, self._default_job())
-        if enabled is not None:
-            job["enabled"] = bool(enabled)
-        if interval_seconds is not None:
-            job["interval_seconds"] = max(10.0, min(float(interval_seconds), 86400.0))
-        if include_runtime_matrix is not None:
-            job["include_runtime_matrix"] = bool(include_runtime_matrix)
-        job["updated_at"] = utc_now_iso()
-        job["next_run_at"] = job.get("next_run_at") or self._next_run_at(job)
-        state["updated_at"] = utc_now_iso()
-        self._write_state(state)
-        return {"status": "success", "job": job, "runtime": self.status()}
+        configured_job: dict[str, Any] = {}
+
+        def configure_job(state: dict[str, Any]) -> None:
+            nonlocal configured_job
+            jobs = state.setdefault("jobs", {})
+            if not isinstance(jobs, dict):
+                state["jobs"] = jobs = {}
+            job = jobs.setdefault(job_id, self._default_job_for(job_id))
+            if not isinstance(job, dict):
+                jobs[job_id] = job = self._default_job_for(job_id)
+            if enabled is not None:
+                job["enabled"] = bool(enabled)
+            if interval_seconds is not None:
+                job["interval_seconds"] = max(10.0, min(float(interval_seconds), 86400.0))
+            if include_runtime_matrix is not None:
+                job["include_runtime_matrix"] = bool(include_runtime_matrix)
+            job["updated_at"] = utc_now_iso()
+            job["next_run_at"] = job.get("next_run_at") or self._next_run_at(job)
+            state["status"] = "configured"
+            state["updated_at"] = utc_now_iso()
+            configured_job = dict(job)
+
+        self.state_store.mutate_json("runtime_cron_state.json", configure_job)
+        return {"status": "success", "job": configured_job, "runtime": self.status()}
 
     def run_once(self, *, job_id: str = DEFAULT_JOB_ID, reason: str = "cron_manual") -> dict[str, Any]:
         state = self._read_state()
         jobs = state.setdefault("jobs", {})
-        job = jobs.setdefault(job_id, self._default_job())
+        job = jobs.setdefault(job_id, self._default_job_for(job_id))
         if not job.get("enabled", True):
             return {"status": "skipped", "reason": "job disabled", "job": job}
         result = self._execute_job(job_id, job, reason=reason)
-        state["updated_at"] = utc_now_iso()
-        self._write_state(state)
+        self._record_execution(job_id, result)
         self.state_store.append_jsonl("action_record.jsonl", {"route": "runtime_cron", "status": result.get("status"), "artifacts": {"job_id": job_id, "reason": reason, "result_status": result.get("result_status")}})
         return result
 
     def run_due(self) -> dict[str, Any]:
-        state = self._read_state()
-        jobs = state.setdefault("jobs", {})
         processed: list[dict[str, Any]] = []
         now = datetime.now(timezone.utc)
-        for job_id, job in jobs.items():
-            if not isinstance(job, dict) or not job.get("enabled", True):
-                continue
-            if self._is_due(job, now):
-                processed.append(self._execute_job(job_id, job, reason="cron_due"))
-        state["last_run_due_at"] = utc_now_iso()
-        state["updated_at"] = utc_now_iso()
-        self._write_state(state)
+        claim_token = f"cron_{uuid4().hex}"
+        for job_id, job in self._claim_due_jobs(now, claim_token=claim_token):
+            result = self._execute_job(job_id, job, reason="cron_due")
+            processed.append(result)
+            self._record_execution(job_id, result, claim_token=claim_token)
+        self.state_store.patch_json(
+            "runtime_cron_state.json",
+            {
+                "status": "configured",
+                "last_run_due_at": utc_now_iso(),
+                "updated_at": utc_now_iso(),
+            },
+        )
         status = "success" if processed else "idle"
         self.state_store.append_jsonl("action_record.jsonl", {"route": "runtime_cron_due", "status": status, "artifacts": {"processed_count": len(processed)}})
         return {"status": status, "processed_count": len(processed), "processed": processed, "runtime": self.status()}
@@ -104,38 +117,97 @@ class Cron:
                 result = {"status": push.get("status"), "result_status": push.get("status"), "job_id": job_id, "push": push}
         else:
             result = {"status": "unsupported", "reason": f"Unsupported cron job: {job_id}"}
-        job["last_run_at"] = utc_now_iso()
-        job["last_result_status"] = result.get("result_status") or result.get("status")
-        job["run_count"] = int(job.get("run_count") or 0) + 1
-        job["next_run_at"] = self._next_run_at(job)
-        job["updated_at"] = utc_now_iso()
         return result
 
     def _ensure_state(self) -> None:
-        state = self.state_store.read_json("runtime_cron_state.json")
-        if not state:
-            self._write_state(
-                {
-                    "status": "configured",
-                    "jobs": {
-                        self.DEFAULT_JOB_ID: self._default_job(),
-                        self.COMMITMENT_PUSH_JOB_ID: self._default_commitment_job(),
-                    },
-                    "updated_at": utc_now_iso(),
-                }
-            )
-            return
-        jobs = state.setdefault("jobs", {})
-        changed = False
-        if self.DEFAULT_JOB_ID not in jobs:
-            jobs[self.DEFAULT_JOB_ID] = self._default_job()
-            changed = True
-        if self.COMMITMENT_PUSH_JOB_ID not in jobs:
-            jobs[self.COMMITMENT_PUSH_JOB_ID] = self._default_commitment_job()
-            changed = True
-        if changed:
+        def ensure_jobs(state: dict[str, Any]) -> None:
+            jobs = state.setdefault("jobs", {})
+            if not isinstance(jobs, dict):
+                state["jobs"] = jobs = {}
+            changed = False
+            if self.DEFAULT_JOB_ID not in jobs:
+                jobs[self.DEFAULT_JOB_ID] = self._default_job()
+                changed = True
+            if self.COMMITMENT_PUSH_JOB_ID not in jobs:
+                jobs[self.COMMITMENT_PUSH_JOB_ID] = self._default_commitment_job()
+                changed = True
+            state["status"] = "configured"
+            if changed or not state.get("updated_at"):
+                state["updated_at"] = utc_now_iso()
+
+        self.state_store.mutate_json("runtime_cron_state.json", ensure_jobs)
+
+    def _claim_due_jobs(
+        self,
+        now: datetime,
+        *,
+        claim_token: str,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        claimed: list[tuple[str, dict[str, Any]]] = []
+
+        def claim(state: dict[str, Any]) -> None:
+            jobs = state.setdefault("jobs", {})
+            if not isinstance(jobs, dict):
+                state["jobs"] = jobs = {}
+            for job_id, job in jobs.items():
+                if (
+                    not isinstance(job, dict)
+                    or not job.get("enabled", True)
+                    or not self._is_due(job, now)
+                ):
+                    continue
+                job["run_claim_token"] = claim_token
+                job["run_claimed_at"] = utc_now_iso()
+                job["next_run_at"] = self._next_run_at(job)
+                job["updated_at"] = utc_now_iso()
+                claimed.append((str(job_id), dict(job)))
+            state["status"] = "configured"
+            state["last_run_due_at"] = utc_now_iso()
             state["updated_at"] = utc_now_iso()
-            self._write_state(state)
+
+        self.state_store.mutate_json("runtime_cron_state.json", claim)
+        return claimed
+
+    def _record_execution(
+        self,
+        job_id: str,
+        result: dict[str, Any],
+        *,
+        claim_token: str | None = None,
+    ) -> dict[str, Any]:
+        recorded_job: dict[str, Any] = {}
+
+        def record(state: dict[str, Any]) -> None:
+            nonlocal recorded_job
+            jobs = state.setdefault("jobs", {})
+            if not isinstance(jobs, dict):
+                state["jobs"] = jobs = {}
+            job = jobs.setdefault(job_id, self._default_job_for(job_id))
+            if not isinstance(job, dict):
+                jobs[job_id] = job = self._default_job_for(job_id)
+            if claim_token and str(job.get("run_claim_token") or "") != claim_token:
+                recorded_job = dict(job)
+                return
+            job["last_run_at"] = utc_now_iso()
+            job["last_result_status"] = result.get("result_status") or result.get("status")
+            job["run_count"] = int(job.get("run_count") or 0) + 1
+            job["next_run_at"] = self._next_run_at(job)
+            job["updated_at"] = utc_now_iso()
+            job.pop("run_claim_token", None)
+            job.pop("run_claimed_at", None)
+            state["status"] = "configured"
+            state["updated_at"] = utc_now_iso()
+            recorded_job = dict(job)
+
+        self.state_store.mutate_json("runtime_cron_state.json", record)
+        return recorded_job
+
+    def _default_job_for(self, job_id: str) -> dict[str, Any]:
+        if job_id == self.COMMITMENT_PUSH_JOB_ID:
+            return self._default_commitment_job()
+        job = self._default_job()
+        job["job_id"] = job_id
+        return job
 
     def _default_job(self) -> dict[str, Any]:
         return {
@@ -180,7 +252,3 @@ class Cron:
 
     def _read_state(self) -> dict[str, Any]:
         return self.state_store.read_json("runtime_cron_state.json") or {"status": "configured", "jobs": {}}
-
-    def _write_state(self, state: dict[str, Any]) -> None:
-        state["status"] = "configured"
-        self.state_store.write_json("runtime_cron_state.json", state)

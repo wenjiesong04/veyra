@@ -1,24 +1,36 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from core.model_client import redact_sensitive
 from core.world_state import WorldStateStore
 from interface.agent_registry import AgentRegistry
-from interface.event_schema import utc_now_iso
 from memory_bridge.local_memory_bridge import LocalMemoryBridge
 
 
 class RuntimeMatrix:
     """Runs a read-mostly capability matrix across configured Agent runtimes."""
 
-    def __init__(self, state_store: WorldStateStore, registry: AgentRegistry, memory_bridge: LocalMemoryBridge) -> None:
+    def __init__(
+        self,
+        state_store: WorldStateStore,
+        registry: AgentRegistry,
+        memory_bridge: LocalMemoryBridge,
+        *,
+        ttl_seconds: int = 1800,
+        now_fn: Callable[[], datetime] | None = None,
+    ) -> None:
         self.state_store = state_store
         self.registry = registry
         self.memory_bridge = memory_bridge
+        self.ttl_seconds = max(1, int(ttl_seconds))
+        self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
 
     def status(self) -> dict[str, Any]:
         current = self.state_store.read_json("ops_runtime_matrix.json") or {"status": "not_run", "runtimes": []}
+        current = dict(current)
         current.setdefault(
             "validation",
             {
@@ -28,6 +40,7 @@ class RuntimeMatrix:
                 "status": "not_run",
             },
         )
+        self._apply_freshness(current)
         return current
 
     def run(self, *, write_memory_probe: bool = False) -> dict[str, Any]:
@@ -41,9 +54,17 @@ class RuntimeMatrix:
             "error": len([item for item in runtimes if item["status"] == "error"]),
         }
         status = "ready" if summary["ready"] and not (summary["degraded"] or summary["error"]) else "not_configured" if summary["not_configured"] == summary["total"] else "degraded"
+        observed = self._now()
+        observed_at = self._iso(observed)
+        ttl_seconds = self.ttl_seconds
         result = {
             "status": status,
-            "checked_at": utc_now_iso(),
+            "checked_at": observed_at,
+            "observed_at": observed_at,
+            "expires_at": self._iso(observed + timedelta(seconds=ttl_seconds)),
+            "ttl_seconds": ttl_seconds,
+            "freshness": "fresh",
+            "age_seconds": 0,
             "write_memory_probe": write_memory_probe,
             "summary": summary,
             "validation": {
@@ -57,6 +78,73 @@ class RuntimeMatrix:
         self.state_store.write_json("ops_runtime_matrix.json", result)
         self.state_store.append_jsonl("action_record.jsonl", {"route": "ops_runtime_matrix", "status": status, "artifacts": redact_sensitive(result, max_string=2200)})
         return result
+
+    def _apply_freshness(self, current: dict[str, Any]) -> None:
+        persisted_status = str(current.get("status") or "not_run")
+        if persisted_status == "not_run":
+            current.setdefault("freshness", "not_observed")
+            current.setdefault("age_seconds", None)
+            current.setdefault("observed_at", None)
+            current.setdefault("expires_at", None)
+            return
+
+        ttl_seconds = self._ttl(current.get("ttl_seconds"))
+        observed_at = str(current.get("observed_at") or current.get("checked_at") or current.get("updated_at") or "")
+        observed = self._parse_timestamp(observed_at)
+        current["ttl_seconds"] = ttl_seconds
+        current["observed_at"] = observed_at or None
+        current["expires_at"] = self._iso(observed + timedelta(seconds=ttl_seconds)) if observed else None
+
+        if observed is None:
+            current["freshness"] = "unknown"
+            current["age_seconds"] = None
+            self._mark_stale(current, persisted_status, reason="missing_or_invalid_observed_at")
+            return
+
+        age_seconds = max(0, int((self._now() - observed).total_seconds()))
+        current["age_seconds"] = age_seconds
+        if age_seconds <= ttl_seconds:
+            current["freshness"] = "fresh"
+            return
+
+        current["freshness"] = "stale"
+        self._mark_stale(current, persisted_status, reason="runtime_matrix_ttl_expired")
+
+    def _mark_stale(self, current: dict[str, Any], persisted_status: str, *, reason: str) -> None:
+        current["observed_status"] = str(current.get("observed_status") or persisted_status)
+        current["status"] = "stale"
+        validation = dict(current.get("validation") or {})
+        validation["observed_status"] = str(validation.get("observed_status") or validation.get("status") or "unknown")
+        validation["status"] = "validation_pending"
+        validation["validated"] = 0
+        validation["reason"] = reason
+        current["validation"] = validation
+
+    def _ttl(self, value: Any) -> int:
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return self.ttl_seconds
+
+    def _now(self) -> datetime:
+        value = self._now_fn()
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    def _parse_timestamp(self, value: str) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _iso(self, value: datetime) -> str:
+        return value.astimezone(timezone.utc).isoformat()
 
     def _runtime_row(self, name: str, *, write_memory_probe: bool) -> dict[str, Any]:
         adapter = self.registry.get(name)

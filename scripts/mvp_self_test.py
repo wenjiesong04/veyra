@@ -177,7 +177,13 @@ def main() -> int:
 
     verifier = Verifier()
     verified_success = verifier.verify_execution_result(
-        ExecutionResult(task_id="v_success", executor="self-test", status="success", result="done", raw={"evidence": True})
+        ExecutionResult(
+            task_id="v_success",
+            executor="self-test",
+            status="success",
+            result="done",
+            raw={"evidence": [{"source": "mvp_self_test", "observed_at": "test_runtime"}]},
+        )
     )
     expect(verified_success.get("status") == "verified_success", "verifier success evidence", verified_success)
     submitted = verifier.verify_execution_result(
@@ -212,7 +218,14 @@ def main() -> int:
 
     mvp = get_json("/mvp/status")
     loops = mvp.get("core_loops", {})
-    expect(all(loops.values()), "MVP readiness flags", loops)
+    expect(all(value is True for value in loops.values()), "MVP implementation flags", loops)
+    expect(mvp.get("implementation_status") == "implemented", "MVP implementation status", mvp)
+    capability_validation = mvp.get("capability_validation", {})
+    expect(
+        capability_validation.get("agent_tool_proxy_enforcement", {}).get("status") in {"validated", "validation_pending"},
+        "MVP separates Agent Tool Proxy enforcement validation",
+        capability_validation,
+    )
 
     print("MVP self-test passed.")
     return 0

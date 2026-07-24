@@ -21,6 +21,9 @@ os.environ["VEYRA_STATE_DIR"] = str(TEST_STATE_ROOT)
 os.environ["VEYRA_STATE_ROOT"] = str(TEST_STATE_ROOT)
 os.environ["VEYRA_AGENCY_DIR"] = str(TEST_AGENCY_ROOT)
 os.environ["VEYRA_AGENCY_ROOT"] = str(TEST_AGENCY_ROOT)
+os.environ["VEYRA_CORE_MODEL_ENABLED"] = "0"
+os.environ["VEYRA_ACTIVE_LOOP_AUTOSTART"] = "0"
+os.environ["VEYRA_FEISHU_WS_AUTOSTART"] = "0"
 TEST_AGENCY_ROOT.mkdir(parents=True, exist_ok=True)
 (TEST_AGENCY_ROOT / "goals.json").write_text("{}", encoding="utf-8")
 (TEST_AGENCY_ROOT / "intention_queue.json").write_text("[]", encoding="utf-8")
@@ -117,14 +120,21 @@ def full_text(body: dict[str, Any]) -> str:
     return "\n".join(messages(body) or [str(body.get("response") or "")])
 
 
-def post(client: TestClient, text: str, *, index: int) -> dict[str, Any]:
+def post(
+    client: TestClient,
+    text: str,
+    *,
+    index: int,
+    user_id: str = "replay-user",
+    session_id: str = "feishu-like-replay",
+) -> dict[str, Any]:
     response = client.post(
         "/events/message",
         json={
             "text": text,
             "channel": "api",
-            "user_id": "replay-user",
-            "session_id": "feishu-like-replay",
+            "user_id": user_id,
+            "session_id": session_id,
             "message_id": f"conversation-replay-{index}",
             "metadata": {
                 "feishu": {
@@ -181,6 +191,31 @@ def main() -> int:
 
     outputs.append(post(client, "标题是什么", index=4))
     expect("卢成风公开视频合集" in full_text(outputs[-1]), "title followup uses last_tool_result", full_text(outputs[-1]))
+
+    tracking = post(
+        client,
+        "帮我关注 PyTorch 新版本",
+        index=40,
+        user_id="tracking-replay-user",
+        session_id="tracking-replay-session",
+    )
+    tracking_text = full_text(tracking)
+    expect(
+        tracking.get("route") == "direct_answer"
+        and ((tracking.get("artifacts") or {}).get("commitment") or {}).get("semantic_source") == "explicit_tracking_guardrail",
+        "explicit tracking bypasses model and Agent routing",
+        tracking,
+    )
+    expect(
+        "回复" in tracking_text and "好的" in tracking_text,
+        "tracking keeps the commitment confirmation followup",
+        tracking_text,
+    )
+    expect(
+        tracking.get("followup_messages"),
+        "commitment confirmation remains a distinct followup",
+        tracking,
+    )
 
     before_weather_count = len([item for item in store.read_json("user_commitments.json").get("commitments", []) if isinstance(item, dict) and item.get("kind") == "weather_daily"])
     outputs.append(post(client, "你以后能每天发天气吗", index=5))

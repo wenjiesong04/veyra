@@ -40,10 +40,13 @@ class ReviewQueue:
                 "decision_reason": None,
             }
         )
-        state = self.state_store.read_json("review_queue.json") or {"items": []}
-        items = state.setdefault("items", [])
-        items.append(review)
-        self.state_store.write_json("review_queue.json", state)
+        def append_review(state: dict[str, Any]) -> None:
+            items = state.setdefault("items", [])
+            if not isinstance(items, list):
+                state["items"] = items = []
+            items.append(review)
+
+        self.state_store.mutate_json("review_queue.json", append_review)
         self.state_store.append_jsonl("action_record.jsonl", {"event_id": event_id, "route": "human_review", "status": "pending", "artifacts": {"review": review}})
         return review
 
@@ -81,27 +84,44 @@ class ReviewQueue:
     def decide(self, review_id: str, decision: str, reason: str = "") -> dict[str, Any]:
         if decision not in {"approved", "rejected"}:
             raise ValueError("decision must be approved or rejected")
-        state = self.state_store.read_json("review_queue.json") or {"items": []}
-        for item in state.setdefault("items", []):
-            if item.get("review_id") == review_id:
-                if item.get("status") != "pending":
-                    return item
-                item["status"] = decision
-                item["decided_at"] = utc_now_iso()
-                item["decision_reason"] = reason
-                self.state_store.write_json("review_queue.json", state)
-                self.state_store.append_jsonl(
-                    "action_record.jsonl",
-                    {
-                        "event_id": item.get("event_id"),
-                        "route": "human_review",
-                        "status": decision,
-                        "artifacts": {"review_id": review_id, "reason": reason},
-                    },
-                )
-                self.state_store.patch_json("risk_state.json", {"current_risk": item.get("risk_level", "R0") if decision == "approved" else "R0"})
-                return item
-        raise KeyError(f"Review not found: {review_id}")
+        selected: dict[str, Any] | None = None
+        changed = False
+
+        def apply_decision(state: dict[str, Any]) -> None:
+            nonlocal selected, changed
+            items = state.setdefault("items", [])
+            if not isinstance(items, list):
+                state["items"] = items = []
+            for item in items:
+                if not isinstance(item, dict) or item.get("review_id") != review_id:
+                    continue
+                if item.get("status") == "pending":
+                    item["status"] = decision
+                    item["decided_at"] = utc_now_iso()
+                    item["decision_reason"] = reason
+                    changed = True
+                selected = dict(item)
+                return
+            raise KeyError(f"Review not found: {review_id}")
+
+        self.state_store.mutate_json("review_queue.json", apply_decision)
+        if selected is None:
+            raise KeyError(f"Review not found: {review_id}")
+        if changed:
+            self.state_store.append_jsonl(
+                "action_record.jsonl",
+                {
+                    "event_id": selected.get("event_id"),
+                    "route": "human_review",
+                    "status": decision,
+                    "artifacts": {"review_id": review_id, "reason": reason},
+                },
+            )
+            self.state_store.patch_json(
+                "risk_state.json",
+                {"current_risk": selected.get("risk_level", "R0") if decision == "approved" else "R0"},
+            )
+        return selected
 
     def mark_resolved(self, review_id: str, reason: str = "") -> dict[str, Any]:
         return self._set_terminal_status(review_id, "resolved", reason or "marked resolved by runtime hygiene")
@@ -110,12 +130,18 @@ class ReviewQueue:
         review = self._set_terminal_status(review_id, "archived", reason or "archived by runtime hygiene")
         archive_path = self._archive_review(review)
         review["archive_path"] = archive_path
-        state = self.state_store.read_json("review_queue.json") or {"items": []}
-        for item in state.setdefault("items", []):
-            if isinstance(item, dict) and item.get("review_id") == review_id:
-                item["archive_path"] = archive_path
-                break
-        self.state_store.write_json("review_queue.json", state)
+
+        def attach_archive_path(state: dict[str, Any]) -> None:
+            items = state.setdefault("items", [])
+            if not isinstance(items, list):
+                state["items"] = items = []
+            for item in items:
+                if isinstance(item, dict) and item.get("review_id") == review_id:
+                    item["archive_path"] = archive_path
+                    return
+            raise KeyError(f"Review not found: {review_id}")
+
+        self.state_store.mutate_json("review_queue.json", attach_archive_path)
         self.state_store.append_jsonl(
             "action_record.jsonl",
             {
@@ -128,48 +154,73 @@ class ReviewQueue:
         return review
 
     def update_execution(self, review_id: str, execution_result: dict[str, Any]) -> dict[str, Any]:
-        state = self.state_store.read_json("review_queue.json") or {"items": []}
-        for item in state.setdefault("items", []):
-            if item.get("review_id") == review_id:
+        selected: dict[str, Any] | None = None
+
+        def apply_execution(state: dict[str, Any]) -> None:
+            nonlocal selected
+            items = state.setdefault("items", [])
+            if not isinstance(items, list):
+                state["items"] = items = []
+            for item in items:
+                if not isinstance(item, dict) or item.get("review_id") != review_id:
+                    continue
                 item["execution_result"] = execution_result
-                self.state_store.write_json("review_queue.json", state)
-                self.state_store.append_jsonl(
-                    "action_record.jsonl",
-                    {
-                        "event_id": item.get("event_id"),
-                        "route": "human_review",
-                        "status": "executed" if execution_result.get("status") in {"ok", "success"} else "execution_failed",
-                        "artifacts": {"review_id": review_id, "execution_result": execution_result},
-                    },
-                )
-                return item
-        raise KeyError(f"Review not found: {review_id}")
+                selected = dict(item)
+                return
+            raise KeyError(f"Review not found: {review_id}")
+
+        self.state_store.mutate_json("review_queue.json", apply_execution)
+        if selected is None:
+            raise KeyError(f"Review not found: {review_id}")
+        self.state_store.append_jsonl(
+            "action_record.jsonl",
+            {
+                "event_id": selected.get("event_id"),
+                "route": "human_review",
+                "status": "executed" if execution_result.get("status") in {"ok", "success"} else "execution_failed",
+                "artifacts": {"review_id": review_id, "execution_result": execution_result},
+            },
+        )
+        return selected
 
     def _set_terminal_status(self, review_id: str, status: str, reason: str) -> dict[str, Any]:
         if status not in {"resolved", "archived"}:
             raise ValueError("status must be resolved or archived")
-        state = self.state_store.read_json("review_queue.json") or {"items": []}
-        for item in state.setdefault("items", []):
-            if not isinstance(item, dict) or item.get("review_id") != review_id:
-                continue
-            if item.get("status") != "pending":
-                return item
-            item["status"] = status
-            item["decided_at"] = utc_now_iso()
-            item["decision_reason"] = reason
-            self.state_store.write_json("review_queue.json", state)
+        selected: dict[str, Any] | None = None
+        changed = False
+
+        def apply_terminal_status(state: dict[str, Any]) -> None:
+            nonlocal selected, changed
+            items = state.setdefault("items", [])
+            if not isinstance(items, list):
+                state["items"] = items = []
+            for item in items:
+                if not isinstance(item, dict) or item.get("review_id") != review_id:
+                    continue
+                if item.get("status") == "pending":
+                    item["status"] = status
+                    item["decided_at"] = utc_now_iso()
+                    item["decision_reason"] = reason
+                    changed = True
+                selected = dict(item)
+                return
+            raise KeyError(f"Review not found: {review_id}")
+
+        self.state_store.mutate_json("review_queue.json", apply_terminal_status)
+        if selected is None:
+            raise KeyError(f"Review not found: {review_id}")
+        if changed:
             self.state_store.append_jsonl(
                 "action_record.jsonl",
                 {
-                    "event_id": item.get("event_id"),
+                    "event_id": selected.get("event_id"),
                     "route": "human_review",
                     "status": status,
                     "artifacts": {"review_id": review_id, "reason": reason},
                 },
             )
             self.state_store.patch_json("risk_state.json", {"current_risk": "R0"})
-            return item
-        raise KeyError(f"Review not found: {review_id}")
+        return selected
 
     def _diagnostic_item(self, item: dict[str, Any], *, stale_after_days: int) -> dict[str, Any]:
         created_at = str(item.get("created_at") or "")

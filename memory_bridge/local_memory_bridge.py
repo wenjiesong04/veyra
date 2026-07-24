@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from core.model_client import redact_sensitive
@@ -10,6 +10,18 @@ from core.world_state import WorldStateStore
 from interface.agent_adapter import AgentAdapter
 from interface.event_schema import utc_now_iso
 from memory_bridge.memory_filter import MemoryFilter
+
+
+PROVIDER_VALIDATION_TTL_SECONDS = 900
+MEMORY_READ_OK_STATUSES = {"success", "ok", "empty", "workspace_file_fallback", "workspace_file_empty"}
+MEMORY_WRITE_OK_STATUSES = {
+    "accepted",
+    "ok",
+    "success",
+    "submitted",
+    "written",
+    "workspace_file_fallback",
+}
 
 
 class LocalMemoryBridge:
@@ -130,6 +142,7 @@ class LocalMemoryBridge:
                 "session_id": session_id,
                 "summary": {"status": "success", "items": len(items), "freshness": self._freshness(items[-20:]), "trust": "local"},
                 "write_probe": {"status": "skipped", "reason": "local provider does not need external probe"},
+                "validation": self._provider_validation("local"),
             }
             return output
         adapter = self._adapter_for(provider)
@@ -142,6 +155,13 @@ class LocalMemoryBridge:
                 "connection": {"status": "adapter_unconfigured", "connected": False},
                 "summary": {"status": "not_configured", "freshness": "stale", "trust": "untrusted"},
                 "write_probe": {"status": "skipped"},
+                "validation": {
+                    "implemented": True,
+                    "configured": False,
+                    "validated": False,
+                    "status": "not_configured",
+                    "validation_source": "none",
+                },
             }
         try:
             connection = adapter.connection_status()
@@ -149,17 +169,34 @@ class LocalMemoryBridge:
             connection = {"status": "error", "connected": False, "error": str(exc)}
         summary = self._external_summary(session_id, provider)
         probe_result = {"status": "skipped", "reason": "write_probe disabled"}
+        read_after_write = {"status": "skipped", "reason": "write_probe disabled"}
+        probe_marker = ""
         if write_probe:
+            probe_marker = self._diagnostic_probe_marker(provider, session_id)
             probe_result = self._external_write(
                 {
                     "session_id": session_id,
                     "task": "veyra_memory_provider_diagnostics",
-                    "result": "probe_write",
+                    "memory_type": "diagnostic_probe",
+                    "topic": probe_marker,
+                    "summary": f"Veyra memory roundtrip marker {probe_marker}",
+                    "result": probe_marker,
                     "freshness": "fresh",
                     "trust": "veyra_probe",
                 },
                 provider,
             )
+            read_after_write = self._external_summary(session_id, provider)
+        validation = self._diagnostic_validation(
+            adapter=adapter,
+            connection=connection,
+            summary=summary,
+            probe_result=probe_result,
+            read_after_write=read_after_write,
+            probe_marker=probe_marker,
+            write_probe=write_probe,
+        )
+        self._record_provider_validation(provider, validation)
         status = self._diagnostic_status(connection, summary, probe_result, write_probe)
         output = {
             "status": status,
@@ -169,6 +206,8 @@ class LocalMemoryBridge:
             "connection": redact_sensitive(connection, max_string=1200),
             "summary": summary,
             "write_probe": probe_result,
+            "read_after_write": read_after_write,
+            "validation": validation,
         }
         self.state_store.append_jsonl("memory_log.jsonl", {"status": status, "reason": "provider_diagnostics", "result": redact_sensitive(output, max_string=1800)})
         return output
@@ -281,7 +320,7 @@ class LocalMemoryBridge:
         except (TypeError, ValueError):
             pass
         trust = str(patch.get("trust") or "")
-        if trust in {"verified", "veyra_probe"}:
+        if trust in {"verified", "veyra_probe", "user_attested"}:
             return 0.88
         if trust in {"observed", "external"}:
             return 0.68
@@ -361,7 +400,19 @@ class LocalMemoryBridge:
 
     def _provider_validation(self, provider: str) -> dict[str, Any]:
         if provider == "local":
-            return {"implemented": True, "configured": True, "validated": True, "status": "validated"}
+            observed_at = utc_now_iso()
+            return {
+                "implemented": True,
+                "configured": True,
+                "connected": True,
+                "validated": True,
+                "status": "validated",
+                "validation_source": "explicit_local_provider",
+                "capabilities": {"memory_summary": True, "memory_patch": True},
+                "observed_at": observed_at,
+                "expires_at": None,
+                "ttl_seconds": 0,
+            }
         if provider == "all":
             return {"implemented": True, "configured": True, "validated": False, "status": "fan_out_runtime_dependent"}
         adapter = self._adapter_for(provider)
@@ -371,17 +422,227 @@ class LocalMemoryBridge:
             connection = adapter.connection_status()
         except Exception as exc:
             return {"implemented": True, "configured": True, "validated": False, "status": "validation_pending", "error": str(exc)}
-        validation = connection.get("validation") if isinstance(connection.get("validation"), dict) else {}
-        if validation:
-            return redact_sensitive(validation, max_string=600)
+        capabilities = self._memory_capability_evidence(adapter, connection)
+        cached = self._cached_provider_validation(provider)
+        summary_validated = capabilities["memory_summary"] is True or bool(
+            cached.get("read", {}).get("validated") if isinstance(cached.get("read"), dict) else False
+        )
+        patch_validated = capabilities["memory_patch"] is True or bool(
+            cached.get("write", {}).get("validated") if isinstance(cached.get("write"), dict) else False
+        )
         connected = bool(connection.get("connected"))
-        configured = str(connection.get("status")) != "adapter_unconfigured"
+        configured = str(connection.get("status")) not in {"adapter_unconfigured", "not_configured"}
+        validated = configured and summary_validated and patch_validated
+        if capabilities["memory_summary"] is True and capabilities["memory_patch"] is True:
+            validation_source = "explicit_capability"
+        elif validated and cached:
+            validation_source = str(cached.get("validation_source") or "diagnostic_roundtrip")
+        else:
+            validation_source = "none"
+        if validated:
+            status = "validated" if connected else "validated_unavailable"
+        elif capabilities["memory_summary"] is False or capabilities["memory_patch"] is False:
+            status = "capability_unavailable"
+        else:
+            status = "validation_pending" if configured else "not_configured"
+        observed_at = str(cached.get("observed_at") or utc_now_iso())
+        expires_at = str(
+            cached.get("expires_at")
+            or (datetime.now(timezone.utc) + timedelta(seconds=PROVIDER_VALIDATION_TTL_SECONDS)).isoformat()
+        )
         return {
             "implemented": True,
             "configured": configured,
-            "validated": connected,
-            "status": "validated" if connected else "validation_pending" if configured else "not_configured",
+            "connected": connected,
+            "validated": validated,
+            "status": status,
+            "validation_source": validation_source,
+            "capabilities": capabilities,
+            "read": {
+                "validated": summary_validated,
+                "source": "explicit_capability"
+                if capabilities["memory_summary"] is True
+                else str(cached.get("read", {}).get("source") or "none")
+                if isinstance(cached.get("read"), dict)
+                else "none",
+            },
+            "write": {
+                "validated": patch_validated,
+                "source": "explicit_capability"
+                if capabilities["memory_patch"] is True
+                else str(cached.get("write", {}).get("source") or "none")
+                if isinstance(cached.get("write"), dict)
+                else "none",
+            },
+            "observed_at": observed_at,
+            "expires_at": expires_at,
+            "ttl_seconds": PROVIDER_VALIDATION_TTL_SECONDS,
         }
+
+    def _memory_capability_evidence(self, adapter: AgentAdapter, connection: dict[str, Any]) -> dict[str, bool | None]:
+        candidates: list[dict[str, Any]] = []
+        if isinstance(connection.get("capabilities"), dict):
+            candidates.append(connection["capabilities"])
+        candidates.append(connection)
+        found = self._memory_capabilities_from_candidates(candidates)
+        if found["memory_summary"] is not None and found["memory_patch"] is not None:
+            return found
+        try:
+            fetched = adapter.fetch_capabilities()
+        except Exception:
+            return found
+        if isinstance(fetched, dict):
+            candidates.append(fetched)
+        return self._memory_capabilities_from_candidates(candidates)
+
+    def _memory_capabilities_from_candidates(self, candidates: list[dict[str, Any]]) -> dict[str, bool | None]:
+        result: dict[str, bool | None] = {"memory_summary": None, "memory_patch": None}
+        for candidate in candidates:
+            raw = candidate.get("raw") if isinstance(candidate.get("raw"), dict) else None
+            if raw is not None:
+                features = raw.get("features") if isinstance(raw.get("features"), dict) else {}
+            else:
+                features = candidate.get("features") if isinstance(candidate.get("features"), dict) else {}
+            compatibility = candidate.get("compatibility") if isinstance(candidate.get("compatibility"), dict) else {}
+            optional_methods = (
+                compatibility.get("optional_methods")
+                if isinstance(compatibility.get("optional_methods"), dict)
+                else {}
+            )
+            optional_features = (
+                compatibility.get("optional_features")
+                if isinstance(compatibility.get("optional_features"), dict)
+                else {}
+            )
+            for field, method in (("memory_summary", "memory.summary"), ("memory_patch", "memory.patch")):
+                if field in features:
+                    result[field] = bool(features.get(field))
+                elif method in optional_methods:
+                    result[field] = bool(optional_methods.get(method))
+                elif isinstance(optional_features.get(field), bool):
+                    result[field] = optional_features[field]
+        return result
+
+    def _diagnostic_validation(
+        self,
+        *,
+        adapter: AgentAdapter,
+        connection: dict[str, Any],
+        summary: dict[str, Any],
+        probe_result: dict[str, Any],
+        read_after_write: dict[str, Any],
+        probe_marker: str,
+        write_probe: bool,
+    ) -> dict[str, Any]:
+        capabilities = self._memory_capability_evidence(adapter, connection)
+        summary_status = str(summary.get("status") or "")
+        read_probe_succeeded = (
+            self._adapter_overrides(adapter, "fetch_memory_summary", AgentAdapter.fetch_memory_summary)
+            and summary_status in MEMORY_READ_OK_STATUSES
+        )
+        write_status = str(probe_result.get("status") or "")
+        write_accepted = (
+            write_probe
+            and self._adapter_overrides(adapter, "write_memory_patch", AgentAdapter.write_memory_patch)
+            and write_status in MEMORY_WRITE_OK_STATUSES
+        )
+        post_summary = str(read_after_write.get("summary") or "")
+        roundtrip_confirmed = bool(write_accepted and probe_marker and probe_marker in post_summary)
+        read_validated = capabilities["memory_summary"] is True or read_probe_succeeded
+        write_validated = capabilities["memory_patch"] is True or roundtrip_confirmed
+        validated = read_validated and write_validated
+        if capabilities["memory_summary"] is True and capabilities["memory_patch"] is True:
+            validation_source = "explicit_capability"
+        elif roundtrip_confirmed:
+            validation_source = "diagnostic_roundtrip"
+        elif read_probe_succeeded:
+            validation_source = "diagnostic_read_only"
+        else:
+            validation_source = "none"
+        observed_at = utc_now_iso()
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=PROVIDER_VALIDATION_TTL_SECONDS)).isoformat()
+        return {
+            "implemented": True,
+            "configured": str(connection.get("status")) not in {"adapter_unconfigured", "not_configured"},
+            "connected": bool(connection.get("connected")),
+            "validated": validated,
+            "status": "validated"
+            if validated
+            else "roundtrip_unconfirmed"
+            if write_probe and write_accepted
+            else "write_probe_required"
+            if read_validated
+            else "validation_pending",
+            "validation_source": validation_source,
+            "capabilities": capabilities,
+            "read": {
+                "validated": read_validated,
+                "source": "explicit_capability" if capabilities["memory_summary"] is True else "diagnostic_read",
+                "status": summary_status,
+            },
+            "write": {
+                "validated": write_validated,
+                "source": "explicit_capability"
+                if capabilities["memory_patch"] is True
+                else "diagnostic_roundtrip"
+                if roundtrip_confirmed
+                else "none",
+                "status": write_status,
+                "accepted": write_accepted,
+                "roundtrip_confirmed": roundtrip_confirmed,
+            },
+            "observed_at": observed_at,
+            "expires_at": expires_at,
+            "ttl_seconds": PROVIDER_VALIDATION_TTL_SECONDS,
+        }
+
+    def _record_provider_validation(self, provider: str, validation: dict[str, Any]) -> None:
+        if provider in {"local", "all"}:
+            return
+
+        def update(state: dict[str, Any]) -> dict[str, Any]:
+            validations = (
+                state.get("provider_validation")
+                if isinstance(state.get("provider_validation"), dict)
+                else {}
+            )
+            current = validations.get(provider) if isinstance(validations.get(provider), dict) else {}
+            if bool(current.get("validated")) and not bool(validation.get("validated")) and not self._validation_expired(current):
+                return state
+            validations[provider] = redact_sensitive(validation, max_string=1200)
+            state["provider_validation"] = validations
+            return state
+
+        self.state_store.mutate_json("agent_memory.json", update)
+
+    def _cached_provider_validation(self, provider: str) -> dict[str, Any]:
+        state = self.state_store.read_json("agent_memory.json")
+        validations = state.get("provider_validation") if isinstance(state.get("provider_validation"), dict) else {}
+        validation = validations.get(provider) if isinstance(validations.get(provider), dict) else {}
+        if not validation or self._validation_expired(validation):
+            return {}
+        return validation
+
+    def _validation_expired(self, validation: dict[str, Any]) -> bool:
+        expires_at = str(validation.get("expires_at") or "")
+        if not expires_at:
+            return True
+        try:
+            parsed = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed <= datetime.now(timezone.utc)
+
+    def _diagnostic_probe_marker(self, provider: str, session_id: str) -> str:
+        raw = f"{provider}|{session_id}|{utc_now_iso()}"
+        return "veyra_mem_probe_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    def _adapter_overrides(self, adapter: AgentAdapter, name: str, base_method: Any) -> bool:
+        method = getattr(adapter, name, None)
+        implementation = getattr(method, "__func__", method)
+        return callable(method) and implementation is not base_method
 
     def _normalize_external_summary(self, provider: str, response: dict[str, Any]) -> dict[str, Any]:
         summary = response.get("summary", "")
@@ -419,7 +680,7 @@ class LocalMemoryBridge:
             return "error"
         if summary.get("status") in {"not_configured", "local_memory_bridge"}:
             return "degraded"
-        if write_probe and probe_result.get("status") not in {"submitted", "local_only"}:
+        if write_probe and probe_result.get("status") not in MEMORY_WRITE_OK_STATUSES | {"local_only"}:
             return "degraded"
         return "success"
 

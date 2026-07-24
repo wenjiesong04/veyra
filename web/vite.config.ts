@@ -24,7 +24,14 @@ export default defineConfig({
       "/definitions": "http://127.0.0.1:8000",
       "/rollback": "http://127.0.0.1:8000",
       "/audit": "http://127.0.0.1:8000",
-      "/ops": "http://127.0.0.1:8000"
+      "/ops": "http://127.0.0.1:8000",
+      "/setup": "http://127.0.0.1:8000",
+      "/memory": "http://127.0.0.1:8000",
+      "/mvp": "http://127.0.0.1:8000",
+      "/proactive": "http://127.0.0.1:8000",
+      "/tool-proxy": "http://127.0.0.1:8000",
+      "/channels": "http://127.0.0.1:8000",
+      "/integrations": "http://127.0.0.1:8000"
     }
   }
 });

@@ -18,3 +18,29 @@ jobs:
         run: python3 scripts/run_smokes.py --group gate
       - name: Compile Python modules
         run: python3 -m compileall core interface runtime execution tool_proxy routers main.py scripts
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            apps/desktop/package-lock.json
+      - name: Install console dependencies
+        working-directory: web
+        run: npm ci
+      - name: Build browser console
+        working-directory: web
+        run: npm run build
+      - name: Build desktop frontend
+        working-directory: web
+        run: npm run build:desktop
+      - name: Validate Tauri config
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm run tauri -- info
