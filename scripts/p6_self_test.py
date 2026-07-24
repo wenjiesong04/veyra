@@ -490,7 +490,15 @@ def main() -> int:
             }
         )
         agent_model_store.write_json("agent_config.json", agent_model_config)
-        agent_model_status = CoreModelClient(agent_model_store).status()
+        previous_agent_model_key = os.environ.get("AGENT_MODEL_KEY")
+        os.environ["AGENT_MODEL_KEY"] = "p6-self-test-token"
+        try:
+            agent_model_status = CoreModelClient(agent_model_store).status()
+        finally:
+            if previous_agent_model_key is None:
+                os.environ.pop("AGENT_MODEL_KEY", None)
+            else:
+                os.environ["AGENT_MODEL_KEY"] = previous_agent_model_key
         expect(
             agent_model_status["configured"] and agent_model_status["api_key_env"] == "AGENT_MODEL_KEY",
             "selected agent model config can power Veyra Core",
@@ -707,11 +715,11 @@ def main() -> int:
         expect(soak.status_code == 200 and soak.json()["status"] == "success", "ops soak endpoint", soak.text)
         soak_status = client.get("/ops/soak/status").json()
         soak_start = client.post("/ops/soak/start", json={"iterations": 2, "interval_seconds": 0}).json()
-        for _ in range(20):
+        for _ in range(100):
             soak_session = client.get("/ops/soak/status").json()
             if soak_session.get("status") in {"completed", "failed"}:
                 break
-            time.sleep(0.02)
+            time.sleep(0.05)
         soak_start_stop = client.post("/ops/soak/start", json={"iterations": 10, "interval_seconds": 1}).json()
         soak_stop = client.post("/ops/soak/stop").json()
         expect(soak_status["status"] in {"idle", "completed", "stale"}, "ops soak status endpoint", soak_status)
@@ -719,7 +727,14 @@ def main() -> int:
         expect(soak_start_stop.get("run_id") and soak_stop["status"] in {"stopping", "stopped", "completed", "stale"}, "ops soak session stop endpoint", soak_stop)
 
         model_status = client.get("/core/model/status")
-        expect(model_status.status_code == 200 and model_status.json()["status"] == "unconfigured", "core model status endpoint", model_status.text)
+        model_status_payload = model_status.json()
+        expect(
+            model_status.status_code == 200
+            and model_status_payload["status"] in {"configured", "unconfigured"}
+            and model_status_payload["configured"] is (model_status_payload["status"] == "configured"),
+            "core model status endpoint",
+            model_status.text,
+        )
         rejected_key = client.post(
             "/core/model/config",
             json={

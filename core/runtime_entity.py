@@ -34,9 +34,10 @@ class RuntimeEntity:
 
     def set_selected_agent(self, selected_agent: str) -> None:
         self.identity.selected_agent = selected_agent
-        config = self.state_store.read_json("agent_config.json")
-        config["selected_agent"] = selected_agent
-        self.state_store.write_json("agent_config.json", config)
+        current = self.state_store.read_json("agent_config.json")
+        if str(current.get("selected_agent") or "") == selected_agent:
+            return
+        self.state_store.patch_json("agent_config.json", {"selected_agent": selected_agent})
 
     def set_status(self, status: str) -> None:
         validated = self.lifecycle_validator.validate(status)

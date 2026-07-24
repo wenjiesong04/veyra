@@ -161,7 +161,11 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     source_root = Path(args.state_root)
     selected_cases = [case for case in SMOKE_CASES if not args.case_ids or case["id"] in set(args.case_ids)]
     if args.live_state:
-        state_store = WorldStateStore(source_root)
+        state_store = WorldStateStore(
+            source_root,
+            exclusive_writer=True,
+            writer_owner="core-cognition-live-smoke",
+        )
         return _run_cases(state_store=state_store, cases=selected_cases, live_agent=args.live_agent, isolated=False)
 
     with TemporaryDirectory(prefix="veyra-core-smoke-") as raw_tmp:
@@ -171,11 +175,12 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _copy_config(source_root: Path, state_store: WorldStateStore) -> None:
-    source_store = WorldStateStore(source_root)
+    source_store = WorldStateStore(source_root, read_only=True)
     for filename in ["agent_config.json", "user_world.json"]:
         payload = source_store.read_json(filename)
         if not payload:
             continue
+        payload.pop("_state_revision", None)
         state_store.write_json(filename, payload)
 
 

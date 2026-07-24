@@ -99,7 +99,7 @@ def _env_hosts(name: str) -> list[str] | None:
 
 
 load_runtime_env()
-state_store = WorldStateStore()
+state_store = WorldStateStore(exclusive_writer=True, writer_owner="veyra-api")
 runtime_entity = RuntimeEntity(state_store=state_store)
 commitment_core = CommitmentCore(state_store)
 awareness_loop = AwarenessLoop(state_store=state_store, runtime_entity=runtime_entity, commitment_core=commitment_core)

@@ -71,21 +71,6 @@ class IntakeGateway:
             return {"status": "blocked", "reason": "channel or user is not allowed", "channel": channel_id}
         mapped_session = self.session_mapper.map(channel_id, user_id, session_id)
         dedupe_id = message_id or f"msg_{uuid4().hex[:12]}"
-        seen = state.setdefault("seen_message_ids", {})
-        if isinstance(seen, dict) and dedupe_id in seen:
-            self._record_intake_trace(
-                text=text,
-                channel=channel_id,
-                user_id=user_id,
-                session_id=mapped_session,
-                message_id=dedupe_id,
-                metadata=metadata or {},
-                started_at=started_at,
-                status="duplicate",
-                final_route="duplicate",
-                reason="duplicate message ignored",
-            )
-            return {"status": "duplicate", "message_id": dedupe_id, "channel": channel_id, "session_id": mapped_session, "previous": seen[dedupe_id]}
 
         event = self.normalizer.user_message(text=text, channel=channel_id, user_id=user_id, session_id=mapped_session, metadata=metadata or {})
         inbox_item = compact_channel_inbox_item(
@@ -100,8 +85,32 @@ class IntakeGateway:
                 "received_at": utc_now_iso(),
             }
         )
-        self._record_inbox(state, inbox_item)
-        result = self.awareness_loop.handle_event(event)
+        previous = self._reserve_inbox(dedupe_id, inbox_item, mapped_session=mapped_session)
+        if previous:
+            self._record_intake_trace(
+                text=text,
+                channel=channel_id,
+                user_id=user_id,
+                session_id=mapped_session,
+                message_id=dedupe_id,
+                metadata=metadata or {},
+                started_at=started_at,
+                status="duplicate",
+                final_route="duplicate",
+                reason="duplicate message ignored",
+            )
+            return {
+                "status": "duplicate",
+                "message_id": dedupe_id,
+                "channel": channel_id,
+                "session_id": mapped_session,
+                "previous": previous,
+            }
+        try:
+            result = self.awareness_loop.handle_event(event)
+        except Exception as exc:
+            self._release_failed_reservation(dedupe_id, error=exc)
+            raise
         adapter = ChannelAdapter(self.state_store, channel=channel_id)
         deliveries: list[dict[str, Any]] = []
         messages = result.ordered_messages()
@@ -136,15 +145,28 @@ class IntakeGateway:
                 }
             deliveries.append(delivery)
         outbox = deliveries[0] if deliveries else {}
-        state = self._channel_state()
-        seen = state.setdefault("seen_message_ids", {})
-        if isinstance(seen, dict):
-            seen[dedupe_id] = {"event_id": event.event_id, "session_id": mapped_session, "processed_at": utc_now_iso(), "status": result.status}
-            state["seen_message_ids"] = dict(list(seen.items())[-300:])
-        sessions = state.setdefault("sessions", {})
-        if isinstance(sessions, dict):
-            sessions[mapped_session] = {"channel": channel_id, "user_id": user_id, "last_event_id": event.event_id, "updated_at": utc_now_iso()}
-        self._write_channel_state(state)
+        def finalize_channel_state(state: dict[str, Any]) -> dict[str, Any]:
+            seen = state.setdefault("seen_message_ids", {})
+            if isinstance(seen, dict):
+                seen[dedupe_id] = {
+                    "event_id": event.event_id,
+                    "session_id": mapped_session,
+                    "processed_at": utc_now_iso(),
+                    "status": result.status,
+                }
+                state["seen_message_ids"] = dict(list(seen.items())[-300:])
+            sessions = state.setdefault("sessions", {})
+            if isinstance(sessions, dict):
+                sessions[mapped_session] = {
+                    "channel": channel_id,
+                    "user_id": user_id,
+                    "last_event_id": event.event_id,
+                    "updated_at": utc_now_iso(),
+                }
+            return state
+
+        if self.state_store:
+            self.state_store.mutate_json("channel_state.json", finalize_channel_state)
         return {
             "status": "delivered",
             "message_id": dedupe_id,
@@ -175,13 +197,19 @@ class IntakeGateway:
 
     def configure_channel(self, channel: str, patch: dict[str, Any]) -> dict[str, Any]:
         channel_id = self.router.resolve(channel)
-        state = self._channel_state()
-        config = self._channel_config(state, channel_id)
-        config.update({key: value for key, value in patch.items() if value is not None})
-        channels = state.setdefault("channels", {})
-        if isinstance(channels, dict):
-            channels[channel_id] = config
-        self._write_channel_state(state)
+        config: dict[str, Any] = {}
+
+        def update_channel(state: dict[str, Any]) -> dict[str, Any]:
+            nonlocal config
+            config = self._channel_config(state, channel_id)
+            config.update({key: value for key, value in patch.items() if value is not None})
+            channels = state.setdefault("channels", {})
+            if isinstance(channels, dict):
+                channels[channel_id] = config
+            return state
+
+        if self.state_store:
+            self.state_store.mutate_json("channel_state.json", update_channel)
         return {"status": "success", "channel": channel_id, "config": redact_sensitive(config)}
 
     def send_channel_message(self, *, channel: str, session_id: str, message: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -223,6 +251,64 @@ class IntakeGateway:
         inbox.append(item)
         state["inbox"] = [compact_channel_inbox_item(entry) for entry in inbox[-200:]]
         self._write_channel_state(state)
+
+    def _reserve_inbox(self, dedupe_id: str, item: dict[str, Any], *, mapped_session: str) -> dict[str, Any]:
+        if not self.state_store:
+            return {}
+        previous: dict[str, Any] = {}
+
+        def reserve(state: dict[str, Any]) -> dict[str, Any]:
+            nonlocal previous
+            seen = state.setdefault("seen_message_ids", {})
+            if not isinstance(seen, dict):
+                seen = {}
+                state["seen_message_ids"] = seen
+            existing = seen.get(dedupe_id)
+            if isinstance(existing, dict):
+                previous = dict(existing)
+                return state
+            seen[dedupe_id] = {
+                "event_id": item.get("event_id"),
+                "session_id": mapped_session,
+                "reserved_at": utc_now_iso(),
+                "status": "processing",
+            }
+            state["seen_message_ids"] = dict(list(seen.items())[-300:])
+            inbox = state.setdefault("inbox", [])
+            if not isinstance(inbox, list):
+                inbox = []
+            inbox.append(item)
+            state["inbox"] = [compact_channel_inbox_item(entry) for entry in inbox[-200:]]
+            return state
+
+        self.state_store.mutate_json("channel_state.json", reserve)
+        return previous
+
+    def _release_failed_reservation(self, dedupe_id: str, *, error: Exception) -> None:
+        if not self.state_store:
+            return
+
+        def release(state: dict[str, Any]) -> dict[str, Any]:
+            seen = state.get("seen_message_ids")
+            if isinstance(seen, dict):
+                reservation = seen.get(dedupe_id)
+                if isinstance(reservation, dict) and reservation.get("status") == "processing":
+                    seen.pop(dedupe_id, None)
+            failures = state.setdefault("intake_failures", [])
+            if not isinstance(failures, list):
+                failures = []
+            failures.append(
+                {
+                    "message_id": dedupe_id,
+                    "failed_at": utc_now_iso(),
+                    "error_type": type(error).__name__,
+                    "reason": redact_sensitive(str(error))[:300],
+                }
+            )
+            state["intake_failures"] = failures[-100:]
+            return state
+
+        self.state_store.mutate_json("channel_state.json", release)
 
     def _record_intake_trace(
         self,

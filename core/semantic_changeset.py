@@ -84,6 +84,8 @@ def build_semantic_change_set(
         return None
     if _looks_like_direct_single_action(compact, lowered):
         return None
+    if _looks_like_implementation_action(raw, compact, lowered):
+        return None
 
     commitments = list(active_commitments or [])
     changes: list[StateChange] = []
@@ -368,6 +370,32 @@ def _looks_like_direct_single_action(compact: str, lowered: str) -> bool:
     )
     shift = any(token in compact for token in ("换成", "改成", "转向", "不如", "没那么重要", "值得关注", "可能", "或许", "考虑"))
     return bool(direct and not shift)
+
+
+def _looks_like_implementation_action(raw: str, compact: str, lowered: str) -> bool:
+    """Keep code/product changes out of the long-term tracking compiler."""
+    if any(token in compact for token in ("追踪", "跟踪", "关注", "订阅", "学习")):
+        return False
+    action = any(token in compact for token in ("实现", "开发", "修复", "添加", "增加", "新增", "加一个", "写一个", "创建"))
+    action = action or any(token in lowered for token in ("implement", "build ", "fix ", "add ", "create "))
+    artifact = any(
+        token in lowered
+        for token in (
+            "router",
+            "api",
+            "endpoint",
+            "module",
+            "class",
+            "function",
+            "component",
+            "service",
+            "test",
+            "veyra",
+            "openclaw",
+        )
+    )
+    artifact = artifact or any(token in raw for token in ("代码", "功能", "接口", "路由", "模块", "组件", "服务", "测试", "文件"))
+    return bool(action and artifact)
 
 
 def _has_negated_action(compact: str) -> bool:

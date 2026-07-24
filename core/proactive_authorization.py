@@ -50,26 +50,30 @@ class AuthorizationPolicy:
         return False, status or "not_authorized"
 
     def _upsert(self, record: dict[str, Any]) -> dict[str, Any]:
-        state = self.state_store.read_json(self.STATE_FILE)
-        records = state.setdefault("authorizations", [])
-        if not isinstance(records, list):
-            records = []
-        replaced = False
-        for index, existing in enumerate(records):
-            if not isinstance(existing, dict):
-                continue
-            if existing.get("subject_type") == record.get("subject_type") and existing.get("subject_id") == record.get("subject_id"):
-                records[index] = {**existing, **record}
-                record = records[index]
-                replaced = True
-                break
-        if not replaced:
-            record["created_at"] = utc_now_iso()
-            records.append(record)
-        state["authorizations"] = records[-300:]
-        state["updated_at"] = utc_now_iso()
-        self.state_store.write_json(self.STATE_FILE, state)
-        return record
+        updated_record = dict(record)
+
+        def upsert(state: dict[str, Any]) -> dict[str, Any]:
+            nonlocal updated_record
+            records = state.get("authorizations") if isinstance(state.get("authorizations"), list) else []
+            records = list(records)
+            replaced = False
+            for index, existing in enumerate(records):
+                if not isinstance(existing, dict):
+                    continue
+                if existing.get("subject_type") == record.get("subject_type") and existing.get("subject_id") == record.get("subject_id"):
+                    updated_record = {**existing, **record}
+                    records[index] = updated_record
+                    replaced = True
+                    break
+            if not replaced:
+                updated_record["created_at"] = utc_now_iso()
+                records.append(updated_record)
+            state["authorizations"] = records[-300:]
+            state["updated_at"] = utc_now_iso()
+            return state
+
+        self.state_store.mutate_json(self.STATE_FILE, upsert)
+        return updated_record
 
     def _records(self) -> list[Any]:
         state = self.state_store.read_json(self.STATE_FILE)

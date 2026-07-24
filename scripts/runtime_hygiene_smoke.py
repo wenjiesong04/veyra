@@ -36,10 +36,11 @@ def test_action_record_auto_retention() -> None:
                 store.append_jsonl("action_record.jsonl", {"route": "hygiene_auto_retention_seed", "status": "success", "artifacts": {"index": index}})
             action_path = store.path_for("action_record.jsonl")
             action_text = action_path.read_text(encoding="utf-8")
-            archives = list((store.root / "archive" / "retention").glob("action_record-*.jsonl"))
+            archives = list((store.root / "archive" / "retention").glob("action_record-*.jsonl.gz"))
             expect(line_count(action_path) <= 5, "action_record auto-retention keeps append writes within limit", line_count(action_path))
             expect(bool(archives), "action_record auto-retention archives old rows", archives)
             expect("ops_retention_auto_enforce" in action_text, "action_record auto-retention writes audit", action_text)
+            expect(len(archives) == 1, "action_record auto-retention rotates a batch, not one file per row", archives)
     finally:
         if previous_limit is None:
             os.environ.pop("VEYRA_ACTION_RECORD_RETENTION_LIMIT", None)
@@ -76,7 +77,11 @@ def main() -> int:
         archive_rows = [item for item in retention.get("files", []) if item.get("file") == "action_record.jsonl" and item.get("archive_path")]
         expect(bool(archive_rows), "retention archive path recorded", retention)
         expect((store.root / archive_rows[0]["archive_path"]).exists(), "retention archive file exists", archive_rows[0])
-        expect("ops_retention_enforce" in action_path.read_text(encoding="utf-8"), "retention audit is retained", action_path.read_text(encoding="utf-8"))
+        expect(
+            any(item.get("route") == "ops_retention_enforce" for item in store.read_jsonl("policy_trace.jsonl", limit=20)),
+            "retention audit is written to policy trace",
+            store.read_jsonl("policy_trace.jsonl", limit=20),
+        )
 
         first = app_module.review_queue.create("evt_hygiene_1", "帮我重启 OpenClaw 服务", "R4", {"risk_level": "R4"}, {"decision": "ask_user", "risk_level": "R4"})
         second = app_module.review_queue.create("evt_hygiene_2", "历史测试 review", "R1", {"risk_level": "R1"}, {"decision": "ask_user", "risk_level": "R1"})

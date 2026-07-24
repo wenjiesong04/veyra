@@ -107,19 +107,23 @@ class AgentSessionRouter:
     ) -> None:
         if not dialogue_session_id or not agent_execution_session_id:
             return
-        index = self._read_index()
-        sessions = index.get("sessions") if isinstance(index.get("sessions"), dict) else {}
-        sessions[dialogue_session_id] = {
-            "agent_execution_session_id": agent_execution_session_id,
-            "task_id": task_id,
-            "user_goal": (user_goal or "")[:200],
-            "recorded_at": time.time(),
-        }
-        # Bound growth: keep the 200 most recently touched dialogue sessions.
-        if len(sessions) > 200:
-            ordered = sorted(sessions.items(), key=lambda kv: kv[1].get("recorded_at", 0.0), reverse=True)
-            sessions = dict(ordered[:200])
-        self.state_store.write_json(STATE_FILE, {"sessions": sessions})
+
+        def update(index: dict[str, Any]) -> dict[str, Any]:
+            sessions = index.get("sessions") if isinstance(index.get("sessions"), dict) else {}
+            sessions = dict(sessions)
+            sessions[dialogue_session_id] = {
+                "agent_execution_session_id": agent_execution_session_id,
+                "task_id": task_id,
+                "user_goal": (user_goal or "")[:200],
+                "recorded_at": time.time(),
+            }
+            if len(sessions) > 200:
+                ordered = sorted(sessions.items(), key=lambda kv: kv[1].get("recorded_at", 0.0), reverse=True)
+                sessions = dict(ordered[:200])
+            index["sessions"] = sessions
+            return index
+
+        self.state_store.mutate_json(STATE_FILE, update)
 
     def _wants_continue(self, text: str) -> bool:
         raw = str(text or "")

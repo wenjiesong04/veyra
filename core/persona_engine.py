@@ -96,7 +96,6 @@ class PersonaEngine:
     def record_binding(self, event: VeyraEvent, persona_patch: dict[str, Any]) -> dict[str, Any]:
         if not self.state_store:
             return {"status": "skipped", "reason": "no state_store"}
-        state = self.state_store.read_json("persona_state.json") or {"active_modes": [], "history": []}
         binding = compact_persona_binding(
             {
                 "event_id": event.event_id,
@@ -112,16 +111,17 @@ class PersonaEngine:
                 "updated_at": utc_now_iso(),
             }
         )
-        history = state.setdefault("history", [])
-        if not isinstance(history, list):
-            history = []
-            state["history"] = history
-        history.append(binding)
-        state["history"] = history[-50:]
-        state["active_modes"] = persona_patch.get("mode", [])
-        state["last_binding"] = binding
-        state["updated_at"] = utc_now_iso()
-        self.state_store.write_json("persona_state.json", state)
+
+        def update_persona(state: dict[str, Any]) -> dict[str, Any]:
+            history = state.get("history") if isinstance(state.get("history"), list) else []
+            history.append(binding)
+            state["history"] = history[-50:]
+            state["active_modes"] = persona_patch.get("mode", [])
+            state["last_binding"] = binding
+            state["updated_at"] = utc_now_iso()
+            return state
+
+        self.state_store.mutate_json("persona_state.json", update_persona)
         return {"status": "success", "binding": binding}
 
     def _response_style(self, channel: str, loaded: list[dict[str, Any]]) -> str:

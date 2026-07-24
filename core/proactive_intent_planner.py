@@ -51,15 +51,15 @@ class ProactiveIntentPlanner:
         return fallback
 
     def record_intent(self, intent: ProactiveIntent) -> dict[str, Any]:
-        state = self.state_store.read_json("proactive_intents.json")
-        intents = state.setdefault("intents", [])
-        if not isinstance(intents, list):
-            intents = []
         item = intent.to_dict()
-        intents.append(item)
-        state["intents"] = intents[-200:]
-        state["updated_at"] = utc_now_iso()
-        self.state_store.write_json("proactive_intents.json", state)
+
+        def append_intent(state: dict[str, Any]) -> dict[str, Any]:
+            intents = state.get("intents") if isinstance(state.get("intents"), list) else []
+            state["intents"] = [*intents, item][-200:]
+            state["updated_at"] = utc_now_iso()
+            return state
+
+        self.state_store.mutate_json("proactive_intents.json", append_intent)
         return item
 
     def _model_plan(self, *, user_text: str, event: VeyraEvent, memory_summary: dict[str, Any]) -> ProactiveIntent | None:

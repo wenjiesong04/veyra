@@ -79,20 +79,29 @@ class ExternalWorldRefresh:
                         "error_type": type(exc).__name__,
                     }
                 )
-        external["summaries"] = (external.get("summaries", []) if isinstance(external.get("summaries"), list) else []) + refreshed
-        external["summaries"] = external["summaries"][-100:]
-        external["knowledge_items"] = self._merge_knowledge_items(
-            external.get("knowledge_items", []) if isinstance(external.get("knowledge_items"), list) else [],
-            refreshed,
-        )
-        external["push_candidates"] = self._merge_push_candidates(
-            external.get("push_candidates", []) if isinstance(external.get("push_candidates"), list) else [],
-            refreshed,
-        )
-        external["watchlist"] = watchlist[-100:]
-        external["last_refresh_at"] = utc_now_iso()
-        self.state_store.write_json("external_world.json", external)
-        return {"status": "success", "refreshed": refreshed, "skipped": skipped, "summary_count": len(external["summaries"])}
+        summary_count = 0
+
+        def merge_refresh(current: dict[str, Any]) -> dict[str, Any]:
+            nonlocal summary_count
+            self._sync_goal_watchlist(current)
+            summaries = current.get("summaries") if isinstance(current.get("summaries"), list) else []
+            current["summaries"] = [*summaries, *refreshed][-100:]
+            current["knowledge_items"] = self._merge_knowledge_items(
+                current.get("knowledge_items", []) if isinstance(current.get("knowledge_items"), list) else [],
+                refreshed,
+            )
+            current["push_candidates"] = self._merge_push_candidates(
+                current.get("push_candidates", []) if isinstance(current.get("push_candidates"), list) else [],
+                refreshed,
+            )
+            current_watchlist = current.get("watchlist") if isinstance(current.get("watchlist"), list) else []
+            current["watchlist"] = current_watchlist[-100:]
+            current["last_refresh_at"] = utc_now_iso()
+            summary_count = len(current["summaries"])
+            return current
+
+        self.state_store.mutate_json("external_world.json", merge_refresh)
+        return {"status": "success", "refreshed": refreshed, "skipped": skipped, "summary_count": summary_count}
 
     def _sync_goal_watchlist(self, external: dict[str, Any]) -> None:
         watchlist = external.setdefault("watchlist", [])

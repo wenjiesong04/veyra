@@ -328,20 +328,20 @@ class CommitmentPushRuntime:
         candidate_id = self._candidate_id(message_context)
         if not candidate_id:
             return
-        external = self.state_store.read_json("external_world.json")
-        candidates = external.get("push_candidates") if isinstance(external.get("push_candidates"), list) else []
-        changed = False
-        for item in candidates:
-            if not isinstance(item, dict) or item.get("candidate_id") != candidate_id:
-                continue
-            item["status"] = status
-            item["updated_at"] = utc_now_iso()
-            if status == "delivered":
-                item["delivered_at"] = utc_now_iso()
-            else:
-                item["last_attempt_at"] = utc_now_iso()
-            changed = True
-            break
-        if changed:
-            external["push_candidates"] = candidates[-100:]
-            self.state_store.write_json("external_world.json", external)
+
+        def mark(external: dict[str, Any]) -> dict[str, Any]:
+            candidates = external.get("push_candidates") if isinstance(external.get("push_candidates"), list) else []
+            for item in candidates:
+                if not isinstance(item, dict) or item.get("candidate_id") != candidate_id:
+                    continue
+                item["status"] = status
+                item["updated_at"] = utc_now_iso()
+                if status == "delivered":
+                    item["delivered_at"] = utc_now_iso()
+                else:
+                    item["last_attempt_at"] = utc_now_iso()
+                external["push_candidates"] = candidates[-100:]
+                break
+            return external
+
+        self.state_store.mutate_json("external_world.json", mark)

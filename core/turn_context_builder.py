@@ -311,6 +311,7 @@ class TurnContextBuilder:
         history = value.get("history") if isinstance(value.get("history"), list) else []
         short_term = value.get("short_term_memory") if isinstance(value.get("short_term_memory"), list) else []
         pending = value.get("pending_agent_tasks") if isinstance(value.get("pending_agent_tasks"), list) else []
+        short_term = [item for item in short_term if not isinstance(item, dict) or not self._memory_expired(item)]
         if session_id:
             history = [
                 item
@@ -333,6 +334,18 @@ class TurnContextBuilder:
             "short_term_memory": [self._compact_task_item(item) for item in short_term[-3:]],
             "pending_agent_tasks": [self._compact_task_item(item) for item in pending[-2:]],
         }
+
+    def _memory_expired(self, item: dict[str, Any]) -> bool:
+        value = str(item.get("expires_at") or "")
+        if not value:
+            return False
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed <= datetime.now(timezone.utc)
 
     def _executor_summary(self, value: Any) -> dict[str, Any]:
         if not isinstance(value, dict):
@@ -473,7 +486,19 @@ class TurnContextBuilder:
             return value
         return {
             key: self._clip(value.get(key), 180)
-            for key in ("route", "status", "task", "message", "result", "updated_at")
+            for key in (
+                "route",
+                "status",
+                "task",
+                "message",
+                "result",
+                "summary",
+                "intent",
+                "session_id",
+                "updated_at",
+                "created_at",
+                "expires_at",
+            )
             if key in value
         }
 

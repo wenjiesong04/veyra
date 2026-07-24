@@ -64,7 +64,7 @@ def file_size(path: Path) -> int:
 
 
 def cleanup_logs(state_root: Path, *, dry_run: bool) -> dict[str, Any]:
-    store = WorldStateStore(state_root)
+    store = WorldStateStore(state_root, read_only=dry_run)
     policy = RetentionPolicy(store)
     summary_before = policy.summary()
     over_before = [item for item in summary_before.get("files", []) if item.get("status") == "over_limit"]
@@ -117,7 +117,7 @@ def cleanup_intentions(agency_root: Path, *, dry_run: bool, keep_terminal: int =
 
 
 def cleanup_review_queue(state_root: Path, *, dry_run: bool, keep_terminal: int = 40) -> dict[str, Any]:
-    store = WorldStateStore(state_root)
+    store = WorldStateStore(state_root, read_only=dry_run)
     path = store.path_for("review_queue.json")
     before = file_size(path)
     state = store.read_json("review_queue.json") or {"items": []}
@@ -160,7 +160,7 @@ def cleanup_review_queue(state_root: Path, *, dry_run: bool, keep_terminal: int 
 
 
 def cleanup_channel_state(state_root: Path, *, dry_run: bool, inbox_limit: int = 200, outbox_limit: int = 200, seen_limit: int = 300) -> dict[str, Any]:
-    store = WorldStateStore(state_root)
+    store = WorldStateStore(state_root, read_only=dry_run)
     path = store.path_for("channel_state.json")
     before = file_size(path)
     state = store.read_json("channel_state.json") or {}
@@ -210,7 +210,7 @@ def cleanup_channel_state(state_root: Path, *, dry_run: bool, inbox_limit: int =
 
 
 def cleanup_active_loop(state_root: Path, *, dry_run: bool, tick_limit: int = 12) -> dict[str, Any]:
-    store = WorldStateStore(state_root)
+    store = WorldStateStore(state_root, read_only=dry_run)
     path = store.path_for("active_loop_state.json")
     before = file_size(path)
     state = store.read_json("active_loop_state.json") or {}
@@ -234,7 +234,7 @@ def cleanup_active_loop(state_root: Path, *, dry_run: bool, tick_limit: int = 12
 
 
 def cleanup_task_state(state_root: Path, *, dry_run: bool, history_limit: int = 80) -> dict[str, Any]:
-    store = WorldStateStore(state_root)
+    store = WorldStateStore(state_root, read_only=dry_run)
     path = store.path_for("task_state.json")
     before = file_size(path)
     state = store.read_json("task_state.json") or {}
@@ -268,6 +268,12 @@ def main() -> int:
 
     state_root = Path(args.state_root)
     agency_root = Path(args.agency_root)
+    if not args.dry_run:
+        WorldStateStore(
+            state_root,
+            exclusive_writer=True,
+            writer_owner="state-storage-cleanup",
+        )
     report = {
         "schema": "veyra.state_storage_cleanup.v1",
         "dry_run": args.dry_run,

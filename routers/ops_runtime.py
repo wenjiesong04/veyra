@@ -50,6 +50,12 @@ class RetentionEnforceRequest(BaseModel):
     limit_overrides: dict[str, int] | None = None
 
 
+class RetentionCompactRequest(BaseModel):
+    dry_run: bool = False
+    min_files_per_group: int = 10
+    max_groups: int | None = None
+
+
 class ReviewQueueActionRequest(BaseModel):
     reason: str = "runtime hygiene"
 
@@ -69,6 +75,15 @@ def build_ops_runtime_router(deps: dict[str, Any]) -> APIRouter:
     async def ops_retention_enforce(request: RetentionEnforceRequest | None = None) -> dict[str, Any]:
         payload = request or RetentionEnforceRequest()
         return deps["retention_policy"].enforce(dry_run=payload.dry_run, limits=payload.limit_overrides)
+
+    @router.post("/ops/retention/compact")
+    async def ops_retention_compact(request: RetentionCompactRequest | None = None) -> dict[str, Any]:
+        payload = request or RetentionCompactRequest()
+        return deps["retention_policy"].compact_archives(
+            dry_run=payload.dry_run,
+            min_files_per_group=max(2, payload.min_files_per_group),
+            max_groups=payload.max_groups,
+        )
 
     @router.get("/ops/reviews/diagnostic")
     async def ops_reviews_diagnostic(stale_after_days: int = 7) -> dict[str, Any]:

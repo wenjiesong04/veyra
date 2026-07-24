@@ -67,10 +67,6 @@ class MemoryPolicyRuntime:
         return {"status": written.get("status", "unknown"), "policy": policy, "write": written}
 
     def _write_short_term(self, event: VeyraEvent, decision: Decision, result: LoopResult) -> dict[str, Any]:
-        state = self.state_store.read_json("task_state.json")
-        short_term = state.setdefault("short_term_memory", [])
-        if not isinstance(short_term, list):
-            short_term = []
         expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
         item = {
             "event_id": event.event_id,
@@ -82,7 +78,33 @@ class MemoryPolicyRuntime:
             "summary": redact_sensitive(result.response, max_string=800),
             "created_at": utc_now_iso(),
             "expires_at": expires_at,
+            "memory_class": "soft",
+            "memory_namespace": "task_short_term",
         }
-        state["short_term_memory"] = (short_term + [item])[-50:]
-        self.state_store.write_json("task_state.json", state)
+
+        def update_short_term(state: dict[str, Any]) -> dict[str, Any]:
+            short_term = state.get("short_term_memory") if isinstance(state.get("short_term_memory"), list) else []
+            now = datetime.now(timezone.utc)
+            active = [
+                candidate
+                for candidate in short_term
+                if isinstance(candidate, dict) and not self._is_expired(candidate, now)
+            ]
+            state["short_term_memory"] = (active + [item])[-50:]
+            return state
+
+        self.state_store.mutate_json("task_state.json", update_short_term)
         return {"status": "written", "policy": "short_term", "item": item}
+
+    @staticmethod
+    def _is_expired(item: dict[str, Any], now: datetime) -> bool:
+        value = str(item.get("expires_at") or "")
+        if not value:
+            return False
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed <= now

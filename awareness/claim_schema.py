@@ -18,6 +18,8 @@ def make_claim(
     status: str = "fresh",
     next_action: str | None = None,
     source_trust: float | None = None,
+    claim_kind: str = "observed",
+    derived_from: str | None = None,
 ) -> dict[str, Any]:
     timestamp = observed_at or utc_now_iso()
     payload: dict[str, Any] = {
@@ -30,9 +32,12 @@ def make_claim(
         "ttl_seconds": ttl_seconds,
         "expires_at": _expires_at(timestamp, ttl_seconds),
         "status": status,
+        "claim_kind": claim_kind if claim_kind in {"observed", "derived"} else "observed",
         "source_trust": _source_trust(source) if source_trust is None else max(0.0, min(1.0, source_trust)),
         "evidence": evidence or {},
     }
+    if derived_from:
+        payload["derived_from"] = derived_from
     if next_action:
         payload["next_action"] = next_action
     return payload

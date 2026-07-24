@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from core.capability_registry import CapabilityRegistry
@@ -11,6 +12,24 @@ from core.reasoning_core import CoreReasoning, safe_model_risk
 from core.understanding_core import TurnUnderstanding
 from core.world_state import WorldStateStore
 from interface.event_schema import Decision, Route, VeyraEvent
+
+
+IMPLEMENTATION_ANTI_MARKERS = (
+    "修复",
+    "解决",
+    "实现",
+    "新增",
+    "添加",
+    "开发",
+    "重构",
+    "改代码",
+    "修改代码",
+    "fix",
+    "repair",
+    "implement",
+    "build",
+    "refactor",
+)
 
 
 FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
@@ -53,7 +72,7 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
         "capability": "openclaw_probe",
         "markers": ("openclaw",),
         "requires_volatile_marker": True,
-        "anti_markers": ("修复", "解决", "改代码", "修改代码", "fix", "repair"),
+        "anti_markers": IMPLEMENTATION_ANTI_MARKERS,
     },
     {
         "name": "local_service_failure",
@@ -74,21 +93,7 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
             "service down",
             "service failed",
         ),
-        "anti_markers": ("修复", "解决", "改代码", "修改代码", "fix", "repair"),
-    },
-    {
-        "name": "local_system_status",
-        "probe": "system",
-        "capability": "system_probe",
-        "markers": ("系统", "环境", "runtime", "当前状态"),
-    },
-    {
-        "name": "openclaw_runtime_status",
-        "probe": "openclaw",
-        "capability": "openclaw_probe",
-        "markers": ("openclaw",),
-        "requires_volatile_marker": True,
-        "anti_markers": ("修复", "解决", "改代码", "修改代码", "fix", "repair"),
+        "anti_markers": IMPLEMENTATION_ANTI_MARKERS,
     },
     {
         "name": "hermes_runtime_status",
@@ -96,6 +101,14 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
         "capability": "hermes_probe",
         "markers": ("hermes",),
         "requires_volatile_marker": True,
+        "anti_markers": IMPLEMENTATION_ANTI_MARKERS,
+    },
+    {
+        "name": "local_system_status",
+        "probe": "system",
+        "capability": "system_probe",
+        "markers": ("系统", "环境", "runtime", "当前状态"),
+        "anti_markers": IMPLEMENTATION_ANTI_MARKERS,
     },
     {
         "name": "mcp_runtime_status",
@@ -103,6 +116,7 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
         "capability": "mcp_probe",
         "markers": ("mcp",),
         "requires_volatile_marker": True,
+        "anti_markers": IMPLEMENTATION_ANTI_MARKERS,
     },
     {
         "name": "url_status",
@@ -121,7 +135,7 @@ FRESHNESS_RULES: tuple[dict[str, Any], ...] = (
         "probe": "search_probe",
         "capability": "web_search",
         "markers": ("秋招", "春招", "校招", "招聘", "招聘信息", "网申", "内推", "求职", "岗位信息", "公司信息", "公司名单"),
-        "anti_markers": ("修复", "解决", "改代码", "修改代码", "新增", "添加", "开发", "重构", "fix", "repair", "implement"),
+        "anti_markers": IMPLEMENTATION_ANTI_MARKERS,
     },
 )
 
@@ -155,6 +169,14 @@ class DecisionCore:
         contract_base = self._rule_decide(text, attention_focus, event=event)
         contract_base = self._apply_understanding_guardrails(text, contract_base, understanding)
         if self._adapter_contract_route_is_deterministic(contract_base):
+            deterministic_signal = {
+                Route.PROBE: "policy:required_probe_preserved",
+                Route.AGENT: "policy:rule_agent_route_preserved",
+                Route.SKILL: "policy:rule_skill_route_preserved",
+                Route.ASK_USER: "policy:rule_ask_user_route_preserved",
+            }.get(contract_base.route)
+            if deterministic_signal and deterministic_signal not in contract_base.signals:
+                contract_base.signals.append(deterministic_signal)
             enriched = self.model_driven.enrich(text, self._with_turn_understanding(contract_base, understanding), event=event)
             return self._enforce_preference_lock(text, enriched)
         if self._should_trust_rule_understanding(understanding):
@@ -657,12 +679,14 @@ class DecisionCore:
     def _freshness_for_text(self, lowered: str) -> dict[str, Any]:
         for rule in FRESHNESS_RULES:
             markers = tuple(str(marker).lower() for marker in rule.get("markers", ()))
-            if not any(marker in lowered for marker in markers):
+            if not any(self._contains_freshness_marker(lowered, marker) for marker in markers):
                 continue
             anti_markers = tuple(str(marker).lower() for marker in rule.get("anti_markers", ()))
-            if any(marker in lowered for marker in anti_markers):
+            if any(self._contains_freshness_marker(lowered, marker) for marker in anti_markers):
                 continue
-            if rule.get("requires_volatile_marker") and not any(marker in lowered for marker in VOLATILE_MARKERS):
+            if rule.get("requires_volatile_marker") and not any(
+                self._contains_freshness_marker(lowered, marker) for marker in VOLATILE_MARKERS
+            ):
                 continue
             capability = str(rule.get("capability") or "")
             return {
@@ -673,6 +697,12 @@ class DecisionCore:
                 "reason": f"{rule.get('name')} requires fresh evidence via {capability}",
             }
         return {"required": False}
+
+    def _contains_freshness_marker(self, text: str, marker: str) -> bool:
+        """Match English tokens as words so `time` does not match `runtime`."""
+        if re.fullmatch(r"[a-z0-9_ ]+", marker) and re.search(r"[a-z]", marker):
+            return re.search(rf"(?<![a-z0-9_]){re.escape(marker)}(?![a-z0-9_])", text) is not None
+        return marker in text
 
     def _priority_intent_decision(self, *, lowered: str, risk: RiskLevel, complexity: str, signals: list[str]) -> Decision | None:
         if risk in {RiskLevel.R3, RiskLevel.R4, RiskLevel.R5}:

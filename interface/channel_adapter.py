@@ -39,14 +39,13 @@ class ChannelAdapter:
         elif item["delivery"] == "webhook":
             item.update(self._send_webhook(session_id=session_id, message=message, metadata=metadata, config=config))
         if self.state_store:
-            state = self.state_store.read_json("channel_state.json")
-            outbox = state.setdefault("outbox", [])
-            if not isinstance(outbox, list):
-                outbox = []
-                state["outbox"] = outbox
-            outbox.append(compact_channel_outbox_item(item))
-            state["outbox"] = outbox[-200:]
-            self.state_store.write_json("channel_state.json", state)
+            def append_outbox(state: dict[str, Any]) -> dict[str, Any]:
+                outbox = state.get("outbox") if isinstance(state.get("outbox"), list) else []
+                outbox.append(compact_channel_outbox_item(item))
+                state["outbox"] = outbox[-200:]
+                return state
+
+            self.state_store.mutate_json("channel_state.json", append_outbox)
         return item
 
     def _channel_config(self) -> dict[str, Any]:

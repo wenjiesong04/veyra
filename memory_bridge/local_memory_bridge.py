@@ -49,8 +49,6 @@ class LocalMemoryBridge:
             result = {"status": "blocked", "reason": "memory policy rejected sensitive patch"}
         else:
             filtered = self._normalize_patch(filtered)
-            state = self.state_store.read_json("agent_memory.json") or {"items": []}
-            items = self._prune_items(state.get("items", []) if isinstance(state.get("items"), list) else [])
             memory_id = self._memory_id(filtered, provider)
             now = utc_now_iso()
             item = {
@@ -68,19 +66,29 @@ class LocalMemoryBridge:
                 "created_at": now,
                 "updated_at": now,
                 "merged_count": 1,
+                "memory_class": "soft",
+                "memory_namespace": "agent_bridge",
             }
             replaced = False
-            for index, existing in enumerate(items):
-                if isinstance(existing, dict) and existing.get("memory_id") == memory_id:
-                    item["created_at"] = existing.get("created_at") or item["created_at"]
-                    item["merged_count"] = int(existing.get("merged_count") or 1) + 1
-                    items[index] = item
-                    replaced = True
-                    break
-            if not replaced:
-                items.append(item)
-            state["items"] = self._rank_items(items)[-200:]
-            self.state_store.write_json("agent_memory.json", state)
+
+            def update_memory(state: dict[str, Any]) -> dict[str, Any]:
+                nonlocal replaced
+                items = self._prune_items(state.get("items", []) if isinstance(state.get("items"), list) else [])
+                for index, existing in enumerate(items):
+                    if isinstance(existing, dict) and existing.get("memory_id") == memory_id:
+                        item["created_at"] = existing.get("created_at") or item["created_at"]
+                        item["merged_count"] = int(existing.get("merged_count") or 1) + 1
+                        items[index] = item
+                        replaced = True
+                        break
+                if not replaced:
+                    items.append(item)
+                state["items"] = self._rank_items(items)[-200:]
+                state["memory_class"] = "soft"
+                state["memory_namespace"] = "agent_bridge"
+                return state
+
+            self.state_store.mutate_json("agent_memory.json", update_memory)
             external = self._external_write(filtered, provider)
             result = {"status": "written", "deduped": replaced, "item": item, "external_write": external}
         self.state_store.append_jsonl("memory_log.jsonl", result)

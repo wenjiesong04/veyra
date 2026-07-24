@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import threading
 import time
@@ -21,6 +22,7 @@ from core.decision_core import DecisionCore
 from core.foresight_engine import ForesightEngine
 from core.guardian_controller import GuardianController
 from core.memory_policy_runtime import MemoryPolicyRuntime
+from core.model_client import redact_sensitive
 from core.perception_layer import PerceptionLayer
 from core.persona_engine import PersonaEngine
 from core.reasoning_core import CoreReasoning
@@ -141,7 +143,7 @@ class AwarenessLoop:
         context_observability: dict[str, Any] = {}
         self.runtime_entity.set_status(LifecycleStatus.THINKING.value)
         text = event.payload.get("text", "")
-        self.state_store.append_jsonl("event_log.jsonl", {"event": event.to_dict(), "phase": "sense"})
+        self.state_store.append_jsonl("event_log.jsonl", self._event_log_record(event))
 
         attention_focus = self.attention.focus_for_text(text)
         self.belief.update_from_event(event)
@@ -1370,6 +1372,12 @@ class AwarenessLoop:
                 }
         if self._is_tracking_memory_question(text):
             return {"reason": "tracking_memory_question", "response": self._tracking_memory_response()}
+        state_answer = self._state_answer_for_turn(event, text)
+        if state_answer:
+            return state_answer
+        semantic_change = self._early_semantic_change_response(event, text)
+        if semantic_change:
+            return semantic_change
         project_identity = self._project_identity_direct_response(text)
         if project_identity:
             return {"reason": "project_identity_direct", "response": project_identity}
@@ -1384,6 +1392,205 @@ class AwarenessLoop:
         if state_ack:
             return {"reason": "state_update_ack", "response": state_ack}
         return {}
+
+    def _early_semantic_change_response(self, event: VeyraEvent, text: str) -> dict[str, Any]:
+        if not self.commitment_core:
+            return {}
+        result = self.commitment_core.propose_semantic_change_for_turn(user_text=text, event=event)
+        if not result:
+            return {}
+        response = str(result.get("primary_response_override") or "").strip()
+        if not response:
+            followups = result.get("followup_messages") if isinstance(result.get("followup_messages"), list) else []
+            response = str(followups[0] if followups else "").strip()
+        if not response:
+            return {}
+        return {
+            "reason": "semantic_change_requires_confirmation",
+            "response": response,
+            "commitment_turn": result,
+        }
+
+    def _event_log_record(self, event: VeyraEvent) -> dict[str, Any]:
+        raw = event.to_dict()
+        payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else {}
+        text = str(payload.get("text") or "")
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        return {
+            "phase": "sense",
+            "event": {
+                "event_id": raw.get("event_id"),
+                "type": raw.get("type"),
+                "source": redact_sensitive(raw.get("source") or {}, max_string=160),
+                "received_at": raw.get("received_at") or raw.get("timestamp"),
+                "payload": {
+                    "text_preview": text[:160],
+                    "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest() if text else "",
+                    "text_length": len(text),
+                    "metadata": redact_sensitive(metadata, max_string=300, max_list=10),
+                    "attachment_count": len(payload.get("attachments") or [])
+                    if isinstance(payload.get("attachments"), list)
+                    else 0,
+                },
+            },
+            "privacy": {
+                "full_text_persisted": False,
+                "classification": "runtime_event_redacted",
+            },
+        }
+
+    def _state_answer_for_turn(self, event: VeyraEvent, text: str) -> dict[str, Any]:
+        if self._is_local_state_overview_question(text) or self._is_state_workload_question(text):
+            contract = self._local_state_answer_contract(text)
+            return {
+                "reason": "state_grounded_local_answer",
+                "response": contract["answer_text"],
+                "state_answer": contract,
+            }
+        if self.commitment_core and self._is_commitment_state_question(text):
+            semantic = self.commitment_core.semantic_intent_for_turn(user_text=text, event=event)
+            if semantic.get("operation") == "query_status":
+                answer = self.commitment_core.answer_commitment_status(semantic, event=event)
+                response = str(answer.get("state_answer") or "").strip()
+                if response:
+                    matches = answer.get("commitment_matches") if isinstance(answer.get("commitment_matches"), list) else []
+                    watchlists = answer.get("watchlist_matches") if isinstance(answer.get("watchlist_matches"), list) else []
+                    return {
+                        "reason": "state_grounded_commitment_answer",
+                        "response": response,
+                        "commitment_turn": answer,
+                        "state_answer": {
+                            "answer_text": response,
+                            "sources": ["user_commitments.json", "external_world.json"],
+                            "observed_at": self._latest_timestamp([*matches, *watchlists]),
+                            "freshness": "state_snapshot",
+                            "confidence": 0.9 if matches or watchlists else 0.72,
+                            "degraded_reason": None,
+                        },
+                    }
+        return {}
+
+    def _is_local_state_overview_question(self, text: str) -> bool:
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "").lower()
+        asks_state = any(marker in compact for marker in ("状态", "怎么样", "情况", "health"))
+        local_subject = any(marker in compact for marker in ("veyra本地", "本地veyra", "本地状态", "veyra状态", "localstate"))
+        current = any(marker in compact for marker in ("当前", "现在", "目前", "current", "now"))
+        return asks_state and local_subject and current
+
+    def _is_state_workload_question(self, text: str) -> bool:
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "").lower()
+        markers = ("未完成任务", "待处理任务", "关注主题", "可用执行器", "正在做什么", "还有哪些任务")
+        return any(marker in compact for marker in markers)
+
+    def _is_commitment_state_question(self, text: str) -> bool:
+        compact = re.sub(r"[\s，,。！？!?、]+", "", text or "").lower()
+        state_markers = ("还在", "状态", "运行", "取消了吗", "暂停了吗", "有没有")
+        subject_markers = ("追踪", "关注", "提醒", "推送", "订阅", "主动任务", "commitment", "tracking")
+        return any(marker in compact for marker in state_markers) and any(marker in compact for marker in subject_markers)
+
+    def _local_state_answer_contract(self, text: str) -> dict[str, Any]:
+        names = [
+            "task_state.json",
+            "attention_state.json",
+            "executor_state.json",
+            "agent_config.json",
+            "user_commitments.json",
+            "external_world.json",
+            "risk_state.json",
+            "belief_state.json",
+            "local_world.json",
+        ]
+        snapshot = self.state_store.read_snapshot(names)
+        task_state = snapshot["task_state.json"]
+        attention = snapshot["attention_state.json"]
+        executor = snapshot["executor_state.json"]
+        agent_config = snapshot["agent_config.json"]
+        commitment_state = snapshot["user_commitments.json"]
+        external = snapshot["external_world.json"]
+        risk = snapshot["risk_state.json"]
+
+        tasks: list[str] = []
+        current_task = task_state.get("current_task")
+        if isinstance(current_task, dict) and str(current_task.get("status") or "") not in {
+            "success",
+            "completed",
+            "cancelled",
+            "failed",
+        }:
+            tasks.append(str(current_task.get("title") or current_task.get("task") or current_task.get("task_id") or "当前任务"))
+        pending_tasks = task_state.get("pending_agent_tasks") if isinstance(task_state.get("pending_agent_tasks"), list) else []
+        for item in pending_tasks:
+            if not isinstance(item, dict) or str(item.get("status") or "") not in NON_TERMINAL_STATUSES:
+                continue
+            tasks.append(str(item.get("title") or item.get("task_id") or "Agent 任务"))
+
+        commitments = commitment_state.get("commitments") if isinstance(commitment_state.get("commitments"), list) else []
+        active_commitments = [
+            item
+            for item in commitments
+            if isinstance(item, dict) and str(item.get("status") or "") in {"active", "pending_confirmation"}
+        ]
+        for item in active_commitments:
+            tasks.append(str(item.get("title") or item.get("kind") or item.get("commitment_id") or "主动任务"))
+
+        topics: list[str] = []
+        focus = attention.get("focus") if isinstance(attention.get("focus"), list) else []
+        topics.extend(str(item) for item in focus if item)
+        watchlist = external.get("watchlist") if isinstance(external.get("watchlist"), list) else []
+        for item in watchlist:
+            if not isinstance(item, dict) or str(item.get("status") or "") in {"cancelled", "paused"}:
+                continue
+            topic = str(item.get("topic") or item.get("query") or "").strip()
+            if topic:
+                topics.append(topic)
+        for item in active_commitments:
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            topic = str(payload.get("topic") or payload.get("location") or "").strip()
+            if topic:
+                topics.append(topic)
+
+        selected_agent = str(executor.get("selected_agent") or agent_config.get("selected_agent") or "unknown")
+        executor_status = str(executor.get("status") or "unknown")
+        if executor.get("connected") is True:
+            executor_status = "connected"
+        unique_tasks = list(dict.fromkeys(item for item in tasks if item))[:6]
+        unique_topics = list(dict.fromkeys(item for item in topics if item))[:6]
+        health = self.state_store.state_health()
+        health_summary = health.get("summary") if isinstance(health.get("summary"), dict) else {}
+        stale_count = int(health_summary.get("stale") or 0) + int(health_summary.get("expired") or 0)
+        fresh_count = int(health_summary.get("fresh") or 0)
+        observed_at = self._latest_timestamp(list(snapshot.values()))
+        workload_only = self._is_state_workload_question(text) and not self._is_local_state_overview_question(text)
+
+        parts: list[str] = []
+        if not workload_only:
+            parts.append(f"本地状态文件：{fresh_count} 个新鲜，{stale_count} 个过期或待刷新")
+        parts.append(f"执行器：{selected_agent}（{executor_status}）")
+        parts.append("未完成事项：" + ("；".join(unique_tasks) if unique_tasks else "没有记录"))
+        parts.append("当前关注：" + ("、".join(unique_topics) if unique_topics else "没有记录"))
+        if not workload_only:
+            parts.append(f"当前风险：{risk.get('current_risk') or 'unknown'}")
+        if observed_at:
+            parts.append(f"快照时间：{observed_at}")
+        answer_text = "；".join(parts) + "。"
+        return {
+            "answer_text": answer_text,
+            "sources": names,
+            "observed_at": observed_at,
+            "freshness": "mixed" if stale_count else "fresh",
+            "confidence": 0.9 if fresh_count else 0.72,
+            "degraded_reason": None,
+        }
+
+    def _latest_timestamp(self, items: list[Any]) -> str | None:
+        values: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            value = str(item.get("updated_at") or item.get("observed_at") or item.get("created_at") or "")
+            if value:
+                values.append(value)
+        return max(values) if values else None
 
     def _is_meta_cognition_question(self, text: str) -> bool:
         lowered = (text or "").lower()
@@ -1584,6 +1791,12 @@ class AwarenessLoop:
 
     def _process_commitment_turn(self, event: VeyraEvent, result: LoopResult) -> dict[str, Any] | None:
         if self.commitment_core is None:
+            return None
+        early = result.artifacts.get("early_awareness") if isinstance(result.artifacts.get("early_awareness"), dict) else {}
+        preprocessed = early.get("commitment_turn") if isinstance(early.get("commitment_turn"), dict) else {}
+        if preprocessed:
+            return preprocessed
+        if str(early.get("reason") or "").startswith("state_grounded_"):
             return None
         if result.route == Route.AGENT:
             return None
@@ -1944,44 +2157,49 @@ class AwarenessLoop:
         return dict(slots) if isinstance(slots, dict) else {}
 
     def _persist_conversation_slots(self, event: VeyraEvent, result: LoopResult) -> None:
-        state = self.state_store.read_json("task_state.json")
-        slots_by_session = state.get("conversation_slots") if isinstance(state.get("conversation_slots"), dict) else {}
-        if not isinstance(slots_by_session, dict):
-            slots_by_session = {}
-        slots = dict(slots_by_session.get(event.source.session_id) or {})
-        text = str(event.payload.get("text") or "")
-        slots["last_intent"] = self._intent_from_result(result)
-        slots["last_topic"] = self._topic_from_turn(text, result, slots)
-        tool_result = self._structured_tool_result(result)
-        if tool_result:
-            slots["last_tool_result"] = tool_result
-            if tool_result.get("type") == "weather":
-                location = str(tool_result.get("requested_location") or tool_result.get("location") or "").strip()
-                if location:
-                    slots["last_location"] = location
-                slots["last_topic"] = "weather"
-            elif tool_result.get("type") == "search":
-                query = str(tool_result.get("query") or "").strip()
-                if query:
-                    slots["last_search_query"] = query
-                    slots["last_topic"] = query
-        elif self._looks_like_location_text(text):
-            resolved_location = self._resolve_weather_location_for_turn(text, slots)
-            if resolved_location:
-                slots["last_location"] = resolved_location
-        commitment_artifact = result.artifacts.get("commitment") if isinstance(result.artifacts.get("commitment"), dict) else {}
-        if commitment_artifact:
-            commitment_topic = self._commitment_topic_from_artifact(commitment_artifact)
-            if commitment_topic:
-                slots["last_commitment_topic"] = commitment_topic
-                slots["last_topic"] = commitment_topic
-        slots["updated_at"] = utc_now_iso()
-        slots_by_session[event.source.session_id] = slots
-        if len(slots_by_session) > 200:
-            slots_by_session = dict(list(slots_by_session.items())[-200:])
-        state["conversation_slots"] = slots_by_session
-        self.state_store.write_json("task_state.json", state)
-        result.artifacts["conversation_slots"] = self._compact_conversation_slots(slots)
+        persisted_slots: dict[str, Any] = {}
+
+        def persist(state: dict[str, Any]) -> dict[str, Any]:
+            nonlocal persisted_slots
+            slots_by_session = state.get("conversation_slots") if isinstance(state.get("conversation_slots"), dict) else {}
+            slots_by_session = dict(slots_by_session)
+            slots = dict(slots_by_session.get(event.source.session_id) or {})
+            text = str(event.payload.get("text") or "")
+            slots["last_intent"] = self._intent_from_result(result)
+            slots["last_topic"] = self._topic_from_turn(text, result, slots)
+            tool_result = self._structured_tool_result(result)
+            if tool_result:
+                slots["last_tool_result"] = tool_result
+                if tool_result.get("type") == "weather":
+                    location = str(tool_result.get("requested_location") or tool_result.get("location") or "").strip()
+                    if location:
+                        slots["last_location"] = location
+                    slots["last_topic"] = "weather"
+                elif tool_result.get("type") == "search":
+                    query = str(tool_result.get("query") or "").strip()
+                    if query:
+                        slots["last_search_query"] = query
+                        slots["last_topic"] = query
+            elif self._looks_like_location_text(text):
+                resolved_location = self._resolve_weather_location_for_turn(text, slots)
+                if resolved_location:
+                    slots["last_location"] = resolved_location
+            commitment_artifact = result.artifacts.get("commitment") if isinstance(result.artifacts.get("commitment"), dict) else {}
+            if commitment_artifact:
+                commitment_topic = self._commitment_topic_from_artifact(commitment_artifact)
+                if commitment_topic:
+                    slots["last_commitment_topic"] = commitment_topic
+                    slots["last_topic"] = commitment_topic
+            slots["updated_at"] = utc_now_iso()
+            slots_by_session[event.source.session_id] = slots
+            if len(slots_by_session) > 200:
+                slots_by_session = dict(list(slots_by_session.items())[-200:])
+            state["conversation_slots"] = slots_by_session
+            persisted_slots = slots
+            return state
+
+        self.state_store.mutate_json("task_state.json", persist)
+        result.artifacts["conversation_slots"] = self._compact_conversation_slots(persisted_slots)
 
     def _commitment_topic_from_artifact(self, artifact: dict[str, Any]) -> str:
         semantic = artifact.get("semantic_intent") if isinstance(artifact.get("semantic_intent"), dict) else {}
@@ -2308,8 +2526,19 @@ class AwarenessLoop:
         signals = self._extract_profile_signals(text)
         if not signals:
             return
-        user_world = self.state_store.read_json("user_world.json")
         user_id = str(event.source.user_id or "local-user")
+        self.state_store.mutate_json(
+            "user_world.json",
+            lambda user_world: self._apply_user_awareness_signals(user_world, user_id=user_id, signals=signals),
+        )
+
+    def _apply_user_awareness_signals(
+        self,
+        user_world: dict[str, Any],
+        *,
+        user_id: str,
+        signals: dict[str, Any],
+    ) -> dict[str, Any]:
         mirror_legacy = user_id in {"", "local-user"}
         legacy_profile = user_world.setdefault("profile", {}) if mirror_legacy else {}
         if mirror_legacy and not isinstance(legacy_profile, dict):
@@ -2368,7 +2597,7 @@ class AwarenessLoop:
         profiles_by_user[user_id] = scoped
         user_world["profiles_by_user"] = profiles_by_user
         user_world["updated_at"] = utc_now_iso()
-        self.state_store.write_json("user_world.json", user_world)
+        return user_world
 
     # --- Generic user-profile extraction (model-first reasoning still flows through
     # turn_context; persistence captures *explicit* self-statements generically so it
@@ -2479,22 +2708,24 @@ class AwarenessLoop:
         return polled
 
     def _append_task_history(self, event: VeyraEvent, result: LoopResult) -> None:
-        state = self.state_store.read_json("task_state.json")
-        history = state.setdefault("history", [])
-        history.append(
-            {
-                "event_id": event.event_id,
-                "session_id": event.source.session_id,
-                "route": result.route.value,
-                "status": result.status,
-                "risk_level": result.risk_level.value,
-                "message": str(event.payload.get("text", ""))[:280],
-                "result": str(result.response or "")[:320],
-                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            }
-        )
-        state["history"] = history[-100:]
-        self.state_store.write_json("task_state.json", state)
+        item = {
+            "event_id": event.event_id,
+            "session_id": event.source.session_id,
+            "route": result.route.value,
+            "status": result.status,
+            "risk_level": result.risk_level.value,
+            "message": str(event.payload.get("text", ""))[:280],
+            "result": str(result.response or "")[:320],
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+
+        def append_history(state: dict[str, Any]) -> dict[str, Any]:
+            history = state.get("history") if isinstance(state.get("history"), list) else []
+            history.append(item)
+            state["history"] = history[-100:]
+            return state
+
+        self.state_store.mutate_json("task_state.json", append_history)
 
     def _agent_poll_windows(self) -> tuple[float, float]:
         config = self.state_store.read_json("agent_config.json")

@@ -87,7 +87,12 @@ def build_loop(tmp: Path) -> tuple[AwarenessLoop, FakeOpenClawAdapter]:
     loop.agent_registry.selected_name = lambda: "openclaw"  # type: ignore[assignment]
 
     # Force the AGENT route so we exercise the agent path deterministically offline.
-    def forced_decide(text: str, attention_focus: list[str], event: VeyraEvent | None = None) -> Decision:
+    def forced_decide(
+        text: str,
+        attention_focus: list[str],
+        event: VeyraEvent | None = None,
+        **_kwargs: Any,
+    ) -> Decision:
         return Decision(
             route=Route.AGENT,
             risk_level=RiskLevel.R0,
@@ -125,10 +130,11 @@ def run() -> None:
         loop, fake = build_loop(tmp)
         dialogue_session = "feishu:ou_test:oc_chat"
 
-        # Use non-YouTube agent tasks here: L1 compact lookup intercepts YouTube title queries before AGENT.
+        # Use implementation/analysis tasks here so deterministic read-only probes do not
+        # intercept the requests before the forced AGENT decision used by this smoke.
         queries = [
-            "检查 veyra 仓库 git 工作区有哪些未提交变更",
-            "什么 PyTorch，我说的是检查 openclaw gateway 连接状态",
+            "重构 Veyra 仓库的状态写入模块并给出补丁",
+            "为 OpenClaw gateway 实现连接重试机制",
             "总结 awareness_loop 在本项目里的职责",
         ]
         for idx, text in enumerate(queries):
@@ -165,12 +171,8 @@ def run() -> None:
         expect(bool(scope), "context_scope report attached", scope)
         expect("agent_memory_summary" in scope.get("omitted_sections", []), "fallback omission recorded in scope", scope)
 
-        # L1 YouTube lookup must not dispatch a heavy agent packet.
-        loop.handle_event(make_event("帮我找一下王志安在 YouTube 最新一期视频标题", session_id=dialogue_session, idx=300))
-        expect(len(fake.sent) == 3, "YouTube title lookup uses L1 compact path, not agent", len(fake.sent))
-
         # Explicit continuation should reuse the previous agent session.
-        loop.handle_event(make_event("基于刚才的结果，给我视频链接", session_id=dialogue_session, idx=99))
+        loop.handle_event(make_event("基于刚才对 awareness_loop 的结果，继续给出重构建议", session_id=dialogue_session, idx=99))
         expect(len(fake.sent) == 4, "continuation dispatched a task", len(fake.sent))
         cont = fake.sent[3]
         expect(
@@ -184,8 +186,12 @@ def run() -> None:
             (cont.agent_execution_session_id, session_ids[2]),
         )
 
+        # L1 YouTube lookup must not dispatch a heavy agent packet.
+        loop.handle_event(make_event("帮我找一下王志安在 YouTube 最新一期视频标题", session_id=dialogue_session, idx=300))
+        expect(len(fake.sent) == 4, "YouTube title lookup uses L1 compact path, not agent", len(fake.sent))
+
         # A different dialogue session must not collide with this one.
-        loop.handle_event(make_event("检查 hermes runtime 在本地的连接状态", session_id="feishu:ou_other:oc_chat2", idx=200))
+        loop.handle_event(make_event("为 Hermes runtime 实现新的会话隔离模块", session_id="feishu:ou_other:oc_chat2", idx=200))
         other = fake.sent[4]
         expect(
             other.agent_execution_session_id not in session_ids,

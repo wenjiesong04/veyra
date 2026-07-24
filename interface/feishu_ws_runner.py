@@ -74,11 +74,21 @@ class FeishuWsRunner:
             "group_policy": feishu.get("groupPolicy"),
             "allow_from": feishu.get("allowFrom") if isinstance(feishu.get("allowFrom"), list) else [],
         }
-        state = self.state_store.read_json("channel_state.json")
-        channels = state.setdefault("channels", {})
-        current = channels.setdefault("feishu", {})
-        current.update({key: value for key, value in patch.items() if value is not None})
-        self.state_store.write_json("channel_state.json", state)
+        current: dict[str, Any] = {}
+
+        def update_feishu(state: dict[str, Any]) -> dict[str, Any]:
+            nonlocal current
+            channels = state.setdefault("channels", {})
+            if not isinstance(channels, dict):
+                channels = {}
+                state["channels"] = channels
+            existing = channels.setdefault("feishu", {})
+            current = existing if isinstance(existing, dict) else {}
+            current.update({key: value for key, value in patch.items() if value is not None})
+            channels["feishu"] = current
+            return state
+
+        self.state_store.mutate_json("channel_state.json", update_feishu)
         self.state_store.append_jsonl("action_record.jsonl", {"route": "feishu_import_openclaw_config", "status": "success", "artifacts": {"path": str(config_path), "connection_mode": patch["connection_mode"]}})
         return {"status": "success", "path": str(config_path), "config": redact_sensitive(current)}
 

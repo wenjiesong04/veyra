@@ -25,12 +25,16 @@ class BeliefCore:
         )
 
     def upsert_claim(self, claim: dict[str, Any]) -> dict[str, Any]:
-        belief = self.state_store.read_json("belief_state.json")
-        claims = belief.setdefault("claims", [])
         claim = refresh_claim_status(claim)
-        key = str(claim.get("key") or claim.get("claim"))
-        for index, current in enumerate(claims):
-            if str(current.get("key") or current.get("claim")) == key:
+
+        def update_belief(belief: dict[str, Any]) -> dict[str, Any]:
+            claims = belief.setdefault("claims", [])
+            if not isinstance(claims, list):
+                claims = []
+            key = str(claim.get("key") or claim.get("claim"))
+            for index, current in enumerate(claims):
+                if not isinstance(current, dict) or str(current.get("key") or current.get("claim")) != key:
+                    continue
                 history = current.get("history") if isinstance(current.get("history"), list) else []
                 history.append(
                     {
@@ -39,28 +43,43 @@ class BeliefCore:
                         "confidence": current.get("confidence"),
                     }
                 )
-                claims[index] = {**current, **claim, "history": history[-12:], "refresh_count": int(current.get("refresh_count") or 0) + 1}
+                claims[index] = {
+                    **current,
+                    **claim,
+                    "history": history[-12:],
+                    "refresh_count": int(current.get("refresh_count") or 0) + 1,
+                }
                 break
-        else:
-            claim.setdefault("refresh_count", 0)
-            claims.append(claim)
-        belief["claims"] = detect_conflicts([refresh_claim_status(item) for item in claims])[-250:]
-        belief["summary"] = self.summary_from_claims(belief["claims"])
-        self.state_store.write_json("belief_state.json", belief)
+            else:
+                claim.setdefault("refresh_count", 0)
+                claims.append(claim)
+            belief["claims"] = detect_conflicts(
+                [refresh_claim_status(item) for item in claims if isinstance(item, dict)]
+            )[-250:]
+            belief["summary"] = self.summary_from_claims(belief["claims"])
+            return belief
+
+        self.state_store.mutate_json("belief_state.json", update_belief)
         return claim
 
     def upsert_claims(self, claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [self.upsert_claim(claim) for claim in claims]
 
     def refresh(self, *, expire_after_seconds: int | None = 3600, prune_expired_after_seconds: int | None = None) -> dict[str, Any]:
-        belief = self.state_store.read_json("belief_state.json")
-        claims = [refresh_claim_status(item, expire_after_seconds=expire_after_seconds) for item in belief.get("claims", [])]
-        belief["claims"] = detect_conflicts(claims)
-        if prune_expired_after_seconds is not None:
-            belief["claims"] = self._prune_expired(belief["claims"], prune_expired_after_seconds)
-        belief["summary"] = self.summary_from_claims(belief["claims"])
-        self.state_store.write_json("belief_state.json", belief)
-        return belief
+        def refresh_belief(belief: dict[str, Any]) -> dict[str, Any]:
+            raw_claims = belief.get("claims") if isinstance(belief.get("claims"), list) else []
+            claims = [
+                refresh_claim_status(item, expire_after_seconds=expire_after_seconds)
+                for item in raw_claims
+                if isinstance(item, dict)
+            ]
+            belief["claims"] = detect_conflicts(claims)
+            if prune_expired_after_seconds is not None:
+                belief["claims"] = self._prune_expired(belief["claims"], prune_expired_after_seconds)
+            belief["summary"] = self.summary_from_claims(belief["claims"])
+            return belief
+
+        return self.state_store.mutate_json("belief_state.json", refresh_belief)
 
     def relevant_claims(self, focus: list[str], limit: int = 30, *, include_stale: bool = True) -> list[dict[str, Any]]:
         belief = self.refresh()

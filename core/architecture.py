@@ -142,8 +142,15 @@ STATE_DEFINITIONS: list[dict[str, Any]] = [
         "id": "risk_state",
         "file": "state/runtime/risk_state.json",
         "owner": "Guardian",
-        "purpose": "Current risk level, risk catalog, and active risk signals.",
+        "purpose": "Current event/task risk assessments and active risk signals.",
         "freshness": "event_scoped",
+    },
+    {
+        "id": "risk_policy",
+        "file": "state/config/risk_policy.json",
+        "owner": "Guardian.Policy",
+        "purpose": "Durable risk catalog and governance policy, versioned independently from runtime assessments.",
+        "freshness": "revision_backed",
     },
     {
         "id": "belief_state",
@@ -221,6 +228,20 @@ STATE_DEFINITIONS: list[dict[str, Any]] = [
         "owner": "VeyraCore.CoreReasoning",
         "purpose": "Redacted evidence of Core model-assisted decision, perception, and agency reasoning.",
         "freshness": "append_only_audit",
+    },
+    {
+        "id": "agent_memory",
+        "file": "state/user/agent_memory.json",
+        "owner": "MemoryBridge",
+        "purpose": "Soft user preferences and verified summaries, separate from probe/config/risk facts.",
+        "freshness": "quality_and_expiry_backed",
+    },
+    {
+        "id": "event_streams",
+        "file": "state/logs/*.jsonl",
+        "owner": "WorldState.Retention",
+        "purpose": "Append-only event/model/execution streams with bounded rotation and gzip archives.",
+        "freshness": "append_only_retained",
     },
 ]
 

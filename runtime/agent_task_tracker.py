@@ -59,42 +59,54 @@ class AgentTaskTracker:
         event_id: str | None = None,
         route: str = "agent",
     ) -> dict[str, Any]:
-        task_state = self.state_store.read_json("task_state.json")
-        pending = task_state.setdefault("pending_agent_tasks", [])
         matched = False
-        for item in pending:
-            if item.get("task_id") != execution.task_id:
-                continue
-            item.update(
-                {
-                    "status": execution.status,
-                    "verification_status": verification.get("status"),
-                    "last_polled_at": utc_now_iso(),
-                    "poll_count": int(item.get("poll_count") or 0) + 1,
-                }
-            )
-            matched = True
-        if not matched and execution.status in NON_TERMINAL_STATUSES:
-            pending.append(
-                {
-                    "task_id": execution.task_id,
-                    "event_id": event_id or f"task_{execution.task_id}",
-                    "route": route,
-                    "executor": execution.executor,
-                    "status": execution.status,
-                    "verification_status": verification.get("status"),
-                    "next_action": verification.get("next_action"),
-                    "registered_at": utc_now_iso(),
-                    "last_polled_at": utc_now_iso(),
-                    "poll_count": 1,
-                }
-            )
-        if execution.status in {"success", "failed", "error", "blocked"}:
-            pending = [item for item in pending if item.get("task_id") != execution.task_id]
-        task_state["pending_agent_tasks"] = pending[-100:]
-        task_state["current_task"] = {"task_id": execution.task_id, "route": route, "status": verification.get("status")}
-        self.state_store.write_json("task_state.json", task_state)
-        return {"pending_agent_tasks": task_state["pending_agent_tasks"], "matched": matched}
+
+        def update_task_state(task_state: dict[str, Any]) -> dict[str, Any]:
+            nonlocal matched
+            pending = task_state.get("pending_agent_tasks") if isinstance(task_state.get("pending_agent_tasks"), list) else []
+            for item in pending:
+                if not isinstance(item, dict) or item.get("task_id") != execution.task_id:
+                    continue
+                item.update(
+                    {
+                        "status": execution.status,
+                        "verification_status": verification.get("status"),
+                        "last_polled_at": utc_now_iso(),
+                        "poll_count": int(item.get("poll_count") or 0) + 1,
+                    }
+                )
+                matched = True
+            if not matched and execution.status in NON_TERMINAL_STATUSES:
+                pending.append(
+                    {
+                        "task_id": execution.task_id,
+                        "event_id": event_id or f"task_{execution.task_id}",
+                        "route": route,
+                        "executor": execution.executor,
+                        "status": execution.status,
+                        "verification_status": verification.get("status"),
+                        "next_action": verification.get("next_action"),
+                        "registered_at": utc_now_iso(),
+                        "last_polled_at": utc_now_iso(),
+                        "poll_count": 1,
+                    }
+                )
+            if execution.status in {"success", "failed", "error", "blocked"}:
+                pending = [
+                    item
+                    for item in pending
+                    if not isinstance(item, dict) or item.get("task_id") != execution.task_id
+                ]
+            task_state["pending_agent_tasks"] = pending[-100:]
+            task_state["current_task"] = {
+                "task_id": execution.task_id,
+                "route": route,
+                "status": verification.get("status"),
+            }
+            return task_state
+
+        task_state = self.state_store.mutate_json("task_state.json", update_task_state)
+        return {"pending_agent_tasks": task_state.get("pending_agent_tasks", []), "matched": matched}
 
     def refresh_pending(self, adapter: AgentAdapter, verifier: Any, limit: int = 20) -> dict[str, Any]:
         prune_report = self.prune_stale_pending(adapter, verifier)
@@ -174,8 +186,32 @@ class AgentTaskTracker:
                     continue
             kept.append(item)
 
-        task_state["pending_agent_tasks"] = kept[-100:]
-        self.state_store.write_json("task_state.json", task_state)
+        original_ids = {
+            str(item.get("task_id") or "")
+            for item in pending
+            if isinstance(item, dict) and item.get("task_id")
+        }
+        kept_by_id = {
+            str(item.get("task_id") or ""): item
+            for item in kept
+            if isinstance(item, dict) and item.get("task_id")
+        }
+
+        def merge_pruned_state(current: dict[str, Any]) -> dict[str, Any]:
+            latest = current.get("pending_agent_tasks") if isinstance(current.get("pending_agent_tasks"), list) else []
+            merged: list[Any] = []
+            for item in latest:
+                if not isinstance(item, dict):
+                    merged.append(item)
+                    continue
+                task_id = str(item.get("task_id") or "")
+                if task_id in original_ids and task_id not in kept_by_id:
+                    continue
+                merged.append(kept_by_id.get(task_id, item))
+            current["pending_agent_tasks"] = merged[-100:]
+            return current
+
+        self.state_store.mutate_json("task_state.json", merge_pruned_state)
         return {"status": "success", "pruned": pruned, "remaining_count": len(kept)}
 
     def _finalize_pruned(
@@ -223,13 +259,15 @@ class AgentTaskTracker:
         return max(0.0, (now - parsed).total_seconds() / 3600.0)
 
     def _upsert_pending(self, task: dict[str, Any]) -> None:
-        task_state = self.state_store.read_json("task_state.json")
-        pending = task_state.setdefault("pending_agent_tasks", [])
-        for index, item in enumerate(pending):
-            if item.get("task_id") == task["task_id"]:
-                pending[index] = {**item, **task}
-                break
-        else:
-            pending.append(task)
-        task_state["pending_agent_tasks"] = pending[-100:]
-        self.state_store.write_json("task_state.json", task_state)
+        def upsert(task_state: dict[str, Any]) -> dict[str, Any]:
+            pending = task_state.get("pending_agent_tasks") if isinstance(task_state.get("pending_agent_tasks"), list) else []
+            for index, item in enumerate(pending):
+                if isinstance(item, dict) and item.get("task_id") == task["task_id"]:
+                    pending[index] = {**item, **task}
+                    break
+            else:
+                pending.append(task)
+            task_state["pending_agent_tasks"] = pending[-100:]
+            return task_state
+
+        self.state_store.mutate_json("task_state.json", upsert)

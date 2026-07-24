@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from awareness.belief_core import BeliefCore
@@ -27,7 +28,9 @@ class PerceptionLayer:
             "observed_at": observed_at,
             "timestamp": probe_result.get("timestamp") or observed_at,
             "ttl_seconds": ttl_seconds,
+            "expires_at": self._expires_at(observed_at, ttl_seconds),
             "confidence": confidence,
+            "fact_kind": "observation",
         }
         anomaly = self._detect_anomaly(enriched)
         if anomaly:
@@ -44,18 +47,29 @@ class PerceptionLayer:
                     "kind": str(model_anomaly.get("kind") or "model_detected"),
                     "next_action": str(model_anomaly.get("next_action") or "review"),
                 }
-        local_world = self.state_store.read_json("local_world.json")
-        probes = local_world.setdefault("probes", {})
-        probes[probe_name] = enriched
-        local_world["last_probe_at"] = observed_at
-        self.state_store.write_json("local_world.json", local_world)
+        observation = dict(enriched)
+        model_interpretation = observation.pop("model_interpretation", None)
+
+        def update_local_world(local_world: dict[str, Any]) -> dict[str, Any]:
+            probes = local_world.setdefault("probes", {})
+            if not isinstance(probes, dict):
+                probes = {}
+                local_world["probes"] = probes
+            probes[probe_name] = observation
+            local_world["last_probe_at"] = observed_at
+            return local_world
+
+        self.state_store.mutate_json("local_world.json", update_local_world)
 
         claims = self._claims_from_probe(enriched) + self._claims_from_model(enriched, model_assist)
         self.belief.upsert_claims(claims)
-        return {
+        result = {
             "local_world.probes": {probe_name: enriched},
             "belief.claims": claims,
         }
+        if model_interpretation:
+            result["model_interpretation"] = model_interpretation
+        return result
 
     def _claims_from_probe(self, probe_result: dict[str, Any]) -> list[dict[str, Any]]:
         explicit = probe_result.get("claims")
@@ -104,6 +118,7 @@ class PerceptionLayer:
                 ttl_seconds=ttl_seconds,
                 observed_at=observed_at,
                 evidence=evidence,
+                claim_kind="observed",
             )
         ]
 
@@ -117,6 +132,7 @@ class PerceptionLayer:
             ttl_seconds=int(claim.get("ttl_seconds") or probe_result.get("ttl_seconds") or 60),
             observed_at=str(claim.get("observed_at") or probe_result.get("observed_at") or probe_result.get("timestamp") or utc_now_iso()),
             evidence=dict(claim.get("evidence") or self._compact_evidence(probe_result)),
+            claim_kind="observed",
         )
 
     def _compact_evidence(self, probe_result: dict[str, Any]) -> dict[str, Any]:
@@ -189,6 +205,8 @@ class PerceptionLayer:
                     ttl_seconds=int(raw_claim.get("ttl_seconds") or probe_result.get("ttl_seconds") or 60),
                     observed_at=observed_at,
                     evidence={"probe": probe_name, "model_assisted": True},
+                    claim_kind="derived",
+                    derived_from=f"probe:{probe_name}:{observed_at}",
                 )
             )
         return claims
@@ -199,3 +217,12 @@ class PerceptionLayer:
             "anomaly": model_assist.get("anomaly") if isinstance(model_assist.get("anomaly"), dict) else None,
             "confidence": model_assist.get("confidence"),
         }
+
+    def _expires_at(self, observed_at: str, ttl_seconds: int) -> str:
+        try:
+            parsed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = datetime.now(timezone.utc)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (parsed + timedelta(seconds=max(0, ttl_seconds))).isoformat()

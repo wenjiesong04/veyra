@@ -1,28 +1,20 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
+import re
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from core.world_state import WorldStateStore
+from core.world_state import JSONL_FILES, WorldStateStore
 from interface.event_schema import utc_now_iso
 
 
 class RetentionPolicy:
-    DEFAULT_LIMITS = {
-        "event_log.jsonl": 10000,
-        "action_record.jsonl": 10000,
-        "tool_call_log.jsonl": 10000,
-        "policy_trace.jsonl": 10000,
-        "execution_trace.jsonl": 10000,
-        "rollback_log.jsonl": 10000,
-        "memory_log.jsonl": 10000,
-        "core_model_trace.jsonl": 10000,
-        "runtime_trace.jsonl": 10000,
-        "decision_trace.jsonl": 10000,
-        "context_drift_log.jsonl": 10000,
-    }
+    """Bounded JSONL retention with batched rotation and compact gzip archives."""
+
+    DEFAULT_LIMITS = {name: 10000 for name in JSONL_FILES}
 
     def __init__(self, state_store: WorldStateStore, limits: dict[str, int] | None = None) -> None:
         self.state_store = state_store
@@ -35,91 +27,179 @@ class RetentionPolicy:
         for name, limit in self._active_limits(limits).items():
             path = self.state_store.path_for(name)
             count = len(self._read_lines(path))
+            high_water, low_water = self.state_store.retention_watermarks(max(limit, 1))
+            if limit <= 0:
+                status = "disabled"
+                recommendation = "retain"
+            elif count > high_water:
+                status = "over_limit"
+                recommendation = "archive_batch_then_truncate"
+            elif count > limit:
+                status = "buffered"
+                recommendation = "retain_until_high_water"
+            else:
+                status = "ok"
+                recommendation = "retain"
             files.append(
                 {
                     "file": name,
                     "entries": count,
-                    "limit": limit,
-                    "status": "over_limit" if count > limit else "ok",
-                    "recommendation": "archive_then_truncate" if count > limit else "retain",
+                    "target_limit": limit,
+                    "high_water": high_water if limit > 0 else None,
+                    "low_water": low_water if limit > 0 else None,
+                    "status": status,
+                    "recommendation": recommendation,
                 }
             )
-        return {"status": "ok", "policy": "append_only_with_archive_before_truncate", "files": files}
+        archive = self.archive_summary()
+        return {
+            "status": "ok",
+            "policy": "append_only_with_batched_gzip_archive",
+            "files": files,
+            "archive": archive,
+        }
 
     def enforce(self, *, dry_run: bool = False, limits: dict[str, int] | None = None) -> dict[str, Any]:
         active_limits = self._active_limits(limits)
-        archive_root = self.state_store.root / "archive" / "retention"
-        files = []
+        files: list[dict[str, Any]] = []
         changed = 0
         for name, limit in active_limits.items():
-            path = self.state_store.path_for(name)
-            lines = self._read_lines(path)
-            entries = len(lines)
-            if entries <= limit:
-                files.append(
-                    {
-                        "file": name,
-                        "entries": entries,
-                        "limit": limit,
-                        "status": "retained",
-                        "pruned_entries": 0,
-                    }
-                )
-                continue
-
-            changed += 1
-            pruned_entries = entries - limit
-            archive_lines = lines[:pruned_entries]
-            retained_lines = lines[pruned_entries:]
-            archive_payload = "\n".join(archive_lines)
-            archive_bytes = (archive_payload + ("\n" if archive_payload else "")).encode("utf-8")
-            archive_name = f"{Path(name).stem}-{utc_now_iso().replace(':', '').replace('.', '')}-{uuid4().hex[:8]}.jsonl"
-            archive_path = archive_root / archive_name
-            relative_archive = str(archive_path.relative_to(self.state_store.root))
-            if not dry_run:
-                archive_root.mkdir(parents=True, exist_ok=True)
-                archive_path.write_bytes(archive_bytes)
-                self._write_lines(path, retained_lines)
-
-            files.append(
-                {
-                    "file": name,
-                    "entries": entries,
-                    "limit": limit,
-                    "status": "would_truncate" if dry_run else "truncated",
-                    "pruned_entries": pruned_entries,
-                    "retained_entries": len(retained_lines),
-                    "archive_path": relative_archive,
-                    "archive_sha256": hashlib.sha256(archive_bytes).hexdigest(),
-                }
-            )
+            rotation = self.state_store.rotate_jsonl(name, limit=limit, dry_run=dry_run)
+            files.append(rotation)
+            if rotation.get("status") in {"would_rotate", "rotated"}:
+                changed += 1
 
         result = {
             "status": "success",
             "dry_run": dry_run,
             "changed": changed,
-            "policy": "append_only_with_archive_before_truncate",
+            "policy": "append_only_with_batched_gzip_archive",
             "checked_at": utc_now_iso(),
             "files": files,
             "validation": {
                 "archive_before_truncate": True,
+                "compressed_archive": True,
                 "dry_run": dry_run,
                 "changed": changed,
                 "status": "previewed" if dry_run else "enforced",
             },
         }
         if not dry_run:
-            self.state_store.append_jsonl("action_record.jsonl", {"route": "ops_retention_enforce", "status": "success", "artifacts": result})
-            audit_trim = self._truncate_to_limit(
-                "action_record.jsonl",
-                active_limits.get("action_record.jsonl", 0),
-                archive_root,
-                status="truncated_after_audit",
+            self.state_store.append_jsonl(
+                "policy_trace.jsonl",
+                {
+                    "route": "ops_retention_enforce",
+                    "status": "success",
+                    "artifacts": result,
+                },
             )
-            if audit_trim:
-                files.append(audit_trim)
-                result["post_audit_retention"] = audit_trim
         return result
+
+    def compact_archives(
+        self,
+        *,
+        dry_run: bool = False,
+        min_files_per_group: int = 10,
+        max_groups: int | None = None,
+    ) -> dict[str, Any]:
+        """Consolidate legacy tiny JSONL archives by stream and UTC day.
+
+        The compact gzip is fsynced and verified before the source files are
+        removed, so this reduces inode usage without discarding audit rows.
+        """
+        archive_root = self.state_store.root / "archive" / "retention"
+        groups: dict[tuple[str, str], list[Path]] = {}
+        pattern = re.compile(r"^(?P<stream>.+?)-(?P<day>\d{4}-\d{2}-\d{2})T")
+        if archive_root.exists():
+            for path in archive_root.glob("*.jsonl"):
+                match = pattern.match(path.name)
+                if match:
+                    groups.setdefault((match.group("stream"), match.group("day")), []).append(path)
+
+        eligible = [
+            (key, sorted(paths, key=lambda item: item.name))
+            for key, paths in sorted(groups.items())
+            if len(paths) >= max(2, int(min_files_per_group))
+        ]
+        if max_groups is not None:
+            eligible = eligible[: max(0, int(max_groups))]
+
+        compacted: list[dict[str, Any]] = []
+        files_removed = 0
+        bytes_before = 0
+        bytes_after = 0
+        with self.state_store.writer_transaction() if not dry_run else _null_transaction():
+            for (stream, day), paths in eligible:
+                raw_parts: list[bytes] = []
+                for path in paths:
+                    content = path.read_bytes()
+                    raw_parts.append(content if content.endswith(b"\n") or not content else content + b"\n")
+                raw = b"".join(raw_parts)
+                compressed = gzip.compress(raw, compresslevel=6, mtime=0)
+                output = archive_root / f"{stream}-{day}-compacted-{uuid4().hex[:8]}.jsonl.gz"
+                row = {
+                    "stream": stream,
+                    "day": day,
+                    "source_files": len(paths),
+                    "source_bytes": len(raw),
+                    "compressed_bytes": len(compressed),
+                    "archive_path": str(output.relative_to(self.state_store.root)),
+                    "archive_sha256": hashlib.sha256(compressed).hexdigest(),
+                    "status": "would_compact" if dry_run else "compacted",
+                }
+                if not dry_run:
+                    self.state_store._write_bytes_atomic(output, compressed)
+                    with gzip.open(output, "rb") as handle:
+                        verified = handle.read()
+                    if verified != raw:
+                        output.unlink(missing_ok=True)
+                        raise RuntimeError(f"archive verification failed for {output}")
+                    for path in paths:
+                        path.unlink()
+                    self.state_store._fsync_directory(archive_root)
+                compacted.append(row)
+                files_removed += len(paths)
+                bytes_before += len(raw)
+                bytes_after += len(compressed)
+
+        result = {
+            "status": "success",
+            "dry_run": dry_run,
+            "groups": len(compacted),
+            "files_compacted": files_removed,
+            "files_replaced_by": len(compacted),
+            "bytes_before": bytes_before,
+            "bytes_after": bytes_after,
+            "saved_bytes": max(0, bytes_before - bytes_after),
+            "items": compacted,
+            "checked_at": utc_now_iso(),
+        }
+        if not dry_run and compacted:
+            self.state_store.append_jsonl(
+                "policy_trace.jsonl",
+                {
+                    "route": "ops_retention_compact_archives",
+                    "status": "success",
+                    "artifacts": {
+                        key: value
+                        for key, value in result.items()
+                        if key != "items"
+                    },
+                },
+            )
+        return result
+
+    def archive_summary(self) -> dict[str, Any]:
+        archive_root = self.state_store.root / "archive" / "retention"
+        if not archive_root.exists():
+            return {"files": 0, "bytes": 0, "legacy_jsonl_files": 0, "gzip_files": 0}
+        files = [path for path in archive_root.iterdir() if path.is_file()]
+        return {
+            "files": len(files),
+            "bytes": sum(path.stat().st_size for path in files),
+            "legacy_jsonl_files": sum(1 for path in files if path.suffix == ".jsonl"),
+            "gzip_files": sum(1 for path in files if path.name.endswith(".jsonl.gz")),
+        }
 
     def _active_limits(self, limits: dict[str, int] | None = None) -> dict[str, int]:
         active = {**self.limits}
@@ -132,35 +212,10 @@ class RetentionPolicy:
     def _read_lines(self, path: Path) -> list[str]:
         return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
 
-    def _write_lines(self, path: Path, lines: list[str]) -> None:
-        path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
-    def _truncate_to_limit(self, name: str, limit: int, archive_root: Path, *, status: str) -> dict[str, Any] | None:
-        if limit <= 0:
-            return None
-        path = self.state_store.path_for(name)
-        lines = self._read_lines(path)
-        entries = len(lines)
-        if entries <= limit:
-            return None
+class _null_transaction:
+    def __enter__(self) -> None:
+        return None
 
-        pruned_entries = entries - limit
-        archive_lines = lines[:pruned_entries]
-        retained_lines = lines[pruned_entries:]
-        archive_payload = "\n".join(archive_lines)
-        archive_bytes = (archive_payload + ("\n" if archive_payload else "")).encode("utf-8")
-        archive_name = f"{Path(name).stem}-{utc_now_iso().replace(':', '').replace('.', '')}-{uuid4().hex[:8]}.jsonl"
-        archive_path = archive_root / archive_name
-        archive_root.mkdir(parents=True, exist_ok=True)
-        archive_path.write_bytes(archive_bytes)
-        self._write_lines(path, retained_lines)
-        return {
-            "file": name,
-            "entries": entries,
-            "limit": limit,
-            "status": status,
-            "pruned_entries": pruned_entries,
-            "retained_entries": len(retained_lines),
-            "archive_path": str(archive_path.relative_to(self.state_store.root)),
-            "archive_sha256": hashlib.sha256(archive_bytes).hexdigest(),
-        }
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        return False

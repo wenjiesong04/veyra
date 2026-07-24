@@ -129,14 +129,14 @@ class CommitmentCore:
             item["invalid_detected_at"] = now
         if item["status"] == "active" and not item["confirmed_at"]:
             item["confirmed_at"] = now
-        state = self._read_state()
-        commitments = state.setdefault("commitments", [])
-        if not isinstance(commitments, list):
-            commitments = []
-        commitments.append(item)
-        state["commitments"] = commitments[-self.MAX_COMMITMENTS :]
-        state["updated_at"] = now
-        self._write_state(state)
+        def add_commitment(state: dict[str, Any]) -> dict[str, Any]:
+            commitments = state.get("commitments") if isinstance(state.get("commitments"), list) else []
+            commitments.append(item)
+            state["commitments"] = commitments[-self.MAX_COMMITMENTS :]
+            state["updated_at"] = now
+            return state
+
+        self.state_store.mutate_json(self.STATE_FILE, add_commitment)
         self._sync_user_world(item)
         self._sync_goal_permission_from_commitment(item)
         self.set_watchlists_for_commitment(item)
@@ -565,6 +565,13 @@ class CommitmentCore:
         change_set = build_semantic_change_set(user_text, active_commitments=commitments)
         return change_set.to_dict() if change_set else None
 
+    def propose_semantic_change_for_turn(self, *, user_text: str, event: VeyraEvent) -> dict[str, Any]:
+        """Create a confirmation-required state-change proposal before Agent routing."""
+        change_set = self.semantic_change_set_for_turn(user_text=user_text, event=event)
+        if not change_set:
+            return {}
+        return self._handle_semantic_change_set(change_set, event=event)
+
     def _semantic_change_should_precede_control(self, semantic_intent: dict[str, Any], change_set: dict[str, Any]) -> bool:
         """Prefer the semantic changeset when a turn implies more than one state change.
 
@@ -813,10 +820,6 @@ class CommitmentCore:
         return None
 
     def _record_semantic_change_set(self, change_set: dict[str, Any], *, event: VeyraEvent) -> dict[str, Any]:
-        state = self._read_semantic_change_state()
-        items = state.setdefault("change_sets", [])
-        if not isinstance(items, list):
-            items = []
         record = {
             **change_set,
             "user_id": event.source.user_id,
@@ -826,10 +829,14 @@ class CommitmentCore:
             "created_at": utc_now_iso(),
             "updated_at": utc_now_iso(),
         }
-        items.append(record)
-        state["change_sets"] = items[-200:]
-        state["updated_at"] = utc_now_iso()
-        self._write_semantic_change_state(state)
+
+        def append_change(state: dict[str, Any]) -> dict[str, Any]:
+            items = state.get("change_sets") if isinstance(state.get("change_sets"), list) else []
+            state["change_sets"] = [*items, record][-200:]
+            state["updated_at"] = utc_now_iso()
+            return state
+
+        self.state_store.mutate_json(self.SEMANTIC_CHANGE_SET_FILE, append_change)
         self.state_store.append_jsonl(
             "decision_trace.jsonl",
             {
@@ -856,22 +863,24 @@ class CommitmentCore:
     def _patch_semantic_change_set(self, changeset_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
         if not changeset_id:
             return None
-        state = self._read_semantic_change_state()
-        items = state.get("change_sets") if isinstance(state.get("change_sets"), list) else []
         updated: dict[str, Any] | None = None
-        for index, item in enumerate(items):
-            if not isinstance(item, dict) or item.get("changeset_id") != changeset_id:
-                continue
-            item.update(patch)
-            item["updated_at"] = utc_now_iso()
-            items[index] = item
-            updated = item
-            break
-        if updated is None:
-            return None
-        state["change_sets"] = items[-200:]
-        state["updated_at"] = utc_now_iso()
-        self._write_semantic_change_state(state)
+
+        def patch_change(state: dict[str, Any]) -> dict[str, Any]:
+            nonlocal updated
+            items = state.get("change_sets") if isinstance(state.get("change_sets"), list) else []
+            for index, item in enumerate(items):
+                if not isinstance(item, dict) or item.get("changeset_id") != changeset_id:
+                    continue
+                changed = {**item, **patch, "updated_at": utc_now_iso()}
+                items[index] = changed
+                updated = changed
+                break
+            if updated is not None:
+                state["change_sets"] = items[-200:]
+                state["updated_at"] = utc_now_iso()
+            return state
+
+        self.state_store.mutate_json(self.SEMANTIC_CHANGE_SET_FILE, patch_change)
         return updated
 
     def _read_semantic_change_state(self) -> dict[str, Any]:
@@ -1347,10 +1356,6 @@ class CommitmentCore:
         commitment: dict[str, Any] | None = None,
         goal: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        external = self.state_store.read_json("external_world.json")
-        watchlist = external.setdefault("watchlist", [])
-        if not isinstance(watchlist, list):
-            watchlist = []
         payload = draft.to_dict()
         watchlist_id = watchlist_id_for(str(payload.get("topic") or ""), str(payload.get("query") or ""))
         item = {
@@ -1372,14 +1377,33 @@ class CommitmentCore:
             "created_at": utc_now_iso(),
             "updated_at": utc_now_iso(),
         }
-        existing = [entry for entry in watchlist if isinstance(entry, dict) and entry.get("watchlist_id") == watchlist_id]
-        if existing:
-            existing[-1].update({key: value for key, value in item.items() if value not in (None, "", [])})
-            item = existing[-1]
-        else:
-            watchlist.append(item)
-        external["watchlist"] = watchlist[-100:]
-        self.state_store.write_json("external_world.json", external)
+        stored_item = dict(item)
+
+        def upsert_watchlist(external: dict[str, Any]) -> dict[str, Any]:
+            nonlocal stored_item
+            watchlist = external.get("watchlist") if isinstance(external.get("watchlist"), list) else []
+            watchlist = list(watchlist)
+            existing_index = next(
+                (
+                    index
+                    for index, entry in enumerate(watchlist)
+                    if isinstance(entry, dict) and entry.get("watchlist_id") == watchlist_id
+                ),
+                None,
+            )
+            if existing_index is not None:
+                stored_item = {
+                    **watchlist[existing_index],
+                    **{key: value for key, value in item.items() if value not in (None, "", [])},
+                }
+                watchlist[existing_index] = stored_item
+            else:
+                watchlist.append(stored_item)
+            external["watchlist"] = watchlist[-100:]
+            return external
+
+        self.state_store.mutate_json("external_world.json", upsert_watchlist)
+        item = stored_item
         return item
 
     def set_watchlists_for_commitment(self, commitment: dict[str, Any]) -> None:
@@ -1387,28 +1411,30 @@ class CommitmentCore:
         watchlist_id = str(payload.get("watchlist_id") or "")
         if not watchlist_id:
             return
-        external = self.state_store.read_json("external_world.json")
-        watchlist = external.get("watchlist") if isinstance(external.get("watchlist"), list) else []
-        changed = False
-        for item in watchlist:
-            if not isinstance(item, dict) or item.get("watchlist_id") != watchlist_id:
-                continue
-            status = str(commitment.get("status") or "")
-            item["commitment_id"] = commitment.get("commitment_id")
-            if status == "active":
-                item["status"] = "active"
-                item["enabled"] = True
-            elif status in {"cancelled", "paused"}:
-                item["status"] = status
-                item["enabled"] = False
-            else:
-                item["status"] = "pending_confirmation"
-                item["enabled"] = False
-            item["updated_at"] = utc_now_iso()
-            changed = True
-        if changed:
-            external["watchlist"] = watchlist[-100:]
-            self.state_store.write_json("external_world.json", external)
+        def update_watchlist(external: dict[str, Any]) -> dict[str, Any]:
+            watchlist = external.get("watchlist") if isinstance(external.get("watchlist"), list) else []
+            changed = False
+            for item in watchlist:
+                if not isinstance(item, dict) or item.get("watchlist_id") != watchlist_id:
+                    continue
+                status = str(commitment.get("status") or "")
+                item["commitment_id"] = commitment.get("commitment_id")
+                if status == "active":
+                    item["status"] = "active"
+                    item["enabled"] = True
+                elif status in {"cancelled", "paused"}:
+                    item["status"] = status
+                    item["enabled"] = False
+                else:
+                    item["status"] = "pending_confirmation"
+                    item["enabled"] = False
+                item["updated_at"] = utc_now_iso()
+                changed = True
+            if changed:
+                external["watchlist"] = watchlist[-100:]
+            return external
+
+        self.state_store.mutate_json("external_world.json", update_watchlist)
 
     def external_tracking_query(self, intent: ProactiveIntent) -> str:
         topic = str(intent.topic or "updates")
@@ -1605,53 +1631,56 @@ class CommitmentCore:
 
     def _upsert_user_goal(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = utc_now_iso()
-        state = self._read_goal_state()
-        goals = state.get("goals") if isinstance(state.get("goals"), list) else []
         topic = str(payload.get("topic") or "")
         kind = str(payload.get("kind") or "generic")
         user_id = str(payload.get("user_id") or "local-user")
         updated: dict[str, Any] | None = None
-        for goal in goals:
-            if not isinstance(goal, dict):
-                continue
-            if goal.get("kind") == kind and goal.get("topic") == topic and goal.get("user_id") == user_id and goal.get("status") != "archived":
-                goal.update(payload)
-                goal["updated_at"] = now
-                updated = goal
-                break
-        if updated is None:
-            updated = {
-                "goal_id": f"goal_{uuid4().hex[:12]}",
-                "created_at": now,
-                "updated_at": now,
-                **payload,
-            }
-            goals.append(updated)
-        state["goals"] = [goal for goal in goals if isinstance(goal, dict)][-self.MAX_GOALS :]
-        state["updated_at"] = now
-        self._write_goal_state(state)
-        return updated
+
+        def upsert_goal(state: dict[str, Any]) -> dict[str, Any]:
+            nonlocal updated
+            goals = state.get("goals") if isinstance(state.get("goals"), list) else []
+            for index, goal in enumerate(goals):
+                if not isinstance(goal, dict):
+                    continue
+                if goal.get("kind") == kind and goal.get("topic") == topic and goal.get("user_id") == user_id and goal.get("status") != "archived":
+                    updated = {**goal, **payload, "updated_at": now}
+                    goals[index] = updated
+                    break
+            if updated is None:
+                updated = {
+                    "goal_id": f"goal_{uuid4().hex[:12]}",
+                    "created_at": now,
+                    "updated_at": now,
+                    **payload,
+                }
+                goals.append(updated)
+            state["goals"] = [goal for goal in goals if isinstance(goal, dict)][-self.MAX_GOALS :]
+            state["updated_at"] = now
+            return state
+
+        self.state_store.mutate_json(self.GOAL_STATE_FILE, upsert_goal)
+        return dict(updated or {})
 
     def _replace_user_goal(self, updated_goal: dict[str, Any]) -> None:
         goal_id = updated_goal.get("goal_id")
         if not goal_id:
             return
-        state = self._read_goal_state()
-        goals = state.get("goals") if isinstance(state.get("goals"), list) else []
-        for index, goal in enumerate(goals):
-            if isinstance(goal, dict) and goal.get("goal_id") == goal_id:
-                updated_goal["updated_at"] = utc_now_iso()
-                goals[index] = updated_goal
-                state["goals"] = goals[-self.MAX_GOALS :]
-                state["updated_at"] = utc_now_iso()
-                self._write_goal_state(state)
-                return
+        def replace_goal(state: dict[str, Any]) -> dict[str, Any]:
+            goals = state.get("goals") if isinstance(state.get("goals"), list) else []
+            for index, goal in enumerate(goals):
+                if isinstance(goal, dict) and goal.get("goal_id") == goal_id:
+                    replacement = {**updated_goal, "updated_at": utc_now_iso()}
+                    goals[index] = replacement
+                    state["goals"] = goals[-self.MAX_GOALS :]
+                    state["updated_at"] = utc_now_iso()
+                    break
+            return state
+
+        self.state_store.mutate_json(self.GOAL_STATE_FILE, replace_goal)
 
     def _sync_learning_goal_to_user_world(self, goal: dict[str, Any], commitment: dict[str, Any] | None) -> None:
         topic = str(goal.get("topic") or goal.get("title") or "学习计划")
-        user_world = self.state_store.read_json("user_world.json")
         user_id = str(goal.get("user_id") or (commitment or {}).get("user_id") or "local-user")
-        scoped = self._scoped_user_world(user_world, user_id)
         patch = {
             "current_goal": f"learning:{topic}"[:180],
             "goal_id": goal.get("goal_id"),
@@ -1661,12 +1690,17 @@ class CommitmentCore:
         if commitment:
             patch["commitment_id"] = commitment.get("commitment_id")
             patch["commitment_kind"] = commitment.get("kind")
-        scoped.update(patch)
-        scoped["updated_at"] = utc_now_iso()
-        if self._should_mirror_legacy_user(user_id):
-            user_world.update(patch)
-        user_world["updated_at"] = utc_now_iso()
-        self.state_store.write_json("user_world.json", user_world)
+
+        def update_user_world(user_world: dict[str, Any]) -> dict[str, Any]:
+            scoped = self._scoped_user_world(user_world, user_id)
+            scoped.update(patch)
+            scoped["updated_at"] = utc_now_iso()
+            if self._should_mirror_legacy_user(user_id):
+                user_world.update(patch)
+            user_world["updated_at"] = utc_now_iso()
+            return user_world
+
+        self.state_store.mutate_json("user_world.json", update_user_world)
 
     def _sync_goal_permission_from_commitment(self, commitment: dict[str, Any]) -> None:
         if commitment.get("kind") != "learning_digest":
@@ -1675,30 +1709,29 @@ class CommitmentCore:
         goal_id = payload.get("goal_id")
         if not goal_id:
             return
-        state = self._read_goal_state()
-        goals = state.get("goals") if isinstance(state.get("goals"), list) else []
-        changed = False
-        for goal in goals:
-            if not isinstance(goal, dict) or goal.get("goal_id") != goal_id:
-                continue
-            goal["commitment_id"] = commitment.get("commitment_id")
-            permissions = goal.setdefault("permissions", {})
-            if isinstance(permissions, dict):
-                status = str(commitment.get("status") or "")
-                if status == "active":
-                    permissions["external_search"] = "granted_for_digest"
-                    permissions["proactive_push"] = "granted"
-                elif status in {"cancelled", "paused"}:
-                    permissions["proactive_push"] = status
-                else:
-                    permissions["proactive_push"] = "pending_confirmation"
-            goal["updated_at"] = utc_now_iso()
-            changed = True
-            break
-        if changed:
-            state["goals"] = goals[-self.MAX_GOALS :]
-            state["updated_at"] = utc_now_iso()
-            self._write_goal_state(state)
+        def sync_permission(state: dict[str, Any]) -> dict[str, Any]:
+            goals = state.get("goals") if isinstance(state.get("goals"), list) else []
+            for goal in goals:
+                if not isinstance(goal, dict) or goal.get("goal_id") != goal_id:
+                    continue
+                goal["commitment_id"] = commitment.get("commitment_id")
+                permissions = goal.setdefault("permissions", {})
+                if isinstance(permissions, dict):
+                    status = str(commitment.get("status") or "")
+                    if status == "active":
+                        permissions["external_search"] = "granted_for_digest"
+                        permissions["proactive_push"] = "granted"
+                    elif status in {"cancelled", "paused"}:
+                        permissions["proactive_push"] = status
+                    else:
+                        permissions["proactive_push"] = "pending_confirmation"
+                goal["updated_at"] = utc_now_iso()
+                state["goals"] = goals[-self.MAX_GOALS :]
+                state["updated_at"] = utc_now_iso()
+                break
+            return state
+
+        self.state_store.mutate_json(self.GOAL_STATE_FILE, sync_permission)
 
     def _learning_plan(self, topic: str) -> dict[str, Any]:
         return {
@@ -1758,40 +1791,45 @@ class CommitmentCore:
         return ("记得" in text or "remember" in lowered) and any(marker in text for marker in ("在学什么", "学习什么", "学什么", "学习目标"))
 
     def heal_invalid_commitments(self) -> dict[str, Any]:
-        state = self._read_state()
-        commitments = state.get("commitments") if isinstance(state.get("commitments"), list) else []
         checked = 0
         invalid_items: list[dict[str, Any]] = []
         newly_invalid: list[dict[str, Any]] = []
-        changed = False
         now = utc_now_iso()
-        for item in commitments:
-            if not isinstance(item, dict) or item.get("kind") != "weather_daily":
-                continue
-            if item.get("status") not in {"active", "pending_confirmation"}:
-                continue
-            checked += 1
-            payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-            schedule = item.get("schedule") if isinstance(item.get("schedule"), dict) else {}
-            validation = self._validate_weather_daily_payload(payload, schedule, require_explicit_time=False)
-            if validation.get("valid"):
-                continue
-            reason = str(validation.get("reason") or "invalid_weather_commitment")
-            was_invalid = bool(item.get("invalid"))
-            item["status"] = "paused"
-            item["invalid"] = True
-            item["invalid_reason"] = reason
-            item["invalid_detected_at"] = item.get("invalid_detected_at") or now
-            item["updated_at"] = now
-            item["next_run_at"] = None
-            invalid_items.append(item)
-            if not was_invalid:
-                newly_invalid.append(item)
-            changed = True
-        if changed:
-            state["commitments"] = commitments
-            state["updated_at"] = now
-            self._write_state(state)
+
+        def heal(state: dict[str, Any]) -> dict[str, Any]:
+            nonlocal checked
+            commitments = state.get("commitments") if isinstance(state.get("commitments"), list) else []
+            changed = False
+            for item in commitments:
+                if not isinstance(item, dict) or item.get("kind") != "weather_daily":
+                    continue
+                if item.get("status") not in {"active", "pending_confirmation"}:
+                    continue
+                checked += 1
+                payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+                schedule = item.get("schedule") if isinstance(item.get("schedule"), dict) else {}
+                validation = self._validate_weather_daily_payload(payload, schedule, require_explicit_time=False)
+                if validation.get("valid"):
+                    continue
+                reason = str(validation.get("reason") or "invalid_weather_commitment")
+                was_invalid = bool(item.get("invalid"))
+                item["status"] = "paused"
+                item["invalid"] = True
+                item["invalid_reason"] = reason
+                item["invalid_detected_at"] = item.get("invalid_detected_at") or now
+                item["updated_at"] = now
+                item["next_run_at"] = None
+                invalid_items.append(dict(item))
+                if not was_invalid:
+                    newly_invalid.append(dict(item))
+                changed = True
+            if changed:
+                state["commitments"] = commitments
+                state["updated_at"] = now
+            return state
+
+        self.state_store.mutate_json(self.STATE_FILE, heal)
+        if invalid_items:
             for item in invalid_items:
                 self.set_watchlists_for_commitment(item)
         return {
@@ -1987,25 +2025,30 @@ class CommitmentCore:
         return None
 
     def _patch_commitment(self, commitment_id: str, patch: dict[str, Any], *, recompute_next_run: bool = False) -> dict[str, Any] | None:
-        state = self._read_state()
-        commitments = state.get("commitments") if isinstance(state.get("commitments"), list) else []
         updated = None
-        for index, item in enumerate(commitments):
-            if not isinstance(item, dict) or item.get("commitment_id") != commitment_id:
-                continue
-            item.update(patch)
-            item["updated_at"] = utc_now_iso()
-            if recompute_next_run:
-                schedule = item.get("schedule") if isinstance(item.get("schedule"), dict) else {}
-                item["next_run_at"] = self._compute_next_run_at(schedule)
-            commitments[index] = item
-            updated = item
-            break
+
+        def update_commitment_state(state: dict[str, Any]) -> dict[str, Any]:
+            nonlocal updated
+            commitments = state.get("commitments") if isinstance(state.get("commitments"), list) else []
+            for index, item in enumerate(commitments):
+                if not isinstance(item, dict) or item.get("commitment_id") != commitment_id:
+                    continue
+                item.update(patch)
+                item["updated_at"] = utc_now_iso()
+                if recompute_next_run:
+                    schedule = item.get("schedule") if isinstance(item.get("schedule"), dict) else {}
+                    item["next_run_at"] = self._compute_next_run_at(schedule)
+                commitments[index] = item
+                updated = dict(item)
+                break
+            if updated is not None:
+                state["commitments"] = commitments
+                state["updated_at"] = utc_now_iso()
+            return state
+
+        self.state_store.mutate_json(self.STATE_FILE, update_commitment_state)
         if updated is None:
             return None
-        state["commitments"] = commitments
-        state["updated_at"] = utc_now_iso()
-        self._write_state(state)
         self._sync_user_world(updated)
         self._sync_goal_permission_from_commitment(updated)
         self.set_watchlists_for_commitment(updated)
@@ -2030,26 +2073,29 @@ class CommitmentCore:
         payload = commitment.get("payload") if isinstance(commitment.get("payload"), dict) else {}
         topic = str(payload.get("topic") or commitment.get("title") or "")
         goal = f"active_commitment:{commitment.get('kind')}:{topic}"[:180]
-        user_world = self.state_store.read_json("user_world.json")
         user_id = str(commitment.get("user_id") or "local-user")
-        scoped = self._scoped_user_world(user_world, user_id)
         patch = {
             "current_goal": goal,
             "commitment_id": commitment.get("commitment_id"),
             "commitment_kind": commitment.get("kind"),
         }
-        scoped.update(patch)
-        preferences = scoped.setdefault("preferences", {})
-        if isinstance(preferences, dict) and payload.get("location"):
-            preferences["default_location"] = payload.get("location")
-        scoped["updated_at"] = utc_now_iso()
-        if self._should_mirror_legacy_user(user_id):
-            user_world.update(patch)
-            legacy_preferences = user_world.setdefault("preferences", {})
-            if isinstance(legacy_preferences, dict) and payload.get("location"):
-                legacy_preferences["default_location"] = payload.get("location")
-        user_world["updated_at"] = utc_now_iso()
-        self.state_store.write_json("user_world.json", user_world)
+
+        def update_user_world(user_world: dict[str, Any]) -> dict[str, Any]:
+            scoped = self._scoped_user_world(user_world, user_id)
+            scoped.update(patch)
+            preferences = scoped.setdefault("preferences", {})
+            if isinstance(preferences, dict) and payload.get("location"):
+                preferences["default_location"] = payload.get("location")
+            scoped["updated_at"] = utc_now_iso()
+            if self._should_mirror_legacy_user(user_id):
+                user_world.update(patch)
+                legacy_preferences = user_world.setdefault("preferences", {})
+                if isinstance(legacy_preferences, dict) and payload.get("location"):
+                    legacy_preferences["default_location"] = payload.get("location")
+            user_world["updated_at"] = utc_now_iso()
+            return user_world
+
+        self.state_store.mutate_json("user_world.json", update_user_world)
 
     def _default_location_for_event(self, event: VeyraEvent) -> str:
         user_world = self.state_store.read_json("user_world.json")

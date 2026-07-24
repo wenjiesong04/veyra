@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from awareness.belief_core import BeliefCore
@@ -102,8 +103,27 @@ class ContextPatchBuilder:
         }
         for field in fields:
             if field in value:
-                output[field] = value[field]
+                if field == "short_term_memory" and isinstance(value[field], list):
+                    output[field] = [
+                        item
+                        for item in value[field]
+                        if not isinstance(item, dict) or not self._memory_expired(item)
+                    ]
+                else:
+                    output[field] = value[field]
         return output
+
+    def _memory_expired(self, item: dict[str, Any]) -> bool:
+        value = str(item.get("expires_at") or "")
+        if not value:
+            return False
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed <= datetime.now(timezone.utc)
 
     def _probe_keys_for_focus(self, focus: list[str]) -> list[str]:
         mapping = {

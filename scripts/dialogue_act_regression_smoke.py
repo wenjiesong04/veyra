@@ -177,10 +177,11 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _copy_config(source_root: Path, state_store: WorldStateStore) -> None:
-    source_store = WorldStateStore(source_root)
+    source_store = WorldStateStore(source_root, read_only=True)
     for filename in ["agent_config.json", "user_world.json"]:
         payload = source_store.read_json(filename)
         if payload:
+            payload.pop("_state_revision", None)
             state_store.write_json(filename, payload)
 
 
