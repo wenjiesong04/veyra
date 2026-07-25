@@ -26,6 +26,7 @@ GATE_SMOKES = [
     "event_inbox_smoke.py",
     "situation_evaluator_smoke.py",
     "event_driven_awareness_smoke.py",
+    "project_guardian_smoke.py",
     "state_integrity_smoke.py",
     "state_truth_isolation_smoke.py",
     "runtime_truth_smoke.py",
