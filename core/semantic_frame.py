@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, m
 
 
 SCHEMA_VERSION = "veyra.semantic_frame.v1"
+_SOURCE_QUOTE_LIMIT = 800
 
 Explicitness = Literal["explicit", "strong_implied", "weak_implied", "inferred", "unknown"]
 MentionMode = Literal["normal_use", "quoted_term", "reported_speech", "example", "hypothetical", "unknown"]
@@ -27,7 +28,7 @@ class StrictSemanticModel(BaseModel):
 
 
 class SourceQuote(StrictSemanticModel):
-    text: str = Field(min_length=1, max_length=800)
+    text: str = Field(min_length=1, max_length=_SOURCE_QUOTE_LIMIT)
     start: int = Field(ge=0)
     end: int = Field(gt=0)
 
@@ -667,6 +668,9 @@ class _FallbackSemanticResolver:
                 source="fallback",
             )
 
+        if len(self.text) > _SOURCE_QUOTE_LIMIT:
+            return self._long_input_frame(resolver_status)
+
         if self._parse_explained_quoted_term():
             return self._frame(resolver_status)
         if self._parse_reported_speech():
@@ -686,6 +690,44 @@ class _FallbackSemanticResolver:
 
         start, end = _trimmed_bounds(self.text, 0, len(self.text))
         self._append_clause(self.text[start:end], start=start)
+        return self._frame(resolver_status)
+
+    def _long_input_frame(
+        self,
+        resolver_status: Literal["degraded", "invalid_output"],
+    ) -> TurnSemanticFrame:
+        """Represent an over-limit fallback input without guessing its meaning."""
+
+        quote_end = min(len(self.text), _SOURCE_QUOTE_LIMIT)
+        unresolved = self._act(
+            kind="task",
+            goal="resolve the complete long user message before acting",
+            operation="resolve_long_input",
+            target=SemanticTarget(
+                type="input_segment",
+                value="long_input",
+                attributes={
+                    "captured_end": quote_end,
+                    "total_length": len(self.text),
+                },
+            ),
+            quote=_source_quote(self.text, 0, quote_end),
+            explicitness="unknown",
+            evidence_need="context",
+        )
+        self.acts.append(unresolved)
+        self.ambiguities.append(
+            SemanticAmbiguity(
+                ambiguity_id="u1",
+                kind="fallback_input_truncated",
+                description=(
+                    "Fallback parsing cannot safely resolve the complete long "
+                    "message within the source quote limit."
+                ),
+                affected_act_ids=[unresolved.act_id],
+                candidates=[],
+            )
+        )
         return self._frame(resolver_status)
 
     def _frame(self, resolver_status: Literal["degraded", "invalid_output"]) -> TurnSemanticFrame:

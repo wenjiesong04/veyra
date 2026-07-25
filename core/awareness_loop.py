@@ -345,8 +345,13 @@ class AwarenessLoop:
                 guardian_decision=guardian_decision,
                 proposal=proposal,
             )
-            response = "该动作需要用户确认后才能执行。"
-            if decision.route == Route.ROLLBACK:
+            response = (
+                "该动作需要用户确认；当前尚无可执行 proposal，"
+                "确认只记录授权，不会自动执行。"
+                if proposal is None
+                else "该动作需要用户确认后才能执行。"
+            )
+            if decision.route == Route.ROLLBACK and proposal is not None:
                 response = "该回滚动作需要用户确认；确认后将通过 RollbackManager 恢复指定 snapshot。"
             result = LoopResult(
                 event_id=event.event_id,

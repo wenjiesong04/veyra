@@ -18,6 +18,10 @@ if str(ROOT) not in sys.path:
 
 from core.world_state import WorldStateStore  # noqa: E402
 from execution.action_executor import ActionExecutor  # noqa: E402
+from guardian.review_queue import ReviewQueue  # noqa: E402
+from rollback_audit.action_journal import ActionJournal  # noqa: E402
+from rollback_audit.replay import Replay  # noqa: E402
+from rollback_audit.replay_runtime import ReplayRuntime  # noqa: E402
 from runtime.proactive_checks import ProactiveChecks  # noqa: E402
 
 
@@ -81,6 +85,122 @@ def main() -> None:
         bare = ActionExecutor(state_store=store)
         bare_result = bare.execute_review(review_for({"type": "proactive_remediation", "suggested_action": "review_resource_pressure"}))
         expect(bare_result.get("status") == "not_supported", "unwired executor reports not_supported honestly", bare_result)
+
+        review_queue = ReviewQueue(store)
+        status_cases = [
+            ("approved-noop", {"status": "approved_noop"}, "governance_only", False),
+            ("approved-no-op", noop, "governance_only", False),
+            ("diagnosed", result, "executed", False),
+            ("recovered", recovered, "executed", False),
+            ("refreshed", {"status": "refreshed"}, "executed", False),
+            ("observed", {"status": "observed"}, "executed", False),
+            ("probed-fallback", {"status": "probed_fallback"}, "executed", False),
+            ("plain-error", {"status": "error", "reason": "simulated failure"}, "execution_failed", True),
+            (
+                "explicit-false",
+                {"status": "success", "success": False, "reason": "business failure"},
+                "execution_failed",
+                True,
+            ),
+            (
+                "nonzero-returncode",
+                {"status": "ok", "returncode": 9, "stderr": "simulated failure"},
+                "execution_failed",
+                True,
+            ),
+            (
+                "failed-verification",
+                {"status": "executed", "verification": {"status": "verified_failed"}},
+                "execution_failed",
+                True,
+            ),
+            (
+                "rollback-required",
+                {"status": "success", "verification": {"needs_rollback": True}},
+                "execution_failed",
+                True,
+            ),
+            (
+                "failed-tool-result",
+                {"status": "executed", "tool_result": {"status": "error"}},
+                "execution_failed",
+                True,
+            ),
+            ("unsupported", bare_result, "not_executed", False),
+            (
+                "incomplete",
+                {"status": "partially_success"},
+                "execution_incomplete",
+                False,
+            ),
+            (
+                "nested-incomplete",
+                {
+                    "status": "success",
+                    "verification": {"status": "partially_success"},
+                },
+                "execution_incomplete",
+                False,
+            ),
+            (
+                "nested-not-executed",
+                {"status": "success", "tool_result": {"status": "blocked"}},
+                "execution_incomplete",
+                False,
+            ),
+            (
+                "unknown",
+                {"status": "made_up_success"},
+                "execution_unknown",
+                False,
+            ),
+        ]
+        expected_replay_events: set[str] = set()
+        blocked_replay_events: set[str] = set()
+        for label, execution_result, expected_audit_status, replay_candidate in status_cases:
+            event_id = f"review-status-{label}"
+            review = review_queue.create(event_id, f"status matrix {label}", "R2", {}, {})
+            review_queue.decide(review["review_id"], "approved", "status matrix")
+            review_queue.update_execution(review["review_id"], execution_result)
+            execution_rows = [
+                item
+                for item in store.read_jsonl("action_record.jsonl", limit=500)
+                if item.get("event_id") == event_id
+                and item.get("status") not in {"pending", "approved"}
+            ]
+            expect(
+                execution_rows
+                and execution_rows[-1].get("status") == expected_audit_status,
+                f"{label} maps to {expected_audit_status}",
+                execution_rows,
+            )
+            if replay_candidate:
+                expected_replay_events.add(event_id)
+            else:
+                blocked_replay_events.add(event_id)
+
+        replay_runtime = ReplayRuntime(
+            state_store=store,
+            replay=Replay(store),
+            journal=ActionJournal(store),
+            review_queue=review_queue,
+            foresight_engine=None,
+        )
+        replay_scan = replay_runtime.scan(limit=500)
+        created_replay_events = {
+            str(item.get("event_id") or "")
+            for item in replay_scan.get("created", [])
+        }
+        expect(
+            expected_replay_events <= created_replay_events,
+            "explicit execution failures enter ReplayRuntime",
+            replay_scan,
+        )
+        expect(
+            not (blocked_replay_events & created_replay_events),
+            "governance-only and completed outcomes stay out of ReplayRuntime",
+            replay_scan,
+        )
 
     print("proactive_review_execution_smoke: ok")
 

@@ -11,6 +11,113 @@ from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
 
 
+_GOVERNANCE_ONLY_EXECUTION_STATUSES = {
+    "approved_no_op",
+    "approved_noop",
+    "governance_only",
+}
+_COMPLETED_EXECUTION_STATUSES = {
+    "diagnosed",
+    "executed",
+    "observed",
+    "ok",
+    "probed_fallback",
+    "recovered",
+    "refreshed",
+    "restored",
+    "success",
+    "verified_success",
+}
+_NOT_EXECUTED_STATUSES = {
+    "blocked",
+    "needs_confirmation",
+    "not_available",
+    "not_configured",
+    "not_found",
+    "not_restorable",
+    "not_supported",
+}
+_INCOMPLETE_EXECUTION_STATUSES = {
+    "needs_more_probe",
+    "partial",
+    "partially_success",
+    "pending",
+    "running",
+    "submitted",
+}
+_FAILED_EXECUTION_STATUSES = {
+    "error",
+    "execution_failed",
+    "failed",
+    "needs_rollback",
+    "timeout",
+    "verified_failed",
+}
+
+
+def _normalize_execution_status(value: Any) -> str:
+    return "_".join(str(value or "").strip().lower().replace("-", "_").split())
+
+
+def _has_nonzero_returncode(payload: dict[str, Any]) -> bool:
+    if "returncode" not in payload or payload.get("returncode") is None:
+        return False
+    try:
+        return int(payload["returncode"]) != 0
+    except (TypeError, ValueError):
+        return True
+
+
+def _has_explicit_failure(payload: dict[str, Any]) -> bool:
+    status = _normalize_execution_status(payload.get("status"))
+    return bool(
+        status in _FAILED_EXECUTION_STATUSES
+        or payload.get("success") is False
+        or payload.get("applied") is False
+        or payload.get("ok") is False
+        or payload.get("failed") is True
+        or payload.get("needs_rollback") is True
+        or _normalize_execution_status(payload.get("next_action"))
+        in {"rollback", "rollback_or_compensate"}
+        or _has_nonzero_returncode(payload)
+        or bool(payload.get("error"))
+    )
+
+
+def _has_incomplete_evidence(payload: dict[str, Any]) -> bool:
+    status = _normalize_execution_status(payload.get("status"))
+    return status in _NOT_EXECUTED_STATUSES | _INCOMPLETE_EXECUTION_STATUSES
+
+
+def _execution_audit_status(execution_result: dict[str, Any]) -> str:
+    execution_status = _normalize_execution_status(execution_result.get("status"))
+    if execution_status in _GOVERNANCE_ONLY_EXECUTION_STATUSES:
+        return "governance_only"
+    if execution_status in _NOT_EXECUTED_STATUSES:
+        return "not_executed"
+
+    evidence = [execution_result]
+    verification = execution_result.get("verification")
+    if isinstance(verification, dict):
+        evidence.append(verification)
+    tool_result = execution_result.get("tool_result")
+    if isinstance(tool_result, dict):
+        evidence.append(tool_result)
+        tool_verification = tool_result.get("verification")
+        if isinstance(tool_verification, dict):
+            evidence.append(tool_verification)
+    if any(_has_explicit_failure(item) for item in evidence):
+        return "execution_failed"
+    if any(_has_incomplete_evidence(item) for item in evidence):
+        return "execution_incomplete"
+
+    if execution_status in _COMPLETED_EXECUTION_STATUSES:
+        return "executed"
+    if execution_status in _INCOMPLETE_EXECUTION_STATUSES:
+        return "execution_incomplete"
+    return "execution_unknown"
+
+
 class ReviewQueue:
     def __init__(self, state_store: WorldStateStore) -> None:
         self.state_store = state_store
@@ -172,12 +279,13 @@ class ReviewQueue:
         self.state_store.mutate_json("review_queue.json", apply_execution)
         if selected is None:
             raise KeyError(f"Review not found: {review_id}")
+        audit_status = _execution_audit_status(execution_result)
         self.state_store.append_jsonl(
             "action_record.jsonl",
             {
                 "event_id": selected.get("event_id"),
                 "route": "human_review",
-                "status": "executed" if execution_result.get("status") in {"ok", "success"} else "execution_failed",
+                "status": audit_status,
                 "artifacts": {"review_id": review_id, "execution_result": execution_result},
             },
         )

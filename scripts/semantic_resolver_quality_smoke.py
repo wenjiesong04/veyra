@@ -293,6 +293,31 @@ def main() -> int:
     expect(transport.semantic_frame.resolver_status == "degraded", "transport failure was not distinguished from invalid output")
     expect(not transport_policy.allowed_effects, "transport degradation authorized a durable effect")
 
+    for size in (801, 10_000):
+        long_text = "x" * size
+        for long_frame in (
+            TurnSemanticFrame.fallback(long_text),
+            TurnSemanticFrame.safe_from_model_payload({}, source_text=long_text),
+        ):
+            long_policy = SemanticPolicyCompiler().compile(long_frame)
+            source = long_frame.acts[0].source_quote
+            expect(
+                source.text == long_text[source.start : source.end]
+                and len(source.text) <= 800,
+                "long fallback input lost its bounded exact source quote",
+                long_frame.model_dump(mode="json"),
+            )
+            expect(
+                any(
+                    ambiguity.kind == "fallback_input_truncated"
+                    for ambiguity in long_frame.ambiguities
+                )
+                and long_policy.preferred_route == "ask_user"
+                and not long_policy.allowed_effects,
+                "long fallback input did not fail closed",
+                long_policy.to_dict(),
+            )
+
     quoted_text = "解释“不要执行，只解释”是什么意思。"
     quoted = TurnSemanticFrame.from_model_payload(
         {
@@ -882,6 +907,7 @@ def main() -> int:
                     "double-invalid output locks all execution",
                     "invalid read-only explanations retain a safe direct fallback",
                     "transport degradation remains distinct",
+                    "long fallback inputs stay bounded and fail closed",
                     "quoted discourse markers ignored by structural scanner",
                     "lexicalized commitment cancellation remains valid",
                     "negative destructive surface remains fail-closed",

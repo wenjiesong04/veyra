@@ -319,7 +319,43 @@ def main() -> int:
         "natural restart is understood first while the R4 review floor remains authoritative",
         natural_restart,
     )
-    expect((artifacts.get("review") or {}).get("review_id"), "natural restart review created", natural_restart)
+    natural_review_id = str((artifacts.get("review") or {}).get("review_id") or "")
+    expect(natural_review_id, "natural restart review created", natural_restart)
+    expect(
+        artifacts.get("proposal") is None
+        and "不会自动执行" in str(natural_restart.get("response") or ""),
+        "review without a proposal is described as governance-only",
+        natural_restart,
+    )
+    approved_natural_review = post_json(
+        f"/reviews/{natural_review_id}/approve",
+        {"reason": "guard smoke validates governance-only approval"},
+    )
+    expect(
+        approved_natural_review.get("execution_result", {}).get("status")
+        == "approved_noop",
+        "governance-only approval records an explicit no-op",
+        approved_natural_review,
+    )
+    natural_event_id = str(natural_restart.get("event_id") or "")
+    natural_action_records = [
+        item
+        for item in (get_json("/logs/actions?limit=200").get("items") or [])
+        if item.get("event_id") == natural_event_id
+        and item.get("route") == "human_review"
+    ]
+    expect(
+        any(
+            item.get("status") == "governance_only"
+            for item in natural_action_records
+        )
+        and not any(
+            item.get("status") == "execution_failed"
+            for item in natural_action_records
+        ),
+        "governance-only approval is not recorded as execution failure",
+        natural_action_records,
+    )
 
     reviews_before_degraded = get_json("/reviews/actions?limit=200").get("items") or []
     degraded_restart = semantic_understanding(
