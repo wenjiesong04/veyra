@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -16,10 +18,17 @@ _TEST_RUNTIME = TemporaryDirectory(prefix="veyra-tool-proxy-guard-")
 TEST_ROOT = Path(_TEST_RUNTIME.name)
 TEST_STATE_ROOT = TEST_ROOT / "state"
 TEST_AGENCY_ROOT = TEST_ROOT / "agency"
-os.environ.setdefault("VEYRA_STATE_ROOT", str(TEST_STATE_ROOT))
-os.environ.setdefault("VEYRA_AGENCY_ROOT", str(TEST_AGENCY_ROOT))
+os.environ["VEYRA_STATE_DIR"] = str(TEST_STATE_ROOT)
+os.environ["VEYRA_STATE_ROOT"] = str(TEST_STATE_ROOT)
+os.environ["VEYRA_AGENCY_DIR"] = str(TEST_AGENCY_ROOT)
+os.environ["VEYRA_AGENCY_ROOT"] = str(TEST_AGENCY_ROOT)
+os.environ["VEYRA_ENV_FILE"] = str(TEST_ROOT / "missing.env")
+os.environ["VEYRA_CORE_MODEL_ENABLED"] = "0"
+os.environ["VEYRA_ACTIVE_LOOP_AUTOSTART"] = "0"
+os.environ["VEYRA_FEISHU_WS_AUTOSTART"] = "0"
 
-from main import app  # noqa: E402
+from core.understanding_core import TurnUnderstanding  # noqa: E402
+from main import app, awareness_loop  # noqa: E402
 
 
 client = TestClient(app)
@@ -45,6 +54,113 @@ def get_json(path: str) -> dict[str, Any]:
 
 def proposal(payload: dict[str, Any]) -> dict[str, Any]:
     return post_json("/actions/proposals", payload)
+
+
+def semantic_understanding(
+    text: str,
+    *,
+    resolver_status: str,
+    operation: str,
+    target_type: str,
+    target_value: str,
+) -> TurnUnderstanding:
+    return TurnUnderstanding.from_payload(
+        {
+            "intent": "action",
+            "task_type": "workspace_task",
+            "explicit_request": text,
+            "user_goal": text,
+            "suggested_mode": "governed_execution",
+            "semantic_frame": {
+                "schema_version": "veyra.semantic_frame.v1",
+                "acts": [
+                    {
+                        "act_id": "guard-a1",
+                        "kind": "workspace_task",
+                        "goal": text,
+                        "operation": operation,
+                        "target": {
+                            "type": target_type,
+                            "value": target_value,
+                            "attributes": {},
+                        },
+                        "polarity": "positive",
+                        "explicitness": "explicit",
+                        "source_quote": {
+                            "text": text,
+                            "start": 0,
+                            "end": len(text),
+                        },
+                        "speaker": "guard-smoke-user",
+                        "authority": "direct_user",
+                        "mention_mode": "normal_use",
+                        "evidence_need": "fresh_local",
+                        "referent": {
+                            "surface": target_value,
+                            "resolved": target_value,
+                            "status": "resolved",
+                            "candidates": [],
+                        },
+                        "condition": None,
+                        "modality": "asserted",
+                        "arguments": {},
+                    }
+                ],
+                "relations": [],
+                "ambiguities": [],
+                "resolver_status": resolver_status,
+                "source": "guard_smoke_fixture",
+            },
+        },
+        source_text=text,
+    )
+
+
+@contextmanager
+def injected_understanding(understanding: TurnUnderstanding) -> Iterator[None]:
+    original_build = awareness_loop.understanding_core.build
+    awareness_loop.understanding_core.build = lambda **_kwargs: understanding
+    try:
+        yield
+    finally:
+        awareness_loop.understanding_core.build = original_build
+
+
+def decision_artifacts(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    artifacts = (
+        payload.get("artifacts")
+        if isinstance(payload.get("artifacts"), dict)
+        else {}
+    )
+    decision = (
+        artifacts.get("decision")
+        if isinstance(artifacts.get("decision"), dict)
+        else {}
+    )
+    if not decision:
+        guardian = (
+            artifacts.get("guardian")
+            if isinstance(artifacts.get("guardian"), dict)
+            else {}
+        )
+        decision = (
+            guardian.get("decision_trace")
+            if isinstance(guardian.get("decision_trace"), dict)
+            else {}
+        )
+    assist = (
+        decision.get("model_assist")
+        if isinstance(decision.get("model_assist"), dict)
+        else {}
+    )
+    policy = (
+        assist.get("semantic_policy")
+        if isinstance(assist.get("semantic_policy"), dict)
+        else {}
+    )
+    return artifacts, decision, policy
 
 
 def main() -> int:
@@ -175,25 +291,28 @@ def main() -> int:
     expect(direct_launchctl.get("status") == "needs_confirmation", "direct ToolProxy launchctl requires human review", direct_launchctl)
     expect(direct_launchctl.get("review", {}).get("review_id"), "direct ToolProxy launchctl review created", direct_launchctl)
 
-    natural_restart = post_json(
-        "/events/message",
-        {
-            "text": "帮我重启 Veyra 服务。",
-            "channel": "api",
-            "user_id": "guard-smoke-user",
-            "session_id": "guard-smoke-session",
-            "message_id": "guard-natural-restart",
-        },
+    natural_restart_text = "帮我重启 Veyra 服务。"
+    resolved_restart = semantic_understanding(
+        natural_restart_text,
+        resolver_status="resolved",
+        operation="restart_service",
+        target_type="service",
+        target_value="Veyra",
     )
+    with injected_understanding(resolved_restart):
+        natural_restart = post_json(
+            "/events/message",
+            {
+                "text": natural_restart_text,
+                "channel": "api",
+                "user_id": "guard-smoke-user",
+                "session_id": "guard-smoke-session",
+                "message_id": "guard-natural-restart-resolved",
+            },
+        )
     expect(natural_restart.get("route") == "human_review", "natural restart enters human review", natural_restart)
     expect(natural_restart.get("risk_level") == "R4", "natural restart keeps the deterministic R4 floor", natural_restart)
-    artifacts = natural_restart.get("artifacts") if isinstance(natural_restart.get("artifacts"), dict) else {}
-    decision = artifacts.get("decision") if isinstance(artifacts.get("decision"), dict) else {}
-    if not decision:
-        guardian = artifacts.get("guardian") if isinstance(artifacts.get("guardian"), dict) else {}
-        decision = guardian.get("decision_trace") if isinstance(guardian.get("decision_trace"), dict) else {}
-    assist = decision.get("model_assist") if isinstance(decision.get("model_assist"), dict) else {}
-    policy = assist.get("semantic_policy") if isinstance(assist.get("semantic_policy"), dict) else {}
+    artifacts, decision, policy = decision_artifacts(natural_restart)
     expect(
         "agent.execute" in (policy.get("allowed_effects") or [])
         and decision.get("route") == "human_review",
@@ -201,6 +320,47 @@ def main() -> int:
         natural_restart,
     )
     expect((artifacts.get("review") or {}).get("review_id"), "natural restart review created", natural_restart)
+
+    reviews_before_degraded = get_json("/reviews/actions?limit=200").get("items") or []
+    degraded_restart = semantic_understanding(
+        natural_restart_text,
+        resolver_status="degraded",
+        operation="fulfill_open_request",
+        target_type="open_goal",
+        target_value=natural_restart_text,
+    )
+    with injected_understanding(degraded_restart):
+        degraded_natural_restart = post_json(
+            "/events/message",
+            {
+                "text": natural_restart_text,
+                "channel": "api",
+                "user_id": "guard-smoke-user",
+                "session_id": "guard-smoke-degraded-session",
+                "message_id": "guard-natural-restart-degraded",
+            },
+        )
+    degraded_artifacts, _, degraded_policy = decision_artifacts(
+        degraded_natural_restart
+    )
+    expect(
+        degraded_natural_restart.get("route") == "ask_user"
+        and degraded_natural_restart.get("risk_level") == "R1",
+        "degraded natural restart fails closed to clarification",
+        degraded_natural_restart,
+    )
+    expect(
+        degraded_policy.get("allowed_effects") == []
+        and not degraded_artifacts.get("review"),
+        "degraded natural restart grants no effects or review",
+        degraded_natural_restart,
+    )
+    reviews_after_degraded = get_json("/reviews/actions?limit=200").get("items") or []
+    expect(
+        len(reviews_after_degraded) == len(reviews_before_degraded),
+        "degraded natural restart does not mutate the review queue",
+        reviews_after_degraded,
+    )
 
     force_push = proposal(
         {
