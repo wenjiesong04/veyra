@@ -50,6 +50,10 @@ class ReplayRuntimeConfigRequest(BaseModel):
     allow_r4_restore: bool | None = None
 
 
+class EventAwarenessConfigRequest(BaseModel):
+    mode: str
+
+
 def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     router = APIRouter()
 
@@ -344,6 +348,142 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     async def attention_active() -> dict[str, Any]:
         return deps["awareness_loop"].attention.active_scope()
 
+    @router.get("/awareness/situations")
+    async def awareness_situations(
+        user_id: str,
+        session_id: str | None = None,
+        status: str | None = None,
+        correlation_id: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        items = deps["awareness_loop"].situation_evaluator.list(
+            user_id=user_id,
+            session_id=session_id,
+            status=status,
+            correlation_id=correlation_id,
+            limit=max(0, min(limit, 500)),
+        )
+        return {
+            "status": "success",
+            "projection_kind": "situation_candidate",
+            "count": len(items),
+            "items": items,
+        }
+
+    @router.get("/awareness/situations/{situation_id}")
+    async def awareness_situation(
+        situation_id: str,
+        user_id: str,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        item = deps["awareness_loop"].situation_evaluator.get(
+            situation_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        if item is None:
+            raise HTTPException(status_code=404, detail="situation not found in the requested scope")
+        return {"status": "success", "item": item}
+
+    @router.get("/events/inbox")
+    async def event_inbox(
+        user_id: str,
+        session_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        document = deps["state_store"].read_json("event_inbox.json")
+        records = document.get("events") if isinstance(document.get("events"), dict) else {}
+        items: list[dict[str, Any]] = []
+        for event_id, record in records.items():
+            if not isinstance(record, dict):
+                continue
+            record_status = str(record.get("status") or "unknown")
+            if status is not None and record_status != status:
+                continue
+            envelope = record.get("envelope") if isinstance(record.get("envelope"), dict) else {}
+            source = envelope.get("source") if isinstance(envelope.get("source"), dict) else {}
+            if str(source.get("user_id") or "") != user_id:
+                continue
+            if session_id is not None and str(source.get("session_id") or "") != session_id:
+                continue
+            items.append(
+                {
+                    "event_id": event_id,
+                    "event_type": envelope.get("type"),
+                    "correlation_id": envelope.get("correlation_id"),
+                    "channel": source.get("channel"),
+                    "user_id": source.get("user_id"),
+                    "session_id": source.get("session_id"),
+                    "privacy_scope": envelope.get("privacy_scope"),
+                    "status": record_status,
+                    "attempts": record.get("attempts"),
+                    "max_attempts": record.get("max_attempts"),
+                    "enqueued_at": record.get("enqueued_at"),
+                    "completed_at": record.get("completed_at"),
+                    "last_error": record.get("last_error"),
+                }
+            )
+        items.sort(key=lambda item: str(item.get("enqueued_at") or ""), reverse=True)
+        scoped_stats: dict[str, int] = {}
+        for item in items:
+            item_status = str(item.get("status") or "unknown")
+            scoped_stats[item_status] = scoped_stats.get(item_status, 0) + 1
+        scoped_stats["total"] = len(items)
+        selected_limit = max(0, min(limit, 500))
+        return {
+            "status": "success",
+            "mode": deps["awareness_loop"].event_awareness.mode,
+            "stats": scoped_stats,
+            "count": min(len(items), selected_limit),
+            "items": items[:selected_limit],
+        }
+
+    @router.get("/events/awareness/status")
+    async def event_awareness_status() -> dict[str, Any]:
+        runtime = deps["awareness_loop"].event_awareness
+        return {
+            "status": "success",
+            "mode": runtime.mode,
+            "allowed_modes": sorted(runtime.MODES),
+        }
+
+    @router.post("/events/awareness/config")
+    async def event_awareness_config(
+        request: EventAwarenessConfigRequest,
+    ) -> dict[str, Any]:
+        mode = str(request.mode or "").strip().lower()
+        runtime = deps["awareness_loop"].event_awareness
+        if mode not in runtime.MODES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"mode must be one of {sorted(runtime.MODES)}",
+            )
+
+        def update(config: dict[str, Any]) -> None:
+            config["event_awareness"] = {
+                "mode": mode,
+                "allowed_modes": sorted(runtime.MODES),
+            }
+
+        deps["state_store"].mutate_json("ops_config.json", update)
+        previous = runtime.mode
+        runtime.mode = mode
+        deps["state_store"].append_jsonl(
+            "action_record.jsonl",
+            {
+                "route": "event_awareness_config",
+                "status": "updated",
+                "artifacts": {"previous_mode": previous, "mode": mode},
+            },
+        )
+        return {
+            "status": "updated",
+            "previous_mode": previous,
+            "mode": mode,
+            "allowed_modes": sorted(runtime.MODES),
+        }
+
     @router.post("/belief/refresh")
     async def belief_refresh(request: BeliefRefreshRequest | None = None) -> dict[str, Any]:
         payload = request or BeliefRefreshRequest()
@@ -362,6 +502,11 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
 
 def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
     public = redact_sensitive(payload)
+    # Event and situation projections are tenant-scoped records. The generic
+    # state endpoint has no authenticated tenant identity, so it must not
+    # expose either collection.
+    public.pop("event_inbox", None)
+    public.pop("situation_state", None)
     agent_config = public.get("agent_config") if isinstance(public.get("agent_config"), dict) else {}
     if isinstance(agent_config, dict):
         core_model = agent_config.get("core_model") if isinstance(agent_config.get("core_model"), dict) else {}

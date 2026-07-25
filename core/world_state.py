@@ -46,6 +46,7 @@ JSONL_FILES = [
     "decision_trace.jsonl",
     "context_drift_log.jsonl",
     "openclaw_workspace_memory_fallback.jsonl",
+    "situation_trace.jsonl",
 ]
 
 STATE_FILE_LAYOUT: dict[str, str] = {
@@ -75,6 +76,8 @@ STATE_FILE_LAYOUT: dict[str, str] = {
     "runtime_cron_state.json": f"{STATE_RUNTIME}/runtime_cron_state.json",
     "self_improvement_proposals.json": f"{STATE_RUNTIME}/self_improvement_proposals.json",
     "state_change_proposals.json": f"{STATE_RUNTIME}/state_change_proposals.json",
+    "event_inbox.json": f"{STATE_RUNTIME}/event_inbox.json",
+    "situation_state.json": f"{STATE_RUNTIME}/situation_state.json",
     "rollback_state.json": f"{STATE_RUNTIME}/rollback_state.json",
     "replay_runtime_state.json": f"{STATE_RUNTIME}/replay_runtime_state.json",
     "ops_soak_state.json": f"{STATE_RUNTIME}/ops_soak_state.json",
@@ -114,6 +117,8 @@ STATE_METADATA: dict[str, dict[str, Any]] = {
     "runtime_cron_state.json": {"source": "runtime_cron", "ttl_seconds": 3600, "confidence": 0.78},
     "self_improvement_proposals.json": {"source": "self_improvement_registry", "ttl_seconds": 86400, "confidence": 0.72},
     "state_change_proposals.json": {"source": "state_proposal_coordinator", "ttl_seconds": 0, "confidence": 1.0},
+    "event_inbox.json": {"source": "event_inbox", "ttl_seconds": 0, "confidence": 1.0},
+    "situation_state.json": {"source": "situation_evaluator", "ttl_seconds": 86400, "confidence": 0.78},
     "feishu_ws_state.json": {"source": "feishu_ws_runner", "ttl_seconds": 600, "confidence": 0.65},
     "ops_runtime_matrix.json": {"source": "runtime_matrix", "ttl_seconds": 1800, "confidence": 0.74},
     "ops_config.json": {"source": "ops_config", "ttl_seconds": 0, "confidence": 0.8},
@@ -122,7 +127,11 @@ STATE_METADATA: dict[str, dict[str, Any]] = {
 }
 
 CONFIG_STATE_FILES = {"agent_config.json", "ops_config.json", "risk_policy.json", "setup_wizard.json", "state_schema.json"}
-DURABLE_STATE_FILES = CONFIG_STATE_FILES | {"agent_memory.json", "state_change_proposals.json"}
+DURABLE_STATE_FILES = CONFIG_STATE_FILES | {
+    "agent_memory.json",
+    "state_change_proposals.json",
+    "event_inbox.json",
+}
 
 _ROOT_LOCKS_GUARD = threading.Lock()
 _ROOT_MUTATION_LOCKS: dict[str, threading.RLock] = {}
@@ -470,6 +479,23 @@ class WorldStateStore:
                 "status": "fresh",
                 "updated_at": None,
             },
+            "event_inbox.json": {
+                "schema_version": "veyra.event_inbox.v1",
+                "events": {},
+                "dedupe_index": {},
+                "evicted_terminal_count": 0,
+                "source": "event_inbox",
+                "confidence": 1.0,
+                "ttl_seconds": 0,
+                "status": "fresh",
+                "updated_at": None,
+            },
+            "situation_state.json": {
+                "schema_version": "veyra.situation_state.v1",
+                "situations": [],
+                "count": 0,
+                "updated_at": None,
+            },
             "feishu_ws_state.json": {"status": "stopped", "last_event_at": None},
             "ops_runtime_matrix.json": {"status": "not_run", "runtimes": []},
             "ops_config.json": {
@@ -491,6 +517,10 @@ class WorldStateStore:
                     "autostart": True,
                     "interval_seconds": 300.0,
                     "health_required": True,
+                },
+                "event_awareness": {
+                    "mode": "record_only",
+                    "allowed_modes": ["disabled", "record_only", "shadow"],
                 },
             },
             "setup_wizard.json": {"completed": False},
@@ -898,6 +928,8 @@ class WorldStateStore:
             "runtime_cron_state": self.read_json("runtime_cron_state.json"),
             "self_improvement_proposals": self.read_json("self_improvement_proposals.json"),
             "state_change_proposals": self.read_json("state_change_proposals.json"),
+            "event_inbox": self.read_json("event_inbox.json"),
+            "situation_state": self.read_json("situation_state.json"),
             "feishu_ws_state": self.read_json("feishu_ws_state.json"),
             "ops_config": self.read_json("ops_config.json"),
         }

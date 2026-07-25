@@ -244,6 +244,7 @@ active_loop = ActiveRuntimeLoop(
     verifier=awareness_loop.verifier,
     replay_runtime=replay_runtime,
     commitment_push=commitment_push,
+    event_consumer=awareness_loop.process_event_inbox,
 )
 runtime_cron = Cron(state_store=state_store, active_loop=active_loop, commitment_push=commitment_push)
 agent_orchestrator = AgentOrchestrator(

@@ -28,6 +28,7 @@ class ActiveRuntimeLoop:
         verifier: Any,
         replay_runtime: Any | None = None,
         commitment_push: Any | None = None,
+        event_consumer: Callable[..., Any] | None = None,
     ) -> None:
         self.state_store = state_store
         self.runtime_entity = runtime_entity
@@ -38,6 +39,7 @@ class ActiveRuntimeLoop:
         self.retention_policy = retention_policy
         self.replay_runtime = replay_runtime
         self.commitment_push = commitment_push
+        self.event_consumer = event_consumer
         self.task_tracker = task_tracker
         self.adapter_resolver = adapter_resolver
         self.verifier = verifier
@@ -98,6 +100,7 @@ class ActiveRuntimeLoop:
         tick_id = f"tick_{uuid4().hex[:12]}"
         steps = [
             self._step("heartbeat", lambda: self._heartbeat()),
+            self._step("event_inbox", lambda: self._event_inbox_tick()),
             self._step("pending_tasks", lambda: self.task_tracker.refresh_pending(self.adapter_resolver(), self.verifier, limit=20)),
             self._step("stale_state", lambda: self.state_refresh.refresh_stale(limit=20)),
             self._step("proactive", lambda: self.proactive_checks.run_read_only(timeout_seconds=12)),
@@ -108,7 +111,11 @@ class ActiveRuntimeLoop:
         ]
         if include_runtime_matrix:
             steps.append(self._step("runtime_matrix", lambda: self.runtime_matrix.run(write_memory_probe=False)))
-        status = "success" if all(step.get("status") not in {"error", "timeout"} for step in steps) else "degraded"
+        status = (
+            "success"
+            if all(step.get("status") not in {"degraded", "error", "timeout"} for step in steps)
+            else "degraded"
+        )
         tick = {
             "tick_id": tick_id,
             "status": status,
@@ -156,7 +163,11 @@ class ActiveRuntimeLoop:
             result_status = str(result.get("status")) if isinstance(result, dict) and result.get("status") else "success"
             return {
                 "name": name,
-                "status": "success" if result_status not in {"error", "timeout"} else result_status,
+                "status": (
+                    "success"
+                    if result_status not in {"degraded", "error", "timeout"}
+                    else result_status
+                ),
                 "result_status": result_status,
                 "duration_ms": int((perf_counter() - started) * 1000),
                 "result": self._compact_result(result),
@@ -194,6 +205,11 @@ class ActiveRuntimeLoop:
         if self.commitment_push is None:
             return {"status": "not_configured"}
         return self.commitment_push.run_due(limit=10, reason="active_loop")
+
+    def _event_inbox_tick(self) -> dict[str, Any]:
+        if self.event_consumer is None:
+            return {"status": "not_configured"}
+        return self.event_consumer(limit=100)
 
     def _run_replay_runtime(self) -> dict[str, Any]:
         if self.replay_runtime is None:

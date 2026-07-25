@@ -71,6 +71,7 @@ from probes.weather_probe import WeatherProbe
 from probes.web_probe import WebProbe
 from rollback_audit.execution_trace import ExecutionTrace
 from runtime.agent_task_tracker import AgentTaskTracker
+from runtime.event_awareness_runtime import ShadowAwarenessRuntime
 from runtime.routing_trace import RuntimeTraceRecorder
 from skills.skill_loader import SkillLoader
 from skills.skill_runtime import SkillRuntime
@@ -125,6 +126,18 @@ class AwarenessLoop:
         self.state_proposals = StateChangeProposalStore(state_store)
         self.controller = VeyraController(self.capabilities)
         self.runtime_trace = RuntimeTraceRecorder(state_store)
+        event_awareness_config = state_store.read_json("ops_config.json").get(
+            "event_awareness",
+            {},
+        )
+        if not isinstance(event_awareness_config, dict):
+            event_awareness_config = {}
+        self.event_awareness = ShadowAwarenessRuntime(
+            state_store,
+            mode=str(event_awareness_config.get("mode") or "record_only"),
+        )
+        self.event_inbox = self.event_awareness.event_inbox
+        self.situation_evaluator = self.event_awareness.situation_evaluator
         self.skill_loader = SkillLoader()
         self.skill_runtime = SkillRuntime(state_store)
         self.probes = {
@@ -159,6 +172,20 @@ class AwarenessLoop:
         self.runtime_entity.set_status(LifecycleStatus.THINKING.value)
         text = event.payload.get("text", "")
         self.state_store.append_jsonl("event_log.jsonl", self._event_log_record(event))
+        try:
+            shadow_intake = self.event_awareness.begin(event)
+        except Exception as exc:
+            shadow_intake = {
+                "status": "degraded",
+                "error_type": type(exc).__name__,
+            }
+        route_trace.append(
+            {
+                "phase": "event_fabric_shadow",
+                "status": shadow_intake.get("status", "unavailable"),
+                "situation_id": shadow_intake.get("situation_id"),
+            }
+        )
 
         attention_focus = self.attention.focus_for_text(text)
         self.belief.update_from_event(event)
@@ -746,8 +773,24 @@ class AwarenessLoop:
             "latency_ms": trace["latency_ms"],
             "final_route": trace["final_route"],
         }
+        try:
+            self.event_awareness.finalize(event, result, trace)
+        except Exception:
+            # Event/situation projection is observational. It must never make an
+            # otherwise completed user turn fail.
+            pass
         self._update(event, result)
         return result
+
+    def publish_event(self, event: VeyraEvent) -> dict[str, Any]:
+        """Durably admit an internal or external event without granting authority."""
+
+        return self.event_awareness.publish(event)
+
+    def process_event_inbox(self, *, limit: int = 20) -> dict[str, Any]:
+        """Project pending events into situations, never actions."""
+
+        return self.event_awareness.process_pending(limit=limit)
 
     def _result_execution_tier(self, result: LoopResult) -> str:
         direct_tier = str(result.artifacts.get("execution_tier") or "").strip()

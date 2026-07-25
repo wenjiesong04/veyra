@@ -19,6 +19,13 @@ class EventType(str, Enum):
     AGENT_RESULT = "agent_result"
     HEARTBEAT = "heartbeat"
     ACTION_PROPOSAL = "action_proposal"
+    OBSERVATION = "observation"
+    STATE_CHANGED = "state_changed"
+    TASK_PROGRESS = "task_progress"
+    TASK_COMPLETED = "task_completed"
+    COMMITMENT_DUE = "commitment_due"
+    COMPONENT_DEGRADED = "component_degraded"
+    USER_FEEDBACK = "user_feedback"
 
 
 class Route(str, Enum):
@@ -47,11 +54,79 @@ class VeyraEvent:
     payload: dict[str, Any]
     event_id: str = field(default_factory=lambda: f"evt_{uuid4().hex[:12]}")
     timestamp: str = field(default_factory=utc_now_iso)
+    correlation_id: str | None = None
+    causation_id: str | None = None
+    subject: Any = None
+    evidence_refs: list[Any] = field(default_factory=list)
+    dedupe_key: str | None = None
+    occurred_at: str | None = None
+    received_at: str | None = None
+    privacy_scope: Any = "user"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.type, EventType):
+            self.type = EventType(str(self.type))
+        if not isinstance(self.source, EventSource):
+            if not isinstance(self.source, dict):
+                raise TypeError("event source must be EventSource or a mapping")
+            self.source = EventSource(
+                channel=str(self.source.get("channel") or ""),
+                user_id=str(self.source.get("user_id") or ""),
+                session_id=str(self.source.get("session_id") or ""),
+            )
+        if not isinstance(self.payload, dict):
+            raise TypeError("event payload must be a mapping")
+        self.event_id = str(self.event_id or f"evt_{uuid4().hex[:12]}")
+        self.timestamp = str(self.timestamp or self.occurred_at or utc_now_iso())
+        self.occurred_at = str(self.occurred_at or self.timestamp)
+        self.received_at = str(self.received_at or utc_now_iso())
+        self.correlation_id = str(self.correlation_id or self.event_id)
+        self.causation_id = str(self.causation_id) if self.causation_id else None
+        self.dedupe_key = str(self.dedupe_key) if self.dedupe_key else None
+        self.evidence_refs = list(self.evidence_refs or [])
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["type"] = self.type.value
         return data
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> VeyraEvent:
+        """Restore both legacy and current event envelopes."""
+        if not isinstance(raw, dict):
+            raise TypeError("event envelope must be a mapping")
+        source = raw.get("source")
+        if isinstance(source, EventSource):
+            normalized_source = source
+        elif isinstance(source, dict):
+            normalized_source = EventSource(
+                channel=str(source.get("channel") or ""),
+                user_id=str(source.get("user_id") or ""),
+                session_id=str(source.get("session_id") or ""),
+            )
+        else:
+            raise TypeError("event envelope source must be a mapping")
+        payload = raw.get("payload")
+        if not isinstance(payload, dict):
+            raise TypeError("event envelope payload must be a mapping")
+        occurred_at = str(raw.get("occurred_at") or raw.get("timestamp") or utc_now_iso())
+        raw_type = raw.get("type")
+        normalized_type = raw_type if isinstance(raw_type, EventType) else EventType(str(raw_type or ""))
+        return cls(
+            type=normalized_type,
+            source=normalized_source,
+            payload=dict(payload),
+            event_id=str(raw.get("event_id") or f"evt_{uuid4().hex[:12]}"),
+            timestamp=str(raw.get("timestamp") or occurred_at),
+            correlation_id=str(raw.get("correlation_id") or raw.get("event_id") or "") or None,
+            causation_id=str(raw.get("causation_id") or "") or None,
+            subject=raw.get("subject"),
+            evidence_refs=list(raw.get("evidence_refs") or []),
+            dedupe_key=str(raw.get("dedupe_key") or "") or None,
+            occurred_at=occurred_at,
+            received_at=str(raw.get("received_at") or utc_now_iso()),
+            privacy_scope=raw.get("privacy_scope", "user"),
+        )
 
 
 @dataclass(slots=True)
