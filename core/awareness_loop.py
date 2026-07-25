@@ -4,7 +4,7 @@ import hashlib
 import re
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any
 
 from awareness.attention_core import AttentionCore
@@ -16,7 +16,14 @@ from core.capability_registry import CapabilityRegistry
 from core.context_patch_builder import ContextPatchBuilder
 from core.compact_external_lookup import CompactExternalLookup
 from core.context_scope import ContextScopeFilter
-from core.execution_tier import TIER_L0_DIRECT_ANSWER, TIER_L1_COMPACT_EXTERNAL, TIER_L5_PROACTIVE, classify_execution_tier
+from core.execution_tier import (
+    TIER_L0_DIRECT_ANSWER,
+    TIER_L1_COMPACT_EXTERNAL,
+    TIER_L2_PROBE_VERIFY,
+    TIER_L3_SCOPED_AGENT,
+    TIER_L5_PROACTIVE,
+    classify_execution_tier,
+)
 from core.definitions import GuardianDecision, LifecycleStatus, RiskLevel
 from core.decision_core import DecisionCore
 from core.foresight_engine import ForesightEngine
@@ -29,6 +36,13 @@ from core.reasoning_core import CoreReasoning
 from core.result_interpreter import ResultInterpreter
 from core.runtime_entity import RuntimeEntity
 from core.response_synthesizer import ResponseSynthesizer
+from core.state_proposal import (
+    ProposalNotFoundError,
+    StateChangeProposal,
+    StateChangeProposalStore,
+    deterministic_idempotency_key,
+    deterministic_proposal_id,
+)
 from core.task_packet_builder import TaskPacketBuilder
 from core.understanding_core import UnderstandingCore
 from core.verifier import Verifier
@@ -108,6 +122,7 @@ class AwarenessLoop:
         self.execution_trace = ExecutionTrace(state_store)
         self.task_tracker = AgentTaskTracker(state_store, self.execution_trace)
         self.memory_policy_runtime = MemoryPolicyRuntime(state_store, lambda patch: self.memory_bridge.write_patch(patch))
+        self.state_proposals = StateChangeProposalStore(state_store)
         self.controller = VeyraController(self.capabilities)
         self.runtime_trace = RuntimeTraceRecorder(state_store)
         self.skill_loader = SkillLoader()
@@ -147,11 +162,12 @@ class AwarenessLoop:
 
         attention_focus = self.attention.focus_for_text(text)
         self.belief.update_from_event(event)
-        followup_result = self._conversation_followup_result(event, str(text or ""), attention_focus)
-        if followup_result:
-            return self._finalize_event(event, followup_result, started_at, route_trace, context_observability)
         low_latency_response = self._low_latency_short_response(str(text or ""))
-        if low_latency_response:
+        if low_latency_response and str(low_latency_response.get("reason") or "") in {
+            "empty_short_message",
+            "casual_short_message",
+            "latency_complaint",
+        }:
             low_latency_route = Route(str(low_latency_response.get("route") or Route.DIRECT_ANSWER.value))
             route_trace.append(
                 {
@@ -173,54 +189,6 @@ class AwarenessLoop:
                 },
             )
             return self._finalize_event(event, result, started_at, route_trace, context_observability)
-        early_response = self._early_awareness_response(event, str(text or ""), attention_focus)
-        if early_response:
-            route_trace.append(
-                {
-                    "phase": "early_awareness",
-                    "status": "handled",
-                    "reason": early_response.get("reason"),
-                }
-            )
-            result = LoopResult(
-                event_id=event.event_id,
-                route=Route.DIRECT_ANSWER,
-                status="success",
-                response=str(early_response.get("response") or ""),
-                risk_level=RiskLevel.R0,
-                artifacts={
-                    "early_awareness": early_response,
-                    "attention": attention_focus,
-                },
-            )
-            return self._finalize_event(event, result, started_at, route_trace, context_observability)
-        early_risk_result = self._early_high_risk_result(event, str(text or ""))
-        if early_risk_result:
-            route_trace.append(
-                {
-                    "phase": "early_risk_gate",
-                    "status": early_risk_result.status,
-                    "route": early_risk_result.route.value,
-                    "risk_level": early_risk_result.risk_level.value,
-                    "reason": early_risk_result.artifacts.get("risk_assessment", {}).get("reason")
-                    if isinstance(early_risk_result.artifacts.get("risk_assessment"), dict)
-                    else None,
-                }
-            )
-            return self._finalize_event(event, early_risk_result, started_at, route_trace, context_observability)
-        early_probe_result = self._early_deterministic_probe_result(event, str(text or ""), attention_focus)
-        if early_probe_result:
-            route_trace.append(
-                {
-                    "phase": "early_probe",
-                    "status": early_probe_result.status,
-                    "route": early_probe_result.route.value,
-                    "probe": early_probe_result.artifacts.get("probe_result", {}).get("probe")
-                    if isinstance(early_probe_result.artifacts.get("probe_result"), dict)
-                    else None,
-                }
-            )
-            return self._finalize_event(event, early_probe_result, started_at, route_trace, context_observability)
         belief_state = self.belief.refresh()
         preliminary_persona = self.persona_engine.patch_for(
             text,
@@ -285,6 +253,51 @@ class AwarenessLoop:
                 "model_status": decision.model_assist.get("status") if isinstance(decision.model_assist, dict) else None,
             }
         )
+        followup_result = self._conversation_followup_result(
+            event,
+            str(text or ""),
+            attention_focus,
+            decision=decision,
+        )
+        if followup_result and self._semantic_result_allowed(decision, followup_result):
+            followup_result.artifacts.setdefault("decision", decision.to_dict())
+            followup_result.artifacts.setdefault("turn_understanding", understanding_payload)
+            route_trace.append(
+                {
+                    "phase": "conversation_followup",
+                    "status": "handled",
+                    "route": followup_result.route.value,
+                }
+            )
+            return self._finalize_event(event, followup_result, started_at, route_trace, context_observability)
+        early_response = self._early_awareness_response(
+            event,
+            str(text or ""),
+            attention_focus,
+            decision=decision,
+        )
+        if early_response:
+            route_trace.append(
+                {
+                    "phase": "semantic_awareness",
+                    "status": "handled",
+                    "reason": early_response.get("reason"),
+                }
+            )
+            result = LoopResult(
+                event_id=event.event_id,
+                route=Route.DIRECT_ANSWER,
+                status="success",
+                response=str(early_response.get("response") or ""),
+                risk_level=decision.risk_level,
+                artifacts={
+                    "early_awareness": early_response,
+                    "attention": attention_focus,
+                    "decision": decision.to_dict(),
+                    "turn_understanding": understanding_payload,
+                },
+            )
+            return self._finalize_event(event, result, started_at, route_trace, context_observability)
         decision, controller_plan = self.controller.prepare(decision)
         route_trace.append({"phase": "controller", **controller_plan.to_dict()})
         self.state_store.patch_json("risk_state.json", {"current_risk": decision.risk_level.value})
@@ -347,6 +360,14 @@ class AwarenessLoop:
 
         self.runtime_entity.set_status(LifecycleStatus.ACTING.value)
         execution_tier = classify_execution_tier(text, decision)
+        semantic_policy = self._semantic_policy_from_decision(decision)
+        semantic_route = str(semantic_policy.get("preferred_route") or "")
+        if semantic_route in {Route.DIRECT_ANSWER.value, Route.ASK_USER.value}:
+            execution_tier = TIER_L0_DIRECT_ANSWER
+        elif semantic_route == Route.PROBE.value and execution_tier == TIER_L5_PROACTIVE:
+            execution_tier = TIER_L2_PROBE_VERIFY
+        elif semantic_route == Route.AGENT.value and execution_tier == TIER_L5_PROACTIVE:
+            execution_tier = TIER_L3_SCOPED_AGENT
         model_assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
         model_first = model_assist.get("pipeline") in {"model_first", "awareness_model_first"}
         if isinstance(decision.model_assist, dict):
@@ -457,6 +478,18 @@ class AwarenessLoop:
             memory_summary = self.memory_bridge.read_summary(event.source.session_id, attention_focus)
             context_patch = self.context_builder.build(text, attention_focus, decision=decision.to_dict(), foresight=foresight, event=event)
             context_patch["memory_summary"] = memory_summary
+            semantic_frame = model_assist.get("semantic_frame") if isinstance(model_assist.get("semantic_frame"), dict) else {}
+            if semantic_frame:
+                context_patch["semantic_frame"] = semantic_frame
+            if semantic_policy:
+                context_patch["semantic_policy"] = semantic_policy
+                canonical_goals = (
+                    semantic_policy.get("canonical_goals")
+                    if isinstance(semantic_policy.get("canonical_goals"), list)
+                    else []
+                )
+                if canonical_goals:
+                    context_patch["user_goal"] = "\n".join(str(item) for item in canonical_goals if item)[:2000]
             if decision.model_assist:
                 context_patch["core_reasoning"] = {
                     "reason": decision.model_assist.get("reason"),
@@ -514,28 +547,11 @@ class AwarenessLoop:
             interpreted = self.result_interpreter.interpret_execution(execution, verified)
             synthesized_response = self.response_synthesizer.agent_response(interpreted, verified)
             self._schedule_agent_follow_up(event=event, decision=decision, execution=execution)
-            memory_write = None
-            if verified.get("needs_memory_patch") and decision.memory_policy == "long_term":
-                memory_write = self.memory_bridge.write_patch(
-                    {
-                        "session_id": event.source.session_id,
-                        "task": text,
-                        "executor": execution.executor,
-                        "status": execution.status,
-                        "result": execution.result,
-                        "memory_policy": decision.memory_policy,
-                        "trust": "verified",
-                        "verification_status": verified.get("status"),
-                        "task_id": execution.task_id,
-                        "correlation_id": event.event_id,
-                    }
-                )
             artifacts = {
                 "task_packet": packet.to_dict(),
                 "execution_result": asdict(execution),
                 "interpreted_result": interpreted,
                 "verification": verified,
-                "memory_write": memory_write,
                 "pending_task": None,
                 "decision": decision.to_dict(),
                 "controller": controller_plan.to_dict(),
@@ -680,6 +696,11 @@ class AwarenessLoop:
                     "semantic_change_recorded",
                     "semantic_change_confirmed",
                     "semantic_change_declined",
+                    "multi_state_change",
+                    "state_change_failed",
+                    "state_change_indeterminate",
+                    "state_change_stale_revision",
+                    "state_change_expired",
                 }
             ):
                 result.primary_response = primary_override
@@ -696,6 +717,16 @@ class AwarenessLoop:
                 result.followup_messages = existing + [message for message in followups if message not in existing]
                 result.artifacts["followup_messages"] = result.followup_messages
             route_trace.append({"phase": "commitment", "status": commitment_turn.get("status"), "actions": commitment_turn.get("actions", [])})
+        profile_state_change = self._sync_user_awareness_from_text(event, result)
+        if profile_state_change:
+            result.artifacts["profile_state_change"] = profile_state_change
+            route_trace.append(
+                {
+                    "phase": "profile_state_change",
+                    "status": profile_state_change.get("status"),
+                }
+            )
+        self._apply_state_change_response_truth(result)
         self._persist_conversation_slots(event, result)
         self._render_final_user_messages(event, result)
         trace = self.runtime_trace.record(
@@ -857,6 +888,10 @@ class AwarenessLoop:
         return decision.route in {Route.AGENT, Route.NATIVE_TOOL, Route.HUMAN_REVIEW, Route.ROLLBACK}
 
     def _ask_user_response(self, decision: Decision) -> str:
+        semantic_policy = self._semantic_policy_from_decision(decision)
+        clarification = str(semantic_policy.get("clarification_reason") or "").strip()
+        if bool(semantic_policy.get("requires_clarification")) and clarification:
+            return self._humanize_semantic_clarification(clarification)
         capability = decision.capability_request.get("capability") if isinstance(decision.capability_request, dict) else ""
         message_type = decision.capability_request.get("message_type") if isinstance(decision.capability_request, dict) else ""
         if capability == "vision":
@@ -872,6 +907,43 @@ class AwarenessLoop:
         if capability:
             return f"这个请求需要当前不可用的能力 `{capability}`。我不会猜测结果；请补充可验证信息或启用相应能力。"
         return "我需要更多上下文才能可靠处理这个请求。"
+
+    @staticmethod
+    def _humanize_semantic_clarification(reason: str) -> str:
+        normalized = reason.strip().rstrip("。")
+        messages = {
+            "external writes need a tool proxy that can enforce the semantic effect scope": (
+                "这个请求会改动外部系统。请明确你是只要我起草内容，还是要实际发送或提交；"
+                "在执行边界可验证前，我不会直接写入外部系统。"
+            ),
+            "non-local Agent execution needs effect-scoped tool enforcement": (
+                "这个请求涉及外部对象或服务。请补充目标和所需内容，并说明是只要草稿/方案，"
+                "还是要实际执行；在执行边界可验证前，我不会直接操作。"
+            ),
+            "the referenced target is unresolved": "你说的对象目前不唯一。请告诉我具体是哪一个，我再继续处理。",
+            "state-changing request is not explicit enough to authorize": (
+                "这句话可能会改变状态，但授权意图还不够明确。请直接说明要改什么、改成什么。"
+            ),
+            "conditional request needs a satisfied trigger before capability use": (
+                "这个动作带有尚未满足或无法验证的条件。请补充条件如何判断，以及满足后是否允许执行。"
+            ),
+            "conflicting state-changing acts need clarification": (
+                "这句话里包含互相冲突的操作。请明确最终要保留哪一个动作。"
+            ),
+            "semantic output remained invalid after one bounded repair": (
+                "我还不能可靠确定你要我回答问题，还是执行操作。请换一种说法，并明确期望结果。"
+            ),
+            "semantic resolution is degraded; no side effect is authorized": (
+                "我理解到了大意，但还不足以安全执行操作。请明确目标、对象和期望结果。"
+            ),
+            "degraded semantic resolution lacks a high-confidence positive read request": (
+                "我还不能确定你是在要求查询，还是只是在提及相关内容。请直接说明要查什么。"
+            ),
+            "speaker and authority fields conflict": (
+                "这句话里的发言者和授权来源不一致。请由当前用户直接确认是否要执行。"
+            ),
+        }
+        return messages.get(normalized, f"我还需要先确认：{normalized}")
 
     def _run_skill(self, event: VeyraEvent, skill_name: str) -> LoopResult:
         skill = self.skill_loader.load(skill_name)
@@ -939,6 +1011,127 @@ class AwarenessLoop:
         )
 
     def _run_probe(self, event: VeyraEvent, decision: Decision, attention_focus: list[str]) -> LoopResult:
+        policy = self._semantic_policy_from_decision(decision)
+        requests = [
+            item
+            for item in (
+                policy.get("probe_requests")
+                if isinstance(policy.get("probe_requests"), list)
+                else []
+            )
+            if isinstance(item, dict) and str(item.get("probe") or "").strip()
+        ]
+        if len(requests) <= 1:
+            return self._run_single_probe(event, decision, attention_focus)
+
+        results: list[LoopResult] = []
+        result_records: list[dict[str, Any]] = []
+        for request in requests:
+            probe_name = str(request.get("probe") or "").strip()
+            arguments = (
+                request.get("arguments")
+                if isinstance(request.get("arguments"), dict)
+                else {}
+            )
+            scoped_policy = {
+                **policy,
+                "selected_probe": probe_name,
+                "capability_arguments": dict(arguments),
+                "probe_requests": [request],
+            }
+            scoped_assist = {
+                **(decision.model_assist if isinstance(decision.model_assist, dict) else {}),
+                "semantic_policy": scoped_policy,
+                "probe_params": dict(arguments),
+            }
+            scoped_decision = replace(
+                decision,
+                selected_probe=probe_name,
+                model_assist=scoped_assist,
+            )
+            item_result = self._run_single_probe(
+                event,
+                scoped_decision,
+                attention_focus,
+            )
+            results.append(item_result)
+            result_records.append(
+                {
+                    "act_id": str(request.get("act_id") or ""),
+                    "goal": str(request.get("goal") or ""),
+                    "probe": probe_name,
+                    "status": item_result.status,
+                    "response": item_result.response,
+                    "probe_result": item_result.artifacts.get("probe_result"),
+                    "verification": item_result.artifacts.get("verification"),
+                    "state_patch": item_result.artifacts.get("state_patch"),
+                    "execution_trace": item_result.artifacts.get("execution_trace"),
+                }
+            )
+
+        successful = all(
+            item.status in {"success", "verified_success", "partially_success"}
+            for item in results
+        )
+        assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
+        frame = assist.get("semantic_frame") if isinstance(assist.get("semantic_frame"), dict) else {}
+        source_labels: dict[str, str] = {}
+        for act in frame.get("acts", []) if isinstance(frame.get("acts"), list) else []:
+            if not isinstance(act, dict):
+                continue
+            quote = act.get("source_quote") if isinstance(act.get("source_quote"), dict) else {}
+            label = str(quote.get("text") or "").strip().rstrip("。.!！")
+            act_id = str(act.get("act_id") or "").strip()
+            if act_id and label:
+                source_labels[act_id] = label
+        response_parts = []
+        for request, item_result in zip(requests, results, strict=True):
+            act_id = str(request.get("act_id") or "").strip()
+            label = str(
+                source_labels.get(act_id)
+                or request.get("goal")
+                or request.get("probe")
+                or "查询结果"
+            ).strip()
+            response_parts.append(f"{label}：{item_result.response}")
+        aggregate_probe_result = {
+            "probe": "multi_probe",
+            "status": "success" if successful else "partial",
+            "results": [
+                {
+                    "act_id": item.get("act_id"),
+                    "probe": item.get("probe"),
+                    "status": item.get("status"),
+                    "result": item.get("probe_result"),
+                }
+                for item in result_records
+            ],
+        }
+        traces = [
+            item.get("execution_trace")
+            for item in result_records
+            if isinstance(item.get("execution_trace"), dict)
+        ]
+        return LoopResult(
+            event_id=event.event_id,
+            route=Route.PROBE,
+            status="verified_success" if successful else "partial",
+            response="\n\n".join(response_parts),
+            risk_level=RiskLevel.R1,
+            artifacts={
+                "probe_result": aggregate_probe_result,
+                "probe_results": result_records,
+                "verification": {
+                    "status": "verified_success" if successful else "partial",
+                    "count": len(result_records),
+                },
+                "decision": decision.to_dict(),
+                "execution_trace": traces[0] if traces else {},
+                "execution_traces": traces,
+            },
+        )
+
+    def _run_single_probe(self, event: VeyraEvent, decision: Decision, attention_focus: list[str]) -> LoopResult:
         text = event.payload.get("text", "")
         probe_name = (decision.selected_probe or "").strip()
         if not probe_name:
@@ -1006,15 +1199,31 @@ class AwarenessLoop:
 
     def _invoke_probe(self, *, probe_name: str, probe: Any, text: str, decision: Decision, event: VeyraEvent) -> dict[str, Any]:
         model_assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
-        params = model_assist.get("probe_params") if isinstance(model_assist.get("probe_params"), dict) else {}
+        semantic_policy = self._semantic_policy_from_decision(decision)
+        semantic_params = (
+            semantic_policy.get("capability_arguments")
+            if isinstance(semantic_policy.get("capability_arguments"), dict)
+            else {}
+        )
+        params = semantic_params or (
+            model_assist.get("probe_params") if isinstance(model_assist.get("probe_params"), dict) else {}
+        )
         if probe_name == "weather_probe":
             location = str(params.get("location") or params.get("place") or params.get("city") or "").strip()
             if not location:
                 slots = self._conversation_slots_for_event(event)
-                location = self._resolve_weather_location_for_turn(text, slots)
+                if semantic_policy:
+                    location = str(slots.get("last_location") or "").strip()
+                else:
+                    location = self._resolve_weather_location_for_turn(text, slots)
             return probe.run(text, location=location or None)
         if probe_name == "search_probe":
-            query = str(params.get("query") or params.get("search_query") or "").strip() or self._search_query_from_text(text)
+            query = str(params.get("query") or params.get("search_query") or "").strip()
+            if not query and semantic_policy:
+                goals = semantic_policy.get("canonical_goals") if isinstance(semantic_policy.get("canonical_goals"), list) else []
+                query = str(goals[0] if goals else "").strip()
+            if not query:
+                query = self._search_query_from_text(text)
             max_results = params.get("max_results")
             try:
                 limit = int(max_results) if max_results is not None else 5
@@ -1068,7 +1277,9 @@ class AwarenessLoop:
         text = str(event.payload.get("text", ""))
         if decision.intent == "identity" or "source:governance_identity" in decision.signals:
             return "我是 Veyra。OpenClaw 是我可以在需要执行复杂任务时治理和调用的 Agent Runtime，不是当前对话身份。"
-        if decision.intent == "preference" or "memory:preference" in decision.signals:
+        if (decision.intent == "preference" or "memory:preference" in decision.signals) and self._semantic_effect_allowed(
+            decision, "memory.write"
+        ):
             return "记住了。之后我会尽量更直接，除非问题本身需要先说明风险、证据或执行边界。"
         if self._is_tracking_memory_question(text):
             return self._tracking_memory_response(event)
@@ -1079,10 +1290,11 @@ class AwarenessLoop:
         contextual_plan = self._user_context_planning_response(text, event)
         if contextual_plan:
             return contextual_plan
-        state_ack = self._state_update_ack_response(text)
-        if state_ack:
-            return state_ack
-        if self._is_proactive_weather_request(text):
+        if self._semantic_effect_allowed(decision, "profile.write"):
+            state_ack = self._state_update_ack_response(text)
+            if state_ack:
+                return state_ack
+        if self._semantic_effect_allowed(decision, "proactive.create") and self._is_proactive_weather_request(text):
             return "可以，你要我每天几点发哪个城市/地区的天气？"
         if self._is_learning_memory_question(text):
             topic = self._current_learning_topic(event.source.user_id)
@@ -1196,7 +1408,11 @@ class AwarenessLoop:
             confidence = None
         if confidence is not None and confidence < 0.45:
             return False
-        if bool(answer_assist.get("needs_observation")) and not decision.freshness_required:
+        if (
+            bool(answer_assist.get("needs_observation"))
+            and not decision.freshness_required
+            and not self._plain_explanation_question(text)
+        ):
             return False
         lowered_question = text.lower()
         lowered_draft = draft.lower()
@@ -1378,7 +1594,19 @@ class AwarenessLoop:
             return "已更新当前注意力：优先继续 Docker 部署，同时保留 Veyra 架构和学校作业作为次级上下文。"
         return ""
 
-    def _early_awareness_response(self, event: VeyraEvent, text: str, attention_focus: list[str]) -> dict[str, Any]:
+    def _early_awareness_response(
+        self,
+        event: VeyraEvent,
+        text: str,
+        attention_focus: list[str],
+        *,
+        decision: Decision,
+    ) -> dict[str, Any]:
+        semantic_policy = self._semantic_policy_from_decision(decision)
+        if not semantic_policy or bool(semantic_policy.get("requires_clarification")):
+            return {}
+        if str(semantic_policy.get("preferred_route") or "") != Route.DIRECT_ANSWER.value:
+            return {}
         compact = re.sub(r"[\s，,。！？!?、]+", "", text or "")
         if compact in {"继续", "接着刚才"}:
             focus_text = " ".join(str(item) for item in attention_focus).lower()
@@ -1397,21 +1625,12 @@ class AwarenessLoop:
                 else "我现在没有找到明确的学习目标记录；你可以直接告诉我要学习的主题，我会记录到 Veyra memory。"
             )
             return {"reason": "state_grounded_learning_memory", "response": response}
-        commitment_control = self._early_commitment_control_response(event, text)
-        if commitment_control:
-            return commitment_control
-        learning_goal = self._early_learning_goal_response(event, text)
-        if learning_goal:
-            return learning_goal
         state_answer = self._state_answer_for_turn(event, text)
         if state_answer:
             return state_answer
-        semantic_change = self._early_semantic_change_response(event, text)
-        if semantic_change:
-            return semantic_change
-        tracking_request = self._early_tracking_request_response(event, text)
-        if tracking_request:
-            return tracking_request
+        # Effectful commitment, tracking, and learning requests deliberately do
+        # not run in the early-response path. They are committed only after the
+        # semantic frame has produced a typed, idempotent state proposal.
         project_identity = self._project_identity_direct_response(text)
         if project_identity:
             return {"reason": "project_identity_direct", "response": project_identity}
@@ -1422,10 +1641,213 @@ class AwarenessLoop:
         contextual_plan = self._user_context_planning_response(text, event)
         if contextual_plan:
             return {"reason": "user_profile_context_plan", "response": contextual_plan}
-        state_ack = self._state_update_ack_response(text)
-        if state_ack:
-            return {"reason": "state_update_ack", "response": state_ack}
+        if self._semantic_effect_allowed(decision, "profile.write"):
+            state_ack = self._state_update_ack_response(text)
+            if state_ack:
+                return {"reason": "state_update_ack", "response": state_ack}
         return {}
+
+    def _semantic_result_allowed(self, decision: Decision, result: LoopResult) -> bool:
+        policy = self._semantic_policy_from_decision(decision)
+        if not policy or bool(policy.get("requires_clarification")):
+            return False
+        preferred = str(policy.get("preferred_route") or "")
+        if result.route == Route.PROBE:
+            if preferred != Route.PROBE.value:
+                return False
+            selected = str(policy.get("selected_probe") or "")
+            probe_result = result.artifacts.get("probe_result") if isinstance(result.artifacts.get("probe_result"), dict) else {}
+            actual = str(probe_result.get("probe") or "")
+            return not selected or not actual or selected == actual
+        return result.route == Route.DIRECT_ANSWER and preferred == Route.DIRECT_ANSWER.value
+
+    def _semantic_policy_from_decision(self, decision: Decision | dict[str, Any] | None) -> dict[str, Any]:
+        if isinstance(decision, Decision):
+            assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
+        elif isinstance(decision, dict):
+            assist = decision.get("model_assist") if isinstance(decision.get("model_assist"), dict) else {}
+        else:
+            return {}
+        policy = assist.get("semantic_policy")
+        return policy if isinstance(policy, dict) else {}
+
+    def _semantic_effect_allowed(self, decision: Decision | dict[str, Any] | None, effect: str) -> bool:
+        policy = self._semantic_policy_from_decision(decision)
+        if not policy:
+            return False
+        allowed = {str(item) for item in policy.get("allowed_effects", []) if isinstance(item, str)}
+        denied = {str(item) for item in policy.get("denied_effects", []) if isinstance(item, str)}
+        return effect in allowed and effect not in denied
+
+    def _semantic_effect_context(
+        self,
+        decision: Decision | dict[str, Any] | None,
+        effect: str,
+        *,
+        fallback_all: bool = False,
+        authorized_act_id: str | None = None,
+    ) -> dict[str, Any]:
+        if isinstance(decision, Decision):
+            assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
+        elif isinstance(decision, dict):
+            assist = decision.get("model_assist") if isinstance(decision.get("model_assist"), dict) else {}
+        else:
+            assist = {}
+        policy = assist.get("semantic_policy") if isinstance(assist.get("semantic_policy"), dict) else {}
+        frame = assist.get("semantic_frame") if isinstance(assist.get("semantic_frame"), dict) else {}
+        authoritative = {
+            str(item)
+            for item in policy.get("authoritative_act_ids", [])
+            if isinstance(item, str)
+        }
+        effect_bindings = (
+            policy.get("effect_authorized_act_ids")
+            if isinstance(policy.get("effect_authorized_act_ids"), dict)
+            else None
+        )
+        effect_authoritative = (
+            {
+                str(item)
+                for item in effect_bindings.get(effect, [])
+                if isinstance(item, str)
+            }
+            if effect_bindings is not None
+            else authoritative
+        )
+        all_acts = [
+            item
+            for item in (frame.get("acts") if isinstance(frame.get("acts"), list) else [])
+            if isinstance(item, dict)
+            and str(item.get("act_id") or "") in authoritative
+            and str(item.get("act_id") or "") in effect_authoritative
+            and (
+                authorized_act_id is None
+                or str(item.get("act_id") or "") == authorized_act_id
+            )
+        ]
+        acts = [item for item in all_acts if self._act_matches_state_effect(item, effect)]
+        if fallback_all and not acts:
+            acts = all_acts
+        acts = sorted(
+            acts,
+            key=lambda item: int(
+                (item.get("source_quote") if isinstance(item.get("source_quote"), dict) else {}).get("start")
+                or 0
+            ),
+        )
+        act_ids = [str(item.get("act_id") or "") for item in acts if str(item.get("act_id") or "")]
+        operations: list[str] = []
+        source_parts: list[str] = []
+        for act in acts:
+            operation = str(act.get("operation") or "").strip()
+            if operation and operation not in operations:
+                operations.append(operation)
+            quote = act.get("source_quote") if isinstance(act.get("source_quote"), dict) else {}
+            quote_text = str(quote.get("text") or "").strip()
+            if quote_text and quote_text not in source_parts:
+                source_parts.append(quote_text)
+        first = acts[0] if acts else {}
+        target = first.get("target") if isinstance(first.get("target"), dict) else {}
+        source_span = first.get("source_quote") if isinstance(first.get("source_quote"), dict) else None
+        explicitness = str(first.get("explicitness") or "unknown")
+        if explicitness not in {"explicit", "strong_implied", "weak_implied", "inferred", "unknown"}:
+            explicitness = "unknown"
+        attributes = target.get("attributes") if isinstance(target.get("attributes"), dict) else {}
+        arguments = first.get("arguments") if isinstance(first.get("arguments"), dict) else {}
+        scope = str(arguments.get("scope") or attributes.get("scope") or "current_user")
+        relations = [
+            relation
+            for relation in (frame.get("relations") if isinstance(frame.get("relations"), list) else [])
+            if isinstance(relation, dict)
+            and (
+                str(relation.get("from_act_id") or "") in act_ids
+                or str(relation.get("to_act_id") or "") in act_ids
+            )
+        ]
+        return {
+            "effect": effect,
+            "act_ids": act_ids,
+            "acts": acts,
+            "relations": relations,
+            "operation": "+".join(operations) or "unknown",
+            "target": {
+                "type": str(target.get("type") or "unknown"),
+                "value": str(target.get("value") or ""),
+                "scope": scope,
+                "attributes": attributes,
+            },
+            "source_span": source_span,
+            "source_text": "，".join(source_parts),
+            "explicitness": explicitness,
+            "resolver_status": str(frame.get("resolver_status") or ""),
+        }
+
+    @staticmethod
+    def _act_matches_state_effect(act: dict[str, Any], effect: str) -> bool:
+        target = act.get("target") if isinstance(act.get("target"), dict) else {}
+        haystack = " ".join(
+            str(value or "")
+            for value in (
+                act.get("kind"),
+                act.get("operation"),
+                act.get("goal"),
+                target.get("type"),
+            )
+        ).lower()
+        if effect == "proactive.create":
+            return any(
+                marker in haystack
+                for marker in (
+                    "proactive",
+                    "recurring",
+                    "reminder",
+                    "subscribe",
+                    "subscription",
+                    "track",
+                    "monitor",
+                    "提醒",
+                    "订阅",
+                    "关注",
+                    "跟踪",
+                    "追踪",
+                    "推送",
+                )
+            )
+        if effect == "commitment.mutate":
+            if AwarenessLoop._act_matches_state_effect(act, "proactive.create"):
+                return False
+            return any(
+                marker in haystack
+                for marker in (
+                    "commitment",
+                    "goal_control",
+                    "schedule_control",
+                    "cancel",
+                    "pause",
+                    "resume",
+                    "confirm",
+                    "decline",
+                    "取消",
+                    "暂停",
+                    "恢复",
+                    "确认",
+                    "拒绝",
+                )
+            )
+        if effect in {"memory.write", "profile.write"}:
+            return any(
+                marker in haystack
+                for marker in (
+                    "preference",
+                    "profile",
+                    "self_disclosure",
+                    "user_fact",
+                    "偏好",
+                    "回答风格",
+                    "个人信息",
+                )
+            )
+        return False
 
     def _early_learning_goal_response(self, event: VeyraEvent, text: str) -> dict[str, Any]:
         if not self.commitment_core:
@@ -1922,6 +2344,19 @@ class AwarenessLoop:
                 topic = str(goal.get("topic") or "").strip()
                 if topic:
                     return topic
+        if self.commitment_core is not None:
+            commitments = self.commitment_core.list_commitments(user_id=user_id)
+            for commitment in reversed(commitments):
+                if not isinstance(commitment, dict):
+                    continue
+                if commitment.get("kind") != "learning_digest":
+                    continue
+                if commitment.get("status") not in {"active", "pending_confirmation", "paused"}:
+                    continue
+                payload = commitment.get("payload") if isinstance(commitment.get("payload"), dict) else {}
+                topic = str(payload.get("topic") or "").strip()
+                if topic:
+                    return topic
         user_world = self.state_store.read_json("user_world.json")
         scoped = self._scoped_user_profile(user_world, user_id)
         topic = str(scoped.get("learning_topic") or "").strip()
@@ -1945,54 +2380,223 @@ class AwarenessLoop:
     def _process_commitment_turn(self, event: VeyraEvent, result: LoopResult) -> dict[str, Any] | None:
         if self.commitment_core is None:
             return None
+        decision = result.artifacts.get("decision") if isinstance(result.artifacts.get("decision"), dict) else {}
+        commitment_allowed = self._semantic_effect_allowed(decision, "commitment.mutate")
+        proactive_allowed = self._semantic_effect_allowed(decision, "proactive.create")
         early = result.artifacts.get("early_awareness") if isinstance(result.artifacts.get("early_awareness"), dict) else {}
-        preprocessed = early.get("commitment_turn") if isinstance(early.get("commitment_turn"), dict) else {}
-        if preprocessed:
-            return preprocessed
         if str(early.get("reason") or "").startswith("state_grounded_"):
             return None
-        if result.route == Route.AGENT:
+        if not commitment_allowed and not proactive_allowed:
             return None
         text = str(event.payload.get("text", ""))
         if self._is_tracking_memory_question(text):
             return None
-        return self.commitment_core.process_turn(
-            event=event,
-            user_text=text,
-            assistant_response=result.response,
-            route=result.route.value,
-            status=result.status,
-        )
+        policy = self._semantic_policy_from_decision(decision)
+        contexts: list[tuple[str, dict[str, Any]]] = []
+        proactive_context = self._semantic_effect_context(decision, "proactive.create")
+        commitment_context = self._semantic_effect_context(decision, "commitment.mutate")
+        if proactive_allowed and proactive_context.get("acts"):
+            contexts.extend(
+                (
+                    "proactive.create",
+                    self._semantic_effect_context(
+                        decision,
+                        "proactive.create",
+                        authorized_act_id=act_id,
+                    ),
+                )
+                for act_id in proactive_context.get("act_ids", [])
+                if isinstance(act_id, str)
+            )
+        if commitment_allowed and commitment_context.get("acts"):
+            contexts.extend(
+                (
+                    "commitment.mutate",
+                    self._semantic_effect_context(
+                        decision,
+                        "commitment.mutate",
+                        authorized_act_id=act_id,
+                    ),
+                )
+                for act_id in commitment_context.get("act_ids", [])
+                if isinstance(act_id, str)
+            )
+        if not contexts and commitment_allowed:
+            contexts.append(("commitment.mutate", self._semantic_effect_context(decision, "commitment.mutate", fallback_all=True)))
+        if not contexts and proactive_allowed:
+            contexts.append(("proactive.create", self._semantic_effect_context(decision, "proactive.create", fallback_all=True)))
+
+        outcomes: list[dict[str, Any]] = []
+        for effect, semantic_context in contexts:
+            effect_text = str(semantic_context.get("source_text") or text)
+            act_ids = [
+                str(item)
+                for item in semantic_context.get("act_ids", [])
+                if isinstance(item, str)
+            ]
+            identity = ",".join(act_ids) or "authoritative_turn"
+            idempotency_key = deterministic_idempotency_key(
+                event.event_id,
+                effect,
+                identity,
+                namespace="veyra.commitment-turn.v1",
+            )
+            proposal_id = deterministic_proposal_id(idempotency_key)
+            state_names = [
+                "user_commitments.json",
+                "user_goals.json",
+                "external_world.json",
+                "proactive_authorizations.json",
+                "proactive_intents.json",
+                "semantic_change_sets.json",
+                "self_improvement_proposals.json",
+            ]
+            existing_proposal: StateChangeProposal | None = None
+            try:
+                existing_proposal = self.state_proposals.get(proposal_id)
+            except ProposalNotFoundError:
+                pass
+            revisions = (
+                dict(existing_proposal.expected_state_revisions)
+                if existing_proposal is not None
+                else {
+                    name: int(self.state_store.read_json(name).get("_state_revision") or 0)
+                    for name in state_names
+                }
+            )
+            proposal = self.state_proposals.create_or_get(
+                effect=effect,
+                operation=str(semantic_context.get("operation") or "unknown"),
+                target=semantic_context.get("target") if isinstance(semantic_context.get("target"), dict) else {},
+                source_span=semantic_context.get("source_span") if isinstance(semantic_context.get("source_span"), dict) else None,
+                explicitness=str(semantic_context.get("explicitness") or "unknown"),
+                preconditions=[
+                    "semantic resolver completed successfully",
+                    f"semantic policy explicitly authorizes {effect}",
+                    "quoted, reported, hypothetical, conditional, and negated acts are excluded",
+                ],
+                payload={
+                    "event": {
+                        "event_id": event.event_id,
+                        "user_id": event.source.user_id,
+                        "session_id": event.source.session_id,
+                        "channel": event.source.channel,
+                    },
+                    "semantic_context": semantic_context,
+                },
+                idempotency_key=idempotency_key,
+                expected_state_revisions=revisions,
+                requires_approval=False,
+            )
+
+            def apply_commitment(_: StateChangeProposal) -> dict[str, Any]:
+                local_effects = (
+                    {"proactive.create", "commitment.mutate"}
+                    if effect == "proactive.create"
+                    else {"commitment.mutate"}
+                )
+                with self.commitment_core.authorized_effects(local_effects):
+                    turn = self.commitment_core.process_turn(
+                        event=event,
+                        user_text=effect_text,
+                        assistant_response=result.response,
+                        route=result.route.value,
+                        status=result.status,
+                        semantic_context={**semantic_context, "effect": effect},
+                    )
+                if not isinstance(turn, dict) or not turn:
+                    raise ValueError("authorized semantic state change could not be mapped to a local operation")
+                return turn
+
+            committed = self.state_proposals.commit(proposal.proposal_id, apply_commitment)
+            commit_payload = committed.model_dump(mode="json")
+            if committed.status == "committed" and isinstance(committed.output, dict):
+                outcome = dict(committed.output)
+                outcome["state_change"] = commit_payload
+                outcomes.append(outcome)
+                continue
+            if committed.status == "indeterminate":
+                message = "我理解了这项状态变更，但提交结果不确定。为避免重复执行，我不会自动重试；需要先核对当前状态。"
+            elif committed.status == "stale_revision":
+                message = "我理解了这项变更，但相关状态刚刚发生变化，因此没有按旧状态继续写入。请确认最新目标后再试。"
+            else:
+                message = "我理解了这项变更，但它没有成功写入；我不会把它说成已经完成。"
+            outcomes.append(
+                {
+                    "status": f"state_change_{committed.status}",
+                    "actions": [],
+                    "primary_response_override": message,
+                    "state_change": commit_payload,
+                }
+            )
+
+        if not outcomes:
+            return None
+        if len(outcomes) == 1:
+            return outcomes[0]
+        primary_messages = [
+            str(item.get("primary_response_override") or "").strip()
+            for item in outcomes
+            if str(item.get("primary_response_override") or "").strip()
+        ]
+        return {
+            "status": "multi_state_change",
+            "actions": [
+                str(action)
+                for item in outcomes
+                for action in (item.get("actions") if isinstance(item.get("actions"), list) else [])
+            ],
+            "outcomes": outcomes,
+            "primary_response_override": "；".join(primary_messages),
+        }
 
     def _commitment_followup_messages(self, commitment_turn: dict[str, Any]) -> list[str]:
         if self.commitment_core is None:
             return []
         return self.commitment_core.followup_messages_for_turn(commitment_turn)
 
-    def _conversation_followup_result(self, event: VeyraEvent, text: str, attention_focus: list[str]) -> LoopResult | None:
-        clarification_rejection = self._clarification_rejection_result(event, text, attention_focus)
-        if clarification_rejection:
-            return clarification_rejection
-        generic = self._generic_previous_turn_followup_result(event, text, attention_focus)
-        if generic:
-            return generic
+    def _conversation_followup_result(
+        self,
+        event: VeyraEvent,
+        text: str,
+        attention_focus: list[str],
+        *,
+        decision: Decision,
+    ) -> LoopResult | None:
+        policy = self._semantic_policy_from_decision(decision)
+        preferred = str(policy.get("preferred_route") or "")
+        selected_probe = str(policy.get("selected_probe") or "")
+        search_allowed = preferred == Route.PROBE.value and selected_probe in {"search", "search_probe"}
+        weather_allowed = preferred == Route.PROBE.value and selected_probe in {"weather", "weather_probe"}
+        direct_allowed = preferred == Route.DIRECT_ANSWER.value
+
+        if search_allowed:
+            clarification_rejection = self._clarification_rejection_result(event, text, attention_focus)
+            if clarification_rejection:
+                return clarification_rejection
+        if direct_allowed:
+            generic = self._generic_previous_turn_followup_result(event, text, attention_focus)
+            if generic:
+                return generic
         slots = self._conversation_slots_for_event(event)
         last_tool = slots.get("last_tool_result") if isinstance(slots.get("last_tool_result"), dict) else {}
         if last_tool.get("type") == "search":
-            retry = self._search_followup_retry_result(event, text, attention_focus, last_tool)
-            if retry:
-                return retry
-            response = self._answer_search_followup(text, last_tool)
-            if response:
-                return LoopResult(
-                    event_id=event.event_id,
-                    route=Route.DIRECT_ANSWER,
-                    status="success",
-                    response=response,
-                    risk_level=RiskLevel.R0,
-                    artifacts={"conversation_followup": {"type": "search_result_reference"}, "attention": attention_focus},
-                )
-        if self._looks_like_weather_followup(text, slots):
+            if search_allowed:
+                retry = self._search_followup_retry_result(event, text, attention_focus, last_tool)
+                if retry:
+                    return retry
+            if direct_allowed:
+                response = self._answer_search_followup(text, last_tool)
+                if response:
+                    return LoopResult(
+                        event_id=event.event_id,
+                        route=Route.DIRECT_ANSWER,
+                        status="success",
+                        response=response,
+                        risk_level=RiskLevel.R0,
+                        artifacts={"conversation_followup": {"type": "search_result_reference"}, "attention": attention_focus},
+                    )
+        if weather_allowed and self._looks_like_weather_followup(text, slots):
             location = self._resolve_weather_location_for_turn(text, slots)
             raw = self.probes["weather_probe"].run(text, location=location or None)
             state_patch = self.perception.interpret_probe_result(raw)
@@ -2661,7 +3265,6 @@ class AwarenessLoop:
     def _update(self, event: VeyraEvent, result: LoopResult) -> None:
         risk_level = result.risk_level.value if hasattr(result.risk_level, "value") else str(result.risk_level)
         self.state_store.patch_json("risk_state.json", {"current_risk": risk_level})
-        self._sync_user_awareness_from_text(event)
         self.state_store.patch_json(
             "task_state.json",
             {"current_task": {"event_id": event.event_id, "route": result.route.value, "status": result.status}},
@@ -2675,18 +3278,107 @@ class AwarenessLoop:
         self.state_store.patch_json("executor_state.json", {"selected_agent": self.agent_registry.selected_name(), **self.agent_adapter.connection_status()})
         self.runtime_entity.set_idle()
 
-    def _sync_user_awareness_from_text(self, event: VeyraEvent) -> None:
+    def _sync_user_awareness_from_text(self, event: VeyraEvent, result: LoopResult) -> dict[str, Any] | None:
+        decision = result.artifacts.get("decision") if isinstance(result.artifacts.get("decision"), dict) else {}
+        if not self._semantic_effect_allowed(decision, "profile.write"):
+            return None
         text = str(event.payload.get("text") or "")
         if not text:
-            return
-        signals = self._extract_profile_signals(text)
+            return None
+        semantic_context = self._semantic_effect_context(decision, "profile.write", fallback_all=True)
+        source_text = str(semantic_context.get("source_text") or text)
+        signals = self._extract_profile_signals(source_text)
         if not signals:
-            return
+            return None
         user_id = str(event.source.user_id or "local-user")
-        self.state_store.mutate_json(
-            "user_world.json",
-            lambda user_world: self._apply_user_awareness_signals(user_world, user_id=user_id, signals=signals),
+        act_ids = [
+            str(item)
+            for item in semantic_context.get("act_ids", [])
+            if isinstance(item, str)
+        ]
+        key = deterministic_idempotency_key(
+            event.event_id,
+            "profile.write",
+            ",".join(act_ids) or "authoritative_turn",
+            namespace="veyra.profile-write.v1",
         )
+        proposal_id = deterministic_proposal_id(key)
+        existing_proposal: StateChangeProposal | None = None
+        try:
+            existing_proposal = self.state_proposals.get(proposal_id)
+        except ProposalNotFoundError:
+            pass
+        expected_revisions = (
+            dict(existing_proposal.expected_state_revisions)
+            if existing_proposal is not None
+            else {
+                "user_world.json": int(
+                    self.state_store.read_json("user_world.json").get("_state_revision")
+                    or 0
+                )
+            }
+        )
+        proposal = self.state_proposals.create_or_get(
+            effect="profile.write",
+            operation=str(semantic_context.get("operation") or "update_user_profile"),
+            target=semantic_context.get("target") if isinstance(semantic_context.get("target"), dict) else {},
+            source_span=semantic_context.get("source_span") if isinstance(semantic_context.get("source_span"), dict) else None,
+            explicitness=str(semantic_context.get("explicitness") or "unknown"),
+            preconditions=[
+                "semantic policy explicitly authorizes profile.write",
+                "profile values come from an authoritative source span in the current user turn",
+            ],
+            payload={"signals": signals, "user_id": user_id},
+            idempotency_key=key,
+            expected_state_revisions=expected_revisions,
+            requires_approval=False,
+        )
+
+        def apply_profile(_: StateChangeProposal) -> dict[str, Any]:
+            stored = self.state_store.mutate_json(
+                "user_world.json",
+                lambda user_world: self._apply_user_awareness_signals(
+                    user_world,
+                    user_id=user_id,
+                    signals=signals,
+                ),
+            )
+            return {
+                "status": "written",
+                "user_id": user_id,
+                "state_revision": int(stored.get("_state_revision") or 0),
+                "signal_keys": sorted(str(key) for key in signals),
+            }
+
+        committed = self.state_proposals.commit(proposal.proposal_id, apply_profile)
+        return committed.model_dump(mode="json")
+
+    def _apply_state_change_response_truth(self, result: LoopResult) -> None:
+        decision = result.artifacts.get("decision") if isinstance(result.artifacts.get("decision"), dict) else {}
+        memory = (
+            result.artifacts.get("memory_policy_execution")
+            if isinstance(result.artifacts.get("memory_policy_execution"), dict)
+            else {}
+        )
+        memory_change = memory.get("state_change") if isinstance(memory.get("state_change"), dict) else {}
+        preference_turn = (
+            str(decision.get("intent") or "") == "preference"
+            or "memory:preference" in {
+                str(item)
+                for item in (decision.get("signals") if isinstance(decision.get("signals"), list) else [])
+            }
+        )
+        if preference_turn and memory_change and str(memory_change.get("status") or "") != "committed":
+            result.primary_response = "我理解了你的偏好，但这次没有成功保存；后续不会假装已经记住。"
+            result.artifacts["response_corrected_from_commit_result"] = "memory.write"
+        profile_change = (
+            result.artifacts.get("profile_state_change")
+            if isinstance(result.artifacts.get("profile_state_change"), dict)
+            else {}
+        )
+        if profile_change and str(profile_change.get("status") or "") != "committed":
+            result.primary_response = "我理解了你提供的背景信息，但这次没有成功写入个人上下文。"
+            result.artifacts["response_corrected_from_commit_result"] = "profile.write"
 
     def _apply_user_awareness_signals(
         self,

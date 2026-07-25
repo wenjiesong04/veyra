@@ -36,7 +36,7 @@ class CoreModelConfig:
     model: str = ""
     timeout: float = 20.0
     decision_mode: str = "auto"
-    max_tokens: int = 700
+    max_tokens: int = 1600
     ca_bundle: str = ""
     retries: int = 1
 
@@ -147,10 +147,10 @@ class CoreModelClient:
                     core_key="max_tokens",
                     agent_key="model_max_tokens",
                     env_key="VEYRA_CORE_MODEL_MAX_TOKENS",
-                    default=700,
+                    default=1600,
                     prefer_agent=agent_enabled and not core_enabled,
                 ),
-                700,
+                1600,
             )
         )
         decision_mode = str(

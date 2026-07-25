@@ -11,8 +11,9 @@ if str(ROOT) not in sys.path:
 
 from core.awareness_loop import AwarenessLoop
 from core.commitment_core import CommitmentCore
+from core.definitions import RiskLevel
 from core.world_state import WorldStateStore
-from interface.event_schema import EventSource, EventType, VeyraEvent
+from interface.event_schema import Decision, EventSource, EventType, Route, VeyraEvent
 
 
 def expect(condition: bool, label: str, details: object = None) -> None:
@@ -25,6 +26,31 @@ def event_for(user_id: str, session_id: str) -> VeyraEvent:
         type=EventType.USER_MESSAGE,
         source=EventSource(channel="api", user_id=user_id, session_id=session_id),
         payload={"text": "当前还有哪些未完成任务和关注主题？"},
+    )
+
+
+def read_only_decision() -> Decision:
+    return Decision(
+        route=Route.DIRECT_ANSWER,
+        risk_level=RiskLevel.R0,
+        reason="smoke-authorized local state read",
+        model_assist={
+            "semantic_policy": {
+                "preferred_route": "direct_answer",
+                "allowed_effects": [],
+                "denied_effects": [
+                    "agent.execute",
+                    "commitment.mutate",
+                    "external.write",
+                    "memory.write",
+                    "proactive.create",
+                    "profile.write",
+                    "workspace.write",
+                ],
+                "authoritative_act_ids": ["state-read-1"],
+                "requires_clarification": False,
+            }
+        },
     )
 
 
@@ -137,7 +163,12 @@ def main() -> int:
         inventory_text = "我现在有哪些正在进行的任务或提醒？"
         expect(loop._is_state_workload_question(inventory_text), "task inventory query is recognized before model routing")
         expect(loop._is_commitment_state_question(inventory_text), "reminder inventory query is read-only")
-        early = loop._early_awareness_response(user_a, inventory_text, [])
+        early = loop._early_awareness_response(
+            user_a,
+            inventory_text,
+            [],
+            decision=read_only_decision(),
+        )
         expect(
             early.get("reason") == "state_grounded_local_answer",
             "task inventory query uses local state instead of a probe",

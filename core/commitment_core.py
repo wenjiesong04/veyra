@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
@@ -64,6 +68,24 @@ class CommitmentCore:
         self.authorization = AuthorizationPolicy(state_store)
         self.memory_bridge = LocalMemoryBridge(state_store)
         self.self_improvement = SelfImprovementProposalRegistry(state_store)
+        self._authorized_effect_scope: ContextVar[frozenset[str] | None] = ContextVar(
+            f"veyra_commitment_effect_scope_{id(self)}",
+            default=frozenset(),
+        )
+
+    @contextmanager
+    def authorized_effects(self, effects: set[str] | list[str] | tuple[str, ...]):
+        """Limit nested writes while one semantic state proposal is committing."""
+
+        token = self._authorized_effect_scope.set(frozenset(str(item) for item in effects))
+        try:
+            yield
+        finally:
+            self._authorized_effect_scope.reset(token)
+
+    def _nested_effect_allowed(self, effect: str) -> bool:
+        scoped = self._authorized_effect_scope.get()
+        return scoped is not None and effect in scoped
 
     def list_commitments(
         self,
@@ -91,6 +113,8 @@ class CommitmentCore:
         return None
 
     def create_commitment(self, payload: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(payload)
+        allow_profile_write = bool(payload.pop("_allow_profile_write", True))
         kind = str(payload.get("kind") or "generic_reminder").strip()
         schedule = self._normalize_schedule(payload.get("schedule") if isinstance(payload.get("schedule"), dict) else {})
         inner_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
@@ -102,6 +126,21 @@ class CommitmentCore:
             validation = self._validate_weather_daily_payload(inner_payload, schedule, require_explicit_time=False)
             payload = {**payload, "payload": inner_payload}
         now = utc_now_iso()
+        source_event_id = str(payload.get("source_event_id") or "").strip()
+        idempotency_key = str(payload.get("idempotency_key") or "").strip()
+        if not idempotency_key and source_event_id:
+            identity = {
+                "source_event_id": source_event_id,
+                "kind": kind,
+                "user_id": str(payload.get("user_id") or "local-user"),
+                "session_id": str(payload.get("session_id") or "local-session"),
+                "schedule": schedule,
+                "payload": inner_payload,
+            }
+            digest = hashlib.sha256(
+                json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()[:24]
+            idempotency_key = f"commitment:{digest}"
         item = {
             "commitment_id": f"cmt_{uuid4().hex[:12]}",
             "kind": kind,
@@ -114,6 +153,7 @@ class CommitmentCore:
             "schedule": schedule,
             "payload": inner_payload,
             "source_event_id": payload.get("source_event_id"),
+            "idempotency_key": idempotency_key or None,
             "created_at": now,
             "updated_at": now,
             "confirmed_at": payload.get("confirmed_at"),
@@ -129,15 +169,36 @@ class CommitmentCore:
             item["invalid_detected_at"] = now
         if item["status"] == "active" and not item["confirmed_at"]:
             item["confirmed_at"] = now
+        persisted = item
+        inserted = False
+
         def add_commitment(state: dict[str, Any]) -> dict[str, Any]:
+            nonlocal persisted, inserted
             commitments = state.get("commitments") if isinstance(state.get("commitments"), list) else []
+            if idempotency_key:
+                existing = next(
+                    (
+                        candidate
+                        for candidate in commitments
+                        if isinstance(candidate, dict)
+                        and str(candidate.get("idempotency_key") or "") == idempotency_key
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    persisted = dict(existing)
+                    return state
             commitments.append(item)
             state["commitments"] = commitments[-self.MAX_COMMITMENTS :]
             state["updated_at"] = now
+            inserted = True
             return state
 
         self.state_store.mutate_json(self.STATE_FILE, add_commitment)
-        self._sync_user_world(item)
+        if not inserted:
+            return persisted
+        if allow_profile_write and self._nested_effect_allowed("profile.write"):
+            self._sync_user_world(item)
         self._sync_goal_permission_from_commitment(item)
         self.set_watchlists_for_commitment(item)
         self.authorization.record_commitment(item)
@@ -231,7 +292,11 @@ class CommitmentCore:
                 patch["status"] = "paused"
                 patch["ended_at"] = utc_now_iso()
                 patch["end_reason"] = "once_completed"
-        return self._patch_commitment(commitment_id, patch)
+        # A successful scheduler delivery may project the active commitment into
+        # operational user context. User-turn proposal scopes do not inherit
+        # this permission.
+        with self.authorized_effects({"profile.write"}):
+            return self._patch_commitment(commitment_id, patch)
 
     def process_turn(
         self,
@@ -241,6 +306,7 @@ class CommitmentCore:
         assistant_response: str,
         route: str,
         status: str,
+        semantic_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Extract or confirm commitments from a conversation turn."""
         if status in {"blocked", "duplicate"}:
@@ -250,7 +316,11 @@ class CommitmentCore:
             return {}
 
         lowered = (user_text or "").lower()
-        semantic_intent = self.semantic_intent_for_turn(user_text=user_text, event=event)
+        semantic_intent = self._semantic_intent_from_context(
+            semantic_context or {},
+            event=event,
+            fallback_text=user_text,
+        ) or self.semantic_intent_for_turn(user_text=user_text, event=event)
         result: dict[str, Any] = {"status": "idle", "actions": [], "semantic_intent": semantic_intent}
 
         if semantic_intent.get("operation") == "query_status":
@@ -298,6 +368,14 @@ class CommitmentCore:
 
         if change_set:
             return self._handle_semantic_change_set(change_set, event=event)
+
+        semantic_proactive = self._proactive_from_semantic_context(
+            semantic_context or {},
+            event=event,
+            user_text=user_text,
+        )
+        if semantic_proactive:
+            return semantic_proactive
 
         if self._looks_like_plain_information_query(user_text, lowered):
             return {}
@@ -388,6 +466,239 @@ class CommitmentCore:
         if result.get("status") != "idle":
             result["intent"] = intent_record
         return result if result.get("status") != "idle" else {}
+
+    def _semantic_intent_from_context(
+        self,
+        context: dict[str, Any],
+        *,
+        event: VeyraEvent,
+        fallback_text: str,
+    ) -> dict[str, Any]:
+        acts = context.get("acts") if isinstance(context.get("acts"), list) else []
+        act = next((item for item in acts if isinstance(item, dict)), {})
+        if not act:
+            return {}
+        operation_text = " ".join(
+            str(value or "")
+            for value in (
+                act.get("operation"),
+                act.get("kind"),
+                act.get("goal"),
+                context.get("operation"),
+            )
+        ).lower()
+        operation = "unknown"
+        operation_markers = (
+            ("cancel", ("cancel", "stop", "unsubscribe", "取消", "停止", "终止")),
+            ("pause", ("pause", "suspend", "暂停")),
+            ("resume", ("resume", "continue", "恢复", "继续")),
+            ("confirm", ("confirm", "approve", "确认", "同意")),
+            ("decline", ("decline", "reject", "拒绝", "不要")),
+            ("create", ("create", "subscribe", "track", "remind", "notify", "创建", "订阅", "关注", "追踪", "提醒", "通知")),
+        )
+        for candidate, markers in operation_markers:
+            if any(marker in operation_text for marker in markers):
+                operation = candidate
+                break
+        target = act.get("target") if isinstance(act.get("target"), dict) else {}
+        arguments = act.get("arguments") if isinstance(act.get("arguments"), dict) else {}
+        referent = act.get("referent") if isinstance(act.get("referent"), dict) else {}
+        resolved_referent = (
+            str(referent.get("resolved") or "").strip()
+            if str(referent.get("status") or "") == "resolved"
+            else ""
+        )
+        target_value = str(target.get("value") or "").strip()
+        combined = f"{operation_text} {target_value}".lower()
+        target_type = "weather" if any(marker in combined for marker in ("weather", "天气", "气温")) else "topic"
+        location = str(arguments.get("location") or "").strip()
+        topic = str(
+            arguments.get("topic")
+            or arguments.get("query")
+            or target_value
+            or resolved_referent
+        ).strip()
+        if target_type == "weather":
+            location = self._normalize_weather_location(location or target_value or self._extract_location(fallback_text))
+            topic = ""
+        scope = str(arguments.get("scope") or "matching")
+        if scope not in {"all", "matching"}:
+            scope = "matching"
+        return {
+            "operation": operation,
+            "target_type": target_type,
+            "entities": {
+                "topic": topic,
+                "location": location,
+                "scope": scope,
+                "session_id": event.source.session_id,
+                "user_id": event.source.user_id,
+            },
+            "confidence": 0.98,
+            "ambiguous": operation in {"cancel", "pause", "resume"} and not topic and not location and scope != "all",
+            "source": "authoritative_semantic_frame",
+            "raw_text": fallback_text,
+        }
+
+    def _proactive_from_semantic_context(
+        self,
+        context: dict[str, Any],
+        *,
+        event: VeyraEvent,
+        user_text: str,
+    ) -> dict[str, Any]:
+        if str(context.get("effect") or "") != "proactive.create":
+            return {}
+        acts = context.get("acts") if isinstance(context.get("acts"), list) else []
+        act = next((item for item in acts if isinstance(item, dict)), {})
+        if not act:
+            return {}
+        target = act.get("target") if isinstance(act.get("target"), dict) else {}
+        arguments = act.get("arguments") if isinstance(act.get("arguments"), dict) else {}
+        semantic_text = " ".join(
+            str(value or "")
+            for value in (
+                act.get("kind"),
+                act.get("goal"),
+                act.get("operation"),
+                target.get("type"),
+                target.get("value"),
+                user_text,
+            )
+        )
+        lowered = semantic_text.lower()
+        schedule_arg = arguments.get("schedule") if isinstance(arguments.get("schedule"), dict) else {}
+        has_schedule = bool(schedule_arg) or has_explicit_schedule_time(user_text) or any(
+            marker in lowered for marker in ("每天", "每日", "daily", "every day", "每周", "weekly")
+        )
+        schedule = self._normalize_schedule(schedule_arg) if schedule_arg else self._default_daily_schedule(user_text)
+        explicitness = str(act.get("explicitness") or "unknown")
+        active = explicitness in {"explicit", "strong_implied"} and has_schedule
+        semantic_act_identity = ",".join(
+            str(item)
+            for item in context.get("act_ids", [])
+            if isinstance(item, str) and item
+        ) or str(act.get("act_id") or "authoritative_turn")
+        semantic_idempotency_key = "commitment-semantic:" + hashlib.sha256(
+            f"{event.event_id}:{semantic_act_identity}".encode("utf-8")
+        ).hexdigest()[:24]
+
+        if any(marker in lowered for marker in ("weather", "天气", "气温")):
+            location = self._normalize_weather_location(
+                str(arguments.get("location") or target.get("value") or self._extract_location(user_text))
+            )
+            validation = self._validate_weather_daily_payload(
+                {"location": location},
+                schedule,
+                require_explicit_time=True,
+                source_text=user_text,
+            )
+            if not validation.get("valid"):
+                return self._weather_parameters_needed(validation)
+            candidate = {
+                "kind": "weather_daily",
+                "status": "active" if active else "pending_confirmation",
+                "title": f"每日天气：{location}",
+                "user_id": event.source.user_id,
+                "channel": event.source.channel,
+                "session_id": event.source.session_id,
+                "source_event_id": event.event_id,
+                "idempotency_key": semantic_idempotency_key,
+                "schedule": schedule,
+                "payload": {"location": location},
+            }
+        elif any(marker in lowered for marker in ("学习", "learn", "study", "课程", "教程")):
+            topic = str(arguments.get("topic") or target.get("value") or self._extract_learning_topic(user_text)).strip()
+            if not topic:
+                return {
+                    "status": "needs_parameters",
+                    "actions": [],
+                    "primary_response_override": "我理解你要建立学习提醒，但还需要明确学习主题。",
+                }
+            candidate = {
+                "kind": "learning_digest",
+                "status": "active" if active else "pending_confirmation",
+                "title": f"学习辅导：{topic}",
+                "user_id": event.source.user_id,
+                "channel": event.source.channel,
+                "session_id": event.source.session_id,
+                "source_event_id": event.event_id,
+                "idempotency_key": semantic_idempotency_key,
+                "schedule": schedule,
+                "payload": {"topic": topic, "phase": "getting_started"},
+            }
+        elif any(marker in lowered for marker in ("track", "watch", "monitor", "subscribe", "关注", "追踪", "跟踪", "订阅", "留意")):
+            topic = str(arguments.get("topic") or arguments.get("query") or target.get("value") or "").strip()
+            if not topic:
+                return {
+                    "status": "needs_parameters",
+                    "actions": [],
+                    "primary_response_override": "我理解你要持续关注信息，但还需要明确关注的主题。",
+                }
+            candidate = {
+                "kind": "external_digest",
+                "status": "active" if active else "pending_confirmation",
+                "title": f"持续关注：{topic}",
+                "user_id": event.source.user_id,
+                "channel": event.source.channel,
+                "session_id": event.source.session_id,
+                "source_event_id": event.event_id,
+                "idempotency_key": semantic_idempotency_key,
+                "schedule": schedule,
+                "payload": {"topic": topic, "query": str(arguments.get("query") or topic)},
+            }
+        else:
+            note = str(arguments.get("note") or target.get("value") or act.get("goal") or "").strip()
+            if not note or not has_schedule:
+                return {
+                    "status": "needs_parameters",
+                    "actions": [],
+                    "primary_response_override": "我理解你要设置提醒，但还需要明确提醒内容和时间。",
+                }
+            candidate = {
+                "kind": "generic_reminder",
+                "status": "active" if active else "pending_confirmation",
+                "title": note[:80],
+                "user_id": event.source.user_id,
+                "channel": event.source.channel,
+                "session_id": event.source.session_id,
+                "source_event_id": event.event_id,
+                "idempotency_key": semantic_idempotency_key,
+                "schedule": schedule,
+                "payload": {"note": note[:500]},
+            }
+
+        existing_key = str(candidate.get("idempotency_key") or "")
+        existing = next(
+            (
+                item
+                for item in self.list_commitments(user_id=event.source.user_id)
+                if str(item.get("idempotency_key") or "") == existing_key
+            ),
+            None,
+        )
+        if existing:
+            return {
+                "status": "already_exists",
+                "commitment": existing,
+                "actions": ["semantic_commitment_already_exists"],
+                "primary_response_override": f"这个任务已经记录：{existing.get('title') or existing.get('kind')}",
+            }
+        created = self.create_commitment(candidate)
+        return {
+            "status": "created",
+            "commitment": created,
+            "actions": ["created_from_semantic_frame"],
+            "semantic_source": "authoritative_semantic_frame",
+            "primary_response_override": (
+                f"已开启：{created.get('title') or created.get('kind')}"
+                if created.get("status") == "active"
+                else (
+                    f"已建立待确认任务：{created.get('title') or created.get('kind')}。"
+                    "回复“好的”即可开启。"
+                )
+            ),
+        }
 
     def process_explicit_learning_goal(self, *, user_text: str, event: VeyraEvent) -> dict[str, Any]:
         """Handle an unambiguous learning start before model-driven routing."""
@@ -1532,7 +1843,7 @@ class CommitmentCore:
                 },
             },
         )
-        if updated:
+        if updated and self._nested_effect_allowed("memory.write"):
             self.memory_bridge.write_patch(
                 {
                     "session_id": intent.session_id,
@@ -2120,7 +2431,8 @@ class CommitmentCore:
         self.state_store.mutate_json(self.STATE_FILE, update_commitment_state)
         if updated is None:
             return None
-        self._sync_user_world(updated)
+        if self._nested_effect_allowed("profile.write"):
+            self._sync_user_world(updated)
         self._sync_goal_permission_from_commitment(updated)
         self.set_watchlists_for_commitment(updated)
         self.authorization.record_commitment(updated)

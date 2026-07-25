@@ -13,6 +13,7 @@ from core.runtime_entity import RuntimeEntity
 from core.turn_context_builder import TurnContextBuilder
 from core.world_state import WorldStateStore
 from interface.event_schema import EventSource, EventType, VeyraEvent
+from scripts.user_profile_generalization_smoke import authorized_profile_result
 
 
 def _event(user_id: str, session_id: str, text: str) -> VeyraEvent:
@@ -30,8 +31,8 @@ def main() -> None:
 
         event_a = _event("user-a", "session-a", "我正在开发 Veyra")
         event_b = _event("user-b", "session-b", "我在做 Agent治理系统")
-        loop._sync_user_awareness_from_text(event_a)
-        loop._sync_user_awareness_from_text(event_b)
+        loop._sync_user_awareness_from_text(event_a, authorized_profile_result(event_a))
+        loop._sync_user_awareness_from_text(event_b, authorized_profile_result(event_b))
 
         user_world = store.read_json("user_world.json")
         profiles = user_world.get("profiles_by_user")

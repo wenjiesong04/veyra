@@ -32,6 +32,7 @@ from core.definitions import RiskLevel  # noqa: E402
 from interface.event_schema import Decision, Route, utc_now_iso  # noqa: E402
 from probes.schema import probe_payload  # noqa: E402
 from probes.weather_probe import WeatherProbe  # noqa: E402
+from core.understanding_core import TurnUnderstanding  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
 from main import app, awareness_loop  # noqa: E402
 
@@ -44,6 +45,141 @@ FORBIDDEN = (
     "raw exception",
     "internal probe error",
 )
+
+TRACKING_TEXT = "帮我关注 PyTorch 新版本"
+INCOMPLETE_WEATHER_TEXT = "你以后能每天发天气吗"
+COMPLETE_WEATHER_TEXT = "每天早上九点发贵阳花溪区天气"
+
+
+def semantic_understanding(text: str, *, user_id: str) -> TurnUnderstanding:
+    if text == TRACKING_TEXT:
+        acts = [
+            semantic_act(
+                text,
+                act_id="tracking-1",
+                kind="proactive_request",
+                operation="track_external_updates",
+                goal="持续关注 PyTorch 新版本",
+                target_type="tracked_topic",
+                target_value="PyTorch",
+                user_id=user_id,
+                arguments={"topic": "PyTorch", "query": "PyTorch 新版本"},
+            )
+        ]
+        ambiguities: list[dict[str, Any]] = []
+        resolver_status = "resolved"
+    elif text == INCOMPLETE_WEATHER_TEXT:
+        acts = [
+            semantic_act(
+                text,
+                act_id="weather-incomplete-1",
+                kind="recurring_request",
+                operation="schedule_weather_push",
+                goal="每天接收天气",
+                target_type="weather_summary",
+                target_value="",
+                user_id=user_id,
+                arguments={},
+            )
+        ]
+        ambiguities = [
+            {
+                "ambiguity_id": "weather-location",
+                "kind": "missing_location",
+                "description": "请补充城市/地区。",
+                "affected_act_ids": ["weather-incomplete-1"],
+                "candidates": [],
+            },
+            {
+                "ambiguity_id": "weather-time",
+                "kind": "missing_schedule_time",
+                "description": "请补充每天几点发送。",
+                "affected_act_ids": ["weather-incomplete-1"],
+                "candidates": [],
+            },
+        ]
+        resolver_status = "ambiguous"
+    elif text == COMPLETE_WEATHER_TEXT:
+        acts = [
+            semantic_act(
+                text,
+                act_id="weather-complete-1",
+                kind="recurring_request",
+                operation="schedule_weather_push",
+                goal="每天早上九点接收贵阳花溪区天气",
+                target_type="weather_summary",
+                target_value="贵阳市花溪区",
+                user_id=user_id,
+                arguments={
+                    "location": "贵阳市花溪区",
+                    "schedule": {
+                        "kind": "daily",
+                        "time_local": "09:00",
+                        "timezone": "Asia/Shanghai",
+                        "interval_seconds": 86400.0,
+                    },
+                },
+            )
+        ]
+        ambiguities = []
+        resolver_status = "resolved"
+    else:
+        raise ValueError(f"no semantic fixture for {text!r}")
+    return TurnUnderstanding.from_payload(
+        {
+            "intent": "action",
+            "task_type": "proactive_request",
+            "explicit_request": text,
+            "user_goal": text,
+            "suggested_mode": "governed_execution",
+            "semantic_frame": {
+                "schema_version": "veyra.semantic_frame.v1",
+                "acts": acts,
+                "relations": [],
+                "ambiguities": ambiguities,
+                "resolver_status": resolver_status,
+                "source": "smoke",
+            },
+        },
+        source_text=text,
+    )
+
+
+def semantic_act(
+    text: str,
+    *,
+    act_id: str,
+    kind: str,
+    operation: str,
+    goal: str,
+    target_type: str,
+    target_value: str,
+    user_id: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "act_id": act_id,
+        "kind": kind,
+        "goal": goal,
+        "operation": operation,
+        "target": {"type": target_type, "value": target_value, "attributes": {}},
+        "polarity": "positive",
+        "explicitness": "explicit",
+        "source_quote": {"text": text, "start": 0, "end": len(text)},
+        "speaker": user_id,
+        "authority": "direct_user",
+        "mention_mode": "normal_use",
+        "evidence_need": "none",
+        "referent": {
+            "surface": "",
+            "resolved": target_value,
+            "status": "resolved" if target_value else "not_applicable",
+            "candidates": [],
+        },
+        "condition": None,
+        "modality": "asserted",
+        "arguments": arguments,
+    }
 
 
 class FakeWeatherProbe:
@@ -175,6 +311,17 @@ def main() -> int:
     awareness_loop.probes["search_probe"] = FakeSearchProbe()
     awareness_loop.compact_external_lookup.search = FakeSearchProbe()
     awareness_loop.core_reasoning.decision_assist = fake_decision_assist  # type: ignore[method-assign]
+    original_understanding_build = awareness_loop.understanding_core.build
+
+    def build_understanding(**kwargs: Any) -> TurnUnderstanding:
+        text = str(kwargs.get("text") or "")
+        if text in {TRACKING_TEXT, INCOMPLETE_WEATHER_TEXT, COMPLETE_WEATHER_TEXT}:
+            event = kwargs.get("event")
+            user_id = str(getattr(getattr(event, "source", None), "user_id", "") or "replay-user")
+            return semantic_understanding(text, user_id=user_id)
+        return original_understanding_build(**kwargs)
+
+    awareness_loop.understanding_core.build = build_understanding  # type: ignore[method-assign]
     client = TestClient(app)
     store = WorldStateStore(TEST_STATE_ROOT)
 
@@ -194,7 +341,7 @@ def main() -> int:
 
     tracking = post(
         client,
-        "帮我关注 PyTorch 新版本",
+        TRACKING_TEXT,
         index=40,
         user_id="tracking-replay-user",
         session_id="tracking-replay-session",
@@ -202,28 +349,29 @@ def main() -> int:
     tracking_text = full_text(tracking)
     expect(
         tracking.get("route") == "direct_answer"
-        and ((tracking.get("artifacts") or {}).get("commitment") or {}).get("semantic_source") == "explicit_tracking_guardrail",
-        "explicit tracking bypasses model and Agent routing",
+        and ((tracking.get("artifacts") or {}).get("commitment") or {}).get("semantic_source") == "authoritative_semantic_frame"
+        and not (tracking.get("artifacts") or {}).get("execution_result"),
+        "explicit tracking follows semantic authority without Agent routing",
         tracking,
     )
     expect(
-        "回复" in tracking_text and "好的" in tracking_text,
-        "tracking keeps the commitment confirmation followup",
+        "待确认" in tracking_text and "好的" in tracking_text,
+        "tracking gives an actionable confirmation prompt",
         tracking_text,
     )
     expect(
-        tracking.get("followup_messages"),
-        "commitment confirmation remains a distinct followup",
+        not tracking.get("followup_messages"),
+        "tracking confirmation prompt is rendered once",
         tracking,
     )
 
     before_weather_count = len([item for item in store.read_json("user_commitments.json").get("commitments", []) if isinstance(item, dict) and item.get("kind") == "weather_daily"])
-    outputs.append(post(client, "你以后能每天发天气吗", index=5))
+    outputs.append(post(client, INCOMPLETE_WEATHER_TEXT, index=5))
     after_weather_count = len([item for item in store.read_json("user_commitments.json").get("commitments", []) if isinstance(item, dict) and item.get("kind") == "weather_daily"])
     expect(before_weather_count == after_weather_count, "incomplete daily weather does not create commitment", store.read_json("user_commitments.json"))
     expect("几点" in full_text(outputs[-1]) and "城市/地区" in full_text(outputs[-1]), "incomplete daily weather asks parameters", full_text(outputs[-1]))
 
-    outputs.append(post(client, "每天早上九点发贵阳花溪区天气", index=6))
+    outputs.append(post(client, COMPLETE_WEATHER_TEXT, index=6))
     commitments = store.read_json("user_commitments.json").get("commitments", [])
     weather_items = [item for item in commitments if isinstance(item, dict) and item.get("kind") == "weather_daily"]
     created = weather_items[-1] if weather_items else {}

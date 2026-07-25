@@ -14,6 +14,7 @@ from core.commitment_core import CommitmentCore  # noqa: E402
 from core.runtime_entity import RuntimeEntity  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
 from interface.event_schema import EventSource, EventType, VeyraEvent  # noqa: E402
+from scripts.user_profile_generalization_smoke import authorized_profile_result  # noqa: E402
 
 
 def expect(condition: bool, label: str, detail: object = None) -> None:
@@ -36,28 +37,31 @@ def main() -> None:
         loop = AwarenessLoop(store, RuntimeEntity(store))
         core = CommitmentCore(store)
 
-        loop._sync_user_awareness_from_text(event("user-a", "s-a", "我正在开发 Veyra"))
-        loop._sync_user_awareness_from_text(event("user-b", "s-b", "我在做 Agent治理系统"))
-        core.create_commitment(
-            {
-                "kind": "weather_daily",
-                "status": "active",
-                "title": "A weather",
-                "user_id": "user-a",
-                "session_id": "s-a",
-                "payload": {"topic": "weather", "location": "北京"},
-            }
-        )
-        core.create_commitment(
-            {
-                "kind": "weather_daily",
-                "status": "active",
-                "title": "B weather",
-                "user_id": "user-b",
-                "session_id": "s-b",
-                "payload": {"topic": "weather", "location": "上海"},
-            }
-        )
+        event_a = event("user-a", "s-a", "我正在开发 Veyra")
+        event_b = event("user-b", "s-b", "我在做 Agent治理系统")
+        loop._sync_user_awareness_from_text(event_a, authorized_profile_result(event_a))
+        loop._sync_user_awareness_from_text(event_b, authorized_profile_result(event_b))
+        with core.authorized_effects({"profile.write"}):
+            core.create_commitment(
+                {
+                    "kind": "weather_daily",
+                    "status": "active",
+                    "title": "A weather",
+                    "user_id": "user-a",
+                    "session_id": "s-a",
+                    "payload": {"topic": "weather", "location": "北京"},
+                }
+            )
+            core.create_commitment(
+                {
+                    "kind": "weather_daily",
+                    "status": "active",
+                    "title": "B weather",
+                    "user_id": "user-b",
+                    "session_id": "s-b",
+                    "payload": {"topic": "weather", "location": "上海"},
+                }
+            )
 
         user_world = store.read_json("user_world.json")
         profiles = user_world.get("profiles_by_user")

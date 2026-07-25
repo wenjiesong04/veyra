@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from core.awareness_context_assembler import AwarenessContextAssembler
 from core.model_client import redact_sensitive
 from core.prompt_loader import load_prompt
 from core.reasoning_core import CoreReasoning
+from core.semantic_frame import (
+    ReferentResolution,
+    SemanticAct,
+    SemanticTarget,
+    SourceQuote,
+    TurnSemanticFrame,
+    semantic_frame_quality_issues,
+)
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent
 
@@ -20,10 +28,30 @@ TURN_UNDERSTANDING_SYSTEM_FALLBACK = (
     "Return strict JSON only. Produce user understanding and awareness orientation, not a route decision. "
     "Start by understanding the person and situation: explicit request, hidden need, emotion, project, goal risk, "
     "constraints, capability needs, time scale, history links, and evidence gaps. "
+    "Also produce a multi-act semantic_frame grounded in exact character spans from the user message. "
     "Do not execute probes or agents, do not write the final user reply, and do not treat missing evidence as fact."
 )
 
-TURN_UNDERSTANDING_SYSTEM = load_prompt("core/turn_understanding.md", TURN_UNDERSTANDING_SYSTEM_FALLBACK)
+TURN_UNDERSTANDING_SYSTEM = (
+    load_prompt("core/turn_understanding.md", TURN_UNDERSTANDING_SYSTEM_FALLBACK)
+    + "\n\nThe semantic_frame records meaning only. It must never contain route, risk, state_effect, "
+    "allowed_capabilities, memory policy, or execution authorization. Preserve every independent act, "
+    "including prohibitions, quotations, reported speech, corrections, alternatives, and conditions. "
+    "kind, goal, operation, target type/value, authority, and evidence_need are open-world strings. "
+    "Every source_quote must be an exact Python-style character slice of user_message: "
+    "user_message[start:end] == text. One semantic act must contain only one independently assertable, "
+    "deniable, or fulfillable goal. Never merge clauses with different polarity, authority, condition, "
+    "or requested outcome into one operation string. For example, 不要每天推送天气，只告诉我现在上海天气 "
+    "must be two acts: a negative recurring-push act and a positive current-weather query, connected by "
+    "a contrast relation. Keep situation fields concise so the complete JSON fits the output budget."
+)
+
+TURN_UNDERSTANDING_REPAIR_SYSTEM = (
+    TURN_UNDERSTANDING_SYSTEM
+    + "\nYour previous candidate was incomplete or invalid. Rebuild the entire JSON object from the original "
+    "user_message. Treat validation_issues as defects to fix, not as semantic facts. Preserve atomic acts, "
+    "opposite polarities, conditions, quotation/authority boundaries, and exact source slices. Return no prose."
+)
 
 
 @dataclass(slots=True)
@@ -54,10 +82,12 @@ class TurnUnderstanding:
     confidence: float = 0.0
     reason: str = ""
     source: str = ""
+    semantic_frame: TurnSemanticFrame | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> "TurnUnderstanding":
+    def from_payload(cls, payload: dict[str, Any], *, source_text: str = "") -> "TurnUnderstanding":
+        root_payload = payload
         if isinstance(payload.get("turn_understanding"), dict):
             payload = payload["turn_understanding"]
         situation = payload.get("situation_assessment") if isinstance(payload.get("situation_assessment"), dict) else {}
@@ -86,6 +116,9 @@ class TurnUnderstanding:
             or ""
         )
         user_goal = str(situation.get("user_goal") or payload.get("user_goal") or explicit_request or task_summary or "")
+        semantic_text = source_text or str(root_payload.get("user_message") or explicit_request or task_summary or "")
+        semantic_frame = _semantic_frame_from_payload(root_payload, source_text=semantic_text)
+        semantic_frame = _apply_model_clarification_gap(semantic_frame, situation)
         return cls(
             intent=str(situation.get("intent") or payload.get("intent") or "unknown"),
             task_summary=task_summary or explicit_request,
@@ -112,7 +145,12 @@ class TurnUnderstanding:
             retrieval_hints=hints,
             confidence=confidence,
             reason=str(situation.get("reason") or payload.get("reason") or ""),
-            source=str(payload.get("source") or ("model" if payload.get("status") == "model_assisted" else "")),
+            source=str(
+                payload.get("source")
+                or root_payload.get("source")
+                or ("model" if root_payload.get("status") == "model_assisted" else "")
+            ),
+            semantic_frame=semantic_frame,
             raw=payload,
         )
 
@@ -144,6 +182,7 @@ class TurnUnderstanding:
             "confidence": self.confidence,
             "reason": self.reason,
             "source": self.source,
+            "semantic_frame": self.semantic_frame.model_dump(mode="json") if self.semantic_frame is not None else None,
         }
         if include_raw:
             data["raw"] = self.raw
@@ -166,6 +205,7 @@ class TurnUnderstanding:
                 "capability_needs": self.capability_needs,
                 "confidence": self.confidence,
                 "source": self.source,
+                "semantic_frame": self.semantic_frame.compact() if self.semantic_frame is not None else None,
             },
             max_string=360,
             max_list=6,
@@ -194,10 +234,15 @@ class UnderstandingCore:
     ) -> TurnUnderstanding:
         snapshot = awareness_snapshot if isinstance(awareness_snapshot, dict) else self._awareness_snapshot(text=text, attention_focus=attention_focus)
         fallback = self.fallback(text=text, attention_focus=attention_focus, event=event, awareness_snapshot=snapshot)
-        if self._prefer_rule_understanding(fallback):
-            return fallback
+        fallback = _contextualize_read_only_fallback(fallback, text=text, turn_context=turn_context or {})
         if allow_model:
-            model = self.orient_model(text=text, awareness_snapshot=snapshot, turn_context=turn_context or {}, event=event)
+            model = self.orient_model(
+                text=text,
+                awareness_snapshot=snapshot,
+                turn_context=turn_context or {},
+                event=event,
+                fallback=fallback,
+            )
             if model is not None:
                 return model
         return fallback
@@ -209,10 +254,22 @@ class UnderstandingCore:
         awareness_snapshot: dict[str, Any],
         turn_context: dict[str, Any],
         event: VeyraEvent | None = None,
+        fallback: TurnUnderstanding | None = None,
     ) -> TurnUnderstanding | None:
         if not self.reasoning.is_enabled():
             return None
         active = turn_context.get("active_context") if isinstance(turn_context.get("active_context"), dict) else {}
+        short_memory = turn_context.get("short_memory") if isinstance(turn_context.get("short_memory"), dict) else {}
+        conversation_tail = (
+            short_memory.get("conversation_tail")
+            if isinstance(short_memory.get("conversation_tail"), list)
+            else []
+        )
+        conversation_slots = (
+            short_memory.get("conversation_slots")
+            if isinstance(short_memory.get("conversation_slots"), dict)
+            else {}
+        )
         payload = {
             "user_message": text,
             "awareness_snapshot": awareness_snapshot,
@@ -221,6 +278,8 @@ class UnderstandingCore:
                 "event": active.get("event"),
                 "attention_focus": active.get("attention_focus"),
                 "persona": active.get("persona"),
+                "conversation_tail": conversation_tail[-6:],
+                "conversation_slots": conversation_slots,
             },
             "required_json_fields": {
                 "situation_assessment": {
@@ -251,6 +310,63 @@ class UnderstandingCore:
                     "confidence": "0.0-1.0",
                     "reason": "short rationale",
                 },
+                "semantic_frame": {
+                    "schema_version": "veyra.semantic_frame.v1",
+                    "acts": [
+                        {
+                            "act_id": "unique id such as a1",
+                            "kind": "open-world discourse act, e.g. request, question, prohibition, correction, preference, statement",
+                            "goal": "the act's natural-language goal without collapsing other acts",
+                            "operation": "concise open-world semantic operation; unknown is allowed",
+                            "target": {
+                                "type": "open-world target type",
+                                "value": "target value",
+                                "attributes": "JSON object with target qualifiers",
+                            },
+                            "polarity": "positive|negative|neutral|other open-world semantic polarity",
+                            "explicitness": "explicit|strong_implied|weak_implied|inferred|unknown",
+                            "source_quote": {
+                                "text": "exact quote from user_message",
+                                "start": "integer Unicode character offset, inclusive",
+                                "end": "integer Unicode character offset, exclusive",
+                            },
+                            "speaker": "actual speaker of this act",
+                            "authority": "direct_user|reported_speech|quoted_text|hypothetical|other open-world value",
+                            "mention_mode": "normal_use|quoted_term|reported_speech|example|hypothetical|unknown",
+                            "evidence_need": "open-world evidence requirement such as none, context, fresh_local, fresh_external",
+                            "referent": {
+                                "surface": "pronoun or referring expression, empty when absent",
+                                "resolved": "resolved entity, empty when unresolved or absent",
+                                "status": "resolved|ambiguous|unresolved|not_applicable",
+                                "candidates": "list of possible referents",
+                            },
+                            "condition": "null or {kind, expression, source_quote}",
+                            "modality": "open-world modality such as asserted, conditional, hypothetical, reported",
+                            "arguments": "JSON object with semantic arguments; never put route, risk, state_effect, or capability grants here",
+                        }
+                    ],
+                    "relations": [
+                        {
+                            "relation_id": "unique id such as r1",
+                            "kind": "open-world relation such as contrast, correction, condition, sequence, alternative, quotation",
+                            "from_act_id": "existing act id",
+                            "to_act_id": "existing act id",
+                            "description": "short explanation",
+                            "source_quote": "null or exact source quote object",
+                        }
+                    ],
+                    "ambiguities": [
+                        {
+                            "ambiguity_id": "unique id such as u1",
+                            "kind": "open-world ambiguity type",
+                            "description": "what cannot yet be resolved",
+                            "affected_act_ids": "list of existing act ids",
+                            "candidates": "list of candidates",
+                        }
+                    ],
+                    "resolver_status": "resolved|ambiguous",
+                    "source": "model",
+                },
                 "retrieval_hints": "optional list: conversation, belief, user, task, capabilities, runtime",
             },
         }
@@ -260,9 +376,49 @@ class UnderstandingCore:
             user=json.dumps(payload, ensure_ascii=False),
         )
         self.reasoning._trace("turn_understanding", result, {"text_len": len(text)})
-        if result.get("status") != "model_assisted":
+        candidate, issues = _validated_model_understanding(result, source_text=text)
+        if candidate is not None and not issues:
+            return candidate
+
+        repairable_status = str(result.get("status") or "") in {
+            "invalid_json",
+            "invalid_response",
+            "model_assisted",
+        }
+        if repairable_status:
+            repair_payload = {
+                **payload,
+                "validation_issues": issues or [str(result.get("status") or "invalid_model_output")],
+                "previous_candidate": _repair_candidate_for_prompt(result),
+            }
+            repaired = self.reasoning.client.complete_json(
+                purpose="turn_understanding_repair",
+                system=TURN_UNDERSTANDING_REPAIR_SYSTEM,
+                user=json.dumps(repair_payload, ensure_ascii=False),
+            )
+            self.reasoning._trace(
+                "turn_understanding_repair",
+                repaired,
+                {"text_len": len(text), "validation_issues": issues[:8]},
+            )
+            repaired_candidate, repaired_issues = _validated_model_understanding(repaired, source_text=text)
+            if repaired_candidate is not None and not repaired_issues:
+                repaired_candidate.reason = (
+                    f"{repaired_candidate.reason}; semantic repair retry passed"
+                    if repaired_candidate.reason
+                    else "semantic repair retry passed"
+                )
+                return repaired_candidate
+            issues = repaired_issues or issues
+
+        if not repairable_status or fallback is None:
             return None
-        return TurnUnderstanding.from_payload(result)
+        return replace(
+            fallback,
+            semantic_frame=TurnSemanticFrame.fallback(text, resolver_status="invalid_output"),
+            source="model_invalid_output",
+            reason=f"model semantic output invalid after bounded repair: {', '.join(issues[:4]) or 'invalid output'}",
+        )
 
     def fallback(
         self,
@@ -395,22 +551,12 @@ class UnderstandingCore:
             "what_user_really_needs": hidden,
             "retrieval_hints": self._retrieval_hints_for(data),
         }
-        return TurnUnderstanding.from_payload(payload)
+        return TurnUnderstanding.from_payload(payload, source_text=text)
 
     def _awareness_snapshot(self, *, text: str, attention_focus: list[str]) -> dict[str, Any]:
         if not self.assembler:
             return {"status": "unavailable"}
         return self.assembler.snapshot(user_message=text, attention_focus=attention_focus)
-
-    def _prefer_rule_understanding(self, understanding: TurnUnderstanding) -> bool:
-        if understanding.source != "rule_fallback" or understanding.confidence < 0.8:
-            return False
-        return understanding.suggested_mode in {
-            "strategic_discussion",
-            "meta_cognition_discussion",
-            "runtime_evidence",
-            "governed_execution",
-        }
 
     def _retrieval_hints_for(self, data: dict[str, Any]) -> list[str]:
         hints = ["conversation"]
@@ -481,6 +627,298 @@ class UnderstandingCore:
 
 def _dict_from(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _contextualize_read_only_fallback(
+    fallback: TurnUnderstanding,
+    *,
+    text: str,
+    turn_context: dict[str, Any],
+) -> TurnUnderstanding:
+    """Resolve a narrow, read-only continuation from trusted session context.
+
+    This adapter may recover an external read request, but it never creates a
+    state-changing act or upgrades a degraded resolver to resolved.
+    """
+
+    if _blocks_contextual_read_recovery(text):
+        return fallback
+
+    short_memory = turn_context.get("short_memory") if isinstance(turn_context.get("short_memory"), dict) else {}
+    slots = short_memory.get("conversation_slots") if isinstance(short_memory.get("conversation_slots"), dict) else {}
+    conversation_tail = (
+        short_memory.get("conversation_tail")
+        if isinstance(short_memory.get("conversation_tail"), list)
+        else []
+    )
+    last_tool = slots.get("last_tool_result") if isinstance(slots.get("last_tool_result"), dict) else {}
+    compact = re.sub(r"[\s，,。！？!?、~～]+", "", text or "").lower()
+    previous_weather_location = str(
+        slots.get("last_location")
+        or last_tool.get("requested_location")
+        or last_tool.get("location")
+        or ""
+    ).strip()
+    weather_followup = (
+        str(last_tool.get("type") or "") == "weather"
+        or str(slots.get("last_topic") or "") == "weather"
+    ) and _looks_like_weather_followup(text)
+    if previous_weather_location and weather_followup:
+        location = _weather_followup_location(
+            text=text,
+            previous_location=previous_weather_location,
+        )
+        source = text or ""
+        frame = TurnSemanticFrame(
+            acts=[
+                SemanticAct(
+                    act_id="a1",
+                    kind="read_request",
+                    goal=f"continue current weather query for {location}",
+                    operation="query_current_weather",
+                    target=SemanticTarget(
+                        type="weather",
+                        value=location,
+                        attributes={"continuation": True},
+                    ),
+                    polarity="positive",
+                    explicitness="strong_implied",
+                    source_quote=SourceQuote(text=source, start=0, end=len(source)),
+                    speaker="user",
+                    authority="direct_user",
+                    mention_mode="normal_use",
+                    evidence_need="fresh_external_weather",
+                    referent=ReferentResolution(
+                        surface=text,
+                        resolved=location,
+                        status="resolved",
+                        candidates=[],
+                    ),
+                    condition=None,
+                    modality="asserted",
+                    arguments={"location": location, "continuation": True},
+                )
+            ],
+            relations=[],
+            ambiguities=[],
+            resolver_status="degraded",
+            source="context_fallback",
+        )
+        return replace(
+            fallback,
+            intent="information",
+            task_type="current_fact",
+            user_goal=f"查询 {location} 的当前天气",
+            explicit_request=text,
+            suggested_mode="runtime_evidence",
+            needs_fresh_evidence=True,
+            evidence_kind="weather",
+            can_answer_from_world_state=False,
+            semantic_frame=frame,
+            source="context_fallback",
+            reason="resolved a read-only weather continuation from the same-session tool slot",
+        )
+    retry_markers = {
+        "没有这些",
+        "没有",
+        "都没有",
+        "不是这些",
+        "没这些",
+        "换一批",
+        "再找",
+        "继续找",
+        "重新搜",
+        "重新找",
+    }
+    previous_query = str(slots.get("last_search_query") or last_tool.get("query") or "").strip()
+    if not previous_query:
+        for item in reversed(conversation_tail[-6:]):
+            if not isinstance(item, dict) or str(item.get("direction") or "") != "inbound":
+                continue
+            candidate = str(item.get("text") or "").strip()
+            if not candidate or candidate == text:
+                continue
+            candidate_compact = re.sub(r"[\s，,。！？!?、]+", "", candidate).lower()
+            has_lookup = any(marker in candidate_compact for marker in ("找", "搜索", "搜", "查", "信息", "search", "find", "lookup"))
+            has_external_topic = any(
+                marker in candidate_compact
+                for marker in ("秋招", "春招", "校招", "招聘", "岗位", "公司", "新闻", "最新", "recruit", "hiring", "jobs")
+            )
+            if has_lookup and has_external_topic:
+                previous_query = candidate
+                break
+    if compact not in retry_markers or not previous_query:
+        return fallback
+    source = text or ""
+    if not source:
+        return fallback
+    frame = TurnSemanticFrame(
+        acts=[
+            SemanticAct(
+                act_id="a1",
+                kind="read_request",
+                goal=f"continue external search for {previous_query}",
+                operation="retry_external_search",
+                target=SemanticTarget(
+                    type="search_query",
+                    value=previous_query,
+                    attributes={"continuation": True},
+                ),
+                polarity="positive",
+                explicitness="strong_implied",
+                source_quote=SourceQuote(text=source, start=0, end=len(source)),
+                speaker="user",
+                authority="direct_user",
+                mention_mode="normal_use",
+                evidence_need="fresh_external_search",
+                referent=ReferentResolution(
+                    surface="这些",
+                    resolved="previous_search_results",
+                    status="resolved",
+                    candidates=[],
+                ),
+                condition=None,
+                modality="asserted",
+                arguments={"query": previous_query, "retry": True},
+            )
+        ],
+        relations=[],
+        ambiguities=[],
+        resolver_status="degraded",
+        source="context_fallback",
+    )
+    return replace(
+        fallback,
+        intent="information",
+        task_type="current_fact",
+        user_goal=f"继续查找：{previous_query}",
+        explicit_request=text,
+        suggested_mode="runtime_evidence",
+        needs_fresh_evidence=True,
+        evidence_kind="search",
+        can_answer_from_world_state=False,
+        semantic_frame=frame,
+        source="context_fallback",
+        reason="resolved a read-only search continuation from the same-session tool slot",
+    )
+
+
+def _looks_like_weather_followup(text: str) -> bool:
+    compact = re.sub(r"[\s，,。！？!?、~～]+", "", text or "")
+    if not compact or len(compact) > 30:
+        return False
+    if compact in {"呢", "今天呢", "现在呢", "明天呢", "温度呢", "气温呢", "天气呢"}:
+        return True
+    if re.fullmatch(
+        r"[\w\u4e00-\u9fff·-]{1,8}(?:省|市|区|县|镇|乡)(?:呢|(?:天气|气温|温度)(?:呢|怎么样|如何))",
+        compact,
+    ):
+        return True
+    return False
+
+
+def _blocks_contextual_read_recovery(text: str) -> bool:
+    """Keep degraded continuation recovery from erasing discourse boundaries."""
+
+    compact = re.sub(r"\s+", "", text or "").lower()
+    return bool(
+        re.search(r"(?:不要|请勿|禁止|先别|别再|不用再|无需再)(?:查|看|搜|查询|搜索)?", compact)
+        or re.search(r"别(?:查|看|搜|查询|搜索|执行|运行)", compact)
+        or re.search(r"\b(?:do not|don't|dont|never|stop)\b", compact)
+        or re.search(r"(?:如果|假如|若|一旦|等我|等到|待).+(?:再|就|才)", compact)
+        or re.search(r"\b(?:if|when)\b.+", compact)
+        or re.search(r"(?:老板|领导|同事|客户|对方|他|她|他们)(?:说|要求|让)", compact)
+        or re.search(r"\b(?:boss|manager|client|colleague|he|she|they)\s+(?:said|asked|told)\b", compact)
+    )
+
+
+def _weather_followup_location(*, text: str, previous_location: str) -> str:
+    fragment = re.sub(r"[\s，,。！？!?、~～]+", "", text or "")
+    for token in ("现在", "当前", "今天", "今日", "明天", "天气", "气温", "温度", "怎么样", "如何", "呢"):
+        fragment = fragment.replace(token, "")
+    fragment = fragment.strip()
+    if not fragment or fragment in previous_location:
+        return previous_location
+    if previous_location in fragment:
+        return fragment
+    if fragment.endswith(("区", "县", "镇", "乡")):
+        city_match = re.match(r"^(.+?市)", previous_location)
+        if city_match:
+            return f"{city_match.group(1)}{fragment}"
+    return fragment
+
+
+def _semantic_frame_from_payload(payload: dict[str, Any], *, source_text: str) -> TurnSemanticFrame | None:
+    is_model_output = payload.get("status") == "model_assisted" or payload.get("source") in {"model", "model_repair"}
+    try:
+        if is_model_output:
+            return TurnSemanticFrame.safe_from_model_payload(payload, source_text=source_text)
+        return TurnSemanticFrame.from_payload(payload, source_text=source_text)
+    except (TypeError, ValueError):
+        if not source_text:
+            return None
+        return TurnSemanticFrame.fallback(
+            source_text,
+            resolver_status="invalid_output" if is_model_output else "degraded",
+        )
+
+
+def _validated_model_understanding(
+    payload: dict[str, Any],
+    *,
+    source_text: str,
+) -> tuple[TurnUnderstanding | None, list[str]]:
+    if payload.get("status") != "model_assisted":
+        return None, [str(payload.get("status") or "model_transport_failure")]
+    candidate = TurnUnderstanding.from_payload(payload, source_text=source_text)
+    frame = candidate.semantic_frame
+    if frame is None:
+        return None, ["semantic_frame_missing"]
+    if frame.resolver_status == "invalid_output":
+        return None, ["semantic_frame_schema_or_source_binding_invalid"]
+    return candidate, semantic_frame_quality_issues(frame, source_text)
+
+
+def _repair_candidate_for_prompt(payload: dict[str, Any]) -> dict[str, Any]:
+    candidate = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"_model", "duration_ms"}
+    }
+    raw_text = candidate.get("raw_text")
+    if isinstance(raw_text, str):
+        candidate["raw_text"] = raw_text[:1600]
+    return redact_sensitive(candidate, max_string=1600, max_list=16)
+
+
+def _apply_model_clarification_gap(
+    frame: TurnSemanticFrame | None,
+    situation: dict[str, Any],
+) -> TurnSemanticFrame | None:
+    """Keep a model-declared context gap inside the authoritative frame."""
+
+    if frame is None or frame.source not in {"model", "model_repair"}:
+        return frame
+    if str(situation.get("suggested_mode") or "") != "clarify" or frame.ambiguities:
+        return frame
+    gap = situation.get("evidence_gap") if isinstance(situation.get("evidence_gap"), dict) else {}
+    description = str(
+        gap.get("what_would_change_the_answer")
+        or situation.get("hidden_need")
+        or "需要补充执行对象、范围或期望结果。"
+    ).strip()
+    payload = frame.model_dump(mode="json")
+    payload["resolver_status"] = "ambiguous"
+    payload["ambiguities"] = [
+        {
+            "ambiguity_id": "model_context_gap",
+            "kind": "missing_context",
+            "description": description[:800],
+            "affected_act_ids": [act.act_id for act in frame.acts],
+            "candidates": [],
+        }
+    ]
+    return TurnSemanticFrame.model_validate(payload, strict=True)
 
 
 def _any_list(value: Any, *, limit: int) -> list[Any]:

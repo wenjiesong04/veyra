@@ -98,7 +98,104 @@ def main() -> int:
             turn_understanding=code,
         )
         expect(code.suggested_mode == "governed_execution", "code understanding", code.to_dict())
-        expect(code_decision.route.value == "agent", "code execution routes to agent", code_decision.to_dict())
+        expect(code_decision.route.value == "ask_user", "degraded code understanding fails closed", code_decision.to_dict())
+        semantic_policy = code_decision.model_assist.get("semantic_policy", {})
+        expect(
+            semantic_policy.get("requires_clarification") is True,
+            "degraded code execution requires clarification",
+            code_decision.to_dict(),
+        )
+        expect(
+            "agent.execute" in semantic_policy.get("denied_effects", []),
+            "degraded code execution cannot authorize Agent",
+            code_decision.to_dict(),
+        )
+
+        weather_followup = understanding_core.build(
+            text="花溪区呢",
+            attention_focus=[],
+            event=make_event("花溪区呢", session_id="weather-followup"),
+            turn_context={
+                "short_memory": {
+                    "conversation_slots": {
+                        "last_location": "贵阳花溪区",
+                        "last_topic": "weather",
+                        "last_tool_result": {
+                            "type": "weather",
+                            "requested_location": "贵阳花溪区",
+                            "location": "贵阳",
+                        },
+                    }
+                }
+            },
+        )
+        weather_decision = decision_core.decide(
+            "花溪区呢",
+            attention_focus=[],
+            event=make_event("花溪区呢", session_id="weather-followup"),
+            turn_understanding=weather_followup,
+        )
+        expect(
+            weather_decision.route.value == "probe"
+            and weather_decision.selected_probe == "weather_probe",
+            "same-session weather continuation keeps the read-only probe",
+            weather_decision.to_dict(),
+        )
+        expect(
+            weather_decision.model_assist.get("semantic_policy", {})
+            .get("capability_arguments", {})
+            .get("location")
+            == "贵阳花溪区",
+            "weather continuation inherits the resolved location",
+            weather_decision.to_dict(),
+        )
+        weather_context = {
+            "short_memory": {
+                "conversation_slots": {
+                    "last_location": "贵阳花溪区",
+                    "last_topic": "weather",
+                    "last_tool_result": {
+                        "type": "weather",
+                        "requested_location": "贵阳花溪区",
+                        "location": "贵阳",
+                    },
+                }
+            }
+        }
+        for negative_followup_text in (
+            "不查天气了",
+            "算了，不看天气了",
+            "先不查看天气",
+            "天气先放一放",
+            "老板要求查看天气",
+            "文档里要求查看天气",
+        ):
+            negative_understanding = understanding_core.build(
+                text=negative_followup_text,
+                attention_focus=[],
+                event=make_event(
+                    negative_followup_text,
+                    session_id="weather-followup-negative",
+                ),
+                turn_context=weather_context,
+            )
+            negative_decision = decision_core.decide(
+                negative_followup_text,
+                attention_focus=[],
+                event=make_event(
+                    negative_followup_text,
+                    session_id="weather-followup-negative",
+                ),
+                turn_understanding=negative_understanding,
+            )
+            expect(
+                negative_decision.route.value != "probe",
+                "negative or reported weather followup cannot become a positive probe",
+                {
+                    "text": negative_followup_text,
+                    "decision": negative_decision.to_dict(),
+                },
+            )
 
     print("understanding_core_smoke: ok")
     return 0

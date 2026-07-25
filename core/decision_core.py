@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from typing import Any
 
 from core.capability_registry import CapabilityRegistry
@@ -9,6 +10,7 @@ from core.model_driven_decision_core import ModelDrivenDecisionCore
 from core.definitions import RiskLevel, classify_text_risk
 from core.memory_policy_runtime import normalize_memory_policy
 from core.reasoning_core import CoreReasoning, safe_model_risk
+from core.semantic_policy import SemanticPolicy, SemanticPolicyCompiler
 from core.understanding_core import TurnUnderstanding
 from core.world_state import WorldStateStore
 from interface.event_schema import Decision, Route, VeyraEvent
@@ -152,6 +154,7 @@ class DecisionCore:
         self.reasoning = reasoning or (CoreReasoning(state_store) if state_store else None)
         self.capabilities = CapabilityRegistry(state_store) if state_store else None
         self.model_driven = ModelDrivenDecisionCore()
+        self.semantic_policy = SemanticPolicyCompiler()
 
     def decide(
         self,
@@ -163,9 +166,19 @@ class DecisionCore:
         turn_understanding: TurnUnderstanding | dict[str, Any] | None = None,
     ) -> Decision:
         understanding = self._normalize_turn_understanding(turn_understanding)
+
+        def finish(candidate: Decision) -> Decision:
+            candidate = self._enforce_preference_lock(text, candidate)
+            return self._enforce_semantic_policy(
+                candidate,
+                understanding,
+                current_user_id=str(event.source.user_id or "") if event is not None else "",
+            )
+
         locked = self._governance_locked_decision(text, attention_focus, event=event)
         if locked:
-            return self.model_driven.enrich(text, self._with_turn_understanding(locked, understanding), event=event)
+            enriched = self.model_driven.enrich(text, self._with_turn_understanding(locked, understanding), event=event)
+            return finish(enriched)
         contract_base = self._rule_decide(text, attention_focus, event=event)
         contract_base = self._apply_understanding_guardrails(text, contract_base, understanding)
         if self._adapter_contract_route_is_deterministic(contract_base):
@@ -178,10 +191,10 @@ class DecisionCore:
             if deterministic_signal and deterministic_signal not in contract_base.signals:
                 contract_base.signals.append(deterministic_signal)
             enriched = self.model_driven.enrich(text, self._with_turn_understanding(contract_base, understanding), event=event)
-            return self._enforce_preference_lock(text, enriched)
+            return finish(enriched)
         if self._should_trust_rule_understanding(understanding):
             enriched = self.model_driven.enrich(text, self._with_turn_understanding(contract_base, understanding), event=event)
-            return self._enforce_preference_lock(text, enriched)
+            return finish(enriched)
         if use_model_first_pipeline(self.reasoning):
             pipeline = CognitionPipeline(self.reasoning, self.state_store, self.capabilities)
             pipeline_decision = pipeline.run(
@@ -194,14 +207,14 @@ class DecisionCore:
             if pipeline_decision is not None:
                 pipeline_decision = self._apply_understanding_guardrails(text, pipeline_decision, understanding)
                 enriched = self.model_driven.enrich(text, self._with_turn_understanding(pipeline_decision, understanding), event=event)
-                return self._enforce_preference_lock(text, enriched)
+                return finish(enriched)
         base = self._rule_decide(text, attention_focus, event=event)
         base = self._apply_understanding_guardrails(text, base, understanding)
         base = self._with_turn_understanding(base, understanding)
         decision = self._apply_model_assist(text, attention_focus, base, event=event)
         decision = self._apply_understanding_guardrails(text, decision, understanding)
         enriched = self.model_driven.enrich(text, self._with_turn_understanding(decision, understanding), event=event)
-        return self._enforce_preference_lock(text, enriched)
+        return finish(enriched)
 
     def _governance_locked_decision(self, text: str, attention_focus: list[str], event: VeyraEvent | None = None) -> Decision | None:
         """Deterministic locks that must never be overridden by model routing."""
@@ -291,6 +304,229 @@ class DecisionCore:
         decision.model_assist = assist
         decision.signals = self._dedupe([*(decision.signals or []), f"understanding:{understanding.suggested_mode or understanding.intent}"])
         return decision
+
+    def _enforce_semantic_policy(
+        self,
+        decision: Decision,
+        understanding: TurnUnderstanding | None,
+        *,
+        current_user_id: str = "",
+    ) -> Decision:
+        """Make the semantic frame authoritative after every routing path.
+
+        Existing rule/model routing remains useful as a candidate planner, but it
+        cannot authorize tools, durable memory, or state mutation on its own.
+        """
+
+        frame = getattr(understanding, "semantic_frame", None) if understanding is not None else None
+        if frame is None:
+            missing_policy = SemanticPolicy(
+                resolver_status="missing",
+                policy_signals=[
+                    "semantic_policy:frame_missing",
+                    "semantic_policy:read_only_default",
+                ],
+            )
+            assist = dict(decision.model_assist or {})
+            assist["semantic_policy"] = missing_policy.to_dict()
+            signals = self._dedupe(
+                [
+                    *(decision.signals or []),
+                    *missing_policy.policy_signals,
+                    "policy:semantic_frame_required",
+                ]
+            )
+            effectful_route = decision.route in {
+                Route.AGENT,
+                Route.NATIVE_TOOL,
+                Route.PROBE,
+                Route.SKILL,
+            } or decision.needs_agent or decision.needs_probe
+            if effectful_route:
+                return replace(
+                    decision,
+                    route=Route.ASK_USER,
+                    risk_level=self._max_risk(RiskLevel.R1, decision.risk_level),
+                    reason="semantic frame is required before capability execution",
+                    requires_confirmation=False,
+                    selected_probe=None,
+                    capability="ask_user",
+                    needs_probe=False,
+                    needs_agent=False,
+                    needs_user_confirmation=False,
+                    memory_policy="forget",
+                    required_capabilities=[],
+                    signals=signals,
+                    constraints=self._dedupe(
+                        [
+                            *(decision.constraints or []),
+                            "do not execute capabilities without a semantic frame",
+                        ]
+                    ),
+                    model_assist=assist,
+                )
+            decision.model_assist = assist
+            decision.signals = signals
+            if decision.memory_policy != "forget":
+                decision.memory_policy = "forget"
+            return decision
+        policy = self.semantic_policy.compile(frame, current_user_id=current_user_id)
+        frame_payload = frame.model_dump(mode="json") if hasattr(frame, "model_dump") else frame
+        assist = dict(decision.model_assist or {})
+        assist["semantic_frame"] = frame_payload if isinstance(frame_payload, dict) else {}
+        assist["semantic_policy"] = policy.to_dict()
+        if policy.capability_arguments:
+            assist["probe_params"] = dict(policy.capability_arguments)
+
+        signals = self._dedupe([*(decision.signals or []), *policy.policy_signals, "policy:semantic_frame_authoritative"])
+        constraints = self._dedupe(
+            [
+                *(decision.constraints or []),
+                "only semantic-policy-authorized capabilities may execute",
+                "quoted, reported, hypothetical, and negated acts cannot authorize side effects",
+            ]
+        )
+
+        hard_evidence_gap = (
+            decision.route == Route.ASK_USER
+            and isinstance(decision.capability_request, dict)
+            and str(decision.capability_request.get("capability") or "") in {"vision", "attachment_content"}
+        )
+        if hard_evidence_gap:
+            assist["semantic_policy"] = {
+                **policy.to_dict(),
+                "preferred_route": Route.ASK_USER.value,
+                "route_reason": "attachment content is unavailable to the understanding layer",
+                "requires_clarification": True,
+                "clarification_reason": "the attachment content must be supplied or made readable",
+                "allowed_capabilities": ["ask_user"],
+                "allowed_effects": [],
+            }
+            decision.model_assist = assist
+            decision.signals = self._dedupe([*signals, "policy:hard_evidence_gap_preserved"])
+            decision.constraints = constraints
+            decision.memory_policy = "forget"
+            return decision
+
+        false_positive_action_words = any(
+            signal in policy.policy_signals
+            for signal in (
+                "semantic_policy:explicit_denial",
+                "semantic_policy:ignored_quoted",
+                "semantic_policy:ignored_quotation",
+                "semantic_policy:ignored_reported",
+                "semantic_policy:ignored_reported_speech",
+                "semantic_policy:ignored_hypothetical",
+                "semantic_policy:ignored_example",
+            )
+        )
+        safety_locked = decision.route in {Route.BLOCK, Route.HUMAN_REVIEW, Route.ROLLBACK}
+        semantic_clarification_is_safer = (
+            decision.route == Route.HUMAN_REVIEW
+            and policy.requires_clarification
+            and not policy.allowed_effects
+        )
+        if safety_locked and not (
+            (false_positive_action_words and not policy.allowed_effects)
+            or semantic_clarification_is_safer
+        ):
+            decision.model_assist = assist
+            decision.signals = signals
+            decision.constraints = constraints
+            return decision
+
+        preferred = policy.preferred_route
+        route = decision.route
+        selected_probe = decision.selected_probe
+        capability = decision.capability
+        required_capabilities = list(decision.required_capabilities)
+        needs_probe = decision.needs_probe
+        needs_agent = decision.needs_agent
+        needs_confirmation = decision.needs_user_confirmation
+        requires_confirmation = decision.requires_confirmation
+        memory_policy = decision.memory_policy
+        risk = decision.risk_level
+        intent = decision.intent
+        reason = decision.reason
+
+        if preferred == Route.ASK_USER.value:
+            route = Route.ASK_USER
+            selected_probe = None
+            capability = "ask_user"
+            required_capabilities = []
+            needs_probe = False
+            needs_agent = False
+            needs_confirmation = False
+            requires_confirmation = False
+            memory_policy = "forget"
+            if not policy.allowed_effects and risk != RiskLevel.R5:
+                risk = RiskLevel.R1
+            reason = f"semantic clarification required: {policy.clarification_reason or 'unresolved intent'}"
+        elif preferred == Route.PROBE.value:
+            route = Route.PROBE
+            selected_probe = policy.selected_probe
+            capability = "probe"
+            required_capabilities = list(policy.allowed_capabilities)
+            needs_probe = True
+            needs_agent = False
+            requires_confirmation = False
+            memory_policy = "forget"
+            risk = self._max_risk(RiskLevel.R1, risk) if risk in {RiskLevel.R0, RiskLevel.R1} else risk
+            reason = f"semantic frame requires fresh evidence via {policy.selected_probe}"
+        elif preferred == Route.AGENT.value:
+            route = Route.AGENT
+            selected_probe = None
+            capability = "selected_agent_runtime"
+            required_capabilities = ["selected_agent_runtime"]
+            needs_probe = False
+            needs_agent = True
+            memory_policy = "short_term" if memory_policy == "forget" else memory_policy
+            reason = "semantic frame explicitly authorizes governed execution"
+        else:
+            route = Route.DIRECT_ANSWER
+            selected_probe = None
+            capability = "native_answer"
+            required_capabilities = ["native_answer"]
+            needs_probe = False
+            needs_agent = False
+            needs_confirmation = False
+            requires_confirmation = False
+            reason = "semantic frame authorizes a read-only core response"
+            if false_positive_action_words and not policy.allowed_effects:
+                risk = RiskLevel.R0
+                signals = self._dedupe([*signals, "policy:mentioned_action_risk_downgraded"])
+
+        if not policy.allows_effect("memory.write"):
+            memory_policy = "forget"
+            signals = self._dedupe([*signals, "policy:durable_memory_denied"])
+            if intent == "preference":
+                understood_intent = str(getattr(understanding, "intent", "") or "")
+                intent = understood_intent if understood_intent and understood_intent != "preference" else "conversation"
+        elif policy.allows_effect("memory.write"):
+            memory_policy = "long_term"
+            intent = "preference"
+        if policy.requires_clarification:
+            constraints = self._dedupe([*constraints, "do not produce side effects before clarification"])
+
+        return replace(
+            decision,
+            route=route,
+            risk_level=risk,
+            reason=reason,
+            requires_confirmation=requires_confirmation,
+            selected_probe=selected_probe,
+            capability=capability,
+            freshness_required=route == Route.PROBE,
+            needs_probe=needs_probe,
+            needs_agent=needs_agent,
+            needs_user_confirmation=needs_confirmation,
+            memory_policy=memory_policy,
+            intent=intent,
+            required_capabilities=self._dedupe(required_capabilities),
+            signals=signals,
+            constraints=constraints,
+            model_assist=assist,
+        )
 
     def _apply_understanding_guardrails(
         self,

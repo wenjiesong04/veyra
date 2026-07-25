@@ -33,6 +33,13 @@ class VeyraController:
 
     def prepare(self, decision: Decision) -> tuple[Decision, ControllerPlan]:
         delegated, delegation_trace = self.delegation_policy.apply(decision)
+        delegated, semantic_boundary_reason = self._enforce_semantic_boundary(delegated)
+        if semantic_boundary_reason:
+            delegation_trace = {
+                **delegation_trace,
+                "reason": semantic_boundary_reason,
+                "semantic_boundary": "enforced",
+            }
         normalized = self._add_route_capability(delegated)
         required = list(dict.fromkeys(normalized.required_capabilities))
         missing = self.capabilities.missing(required)
@@ -160,6 +167,8 @@ class VeyraController:
         return normalized, ControllerPlan(normalized.route, "ready", str(delegation_trace.get("reason") or "route is executable"), [])
 
     def _available_agent_capabilities_for_missing(self, decision: Decision, missing: list[dict[str, Any]]) -> list[str]:
+        if not self._semantic_effect_allowed(decision, "agent.execute"):
+            return []
         if decision.risk_level.value not in {"R0", "R1"}:
             return []
         agent_capabilities: list[str] = []
@@ -175,6 +184,8 @@ class VeyraController:
         return list(dict.fromkeys(agent_capabilities))
 
     def _should_agent_fallback(self, decision: Decision) -> bool:
+        if not self._semantic_effect_allowed(decision, "agent.execute"):
+            return False
         if decision.risk_level.value not in {"R0", "R1"}:
             return False
         if decision.route not in {Route.DIRECT_ANSWER, Route.PROBE, Route.ASK_USER}:
@@ -191,6 +202,112 @@ class VeyraController:
         if mode in {"hybrid", "native_first", "native"}:
             return False
         return bool(routing.get("agent_first_dialogue", False))
+
+    def _enforce_semantic_boundary(self, decision: Decision) -> tuple[Decision, str]:
+        """Prevent delegation and capability fallback from widening authority."""
+
+        policy = self._semantic_policy(decision)
+        if not policy:
+            if decision.route in {
+                Route.AGENT,
+                Route.NATIVE_TOOL,
+                Route.PROBE,
+                Route.SKILL,
+            } or decision.needs_agent or decision.needs_probe:
+                adjusted = replace(
+                    decision,
+                    route=Route.ASK_USER,
+                    capability="ask_user",
+                    selected_probe=None,
+                    needs_agent=False,
+                    needs_probe=False,
+                    needs_user_confirmation=False,
+                    required_capabilities=[],
+                    memory_policy="forget",
+                    signals=list(
+                        dict.fromkeys(
+                            decision.signals
+                            + ["controller:semantic_policy_missing_fail_closed"]
+                        )
+                    ),
+                )
+                return adjusted, "semantic policy is required before capability execution"
+            return decision, ""
+        preferred = str(policy.get("preferred_route") or "")
+        requires_clarification = bool(policy.get("requires_clarification"))
+        agent_allowed = self._semantic_effect_allowed(decision, "agent.execute")
+        allowed_capabilities = {
+            str(item)
+            for item in policy.get("allowed_capabilities", [])
+            if isinstance(item, str) and item
+        }
+
+        if requires_clarification:
+            adjusted = replace(
+                decision,
+                route=Route.ASK_USER,
+                capability="ask_user",
+                selected_probe=None,
+                needs_agent=False,
+                needs_probe=False,
+                needs_user_confirmation=False,
+                required_capabilities=[],
+                signals=list(dict.fromkeys(decision.signals + ["controller:semantic_clarification_lock"])),
+            )
+            return adjusted, "semantic policy requires clarification before execution"
+
+        if decision.route == Route.AGENT and not agent_allowed:
+            fallback_route = Route.PROBE if preferred == Route.PROBE.value else Route.DIRECT_ANSWER
+            selected_probe = str(policy.get("selected_probe") or "") or None if fallback_route == Route.PROBE else None
+            adjusted = replace(
+                decision,
+                route=fallback_route,
+                capability="probe" if fallback_route == Route.PROBE else "native_answer",
+                selected_probe=selected_probe,
+                needs_agent=False,
+                needs_probe=fallback_route == Route.PROBE,
+                required_capabilities=list(allowed_capabilities) or (["native_answer"] if fallback_route == Route.DIRECT_ANSWER else []),
+                signals=list(dict.fromkeys(decision.signals + ["controller:semantic_agent_denied"])),
+            )
+            return adjusted, "semantic policy denied Agent execution"
+
+        if decision.route == Route.PROBE:
+            probe_capability = self.capabilities.capability_for_probe(decision.selected_probe)
+            if preferred != Route.PROBE.value or (probe_capability and probe_capability not in allowed_capabilities):
+                adjusted = replace(
+                    decision,
+                    route=Route.DIRECT_ANSWER,
+                    capability="native_answer",
+                    selected_probe=None,
+                    needs_probe=False,
+                    required_capabilities=["native_answer"],
+                    signals=list(dict.fromkeys(decision.signals + ["controller:semantic_probe_denied"])),
+                )
+                return adjusted, "semantic policy denied the selected probe"
+
+        if decision.needs_agent and not agent_allowed:
+            return (
+                replace(
+                    decision,
+                    needs_agent=False,
+                    signals=list(dict.fromkeys(decision.signals + ["controller:semantic_agent_need_cleared"])),
+                ),
+                "semantic policy cleared an unauthorized Agent requirement",
+            )
+        return decision, ""
+
+    def _semantic_policy(self, decision: Decision) -> dict[str, Any]:
+        assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
+        policy = assist.get("semantic_policy")
+        return policy if isinstance(policy, dict) else {}
+
+    def _semantic_effect_allowed(self, decision: Decision, effect: str) -> bool:
+        policy = self._semantic_policy(decision)
+        if not policy:
+            return False
+        allowed = {str(item) for item in policy.get("allowed_effects", []) if isinstance(item, str)}
+        denied = {str(item) for item in policy.get("denied_effects", []) if isinstance(item, str)}
+        return effect in allowed and effect not in denied
 
     def _add_route_capability(self, decision: Decision) -> Decision:
         required = list(decision.required_capabilities)

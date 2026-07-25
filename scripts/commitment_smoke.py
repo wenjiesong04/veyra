@@ -28,10 +28,86 @@ TEST_AGENCY_ROOT.mkdir(parents=True, exist_ok=True)
 (TEST_AGENCY_ROOT / "goals.json").write_text("{}", encoding="utf-8")
 (TEST_AGENCY_ROOT / "intention_queue.json").write_text("[]", encoding="utf-8")
 
-from main import app  # noqa: E402
+import scripts.semantic_generalization_smoke as semantic_smoke  # noqa: E402
+from main import app, awareness_loop, commitment_core  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
 
 
+LEARNING_TEXT = "请建立深度学习学习辅导，开启前先让我确认。"
+CONFIRM_TEXT = "好的"
+LEARNING_RECALL_TEXT = "你记得我现在在学什么吗？"
+WEATHER_TEXT = "每天早上八点帮我推送北京天气"
+
+
+def install_semantic_fixtures() -> None:
+    semantic_smoke.FRAME_FIXTURES[LEARNING_TEXT] = semantic_smoke._frame(
+        acts=[
+            semantic_smoke._act(
+                LEARNING_TEXT,
+                act_id="learning-1",
+                kind="proactive_request",
+                operation="create_learning_support",
+                goal="建立深度学习学习辅导并在开启前确认",
+                quote=LEARNING_TEXT[:-1],
+                target=semantic_smoke._target("learning_topic", "深度学习"),
+                arguments={"topic": "深度学习"},
+            )
+        ]
+    )
+    semantic_smoke.FRAME_FIXTURES[CONFIRM_TEXT] = semantic_smoke._frame(
+        acts=[
+            semantic_smoke._act(
+                CONFIRM_TEXT,
+                act_id="confirm-1",
+                kind="commitment_control",
+                operation="confirm",
+                goal="确认当前会话中的待确认学习辅导",
+                quote=CONFIRM_TEXT,
+                target=semantic_smoke._target("pending_commitment", "current_session"),
+            )
+        ]
+    )
+    semantic_smoke.FRAME_FIXTURES[LEARNING_RECALL_TEXT] = semantic_smoke._frame(
+        acts=[
+            semantic_smoke._act(
+                LEARNING_RECALL_TEXT,
+                act_id="learning-query-1",
+                kind="question",
+                operation="query_learning_topic",
+                goal="查询当前学习主题",
+                quote=LEARNING_RECALL_TEXT[:-1],
+                target=semantic_smoke._target("learning_topic", "current"),
+            )
+        ]
+    )
+    semantic_smoke.FRAME_FIXTURES[WEATHER_TEXT] = semantic_smoke._frame(
+        acts=[
+            semantic_smoke._act(
+                WEATHER_TEXT,
+                act_id="weather-1",
+                kind="recurring_request",
+                operation="schedule_weather_push",
+                goal="每天早上八点收到北京天气",
+                quote=WEATHER_TEXT,
+                target=semantic_smoke._target("weather_summary", "北京"),
+                arguments={
+                    "location": "北京",
+                    "schedule": {
+                        "kind": "daily",
+                        "time_local": "08:00",
+                        "timezone": "Asia/Shanghai",
+                        "interval_seconds": 86400.0,
+                    },
+                },
+            )
+        ]
+    )
+
+
+install_semantic_fixtures()
+semantic_model = semantic_smoke.ScriptedSemanticModelClient()
+awareness_loop.core_reasoning.client = semantic_model  # type: ignore[assignment]
+commitment_core.intent_planner.client = semantic_model  # type: ignore[assignment]
 client = TestClient(app)
 
 
@@ -51,7 +127,7 @@ def main() -> int:
     learning_turn = client.post(
         "/events/message",
         json={
-            "text": "现在我要开始学习深度学习了，你能不能帮我？",
+            "text": LEARNING_TEXT,
             "channel": "self-test",
             "user_id": "cmt-user",
             "session_id": "cmt-learn",
@@ -60,20 +136,22 @@ def main() -> int:
     expect(learning_turn.status_code == 200, "learning goal message", learning_turn.text)
     learning_body = learning_turn.json()
     learning_artifact = (learning_body.get("artifacts") or {}).get("commitment") or {}
-    expect(learning_artifact.get("status") == "goal_recorded", "learning goal recorded", learning_artifact)
+    expect(learning_artifact.get("status") == "created", "learning task recorded", learning_artifact)
     expect(
         learning_body.get("route") == "direct_answer"
-        and learning_artifact.get("semantic_source") == "explicit_learning_guardrail"
+        and learning_artifact.get("semantic_source") == "authoritative_semantic_frame"
         and not (learning_body.get("artifacts") or {}).get("execution_result"),
-        "explicit learning start bypasses model and Agent routing",
+        "semantic learning request stays inside Veyra without Agent routing",
         learning_body,
     )
-    expect("学习目标" in message_text(learning_body) and "同意开启" in message_text(learning_body), "learning response includes plan and opt-in", learning_body)
+    expect("待确认" in message_text(learning_body), "learning response preserves explicit confirmation boundary", learning_body)
 
     goals = store.read_json("user_goals.json").get("goals", [])
-    learning_goal = next((goal for goal in goals if isinstance(goal, dict) and goal.get("topic") == "深度学习"), None)
-    expect(bool(learning_goal), "user_goals stores learning topic", goals)
-    expect((learning_goal.get("permissions") or {}).get("proactive_push") == "pending_confirmation", "learning push requires confirmation", learning_goal)
+    expect(
+        not any(isinstance(goal, dict) and goal.get("topic") == "深度学习" for goal in goals),
+        "proactive authorization does not silently widen into a separate durable goal write",
+        goals,
+    )
     pending_digest = learning_artifact.get("commitment") if isinstance(learning_artifact.get("commitment"), dict) else {}
     expect(pending_digest.get("status") == "pending_confirmation", "learning digest is pending before consent", pending_digest)
 
@@ -81,7 +159,7 @@ def main() -> int:
     confirm_learning = client.post(
         "/events/message",
         json={
-            "text": "好的",
+            "text": CONFIRM_TEXT,
             "channel": "self-test",
             "user_id": "cmt-user",
             "session_id": "cmt-learn",
@@ -95,21 +173,25 @@ def main() -> int:
     )
     expect(
         confirm_learning.json().get("route") == "direct_answer"
-        and not (confirm_learning.json().get("artifacts") or {}).get("decision")
+        and (
+            (confirm_learning.json().get("artifacts") or {})
+            .get("decision", {})
+            .get("model_assist", {})
+            .get("semantic_policy", {})
+            .get("allowed_effects")
+            == ["commitment.mutate"]
+        )
         and not (confirm_learning.json().get("artifacts") or {}).get("execution_result"),
-        "commitment confirmation bypasses model routing",
+        "commitment confirmation follows semantic authority without Agent execution",
         confirm_learning.json(),
     )
     learning_list = client.get("/commitments", params={"session_id": learn_session, "status": "active"})
     expect(learning_list.status_code == 200 and learning_list.json().get("count", 0) >= 1, "active learning commitment exists", learning_list.json())
     learn_id = learning_list.json()["commitments"][0]["commitment_id"]
-    goals = store.read_json("user_goals.json").get("goals", [])
-    learning_goal = next((goal for goal in goals if isinstance(goal, dict) and goal.get("topic") == "深度学习"), {})
-    expect((learning_goal.get("permissions") or {}).get("proactive_push") == "granted", "confirmed learning updates goal permissions", learning_goal)
     recall_learning = client.post(
         "/events/message",
         json={
-            "text": "你记得我现在在学什么吗？",
+            "text": LEARNING_RECALL_TEXT,
             "channel": "self-test",
             "user_id": "cmt-user",
             "session_id": "cmt-learn",
@@ -126,7 +208,7 @@ def main() -> int:
     weather = client.post(
         "/events/message",
         json={
-            "text": "每天早上帮我推送北京天气",
+            "text": WEATHER_TEXT,
             "channel": "self-test",
             "user_id": "cmt-user",
             "session_id": "cmt-weather",
@@ -153,6 +235,18 @@ def main() -> int:
     expect("response_override" not in ((body.get("artifacts") or {}).get("commitment") or {}), "commitment artifact has no response_override", body.get("artifacts"))
     expect((weather_offer.get("payload") or {}).get("location") == "北京", "weather commitment extracts clean location", weather_offer)
     expect(weather_offer.get("status") == "active", "weather commitment is active after explicit complete request", weather_offer)
+    user_world_after_create = store.read_json("user_world.json")
+    profile_after_create = (
+        (user_world_after_create.get("profiles_by_user") or {}).get("cmt-user", {})
+        if isinstance(user_world_after_create.get("profiles_by_user"), dict)
+        else {}
+    )
+    expect(
+        not profile_after_create.get("current_goal")
+        and not (profile_after_create.get("preferences") or {}).get("default_location"),
+        "semantic commitment creation does not silently widen into profile.write",
+        user_world_after_create,
+    )
 
     mapped_session = (
         weather_offer.get("session_id")
@@ -185,7 +279,11 @@ def main() -> int:
 
     user_world = store.read_json("user_world.json")
     scoped = (user_world.get("profiles_by_user") or {}).get("cmt-user") if isinstance(user_world.get("profiles_by_user"), dict) else {}
-    expect(bool(scoped.get("current_goal")), "scoped user_world reflects commitment goal", user_world)
+    expect(
+        bool(scoped.get("current_goal")),
+        "runtime push projects the active commitment into scoped operational state",
+        user_world,
+    )
 
     print("commitment smoke passed")
     return 0

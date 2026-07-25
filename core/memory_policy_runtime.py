@@ -4,6 +4,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from core.model_client import redact_sensitive
+from core.state_proposal import (
+    ProposalNotFoundError,
+    StateChangeProposal,
+    StateChangeProposalStore,
+    deterministic_idempotency_key,
+    deterministic_proposal_id,
+)
 from core.world_state import WorldStateStore
 from interface.event_schema import Decision, LoopResult, VeyraEvent, utc_now_iso
 
@@ -33,6 +40,7 @@ class MemoryPolicyRuntime:
     def __init__(self, state_store: WorldStateStore, long_term_writer: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
         self.state_store = state_store
         self.long_term_writer = long_term_writer
+        self.state_proposals = StateChangeProposalStore(state_store)
 
     def apply(self, event: VeyraEvent, decision: Decision, result: LoopResult) -> dict[str, Any]:
         policy = normalize_memory_policy(decision.memory_policy)
@@ -40,6 +48,12 @@ class MemoryPolicyRuntime:
             return {"status": "skipped", "policy": policy, "reason": "turn marked forget"}
         if policy == "short_term":
             return self._write_short_term(event, decision, result)
+        if not self._semantic_memory_allowed(decision):
+            return {
+                "status": "skipped",
+                "policy": policy,
+                "reason": "semantic policy did not authorize durable memory",
+            }
         verification = (
             result.artifacts.get("verification")
             if isinstance(result.artifacts.get("verification"), dict)
@@ -81,10 +95,28 @@ class MemoryPolicyRuntime:
                     },
                 }
             )
-        written = self.long_term_writer(patch)
-        if not isinstance(written, dict):
-            written = {"status": "submitted"}
-        return {"status": written.get("status", "unknown"), "policy": policy, "write": written}
+        return self._commit_long_term_memory(
+            patch=patch,
+            writer=self.long_term_writer,
+            identity_parts=(event.event_id, "turn_memory"),
+            decision=decision,
+            base={"policy": policy},
+            preconditions=[
+                "semantic policy explicitly authorizes memory.write",
+                "turn result is stable enough for durable memory",
+            ],
+        )
+
+    def _semantic_memory_allowed(self, decision: Decision) -> bool:
+        assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
+        semantic = assist.get("semantic_policy")
+        if not isinstance(semantic, dict):
+            # Legacy callers keep their existing behavior until they provide a
+            # semantic frame; the AwarenessLoop now always provides one.
+            return True
+        allowed = {str(item) for item in semantic.get("allowed_effects", []) if isinstance(item, str)}
+        denied = {str(item) for item in semantic.get("denied_effects", []) if isinstance(item, str)}
+        return "memory.write" in allowed and "memory.write" not in denied
 
     def apply_agent_result(
         self,
@@ -171,10 +203,140 @@ class MemoryPolicyRuntime:
             "memory_policy": policy,
         }
         writer = long_term_writer or self.long_term_writer
-        written = writer(patch)
-        if not isinstance(written, dict):
-            written = {"status": "submitted"}
-        return {**base, "status": str(written.get("status") or "unknown"), "write": written}
+        return self._commit_long_term_memory(
+            patch=patch,
+            writer=writer,
+            identity_parts=(correlation_id, task_id or "agent_result", "verified_agent_memory"),
+            decision=None,
+            base=base,
+            preconditions=[
+                "authoritative Veyra task context exists",
+                "execution and verification are terminal verified_success",
+                "verifier requested a durable memory patch",
+            ],
+        )
+
+    def _commit_long_term_memory(
+        self,
+        *,
+        patch: dict[str, Any],
+        writer: Callable[[dict[str, Any]], dict[str, Any]],
+        identity_parts: tuple[str, ...],
+        decision: Decision | None,
+        base: dict[str, Any],
+        preconditions: list[str],
+    ) -> dict[str, Any]:
+        key = deterministic_idempotency_key(*identity_parts, namespace="veyra.memory-write.v1")
+        proposal = self._existing_or_create_proposal(
+            idempotency_key=key,
+            patch=patch,
+            decision=decision,
+            preconditions=preconditions,
+        )
+
+        def apply_memory(_: StateChangeProposal) -> dict[str, Any]:
+            written = writer(patch)
+            return written if isinstance(written, dict) else {"status": "submitted"}
+
+        committed = self.state_proposals.commit(proposal.proposal_id, apply_memory)
+        result_payload = committed.model_dump(mode="json")
+        if committed.status != "committed":
+            return {
+                **base,
+                "status": committed.status,
+                "reason": committed.error or "durable memory proposal did not commit",
+                "state_change": result_payload,
+            }
+        written = committed.output if isinstance(committed.output, dict) else {"status": "submitted"}
+        return {
+            **base,
+            "status": str(written.get("status") or "written"),
+            "write": written,
+            "state_change": result_payload,
+        }
+
+    def _existing_or_create_proposal(
+        self,
+        *,
+        idempotency_key: str,
+        patch: dict[str, Any],
+        decision: Decision | None,
+        preconditions: list[str],
+    ) -> StateChangeProposal:
+        proposal_id = deterministic_proposal_id(idempotency_key)
+        existing: StateChangeProposal | None = None
+        try:
+            existing = self.state_proposals.get(proposal_id)
+        except ProposalNotFoundError:
+            pass
+        operation, target, source_span, explicitness = self._semantic_metadata(decision)
+        expected_revisions = (
+            dict(existing.expected_state_revisions)
+            if existing is not None
+            else {
+                "agent_memory.json": int(
+                    self.state_store.read_json("agent_memory.json").get("_state_revision")
+                    or 0
+                )
+            }
+        )
+        return self.state_proposals.create_or_get(
+            effect="memory.write",
+            operation=operation,
+            target=target,
+            source_span=source_span,
+            explicitness=explicitness,
+            preconditions=preconditions,
+            payload={"patch": patch},
+            idempotency_key=idempotency_key,
+            expected_state_revisions=expected_revisions,
+            requires_approval=False,
+        )
+
+    @staticmethod
+    def _semantic_metadata(
+        decision: Decision | None,
+    ) -> tuple[str, dict[str, Any], dict[str, Any] | None, str]:
+        if decision is None:
+            return (
+                "persist_verified_agent_result",
+                {"type": "agent_result", "value": "", "scope": "task_session", "attributes": {}},
+                None,
+                "explicit",
+            )
+        assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
+        frame = assist.get("semantic_frame") if isinstance(assist.get("semantic_frame"), dict) else {}
+        policy = assist.get("semantic_policy") if isinstance(assist.get("semantic_policy"), dict) else {}
+        authoritative = {
+            str(item)
+            for item in policy.get("authoritative_act_ids", [])
+            if isinstance(item, str)
+        }
+        acts = frame.get("acts") if isinstance(frame.get("acts"), list) else []
+        act = next(
+            (
+                item
+                for item in acts
+                if isinstance(item, dict) and str(item.get("act_id") or "") in authoritative
+            ),
+            {},
+        )
+        target = act.get("target") if isinstance(act.get("target"), dict) else {}
+        source_span = act.get("source_quote") if isinstance(act.get("source_quote"), dict) else None
+        explicitness = str(act.get("explicitness") or "unknown")
+        if explicitness not in {"explicit", "strong_implied", "weak_implied", "inferred", "unknown"}:
+            explicitness = "unknown"
+        return (
+            str(act.get("operation") or "remember_user_preference"),
+            {
+                "type": str(target.get("type") or "user_memory"),
+                "value": str(target.get("value") or ""),
+                "scope": "current_user",
+                "attributes": target.get("attributes") if isinstance(target.get("attributes"), dict) else {},
+            },
+            source_span,
+            explicitness,
+        )
 
     def _write_short_term(self, event: VeyraEvent, decision: Decision, result: LoopResult) -> dict[str, Any]:
         expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()

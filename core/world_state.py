@@ -54,6 +54,7 @@ STATE_FILE_LAYOUT: dict[str, str] = {
     "user_commitments.json": f"{STATE_WORLD_USER}/user_commitments.json",
     "proactive_intents.json": f"{STATE_WORLD_USER}/proactive_intents.json",
     "proactive_authorizations.json": f"{STATE_WORLD_USER}/proactive_authorizations.json",
+    "semantic_change_sets.json": f"{STATE_WORLD_USER}/semantic_change_sets.json",
     "agent_memory.json": f"{STATE_WORLD_USER}/agent_memory.json",
     "review_queue.json": f"{STATE_WORLD_USER}/review_queue.json",
     "local_world.json": f"{STATE_WORLD_LOCAL}/local_world.json",
@@ -73,6 +74,7 @@ STATE_FILE_LAYOUT: dict[str, str] = {
     "state_refresh_state.json": f"{STATE_RUNTIME}/state_refresh_state.json",
     "runtime_cron_state.json": f"{STATE_RUNTIME}/runtime_cron_state.json",
     "self_improvement_proposals.json": f"{STATE_RUNTIME}/self_improvement_proposals.json",
+    "state_change_proposals.json": f"{STATE_RUNTIME}/state_change_proposals.json",
     "rollback_state.json": f"{STATE_RUNTIME}/rollback_state.json",
     "replay_runtime_state.json": f"{STATE_RUNTIME}/replay_runtime_state.json",
     "ops_soak_state.json": f"{STATE_RUNTIME}/ops_soak_state.json",
@@ -90,6 +92,7 @@ STATE_METADATA: dict[str, dict[str, Any]] = {
     "user_commitments.json": {"source": "commitment_core", "ttl_seconds": 86400, "confidence": 0.85},
     "proactive_intents.json": {"source": "proactive_intent_framework", "ttl_seconds": 86400, "confidence": 0.78},
     "proactive_authorizations.json": {"source": "proactive_authorization_policy", "ttl_seconds": 86400, "confidence": 0.84},
+    "semantic_change_sets.json": {"source": "commitment_core", "ttl_seconds": 86400, "confidence": 0.85},
     "local_world.json": {"source": "local_probe_cache", "ttl_seconds": 300, "confidence": 0.82},
     "external_world.json": {"source": "external_watchlist", "ttl_seconds": 1800, "confidence": 0.62},
     "executor_state.json": {"source": "agent_registry", "ttl_seconds": 300, "confidence": 0.75},
@@ -110,6 +113,7 @@ STATE_METADATA: dict[str, dict[str, Any]] = {
     "state_refresh_state.json": {"source": "state_refresh", "ttl_seconds": 0, "confidence": 0.9},
     "runtime_cron_state.json": {"source": "runtime_cron", "ttl_seconds": 3600, "confidence": 0.78},
     "self_improvement_proposals.json": {"source": "self_improvement_registry", "ttl_seconds": 86400, "confidence": 0.72},
+    "state_change_proposals.json": {"source": "state_proposal_coordinator", "ttl_seconds": 0, "confidence": 1.0},
     "feishu_ws_state.json": {"source": "feishu_ws_runner", "ttl_seconds": 600, "confidence": 0.65},
     "ops_runtime_matrix.json": {"source": "runtime_matrix", "ttl_seconds": 1800, "confidence": 0.74},
     "ops_config.json": {"source": "ops_config", "ttl_seconds": 0, "confidence": 0.8},
@@ -118,7 +122,7 @@ STATE_METADATA: dict[str, dict[str, Any]] = {
 }
 
 CONFIG_STATE_FILES = {"agent_config.json", "ops_config.json", "risk_policy.json", "setup_wizard.json", "state_schema.json"}
-DURABLE_STATE_FILES = CONFIG_STATE_FILES | {"agent_memory.json"}
+DURABLE_STATE_FILES = CONFIG_STATE_FILES | {"agent_memory.json", "state_change_proposals.json"}
 
 _ROOT_LOCKS_GUARD = threading.Lock()
 _ROOT_MUTATION_LOCKS: dict[str, threading.RLock] = {}
@@ -320,6 +324,7 @@ class WorldStateStore:
             "user_commitments.json": {"commitments": [], "updated_at": None},
             "proactive_intents.json": {"intents": [], "updated_at": None},
             "proactive_authorizations.json": {"authorizations": [], "updated_at": None},
+            "semantic_change_sets.json": {"change_sets": [], "updated_at": None},
             "local_world.json": {"current_project": str(Path.cwd()), "probes": {}, "last_probe_at": None, "updated_at": utc_now_iso()},
             "external_world.json": {"watchlist": [], "summaries": [], "knowledge_items": [], "push_candidates": []},
             "executor_state.json": {"selected_agent": "openclaw", "status": "unknown"},
@@ -413,7 +418,7 @@ class WorldStateStore:
                     "model": "",
                     "timeout": 20,
                     "decision_mode": "auto",
-                    "max_tokens": 700,
+                    "max_tokens": 1600,
                 },
                 "agents": {
                     "openclaw": {"kind": "openclaw", "base_url": "", "api_key_env": "OPENCLAW_GATEWAY_TOKEN", "enabled": True},
@@ -456,6 +461,15 @@ class WorldStateStore:
                 },
             },
             "self_improvement_proposals.json": {"proposals": [], "updated_at": None},
+            "state_change_proposals.json": {
+                "schema_version": "veyra.state_change_proposals.v1",
+                "proposals": {},
+                "source": "state_proposal_coordinator",
+                "confidence": 1.0,
+                "ttl_seconds": 0,
+                "status": "fresh",
+                "updated_at": None,
+            },
             "feishu_ws_state.json": {"status": "stopped", "last_event_at": None},
             "ops_runtime_matrix.json": {"status": "not_run", "runtimes": []},
             "ops_config.json": {
@@ -858,6 +872,7 @@ class WorldStateStore:
         return {
             "user_world": self.read_json("user_world.json"),
             "user_goals": self.read_json("user_goals.json"),
+            "user_commitments": self.read_json("user_commitments.json"),
             "proactive_intents": self.read_json("proactive_intents.json"),
             "proactive_authorizations": self.read_json("proactive_authorizations.json"),
             "local_world": self.read_json("local_world.json"),
@@ -882,6 +897,7 @@ class WorldStateStore:
             "state_refresh_state": self.read_json("state_refresh_state.json"),
             "runtime_cron_state": self.read_json("runtime_cron_state.json"),
             "self_improvement_proposals": self.read_json("self_improvement_proposals.json"),
+            "state_change_proposals": self.read_json("state_change_proposals.json"),
             "feishu_ws_state": self.read_json("feishu_ws_state.json"),
             "ops_config": self.read_json("ops_config.json"),
         }

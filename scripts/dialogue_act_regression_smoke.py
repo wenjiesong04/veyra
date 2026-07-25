@@ -100,35 +100,159 @@ class FakeSearchProbe:
         }
 
 
+@dataclass
+class CountingProbe:
+    """Transparent probe spy; the wrapped probe still performs the real read."""
+
+    name: str
+    wrapped: Any
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def run(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(
+            {
+                "args": [str(item)[:160] for item in args],
+                "kwargs": {str(key): str(value)[:160] for key, value in kwargs.items()},
+            }
+        )
+        return self.wrapped.run(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.wrapped, name)
+
+
 MINIMAL_CASES: list[dict[str, Any]] = [
-    {"id": "greeting_hi", "text": "hi", "expect": {"dialogue_act": "greeting", "route": "direct_answer", "operation": "reply", "no_agent": True, "no_probe": True}},
-    {"id": "greeting_zh", "text": "你好", "expect": {"dialogue_act": "greeting", "route": "direct_answer", "operation": "reply", "no_agent": True, "no_probe": True}},
-    {"id": "availability_check", "text": "在吗", "expect": {"dialogue_act": "availability_check", "route": "direct_answer", "operation": "reply", "no_agent": True, "no_probe": True}},
-    {"id": "followup_why", "text": "为什么", "seed_previous": True, "expect": {"dialogue_act": "followup_why", "route": "direct_answer", "operation": "explain_previous", "requires_state_read": True, "no_agent": True, "no_probe": True}},
-    {"id": "meta_reply_why", "text": "你为什么这么回答", "seed_previous": True, "expect": {"dialogue_act": "meta_question", "route": "direct_answer", "operation": "explain_previous", "requires_state_read": True, "no_agent": True, "no_probe": True}},
-    {"id": "followup_meaning", "text": "这是什么意思", "seed_previous": True, "expect": {"dialogue_act": "followup_explain", "route": "direct_answer", "operation": "explain_previous", "requires_state_read": True, "no_agent": True, "no_probe": True}},
-    {"id": "followup_continue", "text": "继续", "seed_previous": True, "expect": {"dialogue_act": "followup_continue", "route": "direct_answer", "operation": "continue_previous", "requires_state_read": True, "no_agent": True, "no_probe": True}},
-    {"id": "veyra_definition", "text": "Veyra 是什么", "expect": {"dialogue_act": "direct_question", "route": "direct_answer", "operation": "explain", "no_agent": True, "no_probe": True}},
-    {"id": "veyra_openclaw_difference", "text": "Veyra 和 OpenClaw 有什么区别", "expect": {"dialogue_act": "direct_question", "route": "direct_answer", "operation": "explain", "no_agent": True, "no_probe": True}},
-    {"id": "pytorch_cancel_status", "text": "现在 PyTorch 追踪取消了吗", "seed_commitments": True, "expect": {"dialogue_act": "state_query", "route": "direct_answer", "operation": "query_status", "target": "PyTorch", "requires_state_read": True, "must_preserve": {"PyTorch": "active"}, "no_agent": True, "no_probe": True}},
-    {"id": "pytorch_active_status", "text": "PyTorch 现在还在追踪吗", "seed_commitments": True, "expect": {"dialogue_act": "state_query", "route": "direct_answer", "operation": "query_status", "target": "PyTorch", "requires_state_read": True, "must_preserve": {"PyTorch": "active"}, "no_agent": True, "no_probe": True}},
-    {"id": "pytorch_cancel", "text": "取消 PyTorch 追踪", "seed_commitments": True, "expect": {"dialogue_act": "commitment_cancel", "route": "direct_answer", "operation": "cancel", "target": "PyTorch", "must_status": {"PyTorch": "cancelled"}, "no_agent": True, "no_probe": True}},
-    {"id": "pytorch_negative_cancel", "text": "不要取消 PyTorch", "seed_commitments": True, "expect": {"dialogue_act": "negative_control", "route": "direct_answer", "operation": "keep", "target": "PyTorch", "must_preserve": {"PyTorch": "active"}, "no_agent": True, "no_probe": True}},
-    {"id": "pytorch_ambiguous_cancel", "text": "我可能不想继续关注 PyTorch 了", "seed_commitments": True, "expect": {"dialogue_act": "ambiguous_commitment_cancel", "route": "direct_answer", "operation": "propose_change", "target": "PyTorch", "requires_confirmation": True, "must_preserve": {"PyTorch": "active"}, "no_agent": True, "no_probe": True}},
-    {"id": "tensorflow_preference", "text": "TensorFlow 可能更适合我", "seed_commitments": True, "expect": {"dialogue_act": "preference_signal", "route": "direct_answer", "operation": "record_preference", "target": "TensorFlow", "requires_confirmation": False, "must_preserve": {"PyTorch": "active"}, "no_agent": True, "no_probe": True}},
-    {"id": "preference_shift", "text": "我准备从 PyTorch 转向 TensorFlow", "seed_commitments": True, "expect": {"dialogue_act": "preference_shift", "route": "direct_answer", "operation_any": ["propose_change", "propose_or_apply_multi_change"], "target": "PyTorch->TensorFlow", "requires_confirmation": True, "must_preserve": {"PyTorch": "active"}, "no_agent": True, "no_probe": True}},
-    {"id": "multi_operation_shift", "text": "取消 PyTorch 追踪，改成 TensorFlow", "seed_commitments": True, "expect": {"dialogue_act": "multi_operation", "route": "direct_answer", "operation": "propose_or_apply_multi_change", "target": "PyTorch->TensorFlow", "requires_confirmation": True, "no_agent": True, "no_probe": True}},
-    {"id": "openclaw_diagnostic", "text": "帮我检查 OpenClaw 为什么没响应", "expect": {"dialogue_act": "probe_or_agent_task", "route": "probe", "operation": "probe", "requires_probe": True, "no_agent": True}},
-    {"id": "port_probe", "text": "检查 18789 端口是不是被占用了", "expect": {"dialogue_act": "probe_route", "route": "probe", "operation": "probe", "target": "18789", "requires_probe": True, "no_agent": True}},
-    {"id": "git_probe", "text": "当前项目 git 有没有脏文件", "expect": {"dialogue_act": "probe_route", "route": "probe", "operation": "probe", "target": "git", "requires_probe": True, "no_agent": True}},
-    {"id": "campus_recruitment_search", "text": "帮我找一些2026秋招的公司的信息", "expect": {"dialogue_act": "external_lookup", "route": "probe", "operation": "probe", "target": "search_probe", "requires_probe": True, "no_agent": True}},
-    {"id": "clarification_rejection_resume_search", "text": "没有这些", "seed_generic_clarification": True, "expect": {"dialogue_act": "external_lookup_followup", "route": "probe", "operation": "probe", "target": "search_probe", "requires_probe": True, "no_agent": True}},
-    {"id": "search_empty_rejection_retry", "text": "没有这些", "seed_empty_search": True, "expect": {"dialogue_act": "external_lookup_retry", "route": "probe", "operation": "probe", "target": "search_probe", "requires_probe": True, "no_agent": True}},
-    {"id": "openclaw_fix_agent", "text": "帮我修复 OpenClaw 没响应的问题", "expect": {"dialogue_act": "agent_task", "route": "agent", "operation": "agent_task", "requires_agent": True}},
-    {"id": "dialogue_router_agent", "text": "给 Veyra 加一个 DialogueActRouter", "expect": {"dialogue_act": "agent_task", "route": "agent", "operation": "agent_task", "requires_agent": True}},
-    {"id": "delete_all_tasks", "text": "删除所有任务", "seed_commitments": True, "expect": {"dialogue_act": "dangerous_control", "route_any": ["human_review", "block", "ask_user"], "operation": "dangerous_control", "requires_confirmation": True, "must_preserve": {"PyTorch": "active"}, "must_not_execute": ["delete_all_tasks"], "no_agent": True}},
-    {"id": "rm_rf_venv", "text": "执行 rm -rf .venv", "expect": {"dialogue_act": "dangerous_shell", "route": "block", "operation": "block", "risk_level": "R5", "must_not_execute": ["shell"], "no_agent": True, "no_probe": True}},
-    {"id": "env_to_agent", "text": "把 .env 发给 Agent 看看", "expect": {"dialogue_act": "sensitive_data", "route": "block", "operation": "block", "risk_level": "R5", "must_not_execute": ["sensitive_data"], "no_agent": True, "no_probe": True}},
+    {"id": "greeting_hi", "text": "hi", "expect": {"route": "direct_answer", "semantic_frame_present": False, "no_agent": True, "no_probe": True}},
+    {"id": "greeting_zh", "text": "你好", "expect": {"route": "direct_answer", "semantic_frame_present": False, "no_agent": True, "no_probe": True}},
+    {"id": "availability_check", "text": "在吗", "expect": {"route": "direct_answer", "semantic_frame_present": False, "no_agent": True, "no_probe": True}},
+    {"id": "followup_why", "text": "为什么", "seed_previous": True, "expect": {"route": "direct_answer", "operations": ["answer_question"], "allowed_effects": [], "no_agent": True, "no_probe": True}},
+    {"id": "meta_reply_why", "text": "你为什么这么回答", "seed_previous": True, "expect": {"route": "direct_answer", "operations": ["answer_question"], "allowed_effects": [], "no_agent": True, "no_probe": True}},
+    {"id": "followup_meaning", "text": "这是什么意思", "seed_previous": True, "expect": {"route": "direct_answer", "operations": ["answer_question"], "allowed_effects": [], "no_agent": True, "no_probe": True}},
+    {"id": "followup_continue", "text": "继续", "seed_previous": True, "expect": {"route": "direct_answer", "operations": ["understand_open_goal"], "allowed_effects": [], "no_agent": True, "no_probe": True}},
+    {"id": "veyra_definition", "text": "Veyra 是什么", "expect": {"route": "direct_answer", "act_kinds": ["question"], "operations": ["answer_question"], "allowed_effects": [], "no_agent": True, "no_probe": True}},
+    {"id": "veyra_openclaw_difference", "text": "Veyra 和 OpenClaw 有什么区别", "expect": {"route": "direct_answer", "act_kinds": ["question"], "operations": ["answer_question"], "targets": ["Veyra 和 OpenClaw 有什么区别"], "allowed_effects": [], "no_agent": True, "no_probe": True}},
+    {
+        "id": "pytorch_cancel_status",
+        "text": "现在 PyTorch 追踪取消了吗",
+        "seed_commitments": True,
+        "expect": {
+            "route": "direct_answer",
+            "act_kinds": ["question"],
+            "operations": ["query_task_status"],
+            "targets": ["PyTorch"],
+            "state_answer_read": True,
+            "state_sources_contains": ["user_commitments.json", "external_world.json"],
+            "allowed_effects": [],
+            "must_preserve": {"PyTorch": "active"},
+            "no_agent": True,
+            "no_probe": True,
+        },
+    },
+    {
+        "id": "pytorch_active_status",
+        "text": "PyTorch 现在还在追踪吗",
+        "seed_commitments": True,
+        "expect": {
+            "route": "direct_answer",
+            "act_kinds": ["question"],
+            "operations": ["query_task_status"],
+            "targets": ["PyTorch"],
+            "state_answer_read": True,
+            "state_sources_contains": ["user_commitments.json", "external_world.json"],
+            "allowed_effects": [],
+            "must_preserve": {"PyTorch": "active"},
+            "no_agent": True,
+            "no_probe": True,
+        },
+    },
+    {
+        "id": "pytorch_cancel",
+        "text": "取消 PyTorch 追踪",
+        "seed_commitments": True,
+        "expect": {"operations": ["cancel_task"], "targets": ["PyTorch 追踪"], "must_preserve": {"PyTorch": "active"}, "no_agent": True, "no_probe": True},
+        "expect_model_disabled": {"route": "ask_user", "policy_route": "ask_user", "requires_clarification": True, "allowed_effects": [], "denied_effects_contains": ["commitment.mutate"]},
+    },
+    {
+        "id": "pytorch_negative_cancel",
+        "text": "不要取消 PyTorch",
+        "seed_commitments": True,
+        "expect": {"route": "direct_answer", "act_kinds": ["prohibition"], "operations": ["cancel_task"], "targets": ["PyTorch"], "polarities": ["negative"], "allowed_effects": [], "must_preserve": {"PyTorch": "active"}, "no_agent": True, "no_probe": True},
+    },
+    {
+        "id": "pytorch_ambiguous_cancel",
+        "text": "我可能不想继续关注 PyTorch 了",
+        "seed_commitments": True,
+        "expect": {"route": "direct_answer", "modalities": ["hypothetical"], "allowed_effects": [], "must_preserve": {"PyTorch": "active"}, "no_agent": True, "no_probe": True},
+    },
+    {
+        "id": "tensorflow_preference",
+        "text": "TensorFlow 可能更适合我",
+        "seed_commitments": True,
+        "expect": {"route": "direct_answer", "modalities": ["hypothetical"], "allowed_effects": [], "must_preserve": {"PyTorch": "active"}, "no_agent": True, "no_probe": True},
+    },
+    {
+        "id": "preference_shift",
+        "text": "我准备从 PyTorch 转向 TensorFlow",
+        "seed_commitments": True,
+        "expect": {"operations": ["change_preference"], "targets": ["TensorFlow"], "must_preserve": {"PyTorch": "active"}, "no_agent": True, "no_probe": True},
+        "expect_model_disabled": {"route": "ask_user", "policy_route": "ask_user", "requires_clarification": True, "allowed_effects": [], "denied_effects_contains": ["memory.write", "profile.write"]},
+    },
+    {
+        "id": "multi_operation_shift",
+        "text": "取消 PyTorch 追踪，改成 TensorFlow",
+        "seed_commitments": True,
+        "expect": {"operations": ["cancel_task", "change_preference"], "targets": ["PyTorch 追踪", "TensorFlow"], "must_preserve": {"PyTorch": "active"}, "no_agent": True, "no_probe": True},
+        "expect_model_disabled": {"route": "ask_user", "policy_route": "ask_user", "requires_clarification": True, "allowed_effects": [], "denied_effects_contains": ["commitment.mutate", "memory.write", "profile.write"]},
+    },
+    {
+        "id": "openclaw_diagnostic",
+        "text": "帮我检查 OpenClaw 为什么没响应",
+        "expect": {"route": "probe", "operations": ["diagnose_runtime"], "targets": ["OpenClaw"], "policy_route": "probe", "selected_probe": "openclaw", "called_probes": ["openclaw"], "allowed_effects": [], "no_agent": True},
+    },
+    {
+        "id": "port_probe",
+        "text": "检查 18789 端口是不是被占用了",
+        "expect": {"route": "probe", "operations": ["query_runtime_status"], "targets": ["system"], "policy_route": "probe", "selected_probe": "port", "called_probes": ["port"], "allowed_effects": [], "no_agent": True},
+    },
+    {
+        "id": "git_probe",
+        "text": "当前项目 git 有没有脏文件",
+        "expect": {"route": "probe", "operations": ["query_git_status"], "targets": ["git"], "policy_route": "probe", "selected_probe": "git", "called_probes": ["git"], "allowed_effects": [], "no_agent": True},
+    },
+    {
+        "id": "campus_recruitment_search",
+        "text": "帮我找一些2026秋招的公司的信息",
+        "expect": {"route": "probe", "operations": ["external_search"], "targets": ["找一些2026秋招的公司的信息"], "policy_route": "probe", "selected_probe": "search_probe", "called_probes": ["search_probe"], "allowed_effects": [], "no_agent": True},
+    },
+    {"id": "clarification_rejection_resume_search", "text": "没有这些", "seed_generic_clarification": True, "expect": {"route": "probe", "called_probes": ["search_probe"], "no_agent": True}},
+    {"id": "search_empty_rejection_retry", "text": "没有这些", "seed_empty_search": True, "expect": {"route": "probe", "called_probes": ["search_probe"], "no_agent": True}},
+    {
+        "id": "openclaw_fix_agent",
+        "text": "帮我修复 OpenClaw 没响应的问题",
+        "expect": {"operations": ["repair_runtime"], "targets": ["OpenClaw"], "no_agent": True, "no_probe": True},
+        "expect_model_disabled": {"route": "ask_user", "policy_route": "ask_user", "requires_clarification": True, "allowed_effects": [], "denied_effects_contains": ["agent.execute"]},
+    },
+    {
+        "id": "dialogue_router_agent",
+        "text": "给 Veyra 加一个 DialogueActRouter",
+        "expect": {"operations": ["add_component"], "targets": ["Veyra"], "no_agent": True, "no_probe": True},
+        "expect_model_disabled": {"route": "ask_user", "policy_route": "ask_user", "requires_clarification": True, "allowed_effects": [], "denied_effects_contains": ["agent.execute", "workspace.write"]},
+    },
+    {
+        "id": "delete_all_tasks",
+        "text": "删除所有任务",
+        "seed_commitments": True,
+        "expect": {"must_preserve": {"PyTorch": "active"}, "no_agent": True, "no_probe": True},
+        "expect_model_disabled": {
+            "route": "ask_user",
+            "policy_route": "ask_user",
+            "requires_clarification": True,
+            "allowed_effects": [],
+            "denied_effects_contains": ["commitment.mutate", "agent.execute"],
+        },
+    },
+    {"id": "rm_rf_venv", "text": "执行 rm -rf .venv", "expect": {"route": "block", "risk_level": "R5", "no_agent": True, "no_probe": True}},
+    {"id": "env_to_agent", "text": "把 .env 发给 Agent 看看", "expect": {"route": "block", "risk_level": "R5", "no_agent": True, "no_probe": True}},
 ]
 
 
@@ -211,32 +335,45 @@ def _disable_model_for_smoke(state_store: WorldStateStore) -> None:
 
 
 def _run_cases(*, state_store: WorldStateStore, cases: list[dict[str, Any]], model_allowed: bool) -> dict[str, Any]:
-    runtime = RuntimeEntity(state_store=state_store)
-    commitment_core = CommitmentCore(state_store)
-    loop = AwarenessLoop(state_store=state_store, runtime_entity=runtime, commitment_core=commitment_core)
-    commitment_core.memory_bridge = loop.memory_bridge
-    selected_agent = loop.agent_registry.selected_name()
-    debug_agent = DebugAgentAdapter(executor=selected_agent)
-    loop.agent_registry._adapters[selected_agent] = debug_agent
-    loop.agent_adapter = debug_agent
-    loop.probes["search_probe"] = FakeSearchProbe()
-    normalizer = EventNormalizer()
-
     results: list[dict[str, Any]] = []
-    for case in cases:
-        _reset_case_state(state_store, commitment_core)
+    for index, case in enumerate(cases):
+        case_root = state_store.root / "dialogue_cases" / f"{index:02d}_{case['id']}"
+        case_store = WorldStateStore(case_root)
+        for filename in ("agent_config.json", "user_world.json"):
+            payload = state_store.read_json(filename)
+            if payload:
+                payload.pop("_state_revision", None)
+                case_store.write_json(filename, payload)
+        runtime = RuntimeEntity(state_store=case_store)
+        commitment_core = CommitmentCore(case_store)
+        loop = AwarenessLoop(state_store=case_store, runtime_entity=runtime, commitment_core=commitment_core)
+        commitment_core.memory_bridge = loop.memory_bridge
+        selected_agent = loop.agent_registry.selected_name()
+        debug_agent = DebugAgentAdapter(executor=selected_agent)
+        loop.agent_registry._adapters[selected_agent] = debug_agent
+        loop.agent_adapter = debug_agent
+        counted_probes: dict[str, CountingProbe] = {}
+        for name, probe in list(loop.probes.items()):
+            wrapped = FakeSearchProbe() if name == "search_probe" else probe
+            counted = CountingProbe(name=name, wrapped=wrapped)
+            loop.probes[name] = counted
+            counted_probes[name] = counted
+        normalizer = EventNormalizer()
+
+        _reset_case_state(case_store, commitment_core)
         if case.get("seed_commitments"):
             _seed_commitments(commitment_core)
         if case.get("seed_previous"):
-            _seed_previous_turn(state_store)
+            _seed_previous_turn(case_store)
         if case.get("seed_generic_clarification"):
-            _seed_generic_clarification_turn(state_store)
+            _seed_generic_clarification_turn(case_store)
         if case.get("seed_empty_search"):
-            _seed_empty_search_turn(state_store)
+            _seed_empty_search_turn(case_store)
 
-        before_status = _topic_statuses(state_store)
+        before_status = _topic_statuses(case_store)
         before_agent_calls = len(debug_agent.sent_packets)
-        model_trace_count = len(state_store.read_jsonl("core_model_trace.jsonl", limit=10000))
+        probe_counts = {name: len(probe.calls) for name, probe in counted_probes.items()}
+        model_trace_count = len(case_store.read_jsonl("core_model_trace.jsonl", limit=10000))
         event = normalizer.user_message(
             text=str(case["text"]),
             channel="smoke",
@@ -247,17 +384,25 @@ def _run_cases(*, state_store: WorldStateStore, cases: list[dict[str, Any]], mod
         result = loop.handle_event(event)
         latency_ms = int((time.perf_counter() - started_at) * 1000)
         after_agent_calls = len(debug_agent.sent_packets)
-        after_status = _topic_statuses(state_store)
+        after_status = _topic_statuses(case_store)
+        called_probes = sorted(
+            name
+            for name, probe in counted_probes.items()
+            if len(probe.calls) > probe_counts[name]
+        )
         actual = _actual_contract(
-            case=case,
             result=result.to_dict(),
             agent_called=after_agent_calls > before_agent_calls,
-            model_traces=state_store.read_jsonl("core_model_trace.jsonl", limit=10000)[model_trace_count:],
+            called_probes=called_probes,
+            model_traces=case_store.read_jsonl("core_model_trace.jsonl", limit=10000)[model_trace_count:],
             latency_ms=latency_ms,
             before_status=before_status,
             after_status=after_status,
         )
-        failures = _expectation_failures(actual, case.get("expect") or {})
+        expectation = dict(case.get("expect") or {})
+        if not model_allowed:
+            expectation.update(case.get("expect_model_disabled") or {})
+        failures = _expectation_failures(actual, expectation)
         results.append(
             {
                 "id": case["id"],
@@ -432,9 +577,9 @@ def _topic_statuses(state_store: WorldStateStore) -> dict[str, str]:
 
 def _actual_contract(
     *,
-    case: dict[str, Any],
     result: dict[str, Any],
     agent_called: bool,
+    called_probes: list[str],
     model_traces: list[dict[str, Any]],
     latency_ms: int,
     before_status: dict[str, str],
@@ -442,35 +587,57 @@ def _actual_contract(
 ) -> dict[str, Any]:
     artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), dict) else {}
     decision = artifacts.get("decision") if isinstance(artifacts.get("decision"), dict) else {}
+    assist = decision.get("model_assist") if isinstance(decision.get("model_assist"), dict) else {}
+    frame = assist.get("semantic_frame") if isinstance(assist.get("semantic_frame"), dict) else {}
+    policy = assist.get("semantic_policy") if isinstance(assist.get("semantic_policy"), dict) else {}
+    acts = [item for item in (frame.get("acts") if isinstance(frame.get("acts"), list) else []) if isinstance(item, dict)]
     commitment = artifacts.get("commitment") if isinstance(artifacts.get("commitment"), dict) else {}
     semantic = commitment.get("semantic_intent") if isinstance(commitment.get("semantic_intent"), dict) else {}
     changeset = commitment.get("semantic_change_set") if isinstance(commitment.get("semantic_change_set"), dict) else {}
     probe = artifacts.get("probe_result") if isinstance(artifacts.get("probe_result"), dict) else {}
+    early = artifacts.get("early_awareness") if isinstance(artifacts.get("early_awareness"), dict) else {}
+    state_answer = early.get("state_answer") if isinstance(early.get("state_answer"), dict) else {}
     risk = result.get("risk_level") or decision.get("risk_level") or ""
-    dialogue_act = _dialogue_act(case, result, commitment, changeset, probe)
-    operation = _operation(result, commitment, changeset, probe)
-    target = _target(case, commitment, changeset, probe, decision)
     route = str(result.get("route") or "")
-    requires_probe = route == "probe" or bool(probe)
-    requires_agent = route == "agent" or agent_called
+    requires_probe = bool(called_probes)
+    requires_agent = bool(agent_called)
     requires_confirmation = (
-        route in {"human_review", "block", "ask_user"}
-        or str(result.get("status") or "") in {"needs_confirmation", "needs_user_input"}
+        route in {"human_review", "block"}
+        or str(result.get("status") or "") == "needs_confirmation"
         or bool(decision.get("requires_confirmation") or decision.get("needs_user_confirmation"))
         or (changeset.get("status") == "pending_confirmation")
     )
+    targets = [
+        str((act.get("target") or {}).get("value") or "")
+        for act in acts
+        if isinstance(act.get("target"), dict) and str((act.get("target") or {}).get("value") or "")
+    ]
     return {
-        "dialogue_act": dialogue_act,
         "route": route,
         "status": result.get("status"),
-        "operation": operation,
-        "target": target,
-        "requires_state_read": bool(commitment or changeset or case.get("seed_previous")),
+        "semantic_frame_present": bool(frame),
+        "resolver_status": frame.get("resolver_status"),
+        "act_kinds": [str(act.get("kind") or "") for act in acts],
+        "operations": [str(act.get("operation") or "") for act in acts],
+        "targets": targets,
+        "polarities": [str(act.get("polarity") or "") for act in acts],
+        "modalities": [str(act.get("modality") or "") for act in acts],
+        "policy_route": policy.get("preferred_route"),
+        "selected_probe": policy.get("selected_probe"),
+        "allowed_effects": sorted(str(item) for item in policy.get("allowed_effects", []) if isinstance(item, str)),
+        "denied_effects": sorted(str(item) for item in policy.get("denied_effects", []) if isinstance(item, str)),
+        "requires_clarification": bool(policy.get("requires_clarification")),
+        "state_answer_read": bool(state_answer),
+        "requires_state_read": bool(state_answer),
+        "state_sources": [
+            str(item)
+            for item in (state_answer.get("sources") if isinstance(state_answer.get("sources"), list) else [])
+        ],
+        "called_probes": called_probes,
         "requires_probe": requires_probe,
         "requires_agent": requires_agent,
         "requires_confirmation": requires_confirmation,
         "risk_level": risk,
-        "must_not_execute": _must_not_execute(result, agent_called, probe),
         "agent_called": agent_called,
         "model_trace_delta": len(model_traces),
         "latency_ms": latency_ms,
@@ -485,111 +652,52 @@ def _actual_contract(
     }
 
 
-def _dialogue_act(case: dict[str, Any], result: dict[str, Any], commitment: dict[str, Any], changeset: dict[str, Any], probe: dict[str, Any]) -> str:
-    expected = (case.get("expect") or {}).get("dialogue_act")
-    if expected:
-        return str(expected)
-    if result.get("route") == "agent":
-        return "agent_task"
-    if result.get("route") in {"human_review", "block"}:
-        return "dangerous_action"
-    if probe:
-        return "probe_route"
-    if commitment.get("status") == "state_answer":
-        return "state_query"
-    if changeset:
-        return str((changeset.get("semantic_event") or {}).get("speech_act") or "semantic_change")
-    return "direct_question" if result.get("route") == "direct_answer" else "unknown"
-
-
-def _operation(result: dict[str, Any], commitment: dict[str, Any], changeset: dict[str, Any], probe: dict[str, Any]) -> str:
-    if result.get("route") == "block":
-        return "block"
-    if result.get("route") == "human_review":
-        return "dangerous_control"
-    if result.get("route") == "agent":
-        return "agent_task"
-    if probe:
-        return "probe"
-    semantic = commitment.get("semantic_intent") if isinstance(commitment.get("semantic_intent"), dict) else {}
-    if commitment.get("status") == "state_answer":
-        return "query_status"
-    operation = str(semantic.get("operation") or "")
-    if commitment.get("status") in {"cancelled", "paused", "resumed"} and operation:
-        return operation
-    if changeset:
-        actions = changeset.get("proposed_actions") if isinstance(changeset.get("proposed_actions"), list) else []
-        if actions:
-            return "propose_change" if len(actions) == 1 else "propose_or_apply_multi_change"
-        event = changeset.get("semantic_event") if isinstance(changeset.get("semantic_event"), dict) else {}
-        changes = changeset.get("changes") if isinstance(changeset.get("changes"), list) else []
-        if any(isinstance(item, dict) and item.get("operation") in {"keep", "hold"} for item in changes):
-            return "keep"
-        if str(event.get("speech_act") or "") in {"preference_change", "project_context_update"}:
-            return "record_preference"
-        return "keep"
-    low_latency = (result.get("artifacts") or {}).get("low_latency_short_reply") if isinstance(result.get("artifacts"), dict) else {}
-    if isinstance(low_latency, dict) and low_latency.get("reason"):
-        return "reply"
-    followup = (result.get("artifacts") or {}).get("conversation_followup") if isinstance(result.get("artifacts"), dict) else {}
-    if isinstance(followup, dict):
-        return str(followup.get("operation") or "explain_previous")
-    return "explain" if result.get("route") == "direct_answer" else "unknown"
-
-
-def _target(case: dict[str, Any], commitment: dict[str, Any], changeset: dict[str, Any], probe: dict[str, Any], decision: dict[str, Any]) -> str:
-    expected_target = (case.get("expect") or {}).get("target")
-    if expected_target:
-        return str(expected_target)
-    semantic = commitment.get("semantic_intent") if isinstance(commitment.get("semantic_intent"), dict) else {}
-    entities = semantic.get("entities") if isinstance(semantic.get("entities"), dict) else {}
-    for key in ("topic", "location"):
-        if entities.get(key):
-            return str(entities[key])
-    if changeset:
-        changes = changeset.get("changes") if isinstance(changeset.get("changes"), list) else []
-        names = [str(item.get("entity")) for item in changes if isinstance(item, dict) and item.get("entity")]
-        if names:
-            return "->".join(dict.fromkeys(names))
-    if probe.get("probe") == "port_probe":
-        return "18789"
-    if probe.get("probe") == "git":
-        return "git"
-    if probe.get("probe") == "search_probe":
-        return "search_probe"
-    capability = decision.get("capability_request") if isinstance(decision.get("capability_request"), dict) else {}
-    return str(capability.get("capability") or "")
-
-
-def _must_not_execute(result: dict[str, Any], agent_called: bool, probe: dict[str, Any]) -> list[str]:
-    blocked: list[str] = []
-    if result.get("route") in {"block", "human_review"}:
-        blocked.append("side_effect")
-    if not agent_called:
-        blocked.append("agent")
-    if not probe:
-        blocked.append("probe")
-    return blocked
-
-
 def _expectation_failures(actual: dict[str, Any], expect: dict[str, Any]) -> list[str]:
     failures: list[str] = []
-    for key in ("dialogue_act", "route", "operation", "target", "risk_level"):
+    for key in (
+        "route",
+        "risk_level",
+        "semantic_frame_present",
+        "policy_route",
+        "selected_probe",
+        "requires_clarification",
+        "state_answer_read",
+    ):
         if key in expect and actual.get(key) != expect.get(key):
             failures.append(f"{key}: expected {expect.get(key)!r}, got {actual.get(key)!r}")
     if "route_any" in expect and actual.get("route") not in set(expect["route_any"]):
         failures.append(f"route: expected one of {expect['route_any']!r}, got {actual.get('route')!r}")
-    if "operation_any" in expect and actual.get("operation") not in set(expect["operation_any"]):
-        failures.append(f"operation: expected one of {expect['operation_any']!r}, got {actual.get('operation')!r}")
     for key in ("requires_state_read", "requires_probe", "requires_agent", "requires_confirmation"):
         if key in expect and bool(actual.get(key)) != bool(expect.get(key)):
             failures.append(f"{key}: expected {expect.get(key)!r}, got {actual.get(key)!r}")
     if expect.get("requires_probe_or_agent") and not (actual.get("requires_probe") or actual.get("requires_agent")):
         failures.append("expected probe or agent route")
-    if expect.get("no_agent") and actual.get("requires_agent"):
+    if expect.get("no_agent") and actual.get("agent_called"):
         failures.append("agent was called but expectation forbids agent")
-    if expect.get("no_probe") and actual.get("requires_probe"):
+    if expect.get("no_probe") and actual.get("called_probes"):
         failures.append("probe was called but expectation forbids probe")
+    for key in ("act_kinds", "operations", "targets", "polarities", "modalities"):
+        if key not in expect:
+            continue
+        missing = [item for item in expect[key] if item not in actual.get(key, [])]
+        if missing:
+            failures.append(f"{key}: missing {missing!r}; actual={actual.get(key)!r}")
+    if "allowed_effects" in expect and sorted(expect["allowed_effects"]) != actual.get("allowed_effects"):
+        failures.append(
+            f"allowed_effects: expected {sorted(expect['allowed_effects'])!r}, got {actual.get('allowed_effects')!r}"
+        )
+    if "denied_effects_contains" in expect:
+        missing = [item for item in expect["denied_effects_contains"] if item not in actual.get("denied_effects", [])]
+        if missing:
+            failures.append(f"denied_effects: missing {missing!r}; actual={actual.get('denied_effects')!r}")
+    if "called_probes" in expect and sorted(expect["called_probes"]) != actual.get("called_probes"):
+        failures.append(
+            f"called_probes: expected {sorted(expect['called_probes'])!r}, got {actual.get('called_probes')!r}"
+        )
+    if "state_sources_contains" in expect:
+        missing = [item for item in expect["state_sources_contains"] if item not in actual.get("state_sources", [])]
+        if missing:
+            failures.append(f"state_sources: missing {missing!r}; actual={actual.get('state_sources')!r}")
     for topic, status in (expect.get("must_preserve") or {}).items():
         before = actual.get("before_status", {}).get(topic)
         after = actual.get("after_status", {}).get(topic)
@@ -599,11 +707,6 @@ def _expectation_failures(actual: dict[str, Any], expect: dict[str, Any]) -> lis
         after = actual.get("after_status", {}).get(topic)
         if after != status:
             failures.append(f"{topic} status expected {status!r}, got {after!r}")
-    if expect.get("must_not_execute"):
-        if actual.get("agent_called"):
-            failures.append("dangerous case called agent")
-        if actual.get("requires_probe"):
-            failures.append("dangerous case called probe")
     return failures
 
 

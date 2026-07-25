@@ -15,6 +15,7 @@ from core.commitment_core import CommitmentCore  # noqa: E402
 from core.decision_core import DecisionCore  # noqa: E402
 from core.definitions import RiskLevel  # noqa: E402
 from core.runtime_entity import RuntimeEntity  # noqa: E402
+from core.understanding_core import TurnUnderstanding  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
 from interface.event_normalizer import EventNormalizer  # noqa: E402
 from interface.event_schema import utc_now_iso  # noqa: E402
@@ -328,6 +329,52 @@ def main() -> int:
             channel="smoke",
             user_id="dialogue-regression",
             session_id="dialogue-regression-session",
+        )
+        loop.understanding_core.build = lambda **_: TurnUnderstanding.from_payload(  # type: ignore[method-assign]
+            {
+                "intent": "action",
+                "task_type": "proactive_request",
+                "explicit_request": "好的",
+                "user_goal": "确认当前待确认任务",
+                "suggested_mode": "governed_execution",
+                "semantic_frame": {
+                    "schema_version": "veyra.semantic_frame.v1",
+                    "acts": [
+                        {
+                            "act_id": "confirm-1",
+                            "kind": "commitment_control",
+                            "goal": "确认当前待确认任务",
+                            "operation": "confirm",
+                            "target": {
+                                "type": "pending_commitment",
+                                "value": "current_session",
+                                "attributes": {},
+                            },
+                            "polarity": "positive",
+                            "explicitness": "explicit",
+                            "source_quote": {"text": "好的", "start": 0, "end": 2},
+                            "speaker": "dialogue-regression",
+                            "authority": "direct_user",
+                            "mention_mode": "normal_use",
+                            "evidence_need": "none",
+                            "referent": {
+                                "surface": "",
+                                "resolved": "current pending commitment",
+                                "status": "resolved",
+                                "candidates": [],
+                            },
+                            "condition": None,
+                            "modality": "asserted",
+                            "arguments": {},
+                        }
+                    ],
+                    "relations": [],
+                    "ambiguities": [],
+                    "resolver_status": "resolved",
+                    "source": "smoke",
+                },
+            },
+            source_text="好的",
         )
         confirm_result = loop.handle_event(confirm_event).to_dict()
         followups = confirm_result.get("followup_messages") or []

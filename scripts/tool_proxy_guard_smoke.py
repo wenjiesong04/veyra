@@ -186,9 +186,20 @@ def main() -> int:
         },
     )
     expect(natural_restart.get("route") == "human_review", "natural restart enters human review", natural_restart)
-    expect(natural_restart.get("risk_level") == "R4", "natural restart risk raised to R4 before model", natural_restart)
+    expect(natural_restart.get("risk_level") == "R4", "natural restart keeps the deterministic R4 floor", natural_restart)
     artifacts = natural_restart.get("artifacts") if isinstance(natural_restart.get("artifacts"), dict) else {}
-    expect((artifacts.get("safety_gate") or {}).get("phase") == "pre_model", "natural restart uses pre-model safety gate", natural_restart)
+    decision = artifacts.get("decision") if isinstance(artifacts.get("decision"), dict) else {}
+    if not decision:
+        guardian = artifacts.get("guardian") if isinstance(artifacts.get("guardian"), dict) else {}
+        decision = guardian.get("decision_trace") if isinstance(guardian.get("decision_trace"), dict) else {}
+    assist = decision.get("model_assist") if isinstance(decision.get("model_assist"), dict) else {}
+    policy = assist.get("semantic_policy") if isinstance(assist.get("semantic_policy"), dict) else {}
+    expect(
+        "agent.execute" in (policy.get("allowed_effects") or [])
+        and decision.get("route") == "human_review",
+        "natural restart is understood first while the R4 review floor remains authoritative",
+        natural_restart,
+    )
     expect((artifacts.get("review") or {}).get("review_id"), "natural restart review created", natural_restart)
 
     force_push = proposal(
