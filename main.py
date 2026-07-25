@@ -51,6 +51,7 @@ from runtime.external_world_refresh import ExternalWorldRefresh
 from runtime.external_runtime_probe import ExternalRuntimeProbe
 from runtime.ops_monitor import OpsMonitor
 from runtime.proactive_checks import ProactiveChecks
+from runtime.project_guardian import ProjectGuardianRuntime
 from runtime.retention_policy import RetentionPolicy
 from runtime.routing_metrics import RoutingMetrics
 from runtime.runtime_matrix import RuntimeMatrix
@@ -208,6 +209,14 @@ replay_runtime = ReplayRuntime(
     foresight_engine=foresight_engine,
     action_executor=action_executor,
 )
+project_guardian = ProjectGuardianRuntime(
+    state_store=state_store,
+    publish_event=awareness_loop.publish_event,
+    event_fabric_mode=lambda: {
+        "mode": awareness_loop.event_awareness.mode,
+        "mode_epoch": awareness_loop.event_awareness.mode_epoch,
+    },
+)
 
 
 def _schedule_agent_recovery(payload: dict[str, Any]) -> dict[str, Any]:
@@ -245,6 +254,7 @@ active_loop = ActiveRuntimeLoop(
     replay_runtime=replay_runtime,
     commitment_push=commitment_push,
     event_consumer=awareness_loop.process_event_inbox,
+    project_guardian=project_guardian.run_once,
 )
 runtime_cron = Cron(state_store=state_store, active_loop=active_loop, commitment_push=commitment_push)
 agent_orchestrator = AgentOrchestrator(
@@ -607,6 +617,7 @@ app.include_router(
                 "external_world_refresh": lambda: external_world_refresh,
                 "diff_tracker": lambda: diff_tracker,
                 "architecture_snapshot": lambda: architecture_snapshot,
+                "project_guardian": lambda: project_guardian,
             }
         )
     )

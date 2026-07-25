@@ -54,6 +54,10 @@ class EventAwarenessConfigRequest(BaseModel):
     mode: str
 
 
+class ProjectGuardianConfigRequest(BaseModel):
+    mode: str
+
+
 def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     router = APIRouter()
 
@@ -348,6 +352,43 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     async def attention_active() -> dict[str, Any]:
         return deps["awareness_loop"].attention.active_scope()
 
+    @router.get("/awareness/project-guardian/status")
+    async def project_guardian_status() -> dict[str, Any]:
+        return deps["project_guardian"].status()
+
+    @router.post("/awareness/project-guardian/config")
+    async def project_guardian_config(
+        request: ProjectGuardianConfigRequest,
+    ) -> dict[str, Any]:
+        try:
+            return deps["project_guardian"].configure(request.mode)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.post("/awareness/project-guardian/run-once")
+    async def project_guardian_run_once() -> dict[str, Any]:
+        return deps["project_guardian"].run_once(reason="debug_api")
+
+    @router.get("/awareness/project-guardian/candidates")
+    async def project_guardian_candidates(
+        user_id: str,
+        session_id: str | None = None,
+        disposition: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        items = deps["project_guardian"].list_candidates(
+            user_id=user_id,
+            session_id=session_id,
+            disposition=disposition,
+            limit=limit,
+        )
+        return {
+            "status": "success",
+            "projection_kind": "project_guardian_candidate",
+            "count": len(items),
+            "items": items,
+        }
+
     @router.get("/awareness/situations")
     async def awareness_situations(
         user_id: str,
@@ -445,6 +486,7 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
         return {
             "status": "success",
             "mode": runtime.mode,
+            "mode_epoch": runtime.mode_epoch,
             "allowed_modes": sorted(runtime.MODES),
         }
 
@@ -452,37 +494,14 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     async def event_awareness_config(
         request: EventAwarenessConfigRequest,
     ) -> dict[str, Any]:
-        mode = str(request.mode or "").strip().lower()
         runtime = deps["awareness_loop"].event_awareness
-        if mode not in runtime.MODES:
+        try:
+            return runtime.configure(request.mode)
+        except ValueError as exc:
             raise HTTPException(
                 status_code=422,
-                detail=f"mode must be one of {sorted(runtime.MODES)}",
-            )
-
-        def update(config: dict[str, Any]) -> None:
-            config["event_awareness"] = {
-                "mode": mode,
-                "allowed_modes": sorted(runtime.MODES),
-            }
-
-        deps["state_store"].mutate_json("ops_config.json", update)
-        previous = runtime.mode
-        runtime.mode = mode
-        deps["state_store"].append_jsonl(
-            "action_record.jsonl",
-            {
-                "route": "event_awareness_config",
-                "status": "updated",
-                "artifacts": {"previous_mode": previous, "mode": mode},
-            },
-        )
-        return {
-            "status": "updated",
-            "previous_mode": previous,
-            "mode": mode,
-            "allowed_modes": sorted(runtime.MODES),
-        }
+                detail=str(exc),
+            ) from exc
 
     @router.post("/belief/refresh")
     async def belief_refresh(request: BeliefRefreshRequest | None = None) -> dict[str, Any]:
@@ -502,11 +521,13 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
 
 def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
     public = redact_sensitive(payload)
-    # Event and situation projections are tenant-scoped records. The generic
-    # state endpoint has no authenticated tenant identity, so it must not
-    # expose either collection.
+    # Event, situation, and Guardian signal projections are tenant-scoped.
+    # The generic state endpoint has no authenticated tenant identity, so it
+    # must not expose any of these collections.
     public.pop("event_inbox", None)
     public.pop("situation_state", None)
+    public.pop("project_guardian_state", None)
+    public.pop("project_guardian_signal_state", None)
     agent_config = public.get("agent_config") if isinstance(public.get("agent_config"), dict) else {}
     if isinstance(agent_config, dict):
         core_model = agent_config.get("core_model") if isinstance(agent_config.get("core_model"), dict) else {}

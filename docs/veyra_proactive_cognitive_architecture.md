@@ -2,7 +2,7 @@
 
 > 状态：目标架构与实施蓝图
 >
-> 设计核验基线：2026-07-25，架构审计起点 `f166b8551aa8`；第一阶段实现起点 `57d985d`
+> 设计核验基线：2026-07-26，架构审计起点 `f166b8551aa8`；第一阶段关闭于 `c2d3954`
 >
 > 适用范围：Veyra 本地控制面、选定 Agent Runtime、主动感知、长期任务、治理执行与学习闭环
 >
@@ -51,13 +51,35 @@ Veyra 更新世界状态、承诺、经验和下一次主动行为
 - foreground decision 与 outcome 通过稳定 resolution key 在一次状态变更中原子提交；临时失败可立即重试，重复 delivery 可以修复未完成 resolution，但不会重复 lifecycle history；
 - `situation_trace` 有 pending outbox 时 retention 必须延期；先完成 append/ack 去重，再 archive-before-truncate，避免已归档 transition 被恢复逻辑重复补写；
 - 默认 `record_only` 模式只在 foreground turn 做一次有界 admission，情境候选投影由 `ActiveRuntimeLoop` 后台完成；显式 `shadow` 模式只用于评测完整生命周期；
-- `disabled / record_only / shadow` 可以通过本地控制 API 切换，默认 `record_only`，并且公开响应不新增 Situation artifact；
+- `disabled / record_only / shadow` 可以通过本地控制 API 切换，默认 `record_only`；持久 mode epoch 会阻断 disable→re-enable 之前排队的旧 projection，且三种模式都不向公开响应新增 Situation artifact；
 - 入站 evidence ref 一律是非事实指针；只有解析到同一事件的持久 `execution_trace`、验证状态和证据后，enclosing outcome 才能成为 factual outcome；
 - Situation/Event Inbox 调试读取必须显式提供 `user_id`，通用 `/state` 不返回这些集合；这只防止无意枚举，当前 loopback 管理面尚未把认证身份绑定到 user_id，不能宣传为安全多租户 API；
-- 已增加故障注入、伪造 trace、跨用户、后台 tick、组合崩溃恢复、并发 claim、专属 trace retention，以及 direct/probe/agent/ask-user/review 全路由响应等价 smoke；最终本机 30 次/路由/模式样本中 `record_only` 相对 `disabled` 的 p50 增量为 1.240–1.956 ms、p95 增量为 1.853–2.730 ms，完整 `shadow` 的 p50 增量为 19.127–25.701 ms、p95 增量为 31.809–39.803 ms。该 wall-clock benchmark 可复跑但只作诊断，不作为 CI 硬阈值；
+- 已增加故障注入、伪造 trace、跨用户、后台 tick、组合崩溃恢复、并发 claim、专属 trace retention，以及全部 9 个公开 Route 的完整输出、状态和风险等价 smoke；最终本机 30 次/路由/模式样本中 `record_only` 相对 `disabled` 的 p50 增量为 1.240–1.956 ms、p95 增量为 1.853–2.730 ms，完整 `shadow` 的 p50 增量为 19.127–25.701 ms、p95 增量为 31.809–39.803 ms。该 wall-clock benchmark 可复跑但只作诊断，不作为 CI 硬阈值；
 - 当前生产接线只自动把 user-message intake 发布到 EventInbox；其余扩展事件类型已有 envelope、admission 和测试契约，但仍需要各 component/task/commitment 的真实 producer 显式调用 `publish_event()`，不能宣传为已接通的事件源。
 
 这意味着 Phase 1 已完成“事件先可靠进入、关系可以在后台投影、失败可恢复且可审计、事实不能由模型或 artifact 自我认证”的有界基础切片。它**尚未**实现无限历史、长期 dedupe tombstone、多事件 Situation 聚合、主动决策、Attention 调度、Durable Case、Veyra-Agent 多轮协商、真实 pre-tool enforcement 或自动自愈；这些能力必须按后续阶段和非弱化门槛逐步启用。
+
+### 1.2 当前已经落地的 Phase 2 首个纵向切片
+
+当前版本加入了独立的只读 Project Guardian，但只完成 `project_release_risk` 的确定性资格化和 shadow 投影：
+
+- 独立使用 `ops_config.project_guardian.mode = disabled / record_only / shadow`，默认 `disabled`；它不会改写 `event_awareness`、Tool Proxy、Active Loop 或任何执行配置；
+- 只接受 `user_goals.json` 中结构化、仍处于有效时间段的 active `project_release` Goal；自由文本 `current_goal`、项目名称和原始消息都不能被用来猜发布目标；
+- Goal 与信号必须在 `user / goal revision / workspace / repo / target ref / target environment / release cycle` 上完全一致；
+- 只接受保留内部 channel、`privacy_scope=user`、producer component/provenance 一致，并把 `evidence_id` 精确绑定到同 source factual evidence ref 的 `git_dirty / ci_failed / deployment_intent` 结构化 Observation；至少两个不同 signal class 且 30 分钟内相关才生成一个稳定候选；
+- 只有精确匹配结构化 active release Goal 的信号才可进入独立、紧凑且有界的 `project_guardian_signal_state` frontier；资格判断不依赖 EventInbox 的终态保留期，Inbox 已提交而 frontier 写入中断时可在重启/tick 中幂等补建；
+- `received_at` 只表示传输到达时间，不能刷新旧证据；更新的 `clear` 状态会覆盖同类旧 positive 状态；producer 时间只有秒级、present 与 clear 同时刻且没有 sequence 时，保守地让 clear tombstone 优先；
+- `record_only` 仅持久化有界 would-fire 评测；`shadow` 只向现有 EventInbox 发布一个结构化 Observation，下一次 Event Fabric 消费才形成没有 Decision/Outcome 的 Situation 投影；
+- candidate identity 对 Goal 与 release scope 稳定，完整规范化候选语义绑定 candidate revision；同一 candidate 的增量 revision、Goal pause/complete 的 closure、同 revision 再 active 的 reopen 都使用单调 projection sequence 合并进同一 Situation，乱序旧投影只能补历史，不能回滚当前 head；
+- EventInbox admission 只记录 `admitted`，只有 Situation 中存在对应语义 projection 才记录 `projected`；崩溃、重启和 transport retry 不得把排队或重复入队误报为已投影；
+- 开放 lifecycle 使用独立 compact head，不会被有界失败历史挤掉；候选容量不足时先拒绝新 projection 并显式 degraded，不发布无法持久保留 lifecycle 的孤儿；
+- Goal、signal frontier 或 Guardian lifecycle state 损坏时冻结既有 lifecycle 并显式 degraded；未知输入不能被当作 no-signal 而关闭 Situation，也不能覆盖损坏状态；
+- Guardian 与 Event Fabric 各自使用持久 mode epoch，mode 复查与 EventInbox admission/claim 使用同一状态写闸门；disable 成功后，已排队但未消费的旧 epoch Guardian Event 会被标记 suppressed，重新启用必须使用新的 transport attempt；
+- `project_guardian_state` 是 TTL 为 0 的 shadow telemetry，不进入通用 stale-state → 主动 intention 链；
+- Project Guardian 不注入 Agent、ReviewQueue、AlertDispatcher、CommitmentPush、ActionExecutor、SafeTool 或通知通道；候选固定为 `agent_invoked=false / shadow_only=true / notification_allowed=false / execution_allowed=false / interrupt_eligible=false`，projection admission 会重新验证这些不可扩权字段；
+- 独立调试接口只允许查看状态、切换三种模式、单独运行一次和按显式 `user_id` 逻辑过滤候选；通用 `/state` 不暴露 candidate 或 signal frontier。
+
+当前自动化覆盖 3 种双信号正组合、跨 session 聚合、Goal/用户/scope/time/revision 错误关联、producer/evidence/privacy/authority 字段伪造、同秒 clear、过期 tombstone、Inbox 淘汰、frontier crash repair、2→3→2 revision、closure/reopen、乱序 replay、跨实例 kill switch、epoch fence、重启去重、后台故障隔离和零业务副作用；另逐字段比较全部 9 个 Route 在 Guardian `disabled / record_only / shadow / fault` 下的完整公开输出、状态和风险。16 组未见 ID/scope/order 的 canonical fixture 得到 precision/recall 1.0、错误关联 0、evidence contract 1.0；这是**规则级 fixture 证据，不是真实项目 replay 或人工建议 usefulness 证据**。在真实 CI producer、结构化部署意图 producer、release Goal 创建路径和匿名真实 held-out replay 接通前，Phase 2 仍是 `PARTIAL`，不能进入 `advise_only`。
 
 ## 2. “像贾维斯”在本项目中的可实现含义
 
@@ -376,7 +398,7 @@ W3C PROV 将实体、活动、责任主体、派生和来源建模为可交换�
 
 ## 9. Situation Engine：把事件变成“正在发生的事情”
 
-`TARGET` Situation Engine 会聚合多个事件、实体、目标和时间窗口。当前 `VERIFIED` 的 `SituationEvaluator` 只生成“一事件一条”的 `situation_candidate` 物化投影，用于验证关联、证据边界和后台消费；它不能被计作已确认 Situation，也不能直接触发建议或执行。
+`TARGET` Situation Engine 会聚合多个事件、实体、目标和时间窗口。当前 `VERIFIED` 的通用 `SituationEvaluator` 仍只生成“一事件一条”的 `situation_candidate` 物化投影；Phase 2 的 Project Guardian 会先在独立确定性 evaluator 中把多个同 scope 信号资格化为一个稳定 `project_release_risk` 候选 Event，再由通用 evaluator 投影。这个窄域候选不能被计作通用 Situation Engine，也不能直接触发建议或执行。
 
 事件本身不等于值得处理的情境。Situation Engine 负责把多个事件、目标和状态差距聚合为一个有生命周期的 Situation。
 
@@ -1314,7 +1336,7 @@ apps/openclaw/veyra-governance/
 - terminal replay 单调、exact replay 幂等，以及 state+trace outbox 组合恢复；
 - inference/prediction/evidence ref 不可自我升级为事实；
 - 持久 execution trace 绑定后才允许 factual outcome；
-- direct/probe/agent/ask-user/review 主响应等价、故障 fail-open、分路由 p50/p95 诊断；
+- 全部 9 个 Route 的完整公开输出、状态和风险等价，故障 fail-open，并保留分路由 p50/p95 诊断；
 - `situation_trace.jsonl` 专属 dry-run、archive-before-truncate、gzip 归档与顺序完整性验收。
 
 `PARTIAL`：
@@ -1325,22 +1347,43 @@ apps/openclaw/veyra-governance/
 
 本切片没有执行权，不创建主动建议。
 
-### 24.2 下一切片：一个 Project Guardian 候选
+### 24.2 当前切片：一个 Project Guardian 候选
 
-只实现 `project_release_risk`，保持 read-only/shadow：
+当前只实现 `project_release_risk`，保持 read-only/shadow。
 
-- 需要 active project/release Goal；
-- Git dirty、CI fail、用户部署意图至少两个独立信号；
-- 使用确定性实体、目标和时间关联；
-- Agent 仅做只读分析；
-- 记录“为什么现在”“证据”“未知项”和候选建议；
-- 不发送主动通知，不自动改代码、提交、推送或部署。
+`VERIFIED`：
 
-先用 held-out 真实项目事件评估 Situation precision、错误关联率和建议 usefulness；达标后才进入 advise-only。
+- 独立 `disabled / record_only / shadow` kill switch，默认关闭；
+- 需要有有效时间段、revision 和完整 release scope 的 active `project_release` Goal；
+- Git dirty、CI fail、结构化部署意图至少两个不同 signal class，并且 provenance root 独立；
+- signal 必须来自保留内部 channel，`privacy_scope=user`，Goal revision 精确一致，producer component/provenance/evidence ref 三者相互绑定；自由文本、模型推测和不相关 evidence 不能计数；
+- 使用确定性 `user / goal / workspace / repo / ref / environment / release cycle / occurred_at` 关联，不扫描自然语言关键词；
+- 30 分钟 correlation window、2 分钟 future skew、producer `valid_until` 和 1 小时总 freshness 上限；
+- 记录“为什么现在”、非事实 evidence ref、未知项和候选建议；
+- 独立 compact signal frontier 只保留匹配结构化 Goal 的资格字段，不保存原始 diff/log/user text；EventInbox 终态淘汰不删除它，Inbox→frontier 中断可幂等修复；
+- 重复、乱序、跨 session 和重启保持稳定 candidate identity；新的 clean/success/intent-clear 即使自身 freshness 已过期，仍作为更新状态阻止旧 positive 复活，同时间冲突时 clear 保守优先；
+- 完整规范化候选语义绑定 candidate revision；新 evidence 生成新 revision，每个语义 projection 至多物化一次；同一 candidate 的 revision、closure 和 reopen 以持久单调 sequence 更新同一 Situation，旧投影重放只补有序历史；
+- admission 与 Situation projection 分账，只有持久 Situation 含对应 observation identity 才是 projected；Inbox 丢失但 Situation 已提交时可对账，只有 admission 而没有 Inbox/Situation 时允许新 transport attempt；
+- compact lifecycle head 独立于有界投影尝试历史；容量不足时只允许可持久保留的 candidate admission，绝不先发布后静默淘汰；
+- `user_goals / project_guardian_signal_state / project_guardian_state` 任一损坏时 Guardian degraded/frozen，不能把 unknown 解释为 clear、closure 或 reopen；
+- `record_only` 不发布 Event；`shadow` 只发布 Observation，Event Fabric 关闭时不绕过；
+- Guardian/Event Fabric mode epoch 与 admission/claim 线性化；disable 成功后已排队旧 epoch Guardian Event 只会 suppressed，不会再生成 Situation；
+- shadow telemetry 使用 `ttl_seconds=0`，不能经通用 stale-state 检测间接创建 proactive intention；
+- projection 会再次验证固定 authority locks；不调用 Agent，不创建 Review/Commitment/ActionProposal，不发送主动通知，不自动改代码、提交、推送或部署；
+- Guardian 失败只降级独立 Active Loop step；全部 9 个 foreground Route 在 Guardian disabled、record-only、shadow 和注入故障下的完整公开输出、状态与风险逐字段等价。
+
+`PARTIAL`：
+
+- 当前只冻结了 Goal/signal consumer contract；保留 channel 是 schema admission 边界而不是 producer 身份证明，Git、GitHub CI 和权威部署意图尚未接入真实持久 producer/attestation；
+- 当前 Agent 没有被调用；未来若加入分析，只能在确定性资格成立后使用 read-only capability，输出不能新增 counted signal 或事实；
+- 16 组 canonical fixture 已覆盖正反例、scope/time 关联和建议 contract，但还没有匿名真实项目 event replay、人工 blind usefulness 评价或 live CI provider 证据；
+- 当前调试读取仍由调用者显式给出 `user_id`，不是 auth-derived tenant boundary。
+
+只有真实 held-out precision `>= 95%`、recall `>= 85%`、跨 tenant/workspace/goal/time 错误关联为 `0`、evidence correctness 和业务副作用门禁均为 `100%/0`，且人工建议 usefulness `>= 80%`，才允许评估 `advise_only`。
 
 ### 24.3 再下一切片：Qualification 与 Attention
 
-- 把多个 candidate 聚合成同一 Situation；
+- 把多个不同 candidate 进一步聚合成通用 Situation；当前只聚合同一 Project Guardian candidate 的增量 revision；
 - 加入目标相关性、紧急度、影响、信息价值、打扰成本和 cooldown；
 - 模型只能提出标签/假设，不能授权；
 - quiet hours、dismiss 和用户 pause 先于通知。
@@ -1376,6 +1419,18 @@ Phase 1–2 的新链严格 `record_only / shadow / read-only / sandbox`。任�
 - 未解析到权威 ledger 的结果永不标记 factual/verified；
 - 只有 Durable Case 上线后才要求从 `case_id/trace_id` 完整重放。
 
+### 24.8 延后加固的证据门槛
+
+先前实验中的部分思路可能有价值，但不能整包恢复，也不能先于真实需求进入主链：
+
+- 当实际 archive 数量、检索延迟或长期 replay 证明线性扫描已成为问题时，再评估有界 archive index；
+- 当 archive 被正式定义为安全审计证据、存在明确篡改威胁模型，并且密钥托管、轮换、丢失恢复和可用性责任都已确定时，再评估 HMAC/签名；
+- 只有签名格式已经成为正式兼容合同后，才讨论旧索引/旧签名迁移和密钥轮换；
+- 只有实测压缩 CPU、磁盘和恢复时延越过预算后，才增加压缩预算与调度复杂度；
+- 任何恢复都必须从独立小提交、当前数据格式和故障注入开始，不能直接应用旧 stash，也不能为此迁移数据库。
+
+这些是后续可重新评估的设计素材，不是当前 Phase 2 的依赖或完成条件。
+
 ## 25. 完整路线图
 
 ### Phase 0：基线与语义冻结
@@ -1396,10 +1451,10 @@ Phase 1–2 的新链严格 `record_only / shadow / read-only / sandbox`。任�
 
 ### Phase 2：单一 Project Guardian + Attention
 
-- 只读 `project_release_risk`；
-- 多事件聚合、Goal 关联、显著性和打扰预算；
-- held-out Situation/建议评测；
-- 达标后只进入 advise-only。
+- `PARTIAL`：只读 `project_release_risk` 的多信号资格化、Goal 硬关联、三态运行模式、shadow Event 投影和故障隔离已经实现；
+- `PARTIAL`：当前只有固定 `interrupt_eligible=false`，尚未实现通用 Attention、打扰预算、quiet hours 或通知；
+- `PENDING`：真实 Git/CI/部署意图 producer、匿名真实项目 held-out replay 和人工建议评测；
+- 上述门禁达标后才评估 advise-only；当前不得发送主动建议。
 
 ### Phase 3：真实 Tool Proxy 与 CapabilityGrant
 
@@ -1521,6 +1576,7 @@ disabled
 
 - feature flag 可独立关闭；
 - 当前事件候选链使用 `ops_config.event_awareness.mode`，运行时可切换 `disabled / record_only / shadow`；
+- Project Guardian 使用独立 `ops_config.project_guardian.mode`，默认 `disabled`；它不能反向开启 Event Fabric 或 Active Loop；
 - 如果后续采用 SQLite，schema 只做向前兼容迁移并有备份；
 - 新链失败时不破坏现有用户消息路径；
 - 新旧 Decision/Attention 输出都记录，但只允许一条执行权威链；

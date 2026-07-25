@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from typing import Any
@@ -8,8 +9,10 @@ from uuid import uuid4
 from core.situation_evaluator import SituationEvaluator
 from core.world_state import WorldStateStore
 from interface.agent_contract import NON_TERMINAL_STATUSES
-from interface.event_schema import LoopResult, Route, VeyraEvent, utc_now_iso
+from interface.event_schema import EventType, LoopResult, Route, VeyraEvent, utc_now_iso
 from runtime.event_inbox import EventInbox
+from runtime.project_guardian import ProjectGuardianRuntime
+from runtime.project_guardian_signal_ledger import ProjectGuardianSignalLedger
 
 
 VERIFIED_RESULT_STATUSES = {"verified_failed", "verified_success"}
@@ -36,22 +39,139 @@ class ShadowAwarenessRuntime:
             selected_mode = "record_only"
         self.state_store = state_store
         self.mode = selected_mode
+        config = state_store.read_json("ops_config.json")
+        section = config.get("event_awareness") if isinstance(config, dict) else {}
+        self.mode_epoch = self._nonnegative_int(
+            section.get("mode_epoch") if isinstance(section, dict) else 0
+        )
         self.event_inbox = EventInbox(state_store)
         self.situation_evaluator = SituationEvaluator(state_store)
+        self.project_guardian_signals = ProjectGuardianSignalLedger(state_store)
+
+    def configure(self, mode: str) -> dict[str, Any]:
+        selected = str(mode or "").strip().lower()
+        if selected not in self.MODES:
+            raise ValueError(f"mode must be one of {sorted(self.MODES)}")
+        result: dict[str, Any] = {}
+        with self.state_store.writer_transaction():
+            def update(config: dict[str, Any]) -> None:
+                current = (
+                    config.get("event_awareness")
+                    if isinstance(config.get("event_awareness"), dict)
+                    else {}
+                )
+                previous = str(
+                    current.get("mode") or self.mode or "record_only"
+                ).strip().lower()
+                if previous not in self.MODES:
+                    previous = "record_only"
+                previous_epoch = self._nonnegative_int(
+                    current.get("mode_epoch")
+                )
+                next_epoch = previous_epoch + int(previous != selected)
+                config["event_awareness"] = {
+                    **copy.deepcopy(current),
+                    "mode": selected,
+                    "mode_epoch": next_epoch,
+                    "allowed_modes": sorted(self.MODES),
+                }
+                self.mode = selected
+                self.mode_epoch = next_epoch
+                result.update(
+                    previous_mode=previous,
+                    mode=selected,
+                    mode_epoch=next_epoch,
+                )
+
+            self.state_store.mutate_json("ops_config.json", update)
+        self.state_store.append_jsonl(
+            "action_record.jsonl",
+            {
+                "route": "event_awareness_config",
+                "status": "updated",
+                "artifacts": copy.deepcopy(result),
+            },
+        )
+        return {
+            "status": "updated",
+            **result,
+            "allowed_modes": sorted(self.MODES),
+        }
 
     def publish(self, event: VeyraEvent) -> dict[str, Any]:
         """Durably admit an internal or external event without processing it."""
 
-        if self.mode == "disabled":
-            return {"status": "disabled", "event_id": event.event_id}
-        return self.event_inbox.enqueue(event)
+        with self.state_store.writer_transaction():
+            fabric = self._fabric_snapshot()
+            if fabric["mode"] == "disabled":
+                return {
+                    "status": "disabled",
+                    "event_id": event.event_id,
+                    "reason": "event_fabric_disabled",
+                }
+            if self._is_project_guardian_event(event):
+                binding = ProjectGuardianRuntime.validate_projection_event(event)
+                guardian = self._project_guardian_snapshot()
+                if binding is None:
+                    return {
+                        "status": "disabled",
+                        "event_id": event.event_id,
+                        "reason": "invalid_project_guardian_projection",
+                    }
+                if (
+                    guardian["mode"] != "shadow"
+                    or binding["guardian_mode_epoch"] != guardian["mode_epoch"]
+                    or binding["event_fabric_mode_epoch"] != fabric["mode_epoch"]
+                ):
+                    return {
+                        "status": "disabled",
+                        "event_id": event.event_id,
+                        "reason": "stale_project_guardian_mode_epoch",
+                    }
+            admission = self.event_inbox.enqueue(event)
+            if self._is_project_guardian_signal(event):
+                envelope = (
+                    admission.get("envelope")
+                    if isinstance(admission.get("envelope"), dict)
+                    else {}
+                )
+                try:
+                    signal_result = (
+                        self.project_guardian_signals.record_envelope(
+                            envelope
+                        )
+                    )
+                    admission["signal_ledger_status"] = (
+                        signal_result.get("status")
+                    )
+                except Exception as exc:
+                    admission["signal_ledger_status"] = "degraded"
+                    admission["signal_ledger_error_type"] = type(exc).__name__
+                    self._record_error(
+                        "project_guardian_signal_ledger_error",
+                        event.event_id,
+                        exc,
+                    )
+            return admission
 
     def begin(self, event: VeyraEvent) -> dict[str, Any]:
         """Claim and observe a foreground event before the existing turn runs."""
 
-        if self.mode == "disabled":
+        with self.state_store.writer_transaction():
+            return self._begin_locked(
+                event,
+                mode=self._fabric_snapshot()["mode"],
+            )
+
+    def _begin_locked(
+        self,
+        event: VeyraEvent,
+        *,
+        mode: str,
+    ) -> dict[str, Any]:
+        if mode == "disabled":
             return {"status": "disabled"}
-        if self.mode == "record_only":
+        if mode == "record_only":
             try:
                 admission = self.event_inbox.enqueue(event)
                 return {
@@ -90,7 +210,9 @@ class ShadowAwarenessRuntime:
             # JSONL trace projection instead of silently trusting prior state.
             situation = self.situation_evaluator.observe(
                 observed_event,
+                situation_id=self._explicit_situation_id(observed_event),
                 salience_components=self._explicit_salience(observed_event),
+                observation=self._explicit_observation(observed_event),
             )
             situation_id = str(situation.get("situation_id") or "")
             same_event_delivery = canonical_event_id == event.event_id
@@ -153,7 +275,27 @@ class ShadowAwarenessRuntime:
     ) -> dict[str, Any] | None:
         """Record the already-made decision/outcome after observation completed."""
 
-        if self.mode != "shadow":
+        with self.state_store.writer_transaction():
+            if self._fabric_snapshot()["mode"] != "shadow":
+                return None
+            return self._finalize_shadow(
+                event,
+                result,
+                trace,
+                situation_id=situation_id,
+                canonical_event_id=canonical_event_id,
+            )
+
+    def _finalize_shadow(
+        self,
+        event: VeyraEvent,
+        result: LoopResult,
+        trace: dict[str, Any],
+        *,
+        situation_id: str | None = None,
+        canonical_event_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        if self._fabric_snapshot()["mode"] != "shadow":
             return None
         selected_situation_id = str(situation_id or "")
         try:
@@ -189,7 +331,9 @@ class ShadowAwarenessRuntime:
                 # the already-made decision and outcome.
                 situation = self.situation_evaluator.observe(
                     event,
+                    situation_id=self._explicit_situation_id(event),
                     salience_components=self._explicit_salience(event),
+                    observation=self._explicit_observation(event),
                 )
             if not self._situation_matches_event(situation, event):
                 raise ValueError(
@@ -401,19 +545,37 @@ class ShadowAwarenessRuntime:
     def process_pending(self, *, limit: int = 20) -> dict[str, Any]:
         """Project pending background events into situations, never actions."""
 
-        if self.mode == "disabled":
+        if self._fabric_snapshot()["mode"] == "disabled":
             return {
                 "status": "disabled",
                 "processed_count": 0,
+                "suppressed_count": 0,
                 "failed_count": 0,
                 "processed": [],
+                "suppressed": [],
                 "failed": [],
                 "inbox": self.event_inbox.stats(),
             }
         processed: list[dict[str, Any]] = []
+        suppressed: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
         consumer_id = "awareness-shadow-background"
         trace_recovery_error: str | None = None
+        signal_reconciliation: dict[str, Any]
+        try:
+            signal_reconciliation = (
+                self.project_guardian_signals.reconcile_event_inbox()
+            )
+        except Exception as exc:
+            signal_reconciliation = {
+                "status": "degraded",
+                "error_type": type(exc).__name__,
+            }
+            self._record_error(
+                "project_guardian_signal_reconciliation_error",
+                "",
+                exc,
+            )
         try:
             self.situation_evaluator.flush_trace_outbox()
         except Exception as exc:
@@ -424,24 +586,111 @@ class ShadowAwarenessRuntime:
                 exc,
             )
         for _ in range(max(0, min(int(limit), 100))):
-            claimed = self.event_inbox.claim(consumer_id, lease_seconds=60)
-            if not isinstance(claimed, dict):
-                break
-            event_id = str(claimed.get("event_id") or "")
+            event_id = ""
             try:
-                event = VeyraEvent.from_dict(claimed)
-                situation = self.situation_evaluator.observe(
-                    event,
-                    salience_components=self._explicit_salience(event),
-                )
-                self.event_inbox.complete(
-                    event_id,
-                    consumer_id,
-                    {
-                        "status": "observed",
-                        "situation_id": situation.get("situation_id"),
-                    },
-                )
+                with self.state_store.writer_transaction():
+                    fabric = self._fabric_snapshot()
+                    if fabric["mode"] == "disabled":
+                        break
+                    claimed = self.event_inbox.claim(
+                        consumer_id,
+                        lease_seconds=60,
+                    )
+                    if not isinstance(claimed, dict):
+                        break
+                    event_id = str(claimed.get("event_id") or "")
+                    event = VeyraEvent.from_dict(claimed)
+                    if self._is_project_guardian_event(event):
+                        binding = ProjectGuardianRuntime.validate_projection_event(
+                            event
+                        )
+                        guardian = self._project_guardian_snapshot()
+                        suppression_reason = ""
+                        if binding is None:
+                            suppression_reason = (
+                                "invalid_project_guardian_projection"
+                            )
+                        elif (
+                            guardian["mode"] != "shadow"
+                            or binding["guardian_mode_epoch"]
+                            != guardian["mode_epoch"]
+                            or binding["event_fabric_mode_epoch"]
+                            != fabric["mode_epoch"]
+                        ):
+                            suppression_reason = (
+                                "stale_project_guardian_mode_epoch"
+                            )
+                        if suppression_reason:
+                            self.event_inbox.complete(
+                                event_id,
+                                consumer_id,
+                                {
+                                    "status": "suppressed",
+                                    "reason": suppression_reason,
+                                },
+                            )
+                            ProjectGuardianRuntime.record_projection_result(
+                                self.state_store,
+                                event,
+                                status="suppressed",
+                            )
+                            suppressed.append(
+                                {
+                                    "event_id": event_id,
+                                    "status": "suppressed",
+                                    "reason": suppression_reason,
+                                }
+                            )
+                            continue
+                        situation_id = self._explicit_situation_id(event)
+                        situation = self.situation_evaluator.observe(
+                            event,
+                            situation_id=situation_id,
+                            salience_components=self._explicit_salience(event),
+                            observation=self._explicit_observation(event),
+                            status=self._explicit_situation_status(event),
+                            observation_sequence=binding[
+                                "projection_sequence"
+                            ],
+                            observation_id=(
+                                f"{binding['candidate_id']}:"
+                                f"{binding['candidate_revision']}"
+                            ),
+                            allow_terminal_reopen=(
+                                binding["projection_kind"] == "reopen"
+                            ),
+                        )
+                        self.event_inbox.complete(
+                            event_id,
+                            consumer_id,
+                            {
+                                "status": "observed",
+                                "situation_id": situation.get("situation_id"),
+                            },
+                        )
+                        ProjectGuardianRuntime.record_projection_result(
+                            self.state_store,
+                            event,
+                            status="projected",
+                            situation_id=str(
+                                situation.get("situation_id") or ""
+                            ),
+                        )
+                    else:
+                        situation = self.situation_evaluator.observe(
+                            event,
+                            situation_id=self._explicit_situation_id(event),
+                            salience_components=self._explicit_salience(event),
+                            observation=self._explicit_observation(event),
+                        )
+                        self.event_inbox.complete(
+                            event_id,
+                            consumer_id,
+                            {
+                                "status": "observed",
+                                "situation_id": situation.get("situation_id"),
+                            },
+                        )
                 processed.append(
                     {
                         "event_id": event_id,
@@ -465,13 +714,16 @@ class ShadowAwarenessRuntime:
                 else "degraded"
             ),
             "processed_count": len(processed),
+            "suppressed_count": len(suppressed),
             "failed_count": len(failed),
             "processed": processed,
+            "suppressed": suppressed,
             "failed": failed,
             "trace_recovery": {
                 "status": "success" if trace_recovery_error is None else "degraded",
                 "error_type": trace_recovery_error,
             },
+            "signal_reconciliation": signal_reconciliation,
             "inbox": self.event_inbox.stats(),
         }
 
@@ -639,6 +891,75 @@ class ShadowAwarenessRuntime:
     def _explicit_salience(event: VeyraEvent) -> dict[str, Any]:
         components = event.payload.get("salience_components")
         return components if isinstance(components, dict) else {}
+
+    @staticmethod
+    def _explicit_observation(event: VeyraEvent) -> dict[str, Any] | None:
+        if event.type != EventType.OBSERVATION:
+            return None
+        observation = event.payload.get("observation")
+        return copy.deepcopy(observation) if isinstance(observation, dict) else None
+
+    @staticmethod
+    def _explicit_situation_id(event: VeyraEvent) -> str | None:
+        binding = ProjectGuardianRuntime.validate_projection_event(event)
+        if binding is None:
+            return None
+        return str(event.payload.get("situation_id") or "") or None
+
+    @staticmethod
+    def _is_project_guardian_event(event: VeyraEvent) -> bool:
+        return str(event.source.channel or "") == "project_guardian"
+
+    @staticmethod
+    def _is_project_guardian_signal(event: VeyraEvent) -> bool:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        return (
+            str(event.source.channel or "") == "project_guardian_signal"
+            and str(payload.get("schema_version") or "")
+            == "veyra.project_guardian_signal.v1"
+            and isinstance(payload.get("project_guardian_signal"), dict)
+        )
+
+    @staticmethod
+    def _explicit_situation_status(event: VeyraEvent) -> str:
+        return (
+            "closed"
+            if str(event.payload.get("situation_status") or "") == "closed"
+            else "observed"
+        )
+
+    def _fabric_snapshot(self) -> dict[str, Any]:
+        config = self.state_store.read_json("ops_config.json")
+        section = config.get("event_awareness") if isinstance(config, dict) else {}
+        section = section if isinstance(section, dict) else {}
+        mode = (
+            str(section.get("mode") or self.mode or "record_only")
+            .strip()
+            .lower()
+        )
+        return {
+            "mode": mode if mode in self.MODES else "record_only",
+            "mode_epoch": self._nonnegative_int(
+                section.get("mode_epoch", self.mode_epoch)
+            ),
+        }
+
+    def _project_guardian_snapshot(self) -> dict[str, Any]:
+        config = self.state_store.read_json("ops_config.json")
+        section = config.get("project_guardian") if isinstance(config, dict) else {}
+        section = section if isinstance(section, dict) else {}
+        mode = str(section.get("mode") or "disabled").strip().lower()
+        return {
+            "mode": mode if mode in self.MODES else "disabled",
+            "mode_epoch": self._nonnegative_int(section.get("mode_epoch")),
+        }
+
+    @staticmethod
+    def _nonnegative_int(value: Any) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
 
     @staticmethod
     def _decision_status(result: LoopResult) -> str:

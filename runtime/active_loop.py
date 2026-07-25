@@ -29,6 +29,7 @@ class ActiveRuntimeLoop:
         replay_runtime: Any | None = None,
         commitment_push: Any | None = None,
         event_consumer: Callable[..., Any] | None = None,
+        project_guardian: Callable[..., Any] | None = None,
     ) -> None:
         self.state_store = state_store
         self.runtime_entity = runtime_entity
@@ -40,6 +41,7 @@ class ActiveRuntimeLoop:
         self.replay_runtime = replay_runtime
         self.commitment_push = commitment_push
         self.event_consumer = event_consumer
+        self.project_guardian = project_guardian
         self.task_tracker = task_tracker
         self.adapter_resolver = adapter_resolver
         self.verifier = verifier
@@ -101,6 +103,7 @@ class ActiveRuntimeLoop:
         steps = [
             self._step("heartbeat", lambda: self._heartbeat()),
             self._step("event_inbox", lambda: self._event_inbox_tick()),
+            self._step("project_guardian", lambda: self._project_guardian_tick()),
             self._step("pending_tasks", lambda: self.task_tracker.refresh_pending(self.adapter_resolver(), self.verifier, limit=20)),
             self._step("stale_state", lambda: self.state_refresh.refresh_stale(limit=20)),
             self._step("proactive", lambda: self.proactive_checks.run_read_only(timeout_seconds=12)),
@@ -211,6 +214,11 @@ class ActiveRuntimeLoop:
             return {"status": "not_configured"}
         return self.event_consumer(limit=100)
 
+    def _project_guardian_tick(self) -> dict[str, Any]:
+        if self.project_guardian is None:
+            return {"status": "not_configured"}
+        return self.project_guardian(reason="active_loop")
+
     def _run_replay_runtime(self) -> dict[str, Any]:
         if self.replay_runtime is None:
             return {"status": "not_configured"}
@@ -238,7 +246,12 @@ class ActiveRuntimeLoop:
                     "created_count",
                     "processed_count",
                     "due_count",
-                    "processed_count",
+                    "candidate_count",
+                    "would_publish_count",
+                    "published_count",
+                    "projected_count",
+                    "deduplicated_count",
+                    "closure_count",
                 )
                 if key in value
             }

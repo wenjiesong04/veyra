@@ -78,6 +78,8 @@ STATE_FILE_LAYOUT: dict[str, str] = {
     "state_change_proposals.json": f"{STATE_RUNTIME}/state_change_proposals.json",
     "event_inbox.json": f"{STATE_RUNTIME}/event_inbox.json",
     "situation_state.json": f"{STATE_RUNTIME}/situation_state.json",
+    "project_guardian_state.json": f"{STATE_RUNTIME}/project_guardian_state.json",
+    "project_guardian_signal_state.json": f"{STATE_RUNTIME}/project_guardian_signal_state.json",
     "rollback_state.json": f"{STATE_RUNTIME}/rollback_state.json",
     "replay_runtime_state.json": f"{STATE_RUNTIME}/replay_runtime_state.json",
     "ops_soak_state.json": f"{STATE_RUNTIME}/ops_soak_state.json",
@@ -119,6 +121,8 @@ STATE_METADATA: dict[str, dict[str, Any]] = {
     "state_change_proposals.json": {"source": "state_proposal_coordinator", "ttl_seconds": 0, "confidence": 1.0},
     "event_inbox.json": {"source": "event_inbox", "ttl_seconds": 0, "confidence": 1.0},
     "situation_state.json": {"source": "situation_evaluator", "ttl_seconds": 86400, "confidence": 0.78},
+    "project_guardian_state.json": {"source": "project_guardian", "ttl_seconds": 0, "confidence": 0.82},
+    "project_guardian_signal_state.json": {"source": "project_guardian_signal_ledger", "ttl_seconds": 0, "confidence": 0.9},
     "feishu_ws_state.json": {"source": "feishu_ws_runner", "ttl_seconds": 600, "confidence": 0.65},
     "ops_runtime_matrix.json": {"source": "runtime_matrix", "ttl_seconds": 1800, "confidence": 0.74},
     "ops_config.json": {"source": "ops_config", "ttl_seconds": 0, "confidence": 0.8},
@@ -131,6 +135,8 @@ DURABLE_STATE_FILES = CONFIG_STATE_FILES | {
     "agent_memory.json",
     "state_change_proposals.json",
     "event_inbox.json",
+    "project_guardian_state.json",
+    "project_guardian_signal_state.json",
 }
 
 _ROOT_LOCKS_GUARD = threading.Lock()
@@ -496,6 +502,20 @@ class WorldStateStore:
                 "count": 0,
                 "updated_at": None,
             },
+            "project_guardian_state.json": {
+                "schema_version": "veyra.project_guardian_state.v1",
+                "candidate_kind": "project_release_risk",
+                "candidates": [],
+                "runs": [],
+                "last_run": None,
+                "updated_at": None,
+            },
+            "project_guardian_signal_state.json": {
+                "schema_version": "veyra.project_guardian_signal_frontier.v1",
+                "signals": {},
+                "signal_count": 0,
+                "updated_at": None,
+            },
             "feishu_ws_state.json": {"status": "stopped", "last_event_at": None},
             "ops_runtime_matrix.json": {"status": "not_run", "runtimes": []},
             "ops_config.json": {
@@ -520,6 +540,12 @@ class WorldStateStore:
                 },
                 "event_awareness": {
                     "mode": "record_only",
+                    "mode_epoch": 0,
+                    "allowed_modes": ["disabled", "record_only", "shadow"],
+                },
+                "project_guardian": {
+                    "mode": "disabled",
+                    "mode_epoch": 0,
                     "allowed_modes": ["disabled", "record_only", "shadow"],
                 },
             },
@@ -930,6 +956,8 @@ class WorldStateStore:
             "state_change_proposals": self.read_json("state_change_proposals.json"),
             "event_inbox": self.read_json("event_inbox.json"),
             "situation_state": self.read_json("situation_state.json"),
+            "project_guardian_state": self.read_json("project_guardian_state.json"),
+            "project_guardian_signal_state": self.read_json("project_guardian_signal_state.json"),
             "feishu_ws_state": self.read_json("feishu_ws_state.json"),
             "ops_config": self.read_json("ops_config.json"),
         }

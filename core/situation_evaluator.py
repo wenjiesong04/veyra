@@ -122,12 +122,18 @@ class SituationEvaluator:
         observation: Any | None = None,
         observation_source: str = "event",
         observation_evidence_verified: bool = False,
+        observation_sequence: int | None = None,
+        observation_id: str | None = None,
+        allow_terminal_reopen: bool = False,
     ) -> dict[str, Any]:
         """Observe one event and create or update its evidence-linked situation.
 
         Only explicit structured fields are consumed from ``event.payload``.
         The evaluator never scans message text for keywords and never produces an
-        authorization or routing decision.
+        authorization or routing decision. Callers that aggregate multiple
+        observations into one stable Situation may provide a durable sequence and
+        semantic observation identity. Older sequences remain in ordered history
+        but cannot replace the current head.
         """
 
         source = self._event_source(event)
@@ -152,6 +158,17 @@ class SituationEvaluator:
             session_id=session_id,
             event_id=source["event_id"],
             correlation_id=correlation,
+        )
+        selected_observation_sequence = self._normalize_observation_sequence(
+            observation_sequence
+        )
+        selected_observation_id = (
+            self._text(observation_id, max_length=240)
+            or (
+                source["event_id"]
+                if selected_observation_sequence is not None
+                else ""
+            )
         )
         now = self._now_iso()
         normalized_goals = self._merge_refs(
@@ -203,6 +220,17 @@ class SituationEvaluator:
             evidence_refs=normalized_evidence,
             evidence_verified=observation_evidence_verified,
         ) if observation is not None else None
+        if source_observation is not None and (
+            selected_observation_sequence is not None
+            or selected_observation_id
+        ):
+            source_observation["source_event_id"] = source["event_id"]
+            if selected_observation_sequence is not None:
+                source_observation[
+                    "observation_sequence"
+                ] = selected_observation_sequence
+            if selected_observation_id:
+                source_observation["observation_id"] = selected_observation_id
         inference_record = self._epistemic_record(
             inference,
             source="model",
@@ -254,7 +282,15 @@ class SituationEvaluator:
             "created_at": now,
             "updated_at": now,
         }
+        if selected_observation_sequence is not None:
+            incoming["observation_sequence"] = selected_observation_sequence
+        if selected_observation_id:
+            incoming["observation_id"] = selected_observation_id
         incoming["source_observation_fingerprint"] = self._observation_fingerprint(incoming)
+        if source_observation is not None and selected_observation_id:
+            source_observation["observation_fingerprint"] = incoming[
+                "source_observation_fingerprint"
+            ]
         incoming["observation_revision"] = 1
         persisted: dict[str, Any] = {}
         evicted_ids: list[str] = []
@@ -275,26 +311,71 @@ class SituationEvaluator:
             if existing_index is not None:
                 existing = situations[existing_index]
                 self._assert_owner(existing, user_id=user_id, session_id=session_id)
-                replayed = source["event_id"] == str(existing.get("source_event_id") or "")
-                exact_replay = (
-                    replayed
-                    and str(existing.get("source_observation_fingerprint") or "")
-                    == incoming["source_observation_fingerprint"]
+                replayed = source["event_id"] == str(
+                    existing.get("source_event_id") or ""
                 )
+                exact_replay = False
+                if selected_observation_id:
+                    identity_fingerprint = self._observation_identity_fingerprint(
+                        existing,
+                        selected_observation_id,
+                    )
+                    if identity_fingerprint is not None:
+                        if (
+                            identity_fingerprint
+                            != incoming["source_observation_fingerprint"]
+                        ):
+                            raise ValueError(
+                                "observation_id is already bound to different content"
+                            )
+                        exact_replay = True
+                        replayed = True
+                if not exact_replay:
+                    exact_replay = (
+                        replayed
+                        and str(
+                            existing.get("source_observation_fingerprint") or ""
+                        )
+                        == incoming["source_observation_fingerprint"]
+                    )
                 if exact_replay:
                     persisted = copy.deepcopy(existing)
                 else:
+                    sequence_aware = self._sequence_aware_observation(
+                        existing,
+                        incoming,
+                    )
+                    replace_head = self._incoming_observation_is_head(
+                        existing,
+                        incoming,
+                    )
+                    same_source_event = bool(
+                        replayed
+                        and not (
+                            sequence_aware
+                            and (
+                                selected_observation_sequence is not None
+                                or selected_observation_id
+                            )
+                        )
+                    )
                     merged = self._merge_observation(
                         existing,
                         incoming,
-                        same_source_event=replayed,
+                        same_source_event=same_source_event,
+                        replace_head=replace_head,
+                        sequence_aware=sequence_aware,
+                        allow_terminal_reopen=bool(allow_terminal_reopen),
                     )
-                    merged["observation_revision"] = (
-                        int(existing.get("observation_revision") or 0) + 1
-                    )
-                    situations[existing_index] = merged
-                    persisted = copy.deepcopy(merged)
-                    transition_created = True
+                    if merged == existing:
+                        persisted = copy.deepcopy(existing)
+                    else:
+                        merged["observation_revision"] = (
+                            int(existing.get("observation_revision") or 0) + 1
+                        )
+                        situations[existing_index] = merged
+                        persisted = copy.deepcopy(merged)
+                        transition_created = True
             else:
                 situations.append(incoming)
                 persisted = copy.deepcopy(incoming)
@@ -311,24 +392,33 @@ class SituationEvaluator:
                     if replayed
                     else "situation_observed"
                 )
+                trace_detail = {
+                    "source_event": source,
+                    "goal_refs": normalized_goals,
+                    "commitment_refs": normalized_commitments,
+                    "evidence_refs": normalized_evidence,
+                    "salience_components": normalized_salience["components"],
+                    "salience_score": normalized_salience["score"],
+                    "inference": inference_record,
+                    "prediction": prediction_record,
+                    "decision": decision_record,
+                    "outcome": outcome_record,
+                    "observation_revision": persisted.get(
+                        "observation_revision"
+                    ),
+                    "evicted_situation_ids": evicted_ids,
+                }
+                if selected_observation_sequence is not None:
+                    trace_detail[
+                        "observation_sequence"
+                    ] = selected_observation_sequence
+                if selected_observation_id:
+                    trace_detail["observation_id"] = selected_observation_id
                 self._enqueue_trace(
                     state,
                     trace_type=trace_type,
                     situation=persisted,
-                    detail={
-                        "source_event": source,
-                        "goal_refs": normalized_goals,
-                        "commitment_refs": normalized_commitments,
-                        "evidence_refs": normalized_evidence,
-                        "salience_components": normalized_salience["components"],
-                        "salience_score": normalized_salience["score"],
-                        "inference": inference_record,
-                        "prediction": prediction_record,
-                        "decision": decision_record,
-                        "outcome": outcome_record,
-                        "observation_revision": persisted.get("observation_revision"),
-                        "evicted_situation_ids": evicted_ids,
-                    },
+                    detail=trace_detail,
                     timestamp=now,
                 )
             return state
@@ -820,25 +910,66 @@ class SituationEvaluator:
         incoming: dict[str, Any],
         *,
         same_source_event: bool,
+        replace_head: bool,
+        sequence_aware: bool,
+        allow_terminal_reopen: bool,
     ) -> dict[str, Any]:
         merged = copy.deepcopy(existing)
+        if not replace_head:
+            history = self._merge_observation_history(
+                merged.get("observations"),
+                incoming.get("observations"),
+            )
+            if history != merged.get("observations"):
+                merged["observations"] = history
+                merged["updated_at"] = incoming["updated_at"]
+            return merged
+
         merged["correlation_id"] = incoming["correlation_id"]
         merged["channel"] = incoming["channel"]
         merged["source_event"] = incoming["source_event"]
         merged["source_event_id"] = incoming["source_event_id"]
         merged["source_event_type"] = incoming["source_event_type"]
+        if "observation_sequence" in incoming:
+            merged["observation_sequence"] = incoming["observation_sequence"]
+        if "observation_id" in incoming:
+            merged["observation_id"] = incoming["observation_id"]
         for key in ("goal_refs", "commitment_refs", "evidence_refs"):
-            merged[key] = self._merge_refs(
-                self._normalize_refs(merged.get(key), evidence=key == "evidence_refs"),
-                incoming[key],
+            merged[key] = (
+                copy.deepcopy(incoming[key])
+                if sequence_aware
+                else self._merge_refs(
+                    self._normalize_refs(
+                        merged.get(key),
+                        evidence=key == "evidence_refs",
+                    ),
+                    incoming[key],
+                )
             )
-        merged["salience_components"] = {
-            **(merged.get("salience_components") if isinstance(merged.get("salience_components"), dict) else {}),
-            **incoming["salience_components"],
-        }
+        merged["salience_components"] = (
+            copy.deepcopy(incoming["salience_components"])
+            if sequence_aware
+            else {
+                **(
+                    merged.get("salience_components")
+                    if isinstance(merged.get("salience_components"), dict)
+                    else {}
+                ),
+                **incoming["salience_components"],
+            }
+        )
         merged["salience_score"] = self._normalize_salience(merged["salience_components"])["score"]
+        terminal_reopened = bool(
+            allow_terminal_reopen
+            and self._status(existing.get("status"), default="observed")
+            == "closed"
+            and self._status(incoming.get("status"), default="observed")
+            == "observed"
+        )
         if same_source_event:
             merged["status"] = self._status(existing.get("status"), default="observed")
+        elif terminal_reopened:
+            merged["status"] = "observed"
         else:
             merged["status"] = self._monotonic_status(
                 merged.get("status"),
@@ -848,7 +979,13 @@ class SituationEvaluator:
         # it is not a new lifecycle transition and therefore cannot reschedule
         # the situation. A terminal lifecycle is also absorbing with respect to
         # a later non-terminal observation.
-        if not same_source_event and not self._is_terminal(existing.get("status")):
+        if (
+            not same_source_event
+            and (
+                not self._is_terminal(existing.get("status"))
+                or terminal_reopened
+            )
+        ):
             merged["next_evaluation_at"] = incoming["next_evaluation_at"]
         for singular, history in (
             ("decision", "decision_history"),
@@ -858,7 +995,17 @@ class SituationEvaluator:
             if incoming.get(singular) is not None:
                 merged[singular] = incoming[singular]
                 merged[history] = self._append_history(merged.get(history), incoming[singular])
-        merged["observations"] = self._extend_history(merged.get("observations"), incoming.get("observations"))
+        merged["observations"] = (
+            self._merge_observation_history(
+                merged.get("observations"),
+                incoming.get("observations"),
+            )
+            if sequence_aware
+            else self._extend_history(
+                merged.get("observations"),
+                incoming.get("observations"),
+            )
+        )
         merged["inferences"] = self._extend_history(merged.get("inferences"), incoming.get("inferences"))
         merged["source_observation_fingerprint"] = incoming["source_observation_fingerprint"]
         merged.setdefault("created_at", incoming["created_at"])
@@ -1392,6 +1539,159 @@ class SituationEvaluator:
             history.extend(copy.deepcopy(entry) for entry in additions if isinstance(entry, dict))
         return history[-self.max_history_per_situation :]
 
+    def _merge_observation_history(
+        self,
+        existing: Any,
+        additions: Any,
+    ) -> list[dict[str, Any]]:
+        history = (
+            [copy.deepcopy(entry) for entry in existing if isinstance(entry, dict)]
+            if isinstance(existing, list)
+            else []
+        )
+        if isinstance(additions, list):
+            history.extend(
+                copy.deepcopy(entry)
+                for entry in additions
+                if isinstance(entry, dict)
+            )
+
+        seen_ids: set[str] = set()
+        unsequenced: list[dict[str, Any]] = []
+        sequenced: list[dict[str, Any]] = []
+        for entry in history:
+            identity = self._text(entry.get("observation_id"), max_length=240)
+            if identity:
+                if identity in seen_ids:
+                    continue
+                seen_ids.add(identity)
+            sequence = self._stored_observation_sequence(
+                entry.get("observation_sequence")
+            )
+            if sequence is None:
+                unsequenced.append(entry)
+            else:
+                sequenced.append(entry)
+        sequenced.sort(
+            key=lambda entry: (
+                self._stored_observation_sequence(
+                    entry.get("observation_sequence")
+                )
+                or 0,
+                str(entry.get("observation_id") or ""),
+                str(entry.get("source_event_id") or ""),
+            )
+        )
+        return [*unsequenced, *sequenced][-self.max_history_per_situation :]
+
+    def _observation_identity_fingerprint(
+        self,
+        situation: dict[str, Any],
+        observation_id: str,
+    ) -> str | None:
+        selected_id = self._text(observation_id, max_length=240)
+        if not selected_id:
+            return None
+        if (
+            self._text(situation.get("observation_id"), max_length=240)
+            == selected_id
+        ):
+            fingerprint = self._text(
+                situation.get("source_observation_fingerprint"),
+                max_length=240,
+            )
+            if fingerprint:
+                return fingerprint
+        observations = (
+            situation.get("observations")
+            if isinstance(situation.get("observations"), list)
+            else []
+        )
+        for entry in observations:
+            if not isinstance(entry, dict):
+                continue
+            if (
+                self._text(entry.get("observation_id"), max_length=240)
+                != selected_id
+            ):
+                continue
+            return self._text(
+                entry.get("observation_fingerprint"),
+                max_length=240,
+            )
+        return None
+
+    def _sequence_aware_observation(
+        self,
+        existing: dict[str, Any],
+        incoming: dict[str, Any],
+    ) -> bool:
+        return any(
+            key in item
+            for item in (existing, incoming)
+            for key in ("observation_sequence", "observation_id")
+        )
+
+    def _incoming_observation_is_head(
+        self,
+        existing: dict[str, Any],
+        incoming: dict[str, Any],
+    ) -> bool:
+        existing_sequence = self._stored_observation_sequence(
+            existing.get("observation_sequence")
+        )
+        incoming_sequence = self._stored_observation_sequence(
+            incoming.get("observation_sequence")
+        )
+        if existing_sequence is None and incoming_sequence is None:
+            return True
+        if incoming_sequence is None:
+            return False
+        if existing_sequence is None:
+            return True
+        existing_id = self._text(
+            existing.get("observation_id")
+            or existing.get("source_event_id"),
+            max_length=240,
+        )
+        incoming_id = self._text(
+            incoming.get("observation_id")
+            or incoming.get("source_event_id"),
+            max_length=240,
+        )
+        return (incoming_sequence, incoming_id) > (
+            existing_sequence,
+            existing_id,
+        )
+
+    @staticmethod
+    def _normalize_observation_sequence(value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("observation_sequence must be a non-negative integer")
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError("observation_sequence must be a non-negative integer")
+        try:
+            selected = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "observation_sequence must be a non-negative integer"
+            ) from exc
+        if selected < 0:
+            raise ValueError("observation_sequence must be a non-negative integer")
+        return selected
+
+    @staticmethod
+    def _stored_observation_sequence(value: Any) -> int | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            selected = int(value)
+        except (TypeError, ValueError):
+            return None
+        return selected if selected >= 0 else None
+
     def _state_situations(self, state: dict[str, Any]) -> list[dict[str, Any]]:
         raw = state.get("situations") if isinstance(state, dict) else []
         if isinstance(raw, dict):
@@ -1448,6 +1748,9 @@ class SituationEvaluator:
                 "inferences",
             )
         }
+        for key in ("observation_sequence", "observation_id"):
+            if key in incoming:
+                semantic[key] = incoming[key]
         stable = self._stable_transition_value(semantic)
         encoded = json.dumps(
             stable,
