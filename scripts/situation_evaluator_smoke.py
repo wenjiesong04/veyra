@@ -12,7 +12,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.situation_evaluator import SituationAccessError, SituationEvaluator  # noqa: E402
+from core.situation_evaluator import (  # noqa: E402
+    SituationAccessError,
+    SituationEvaluator,
+    SituationTraceBackpressureError,
+)
 from core.world_state import WorldStateStore  # noqa: E402
 from interface.event_schema import EventSource, EventType, VeyraEvent  # noqa: E402
 
@@ -32,6 +36,34 @@ class MutableClock:
 
     def advance(self, **kwargs: Any) -> None:
         self.value += timedelta(**kwargs)
+
+
+class FaultInjectingWorldStateStore(WorldStateStore):
+    def __init__(self, root: Path) -> None:
+        self.state_mutation_failures = 0
+        super().__init__(root)
+        self.trace_failure_modes: list[str] = []
+
+    def mutate_json(self, name: str, mutator: Any) -> dict[str, Any]:
+        if (
+            name == SituationEvaluator.STATE_FILE
+            and self.state_mutation_failures > 0
+        ):
+            self.state_mutation_failures -= 1
+            raise OSError("injected situation state mutation failure")
+        return super().mutate_json(name, mutator)
+
+    def append_jsonl(self, name: str, payload: dict[str, Any]) -> None:
+        mode = (
+            self.trace_failure_modes.pop(0)
+            if name == SituationEvaluator.TRACE_FILE and self.trace_failure_modes
+            else None
+        )
+        if mode == "before":
+            raise OSError("injected trace append failure before write")
+        super().append_jsonl(name, payload)
+        if mode == "after":
+            raise OSError("injected interruption after trace append")
 
 
 def event(
@@ -311,11 +343,495 @@ def test_tenant_isolation_idempotence_and_bounds(root: Path) -> None:
     )
 
 
+def test_terminal_replay_is_monotonic(root: Path) -> None:
+    clock = MutableClock()
+    store = WorldStateStore(root)
+    evaluator = SituationEvaluator(store, clock=clock)
+    situations: dict[str, dict[str, Any]] = {}
+
+    monitoring_event = event(
+        "evt-monitoring-replay",
+        user_id="user-terminal",
+        session_id="session-terminal",
+        payload={"correlation_id": "corr-monitoring-replay"},
+    )
+    monitoring_observed = evaluator.observe(
+        monitoring_event,
+        salience_components={"impact": 0.2},
+    )
+    monitoring = evaluator.record_decision(
+        monitoring_observed["situation_id"],
+        {"recommendation": "continue monitoring"},
+        user_id="user-terminal",
+        session_id="session-terminal",
+        status="monitoring",
+        due_at=clock.value + timedelta(hours=3),
+    )
+    monitoring_replay = evaluator.observe(
+        monitoring_event,
+        status="observed",
+        salience_components={"impact": 0.8},
+        next_evaluation_at=clock.value + timedelta(minutes=5),
+    )
+    expect(
+        monitoring_replay["status"] == "monitoring"
+        and monitoring_replay["next_evaluation_at"] == monitoring["next_evaluation_at"],
+        "same-event replay cannot roll back a non-terminal lifecycle or schedule",
+        {
+            "before": monitoring,
+            "after": monitoring_replay,
+        },
+    )
+
+    for index, terminal_status in enumerate(sorted(SituationEvaluator._TERMINAL_STATUSES)):
+        source_event = event(
+            f"evt-terminal-{index}",
+            user_id="user-terminal",
+            session_id="session-terminal",
+            payload={"correlation_id": f"corr-terminal-{index}"},
+        )
+        scheduled_at = clock.value + timedelta(hours=2)
+        observed = evaluator.observe(
+            source_event,
+            salience_components={"impact": 0.1},
+            next_evaluation_at=scheduled_at,
+        )
+        terminal = evaluator.record_outcome(
+            observed["situation_id"],
+            {"terminal_status": terminal_status},
+            user_id="user-terminal",
+            session_id="session-terminal",
+            status=terminal_status,
+        )
+        original_schedule = terminal["next_evaluation_at"]
+        clock.advance(seconds=1)
+        replayed = evaluator.observe(
+            source_event,
+            status="observed",
+            salience_components={"impact": 0.9},
+            next_evaluation_at=clock.value + timedelta(days=1),
+        )
+        expect(
+            replayed["status"] == terminal_status
+            and replayed["next_evaluation_at"] == original_schedule,
+            f"same-event replay preserves {terminal_status} lifecycle and schedule",
+            {
+                "before": terminal,
+                "after": replayed,
+            },
+        )
+        situations[terminal_status] = replayed
+
+    partial = situations["partial"]
+    refined = evaluator.record_outcome(
+        partial["situation_id"],
+        {"verification": "success"},
+        user_id="user-terminal",
+        session_id="session-terminal",
+        status="verified_success",
+    )
+    expect(
+        refined["status"] == "verified_success",
+        "authoritative outcome may refine one terminal status into another",
+        refined,
+    )
+
+
+def test_trace_outbox_recovers_append_failures(root: Path) -> None:
+    clock = MutableClock()
+    store = FaultInjectingWorldStateStore(root)
+    evaluator = SituationEvaluator(store, clock=clock)
+    before_event = event(
+        "evt-trace-before",
+        user_id="user-trace",
+        session_id="session-trace",
+        payload={"correlation_id": "corr-trace-before"},
+    )
+
+    store.trace_failure_modes = ["before"]
+    committed_before = evaluator.observe(
+        before_event,
+        salience_components={"impact": 0.4},
+    )
+    expect(
+        committed_before["source_event_id"] == "evt-trace-before",
+        "trace failure does not misreport the durable observation as failed",
+        committed_before,
+    )
+
+    pending_before = store.read_json("situation_state.json")
+    pending_before_entries = pending_before.get("trace_outbox")
+    pending_before_id = (
+        pending_before_entries[0].get("transition_id")
+        if isinstance(pending_before_entries, list)
+        and pending_before_entries
+        and isinstance(pending_before_entries[0], dict)
+        else None
+    )
+    expect(
+        pending_before.get("count") == 1
+        and pending_before.get("trace_outbox_count") == 1
+        and bool(pending_before_id)
+        and store.read_jsonl("situation_trace.jsonl", limit=100) == [],
+        "state transition retains a durable outbox after append failure",
+        pending_before,
+    )
+
+    clock.advance(minutes=5)
+    recovered_before = evaluator.observe(
+        before_event,
+        salience_components={"impact": 0.4},
+    )
+    trace_after_before_retry = store.read_jsonl("situation_trace.jsonl", limit=100)
+    state_after_before_retry = store.read_json("situation_state.json")
+    revision_after_recovery = state_after_before_retry.get("_state_revision")
+    expect(
+        recovered_before["source_event_id"] == "evt-trace-before"
+        and state_after_before_retry.get("trace_outbox_count") == 0
+        and len(trace_after_before_retry) == 1
+        and trace_after_before_retry[0].get("transition_id") == pending_before_id,
+        "retry repairs a pre-append failure without duplicating the observation",
+        {
+            "state": state_after_before_retry,
+            "trace": trace_after_before_retry,
+        },
+    )
+
+    clock.advance(minutes=5)
+    evaluator.observe(
+        before_event,
+        salience_components={"impact": 0.4},
+    )
+    exact_replay_trace = store.read_jsonl("situation_trace.jsonl", limit=100)
+    exact_replay_state = store.read_json("situation_state.json")
+    expect(
+        len(exact_replay_trace) == 1
+        and exact_replay_state.get("_state_revision") == revision_after_recovery,
+        "exact same-event replay is a state and trace no-op",
+        {
+            "state_revision": exact_replay_state.get("_state_revision"),
+            "trace": exact_replay_trace,
+        },
+    )
+
+    after_event = event(
+        "evt-trace-after",
+        user_id="user-trace",
+        session_id="session-trace",
+        payload={"correlation_id": "corr-trace-after"},
+    )
+    store.trace_failure_modes = ["after"]
+    committed_after = evaluator.observe(
+        after_event,
+        salience_components={"impact": 0.7},
+    )
+    expect(
+        committed_after["source_event_id"] == "evt-trace-after",
+        "post-append interruption does not misreport the durable observation",
+        committed_after,
+    )
+
+    pending_after = store.read_json("situation_state.json")
+    trace_after_interruption = store.read_jsonl("situation_trace.jsonl", limit=100)
+    pending_after_entries = pending_after.get("trace_outbox")
+    pending_after_id = (
+        pending_after_entries[0].get("transition_id")
+        if isinstance(pending_after_entries, list)
+        and pending_after_entries
+        and isinstance(pending_after_entries[0], dict)
+        else None
+    )
+    expect(
+        pending_after.get("trace_outbox_count") == 1
+        and len(trace_after_interruption) == 2
+        and bool(pending_after_id)
+        and trace_after_interruption[-1].get("transition_id") == pending_after_id,
+        "append success before acknowledgement leaves a recoverable outbox",
+        {
+            "state": pending_after,
+            "trace": trace_after_interruption,
+        },
+    )
+
+    evaluator.observe(
+        after_event,
+        salience_components={"impact": 0.7},
+    )
+    recovered_after = store.read_json("situation_state.json")
+    final_trace = store.read_jsonl("situation_trace.jsonl", limit=100)
+    transition_ids = [row.get("transition_id") for row in final_trace]
+    expect(
+        recovered_after.get("trace_outbox_count") == 0
+        and len(final_trace) == 2
+        and len(set(transition_ids)) == 2,
+        "retry deduplicates an already-appended transition before acknowledging it",
+        {
+            "state": recovered_after,
+            "trace": final_trace,
+        },
+    )
+    expect(
+        [row.get("source_event_id") for row in final_trace]
+        == ["evt-trace-before", "evt-trace-after"],
+        "outbox recovery preserves trace order",
+        final_trace,
+    )
+
+    store.trace_failure_modes = ["before", "before", "before", "before"]
+    decision = evaluator.record_decision(
+        committed_after["situation_id"],
+        {"recommendation": "continue lifecycle"},
+        user_id="user-trace",
+        session_id="session-trace",
+        status="monitoring",
+    )
+    expect(
+        decision["status"] == "monitoring",
+        "decision remains committed while trace delivery is unavailable",
+        decision,
+    )
+    try:
+        evaluator.flush_trace_outbox()
+        raise AssertionError("explicit trace repair unexpectedly hid its delivery failure")
+    except OSError as exc:
+        expect(
+            "before write" in str(exc),
+            "explicit trace repair surfaces delivery failure to operators",
+            str(exc),
+        )
+
+    outcome = evaluator.record_outcome(
+        committed_after["situation_id"],
+        {"state": "completed"},
+        user_id="user-trace",
+        session_id="session-trace",
+        status="resolved",
+    )
+    lifecycle_pending = store.read_json("situation_state.json")
+    expect(
+        outcome["status"] == "resolved"
+        and lifecycle_pending.get("trace_outbox_count") == 2
+        and len(store.read_jsonl("situation_trace.jsonl", limit=100)) == 2,
+        "outcome still commits after decision trace delivery fails",
+        {
+            "outcome": outcome,
+            "state": lifecycle_pending,
+        },
+    )
+
+    repair = evaluator.flush_trace_outbox()
+    lifecycle_trace = store.read_jsonl("situation_trace.jsonl", limit=100)
+    expect(
+        repair == {
+            "pending": 0,
+            "appended": 2,
+            "deduplicated": 0,
+            "acknowledged": 2,
+        }
+        and [row.get("trace_type") for row in lifecycle_trace[-2:]]
+        == ["situation_decision_recorded", "situation_outcome_recorded"],
+        "explicit repair restores the complete lifecycle in transition order",
+        {
+            "repair": repair,
+            "trace": lifecycle_trace,
+        },
+    )
+
+
+def test_trace_outbox_backpressure_is_bounded(root: Path) -> None:
+    store = FaultInjectingWorldStateStore(root)
+    invalid_capacity_rejected = False
+    try:
+        SituationEvaluator(store, max_trace_outbox=1)
+    except ValueError:
+        invalid_capacity_rejected = True
+    evaluator = SituationEvaluator(store, max_trace_outbox=2)
+    store.trace_failure_modes = ["before"] * 20
+    for index in range(2):
+        evaluator.observe(
+            event(
+                f"evt-trace-cap-{index}",
+                user_id="user-trace-cap",
+                session_id="session-trace-cap",
+                payload={"correlation_id": f"corr-trace-cap-{index}"},
+            ),
+            salience_components={"impact": 0.2 + index / 10},
+        )
+
+    rejected = False
+    try:
+        evaluator.observe(
+            event(
+                "evt-trace-cap-rejected",
+                user_id="user-trace-cap",
+                session_id="session-trace-cap",
+                payload={"correlation_id": "corr-trace-cap-rejected"},
+            ),
+            salience_components={"impact": 0.9},
+        )
+    except RuntimeError as exc:
+        rejected = "outbox capacity is exhausted" in str(exc)
+    state = store.read_json("situation_state.json")
+    expect(
+        invalid_capacity_rejected
+        and rejected
+        and state.get("trace_outbox_count") == 2
+        and state.get("count") == 2
+        and all(
+            item.get("source_event_id") != "evt-trace-cap-rejected"
+            for item in state.get("situations", [])
+            if isinstance(item, dict)
+        ),
+        "trace outage applies bounded backpressure before an unaudited transition commits",
+        state,
+    )
+
+    byte_store = FaultInjectingWorldStateStore(root / "byte-cap")
+    byte_evaluator = SituationEvaluator(
+        byte_store,
+        max_trace_outbox=10,
+    )
+    byte_store.trace_failure_modes = ["before"] * 10
+    byte_evaluator.observe(
+        event(
+            "evt-trace-byte-cap-0",
+            user_id="user-trace-byte-cap",
+            session_id="session-trace-byte-cap",
+        )
+    )
+    pending_bytes = int(
+        byte_store.read_json("situation_state.json").get(
+            "trace_outbox_bytes"
+        )
+        or 0
+    )
+    byte_evaluator.max_trace_outbox_bytes = pending_bytes
+    total_bytes_rejected = False
+    try:
+        byte_evaluator.observe(
+            event(
+                "evt-trace-byte-cap-1",
+                user_id="user-trace-byte-cap",
+                session_id="session-trace-byte-cap",
+            )
+        )
+    except SituationTraceBackpressureError:
+        total_bytes_rejected = True
+
+    entry_store = FaultInjectingWorldStateStore(root / "entry-cap")
+    entry_evaluator = SituationEvaluator(
+        entry_store,
+        max_trace_entry_bytes=128,
+        max_trace_outbox_bytes=1024,
+    )
+    entry_bytes_rejected = False
+    try:
+        entry_evaluator.observe(
+            event(
+                "evt-trace-entry-cap",
+                user_id="user-trace-entry-cap",
+                session_id="session-trace-entry-cap",
+            )
+        )
+    except SituationTraceBackpressureError:
+        entry_bytes_rejected = True
+    expect(
+        pending_bytes > 0
+        and total_bytes_rejected
+        and entry_bytes_rejected
+        and byte_store.read_json("situation_state.json").get("count") == 1
+        and entry_store.read_json("situation_state.json").get("count") == 0,
+        "trace outbox enforces per-entry and total serialized byte bounds",
+        {
+            "pending_bytes": pending_bytes,
+            "byte_state": byte_store.read_json("situation_state.json"),
+            "entry_state": entry_store.read_json("situation_state.json"),
+        },
+    )
+
+
+def test_atomic_resolution_is_retryable_and_idempotent(root: Path) -> None:
+    store = FaultInjectingWorldStateStore(root)
+    evaluator = SituationEvaluator(store)
+    observed = evaluator.observe(
+        event(
+            "evt-resolution",
+            user_id="user-resolution",
+            session_id="session-resolution",
+            payload={"correlation_id": "corr-resolution"},
+        )
+    )
+    kwargs = {
+        "idempotency_key": "resolution-key-1",
+        "decision": {
+            "route": "direct_answer",
+            "status": "success",
+            "risk_level": "R0",
+        },
+        "outcome": {
+            "route": "direct_answer",
+            "status": "success",
+            "verification": {},
+        },
+        "user_id": "user-resolution",
+        "session_id": "session-resolution",
+        "decision_evidence_refs": [{"ref_id": "trace:resolution"}],
+        "outcome_evidence_refs": [{"ref_id": "trace:resolution"}],
+        "decision_source": "veyra_policy",
+        "outcome_source": "runtime_result",
+        "decision_status": "decided",
+        "outcome_status": "resolved",
+    }
+    store.state_mutation_failures = 1
+    failed = False
+    try:
+        evaluator.record_resolution(observed["situation_id"], **kwargs)
+    except OSError:
+        failed = True
+    unchanged = evaluator.get(
+        observed["situation_id"],
+        user_id="user-resolution",
+        session_id="session-resolution",
+    )
+    resolved = evaluator.record_resolution(observed["situation_id"], **kwargs)
+    replayed = evaluator.record_resolution(observed["situation_id"], **kwargs)
+    trace = store.read_jsonl("situation_trace.jsonl", limit=20)
+    expect(
+        failed
+        and isinstance(unchanged, dict)
+        and unchanged.get("decision") is None
+        and unchanged.get("outcome") is None
+        and len(resolved.get("decision_history") or []) == 1
+        and len(resolved.get("outcome_history") or []) == 1
+        and replayed.get("decision", {}).get("decision_id")
+        == resolved.get("decision", {}).get("decision_id")
+        and replayed.get("outcome", {}).get("outcome_id")
+        == resolved.get("outcome", {}).get("outcome_id")
+        and [row.get("trace_type") for row in trace]
+        == [
+            "situation_observed",
+            "situation_decision_recorded",
+            "situation_outcome_recorded",
+        ],
+        "resolution commits decision and outcome atomically and replays by stable key",
+        {
+            "unchanged": unchanged,
+            "resolved": resolved,
+            "replayed": replayed,
+            "trace": trace,
+        },
+    )
+
+
 def main() -> int:
     with TemporaryDirectory(prefix="veyra-situation-evaluator-") as temp:
         root = Path(temp) / "state"
         test_evidence_linked_lifecycle(root / "lifecycle")
         test_tenant_isolation_idempotence_and_bounds(root / "isolation")
+        test_terminal_replay_is_monotonic(root / "terminal-replay")
+        test_trace_outbox_recovers_append_failures(root / "trace-outbox")
+        test_trace_outbox_backpressure_is_bounded(root / "trace-outbox-cap")
+        test_atomic_resolution_is_retryable_and_idempotent(root / "resolution")
     print("situation evaluator smoke passed")
     return 0
 

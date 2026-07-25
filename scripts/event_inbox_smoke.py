@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Barrier
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,7 +16,11 @@ if str(ROOT) not in sys.path:
 from core.world_state import WorldStateStore  # noqa: E402
 from interface.event_normalizer import EventNormalizer  # noqa: E402
 from interface.event_schema import EventSource, EventType, VeyraEvent  # noqa: E402
-from runtime.event_inbox import EventInbox, EventInboxClaimError  # noqa: E402
+from runtime.event_inbox import (  # noqa: E402
+    EventInbox,
+    EventInboxClaimError,
+    EventInboxConflictError,
+)
 
 
 def expect(condition: bool, label: str, detail: Any = None) -> None:
@@ -244,6 +250,215 @@ def test_durable_inbox(root: Path) -> None:
     expect(reloaded.get(event.event_id) == persisted, "event envelope survives store reconstruction")
 
 
+def test_redelivery_metadata_and_conflicts(root: Path) -> None:
+    clock = MutableClock()
+    store = WorldStateStore(root, exclusive_writer=True, writer_owner="event-redelivery-smoke")
+    inbox = EventInbox(store, clock=clock)
+    first_received_at = "2026-07-25T08:00:01+00:00"
+    last_received_at = "2026-07-25T08:00:09+00:00"
+    event = EventNormalizer().normalize(
+        EventType.USER_FEEDBACK,
+        {"text": "alpha", "rating": 5},
+        channel="api",
+        user_id="user-a",
+        session_id="session-a",
+        event_id="evt_redelivery",
+        dedupe_key="feedback-redelivery",
+        received_at=first_received_at,
+        privacy_scope={"tenant": "user-a", "visibility": "private"},
+    )
+    admitted = inbox.enqueue(event)
+    redelivery = {**event.to_dict(), "received_at": last_received_at}
+    duplicate = inbox.enqueue(redelivery)
+    record = inbox.get_record(event.event_id)
+    expect(
+        admitted.get("status") == "enqueued"
+        and duplicate.get("status") == "duplicate"
+        and record.get("first_received_at") == first_received_at
+        and record.get("last_received_at") == last_received_at
+        and record.get("delivery_count") == 2
+        and record.get("envelope", {}).get("received_at") == first_received_at,
+        "same event id accepts transport redelivery and tracks delivery metadata",
+        {"duplicate": duplicate, "record": record},
+    )
+
+    changed_business_field = {
+        **event.to_dict(),
+        "received_at": "2026-07-25T08:00:10+00:00",
+        "payload": {"text": "alpha", "rating": 4},
+    }
+    conflict_detected = False
+    try:
+        inbox.enqueue(changed_business_field)
+    except EventInboxConflictError:
+        conflict_detected = True
+    unchanged_record = inbox.get_record(event.event_id)
+    expect(
+        conflict_detected
+        and unchanged_record.get("delivery_count") == 2
+        and unchanged_record.get("last_received_at") == last_received_at,
+        "same event id rejects immutable payload changes without counting delivery",
+        unchanged_record,
+    )
+
+    privacy_preserving_redelivery = {
+        **event.to_dict(),
+        "received_at": "2026-07-25T08:00:11+00:00",
+        "payload": {"text": "bravo", "rating": 5},
+    }
+    minimized_duplicate = inbox.enqueue(privacy_preserving_redelivery)
+    minimized_record = inbox.get_record(event.event_id)
+    expect(
+        minimized_duplicate.get("status") == "duplicate"
+        and minimized_record.get("delivery_count") == 3
+        and minimized_record.get("last_received_at")
+        == privacy_preserving_redelivery["received_at"]
+        and "alpha" not in str(minimized_record)
+        and "bravo" not in str(minimized_record),
+        "same-length free-text change is intentionally indistinguishable after privacy minimization",
+        minimized_record,
+    )
+
+    zero_attempts_rejected = 0
+    for atomic in (False, True):
+        try:
+            if atomic:
+                inbox.enqueue_and_claim(
+                    event,
+                    "zero-attempt-consumer",
+                    max_attempts=0,
+                )
+            else:
+                inbox.enqueue(event, max_attempts=0)
+        except ValueError:
+            zero_attempts_rejected += 1
+    expect(
+        zero_attempts_rejected == 2,
+        "explicit zero max_attempts is rejected instead of silently defaulted",
+        zero_attempts_rejected,
+    )
+
+
+def test_atomic_enqueue_and_claim_concurrency(root: Path) -> None:
+    def run_case(
+        case_root: Path,
+        deliveries: list[dict[str, Any]],
+        *,
+        label: str,
+    ) -> None:
+        clock = MutableClock()
+        store = WorldStateStore(
+            case_root,
+            exclusive_writer=True,
+            writer_owner=f"event-atomic-{label}",
+        )
+        inbox = EventInbox(store, clock=clock)
+        barrier = Barrier(2)
+
+        def deliver(index: int) -> dict[str, Any]:
+            barrier.wait(timeout=5)
+            return inbox.enqueue_and_claim(
+                deliveries[index],
+                f"foreground-{index}",
+                lease_seconds=30,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(deliver, index) for index in range(2)]
+            results = [future.result(timeout=10) for future in futures]
+
+        canonical_ids = {
+            str(result.get("canonical_event_id") or "") for result in results
+        }
+        claimed = [result for result in results if result.get("claimed")]
+        state = store.read_json("event_inbox.json")
+        events = state.get("events", {})
+        canonical_id = next(iter(canonical_ids))
+        record = events.get(canonical_id, {})
+        expect(
+            len(events) == 1
+            and len(canonical_ids) == 1
+            and sorted(str(result.get("status")) for result in results)
+            == ["duplicate", "enqueued"]
+            and len(claimed) == 1
+            and claimed[0].get("claim_status") == "claimed"
+            and isinstance(claimed[0].get("claimed_envelope"), dict)
+            and sum(result.get("claim_status") == "unavailable" for result in results) == 1
+            and sum(result.get("claimed_envelope") is None for result in results) == 1
+            and all(
+                result.get("event_id") == result.get("canonical_event_id")
+                and isinstance(result.get("canonical_envelope"), dict)
+                for result in results
+            )
+            and record.get("status") == "claimed"
+            and record.get("attempts") == 1
+            and record.get("delivery_count") == 2,
+            f"atomic enqueue+claim serializes concurrent {label} deliveries",
+            {"results": results, "record": record},
+        )
+        inbox.complete(canonical_id, str(record.get("claimed_by") or ""))
+        terminal_duplicate = inbox.enqueue_and_claim(
+            deliveries[0],
+            "foreground-after-completion",
+            lease_seconds=30,
+        )
+        expect(
+            terminal_duplicate.get("status") == "duplicate"
+            and terminal_duplicate.get("canonical_event_id") == canonical_id
+            and isinstance(terminal_duplicate.get("canonical_envelope"), dict)
+            and not terminal_duplicate.get("claimed")
+            and terminal_duplicate.get("claimed_envelope") is None
+            and terminal_duplicate.get("claim_status") == "unavailable",
+            f"atomic enqueue+claim preserves canonical {label} envelope after completion",
+            terminal_duplicate,
+        )
+
+    normalizer = EventNormalizer()
+    same_event = normalizer.normalize(
+        EventType.OBSERVATION,
+        {"metric": "queue_depth", "value": 3},
+        channel="runtime",
+        user_id="user-a",
+        session_id="session-a",
+        event_id="evt_atomic_same",
+        dedupe_key="atomic-same-event",
+        received_at="2026-07-25T08:00:01+00:00",
+        privacy_scope={"tenant": "user-a", "visibility": "private"},
+    ).to_dict()
+    run_case(
+        root / "same-event",
+        [
+            same_event,
+            {**same_event, "received_at": "2026-07-25T08:00:02+00:00"},
+        ],
+        label="same-event",
+    )
+
+    shared_dedupe = normalizer.normalize(
+        EventType.TASK_PROGRESS,
+        {"task_id": "task-atomic", "progress": 0.5},
+        channel="runtime",
+        user_id="user-a",
+        session_id="session-a",
+        event_id="evt_atomic_dedupe_a",
+        dedupe_key="atomic-shared-dedupe",
+        received_at="2026-07-25T08:00:03+00:00",
+        privacy_scope={"tenant": "user-a", "visibility": "private"},
+    ).to_dict()
+    run_case(
+        root / "shared-dedupe",
+        [
+            shared_dedupe,
+            {
+                **shared_dedupe,
+                "event_id": "evt_atomic_dedupe_b",
+                "received_at": "2026-07-25T08:00:04+00:00",
+            },
+        ],
+        label="shared-dedupe",
+    )
+
+
 def test_lease_crash_recovery(root: Path) -> None:
     clock = MutableClock()
     store = WorldStateStore(root, exclusive_writer=True, writer_owner="event-lease-smoke")
@@ -344,6 +559,10 @@ def main() -> int:
     test_schema_and_normalizer()
     with TemporaryDirectory(prefix="veyra-event-inbox-") as temp_dir:
         test_durable_inbox(Path(temp_dir))
+    with TemporaryDirectory(prefix="veyra-event-redelivery-") as temp_dir:
+        test_redelivery_metadata_and_conflicts(Path(temp_dir))
+    with TemporaryDirectory(prefix="veyra-event-atomic-") as temp_dir:
+        test_atomic_enqueue_and_claim_concurrency(Path(temp_dir))
     with TemporaryDirectory(prefix="veyra-event-lease-") as temp_dir:
         test_lease_crash_recovery(Path(temp_dir))
     with TemporaryDirectory(prefix="veyra-event-bounds-") as temp_dir:

@@ -75,6 +75,51 @@ class RetentionPolicy:
                     }
                 )
                 continue
+            if name == "situation_trace.jsonl":
+                # The outbox check and rotation must share the one-writer
+                # transaction. Otherwise an append-success/ack-failure can
+                # appear between the check and rotate, move the transition to
+                # gzip, and make live-file recovery append it a second time.
+                with self.state_store.writer_transaction():
+                    situation_state = self.state_store.read_json(
+                        "situation_state.json"
+                    )
+                    raw_outbox = situation_state.get("trace_outbox")
+                    pending_outbox = max(
+                        0,
+                        int(
+                            situation_state.get("trace_outbox_count")
+                            or 0
+                        ),
+                        (
+                            len(raw_outbox)
+                            if isinstance(raw_outbox, list)
+                            else 0
+                        ),
+                    )
+                    if pending_outbox:
+                        rotation = {
+                            "file": name,
+                            "entries": len(
+                                self._read_lines(
+                                    self.state_store.path_for(name)
+                                )
+                            ),
+                            "limit": limit,
+                            "status": "deferred_pending_outbox",
+                            "pending_trace_outbox": pending_outbox,
+                            "pruned_entries": 0,
+                        }
+                    else:
+                        rotation = self.state_store.rotate_jsonl(
+                            name,
+                            limit=limit,
+                            dry_run=dry_run,
+                        )
+                files.append(rotation)
+                if rotation.get("status") in {"would_rotate", "rotated"}:
+                    changed += 1
+                continue
             rotation = self.state_store.rotate_jsonl(name, limit=limit, dry_run=dry_run)
             files.append(rotation)
             if rotation.get("status") in {"would_rotate", "rotated"}:

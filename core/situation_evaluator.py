@@ -17,6 +17,10 @@ class SituationAccessError(PermissionError):
     """Raised when a caller tries to mutate another user's situation."""
 
 
+class SituationTraceBackpressureError(RuntimeError):
+    """Raised before an unaudited transition can exceed trace-outbox bounds."""
+
+
 class SituationEvaluator:
     """Persist evidence-linked situations without granting authority.
 
@@ -67,6 +71,9 @@ class SituationEvaluator:
         max_situations: int = 500,
         max_situations_per_user: int = 200,
         max_history_per_situation: int = 24,
+        max_trace_outbox: int = 2000,
+        max_trace_entry_bytes: int = 256 * 1024,
+        max_trace_outbox_bytes: int = 32 * 1024 * 1024,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if max_situations < 1:
@@ -75,12 +82,24 @@ class SituationEvaluator:
             raise ValueError("max_situations_per_user must be at least 1")
         if max_history_per_situation < 1:
             raise ValueError("max_history_per_situation must be at least 1")
+        if max_trace_outbox < 2:
+            raise ValueError(
+                "max_trace_outbox must be at least 2 so one atomic "
+                "decision/outcome resolution can be admitted"
+            )
+        if max_trace_entry_bytes < 1:
+            raise ValueError("max_trace_entry_bytes must be positive")
+        if max_trace_outbox_bytes < 1:
+            raise ValueError("max_trace_outbox_bytes must be positive")
         self.state_store = state_store
         self.state_file = str(state_file)
         self.trace_file = str(trace_file)
         self.max_situations = int(max_situations)
         self.max_situations_per_user = min(int(max_situations_per_user), self.max_situations)
         self.max_history_per_situation = int(max_history_per_situation)
+        self.max_trace_outbox = int(max_trace_outbox)
+        self.max_trace_entry_bytes = int(max_trace_entry_bytes)
+        self.max_trace_outbox_bytes = int(max_trace_outbox_bytes)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def observe(
@@ -112,6 +131,10 @@ class SituationEvaluator:
         """
 
         source = self._event_source(event)
+        # Recover an earlier trace when possible, but never report the durable
+        # situation mutation as failed merely because JSONL delivery is down.
+        # The full trace entry remains in the state document's outbox.
+        self._try_flush_trace_outbox()
         user_id = source["user_id"]
         session_id = source["session_id"]
         payload = event.payload if isinstance(event.payload, dict) else {}
@@ -231,12 +254,15 @@ class SituationEvaluator:
             "created_at": now,
             "updated_at": now,
         }
+        incoming["source_observation_fingerprint"] = self._observation_fingerprint(incoming)
+        incoming["observation_revision"] = 1
         persisted: dict[str, Any] = {}
         evicted_ids: list[str] = []
         replayed = False
+        transition_created = False
 
         def upsert(state: dict[str, Any]) -> dict[str, Any]:
-            nonlocal persisted, evicted_ids, replayed
+            nonlocal persisted, evicted_ids, replayed, transition_created
             situations = self._state_situations(state)
             existing_index = next(
                 (
@@ -250,37 +276,65 @@ class SituationEvaluator:
                 existing = situations[existing_index]
                 self._assert_owner(existing, user_id=user_id, session_id=session_id)
                 replayed = source["event_id"] == str(existing.get("source_event_id") or "")
-                merged = self._merge_observation(existing, incoming)
-                situations[existing_index] = merged
-                persisted = copy.deepcopy(merged)
+                exact_replay = (
+                    replayed
+                    and str(existing.get("source_observation_fingerprint") or "")
+                    == incoming["source_observation_fingerprint"]
+                )
+                if exact_replay:
+                    persisted = copy.deepcopy(existing)
+                else:
+                    merged = self._merge_observation(
+                        existing,
+                        incoming,
+                        same_source_event=replayed,
+                    )
+                    merged["observation_revision"] = (
+                        int(existing.get("observation_revision") or 0) + 1
+                    )
+                    situations[existing_index] = merged
+                    persisted = copy.deepcopy(merged)
+                    transition_created = True
             else:
                 situations.append(incoming)
                 persisted = copy.deepcopy(incoming)
-            situations, evicted_ids = self._bound_state(situations)
+                transition_created = True
+            if transition_created:
+                situations, evicted_ids = self._bound_state(situations)
             state["schema_version"] = self.SCHEMA_VERSION
             state["situations"] = situations
             state["count"] = len(situations)
             state["updated_at"] = now
+            if transition_created:
+                trace_type = (
+                    "situation_observation_replayed"
+                    if replayed
+                    else "situation_observed"
+                )
+                self._enqueue_trace(
+                    state,
+                    trace_type=trace_type,
+                    situation=persisted,
+                    detail={
+                        "source_event": source,
+                        "goal_refs": normalized_goals,
+                        "commitment_refs": normalized_commitments,
+                        "evidence_refs": normalized_evidence,
+                        "salience_components": normalized_salience["components"],
+                        "salience_score": normalized_salience["score"],
+                        "inference": inference_record,
+                        "prediction": prediction_record,
+                        "decision": decision_record,
+                        "outcome": outcome_record,
+                        "observation_revision": persisted.get("observation_revision"),
+                        "evicted_situation_ids": evicted_ids,
+                    },
+                    timestamp=now,
+                )
             return state
 
         self.state_store.mutate_json(self.state_file, upsert)
-        self._append_trace(
-            trace_type="situation_observation_replayed" if replayed else "situation_observed",
-            situation=persisted,
-            detail={
-                "source_event": source,
-                "goal_refs": normalized_goals,
-                "commitment_refs": normalized_commitments,
-                "evidence_refs": normalized_evidence,
-                "salience_components": normalized_salience["components"],
-                "salience_score": normalized_salience["score"],
-                "inference": inference_record,
-                "prediction": prediction_record,
-                "decision": decision_record,
-                "outcome": outcome_record,
-                "evicted_situation_ids": evicted_ids,
-            },
-        )
+        self._try_flush_trace_outbox()
         return copy.deepcopy(persisted)
 
     def record_decision(
@@ -299,6 +353,7 @@ class SituationEvaluator:
     ) -> dict[str, Any]:
         """Record a decision made elsewhere; this method does not authorize it."""
 
+        self._try_flush_trace_outbox()
         normalized_evidence = self._normalize_refs(evidence_refs, evidence=True)
         decision_record = self._decision_record(
             decision,
@@ -335,16 +390,15 @@ class SituationEvaluator:
             apply,
             user_id=user_id,
             session_id=session_id,
-        )
-        self._append_trace(
             trace_type="situation_decision_recorded",
-            situation=persisted,
-            detail={
+            trace_detail={
                 "decision": decision_record,
                 "prediction": prediction_record,
                 "evidence_refs": normalized_evidence,
             },
+            trace_timestamp=now,
         )
+        self._try_flush_trace_outbox()
         return persisted
 
     def record_outcome(
@@ -363,6 +417,7 @@ class SituationEvaluator:
     ) -> dict[str, Any]:
         """Record an outcome while preserving its provenance and evidence."""
 
+        self._try_flush_trace_outbox()
         normalized_evidence = self._normalize_refs(evidence_refs, evidence=True)
         now = self._now_iso()
         existing = self.get(situation_id, user_id=user_id, session_id=session_id)
@@ -397,16 +452,190 @@ class SituationEvaluator:
             apply,
             user_id=user_id,
             session_id=session_id,
-        )
-        self._append_trace(
             trace_type="situation_outcome_recorded",
-            situation=persisted,
-            detail={
+            trace_detail={
                 "outcome": outcome_record,
                 "prediction_ref": outcome_record.get("prediction_ref"),
                 "evidence_refs": normalized_evidence,
             },
+            trace_timestamp=now,
         )
+        self._try_flush_trace_outbox()
+        return persisted
+
+    def record_resolution(
+        self,
+        situation_id: str,
+        *,
+        idempotency_key: str,
+        decision: Any,
+        outcome: Any,
+        user_id: str | None = None,
+        session_id: str | None = None,
+        decision_evidence_refs: Iterable[Any] | Any | None = None,
+        outcome_evidence_refs: Iterable[Any] | Any | None = None,
+        decision_source: str = "policy",
+        outcome_source: str = "observed",
+        outcome_evidence_verified: bool = False,
+        decision_status: str = "decided",
+        outcome_status: str = "resolved",
+    ) -> dict[str, Any]:
+        """Atomically persist one idempotent decision/outcome resolution.
+
+        Foreground result projection must not leave a decision without its
+        corresponding outcome. Both materialized records and both trace-outbox
+        entries therefore commit in one state mutation. Re-delivery with the
+        same bounded key is a no-op, including under concurrent callers.
+        """
+
+        selected_id = str(situation_id or "").strip()
+        selected_key = self._text(idempotency_key, max_length=240).strip()
+        if not selected_id:
+            raise ValueError("situation_id must be non-empty")
+        if not selected_key:
+            raise ValueError("idempotency_key must be non-empty")
+        self._try_flush_trace_outbox()
+        decision_evidence = self._normalize_refs(
+            decision_evidence_refs,
+            evidence=True,
+        )
+        outcome_evidence = self._normalize_refs(
+            outcome_evidence_refs,
+            evidence=True,
+        )
+        decision_record = self._decision_record(
+            decision,
+            source=decision_source,
+            evidence_refs=decision_evidence,
+        )
+        existing = self.get(
+            selected_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        if existing is None:
+            raise KeyError(f"unknown situation: {selected_id}")
+        prediction = (
+            existing.get("prediction")
+            if isinstance(existing.get("prediction"), dict)
+            else {}
+        )
+        outcome_record = self._outcome_record(
+            outcome,
+            source=outcome_source,
+            evidence_refs=outcome_evidence,
+            prediction_id=str(prediction.get("prediction_id") or "") or None,
+            evidence_verified=bool(outcome_evidence_verified),
+        )
+        now = self._now_iso()
+        persisted: dict[str, Any] | None = None
+
+        def resolve(state: dict[str, Any]) -> dict[str, Any]:
+            nonlocal persisted
+            situations = self._state_situations(state)
+            target = next(
+                (
+                    item
+                    for item in situations
+                    if str(item.get("situation_id") or "") == selected_id
+                ),
+                None,
+            )
+            if target is None:
+                raise KeyError(f"unknown situation: {selected_id}")
+            self._assert_owner(
+                target,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            resolution_keys = [
+                str(item)
+                for item in (
+                    target.get("resolution_keys")
+                    if isinstance(target.get("resolution_keys"), list)
+                    else []
+                )
+                if str(item)
+            ]
+            if selected_key in resolution_keys:
+                persisted = copy.deepcopy(target)
+                return state
+
+            target["decision"] = decision_record
+            target["decision_history"] = self._append_history(
+                target.get("decision_history"),
+                decision_record,
+            )
+            target["evidence_refs"] = self._merge_refs(
+                self._normalize_refs(
+                    target.get("evidence_refs"),
+                    evidence=True,
+                ),
+                decision_evidence,
+            )
+            target["status"] = self._status(
+                decision_status,
+                default="decided",
+            )
+            target["updated_at"] = now
+            decision_snapshot = copy.deepcopy(target)
+
+            target["outcome"] = outcome_record
+            target["outcome_history"] = self._append_history(
+                target.get("outcome_history"),
+                outcome_record,
+            )
+            target["evidence_refs"] = self._merge_refs(
+                self._normalize_refs(
+                    target.get("evidence_refs"),
+                    evidence=True,
+                ),
+                outcome_evidence,
+            )
+            target["status"] = self._status(
+                outcome_status,
+                default="resolved",
+            )
+            target["updated_at"] = now
+            target["resolution_keys"] = (
+                resolution_keys + [selected_key]
+            )[-self.max_history_per_situation :]
+            persisted = copy.deepcopy(target)
+
+            state["schema_version"] = self.SCHEMA_VERSION
+            state["situations"] = situations
+            state["count"] = len(situations)
+            state["updated_at"] = now
+            self._enqueue_trace(
+                state,
+                trace_type="situation_decision_recorded",
+                situation=decision_snapshot,
+                detail={
+                    "decision": decision_record,
+                    "prediction": None,
+                    "evidence_refs": decision_evidence,
+                    "resolution_key": selected_key,
+                },
+                timestamp=now,
+            )
+            self._enqueue_trace(
+                state,
+                trace_type="situation_outcome_recorded",
+                situation=persisted,
+                detail={
+                    "outcome": outcome_record,
+                    "prediction_ref": outcome_record.get("prediction_ref"),
+                    "evidence_refs": outcome_evidence,
+                    "resolution_key": selected_key,
+                },
+                timestamp=now,
+            )
+            return state
+
+        self.state_store.mutate_json(self.state_file, resolve)
+        self._try_flush_trace_outbox()
+        if persisted is None:  # pragma: no cover - guarded by the mutation.
+            raise KeyError(f"unknown situation: {selected_id}")
         return persisted
 
     def list(
@@ -511,6 +740,9 @@ class SituationEvaluator:
         *,
         user_id: str | None,
         session_id: str | None,
+        trace_type: str,
+        trace_detail: dict[str, Any],
+        trace_timestamp: str,
     ) -> dict[str, Any]:
         selected_id = str(situation_id or "")
         persisted: dict[str, Any] | None = None
@@ -531,6 +763,13 @@ class SituationEvaluator:
             state["situations"] = situations
             state["count"] = len(situations)
             state["updated_at"] = self._now_iso()
+            self._enqueue_trace(
+                state,
+                trace_type=trace_type,
+                situation=persisted,
+                detail=trace_detail,
+                timestamp=trace_timestamp,
+            )
             return state
 
         self.state_store.mutate_json(self.state_file, update)
@@ -538,7 +777,13 @@ class SituationEvaluator:
             raise KeyError(f"unknown situation: {selected_id}")
         return persisted
 
-    def _merge_observation(self, existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    def _merge_observation(
+        self,
+        existing: dict[str, Any],
+        incoming: dict[str, Any],
+        *,
+        same_source_event: bool,
+    ) -> dict[str, Any]:
         merged = copy.deepcopy(existing)
         merged["correlation_id"] = incoming["correlation_id"]
         merged["channel"] = incoming["channel"]
@@ -555,8 +800,19 @@ class SituationEvaluator:
             **incoming["salience_components"],
         }
         merged["salience_score"] = self._normalize_salience(merged["salience_components"])["score"]
-        merged["status"] = incoming["status"]
-        merged["next_evaluation_at"] = incoming["next_evaluation_at"]
+        if same_source_event:
+            merged["status"] = self._status(existing.get("status"), default="observed")
+        else:
+            merged["status"] = self._monotonic_status(
+                merged.get("status"),
+                incoming["status"],
+            )
+        # Re-delivery of one source event can enrich its evidence/salience, but
+        # it is not a new lifecycle transition and therefore cannot reschedule
+        # the situation. A terminal lifecycle is also absorbing with respect to
+        # a later non-terminal observation.
+        if not same_source_event and not self._is_terminal(existing.get("status")):
+            merged["next_evaluation_at"] = incoming["next_evaluation_at"]
         for singular, history in (
             ("decision", "decision_history"),
             ("prediction", "prediction_history"),
@@ -567,6 +823,7 @@ class SituationEvaluator:
                 merged[history] = self._append_history(merged.get(history), incoming[singular])
         merged["observations"] = self._extend_history(merged.get("observations"), incoming.get("observations"))
         merged["inferences"] = self._extend_history(merged.get("inferences"), incoming.get("inferences"))
+        merged["source_observation_fingerprint"] = incoming["source_observation_fingerprint"]
         merged.setdefault("created_at", incoming["created_at"])
         merged["updated_at"] = incoming["updated_at"]
         return merged
@@ -592,30 +849,191 @@ class SituationEvaluator:
         ]
         return retained, evicted
 
-    def _append_trace(
+    def _try_flush_trace_outbox(self) -> dict[str, Any]:
+        """Best-effort delivery for lifecycle writes that are already durable."""
+
+        try:
+            return self.flush_trace_outbox()
+        except Exception as exc:
+            state = self.state_store.read_json(self.state_file)
+            return {
+                "pending": len(self._trace_outbox(state)),
+                "appended": 0,
+                "deduplicated": 0,
+                "acknowledged": 0,
+                "error_type": type(exc).__name__,
+            }
+
+    def flush_trace_outbox(self) -> dict[str, int]:
+        """Recover pending situation traces without claiming a cross-file transaction.
+
+        Situation state and its full trace entry are committed atomically to the
+        JSON state document. This method then appends pending entries to JSONL
+        in order and acknowledges them in a later JSON mutation. A deterministic
+        ``transition_id`` lets a retry recognize an append that succeeded before
+        a crash or acknowledgement failure.
+        """
+
+        appended = 0
+        deduplicated = 0
+        acknowledged = 0
+        remaining_after_ack = 0
+        # Holding the store's writer transaction serializes scan/append/ack
+        # within the one-writer state boundary. Durability still comes from the
+        # outbox and transition-id recovery, not from pretending the two files
+        # share one atomic transaction.
+        with self.state_store.writer_transaction():
+            state = self.state_store.read_json(self.state_file)
+            pending = self._trace_outbox(state)
+            if not pending:
+                return {
+                    "pending": 0,
+                    "appended": 0,
+                    "deduplicated": 0,
+                    "acknowledged": 0,
+                }
+
+            existing_rows = self.state_store.read_jsonl(
+                self.trace_file,
+                limit=(1 << 63) - 1,
+            )
+            persisted_ids = {
+                str(row.get("transition_id") or "")
+                for row in existing_rows
+                if isinstance(row, dict) and row.get("transition_id")
+            }
+            acknowledged_ids: set[str] = set()
+            for entry in pending:
+                transition_id = str(entry.get("transition_id") or "")
+                if not transition_id:
+                    raise ValueError("situation trace outbox entry is missing transition_id")
+                if transition_id in persisted_ids:
+                    deduplicated += 1
+                else:
+                    self.state_store.append_jsonl(self.trace_file, copy.deepcopy(entry))
+                    persisted_ids.add(transition_id)
+                    appended += 1
+                acknowledged_ids.add(transition_id)
+
+            if acknowledged_ids:
+
+                def acknowledge(current: dict[str, Any]) -> dict[str, Any]:
+                    nonlocal acknowledged, remaining_after_ack
+                    current_outbox = self._trace_outbox(current)
+                    remaining = [
+                        entry
+                        for entry in current_outbox
+                        if str(entry.get("transition_id") or "") not in acknowledged_ids
+                    ]
+                    acknowledged = len(current_outbox) - len(remaining)
+                    remaining_after_ack = len(remaining)
+                    current["trace_outbox"] = remaining
+                    current["trace_outbox_count"] = len(remaining)
+                    current["trace_outbox_bytes"] = self._trace_outbox_size(
+                        remaining
+                    )
+                    current["updated_at"] = self._now_iso()
+                    return current
+
+                self.state_store.mutate_json(self.state_file, acknowledge)
+
+        return {
+            "pending": remaining_after_ack,
+            "appended": appended,
+            "deduplicated": deduplicated,
+            "acknowledged": acknowledged,
+        }
+
+    def _enqueue_trace(
         self,
+        state: dict[str, Any],
         *,
         trace_type: str,
         situation: dict[str, Any],
         detail: dict[str, Any],
+        timestamp: str,
     ) -> None:
-        self.state_store.append_jsonl(
-            self.trace_file,
-            {
-                "schema_version": self.TRACE_SCHEMA_VERSION,
-                "trace_id": f"strace_{uuid4().hex[:16]}",
-                "trace_type": trace_type,
-                "situation_id": situation.get("situation_id"),
-                "correlation_id": situation.get("correlation_id"),
-                "user_id": situation.get("user_id"),
-                "session_id": situation.get("session_id"),
-                "source_event_id": situation.get("source_event_id"),
-                "source_event_type": situation.get("source_event_type"),
-                "status": situation.get("status"),
-                "timestamp": self._now_iso(),
-                "detail": self._bounded_value(detail),
-            },
+        sequence = int(state.get("trace_sequence") or 0) + 1
+        identity = {
+            "state_file": self.state_file,
+            "sequence": sequence,
+            "trace_type": trace_type,
+            "situation_id": situation.get("situation_id"),
+        }
+        encoded = json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        transition_id = f"sitxn_{digest[:32]}"
+        entry = {
+            "schema_version": self.TRACE_SCHEMA_VERSION,
+            "trace_id": f"strace_{digest[:16]}",
+            "transition_id": transition_id,
+            "transition_sequence": sequence,
+            "trace_type": trace_type,
+            "situation_id": situation.get("situation_id"),
+            "correlation_id": situation.get("correlation_id"),
+            "user_id": situation.get("user_id"),
+            "session_id": situation.get("session_id"),
+            "source_event_id": situation.get("source_event_id"),
+            "source_event_type": situation.get("source_event_type"),
+            "status": situation.get("status"),
+            "timestamp": timestamp,
+            "detail": self._bounded_value(detail),
+        }
+        entry_bytes = self._trace_entry_size(entry)
+        if entry_bytes > self.max_trace_entry_bytes:
+            raise SituationTraceBackpressureError(
+                "situation trace entry exceeds the serialized byte limit"
+            )
+        outbox = self._trace_outbox(state)
+        if not any(
+            str(item.get("transition_id") or "") == transition_id
+            for item in outbox
+        ):
+            if len(outbox) >= self.max_trace_outbox:
+                raise SituationTraceBackpressureError(
+                    "situation trace outbox capacity is exhausted; "
+                    "repair trace delivery before accepting more transitions"
+                )
+            outbox_bytes = self._trace_outbox_size(outbox)
+            if outbox_bytes + entry_bytes > self.max_trace_outbox_bytes:
+                raise SituationTraceBackpressureError(
+                    "situation trace outbox serialized byte capacity is "
+                    "exhausted; repair trace delivery before accepting more "
+                    "transitions"
+                )
+            outbox.append(entry)
+        state["trace_sequence"] = sequence
+        state["trace_outbox"] = outbox
+        state["trace_outbox_count"] = len(outbox)
+        state["trace_outbox_bytes"] = self._trace_outbox_size(outbox)
+
+    def _trace_outbox(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        raw = state.get("trace_outbox") if isinstance(state, dict) else []
+        if not isinstance(raw, list):
+            return []
+        return [copy.deepcopy(item) for item in raw if isinstance(item, dict)]
+
+    @staticmethod
+    def _trace_entry_size(entry: dict[str, Any]) -> int:
+        return len(
+            json.dumps(
+                entry,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
         )
+
+    @classmethod
+    def _trace_outbox_size(cls, entries: list[dict[str, Any]]) -> int:
+        return sum(cls._trace_entry_size(entry) for entry in entries)
 
     def _event_source(self, event: VeyraEvent) -> dict[str, Any]:
         if event is None or not hasattr(event, "source"):
@@ -943,6 +1361,78 @@ class SituationEvaluator:
     def _status(self, value: Any, *, default: str) -> str:
         selected = self._text(value, max_length=120).strip().lower().replace(" ", "_")
         return selected or default
+
+    def _is_terminal(self, status: Any) -> bool:
+        return self._status(status, default="") in self._TERMINAL_STATUSES
+
+    def _monotonic_status(self, existing: Any, incoming: Any) -> str:
+        current = self._status(existing, default="observed")
+        selected = self._status(incoming, default=current)
+        if current in self._TERMINAL_STATUSES and selected not in self._TERMINAL_STATUSES:
+            return current
+        return selected
+
+    def _observation_fingerprint(self, incoming: dict[str, Any]) -> str:
+        """Identify an observation call without UUIDs, clocks, or due-time resets."""
+
+        semantic = {
+            key: incoming.get(key)
+            for key in (
+                "situation_id",
+                "correlation_id",
+                "user_id",
+                "session_id",
+                "channel",
+                "source_event",
+                "source_event_id",
+                "source_event_type",
+                "goal_refs",
+                "commitment_refs",
+                "evidence_refs",
+                "salience_components",
+                "salience_score",
+                "status",
+                "decision",
+                "prediction",
+                "outcome",
+                "observations",
+                "inferences",
+            )
+        }
+        stable = self._stable_transition_value(semantic)
+        encoded = json.dumps(
+            stable,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return f"sobs_{hashlib.sha256(encoded).hexdigest()[:32]}"
+
+    def _stable_transition_value(self, value: Any) -> Any:
+        """Remove locally generated identity/time fields from replay matching."""
+
+        volatile_keys = {
+            "created_at",
+            "decision_id",
+            "outcome_id",
+            "prediction_id",
+            "prediction_ref",
+            "record_id",
+            "recorded_at",
+            "trace_id",
+            "transition_id",
+            "updated_at",
+        }
+        if isinstance(value, list):
+            return [self._stable_transition_value(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        return {
+            key: self._stable_transition_value(item)
+            for key, item in value.items()
+            if key not in volatile_keys
+        }
 
     def _is_model_source(self, source: Any) -> bool:
         selected = str(source or "").strip().lower()

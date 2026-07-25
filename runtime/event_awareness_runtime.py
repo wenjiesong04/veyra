@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
+from uuid import uuid4
 
 from core.situation_evaluator import SituationEvaluator
 from core.world_state import WorldStateStore
@@ -55,60 +58,114 @@ class ShadowAwarenessRuntime:
             except Exception as exc:
                 self._record_error("event_record_only_error", event.event_id, exc)
                 return {"status": "degraded", "error_type": type(exc).__name__}
-        consumer_id = "awareness-shadow-foreground"
+        consumer_id = f"awareness-shadow-foreground-{uuid4().hex[:12]}"
         claimed = False
+        canonical_event_id = event.event_id
+        situation_id = ""
         try:
-            admission = self.event_inbox.enqueue(event)
-            envelope = self.event_inbox.claim_by_id(
-                event.event_id,
+            admission = self.event_inbox.enqueue_and_claim(
+                event,
                 consumer_id,
                 lease_seconds=120,
             )
+            claimed = bool(admission.get("claimed"))
+            canonical_event_id = str(
+                admission.get("canonical_event_id") or event.event_id
+            )
+            canonical_envelope = admission.get("canonical_envelope")
+            claimed_envelope = admission.get("claimed_envelope")
+            envelope = (
+                claimed_envelope
+                if isinstance(claimed_envelope, dict)
+                else canonical_envelope
+            )
             if not isinstance(envelope, dict):
-                existing = self._situation_for_event(event)
-                return {
-                    "status": str(admission.get("status") or "duplicate"),
-                    "situation_id": existing.get("situation_id") if existing else None,
-                }
-            claimed = True
+                raise ValueError("event inbox did not return a canonical envelope")
             observed_event = VeyraEvent.from_dict(envelope)
-            existing = self._situation_for_event(observed_event)
-            situation = existing or self.situation_evaluator.observe(
+            # ``observe`` is replay-safe and also drains a durable trace outbox.
+            # Calling it for duplicates repairs a crash between state commit and
+            # JSONL trace projection instead of silently trusting prior state.
+            situation = self.situation_evaluator.observe(
                 observed_event,
                 salience_components=self._explicit_salience(observed_event),
             )
             situation_id = str(situation.get("situation_id") or "")
+            if not claimed:
+                return {
+                    "status": str(admission.get("status") or "duplicate"),
+                    "event_id": canonical_event_id,
+                    "situation_id": situation_id,
+                    # Resolution writes are atomically idempotent. A duplicate
+                    # can repair an earlier failed finalize without duplicating
+                    # lifecycle history under concurrent callers.
+                    "finalize_allowed": True,
+                }
             self.event_inbox.complete(
-                event.event_id,
+                canonical_event_id,
                 consumer_id,
                 {
                     "status": "observed",
                     "situation_id": situation_id,
                 },
             )
-            return {"status": "observed", "situation_id": situation_id}
+            return {
+                "status": "observed",
+                "event_id": canonical_event_id,
+                "situation_id": situation_id,
+                "finalize_allowed": True,
+            }
         except Exception as exc:
             if claimed:
-                self._fail_claim(event.event_id, consumer_id, exc)
-            self._record_error("shadow_awareness_intake_error", event.event_id, exc)
-            return {"status": "degraded", "error_type": type(exc).__name__}
+                self._fail_claim(canonical_event_id, consumer_id, exc)
+            self._record_error(
+                "shadow_awareness_intake_error",
+                canonical_event_id,
+                exc,
+            )
+            return {
+                "status": "degraded",
+                "event_id": canonical_event_id,
+                "situation_id": situation_id or None,
+                # If observation committed before a later inbox completion
+                # failure, preserve this turn's decision/outcome projection.
+                "finalize_allowed": bool(situation_id and claimed),
+                "error_type": type(exc).__name__,
+            }
 
     def finalize(
         self,
         event: VeyraEvent,
         result: LoopResult,
         trace: dict[str, Any],
+        *,
+        situation_id: str | None = None,
+        canonical_event_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Record the already-made decision/outcome after observation completed."""
 
         if self.mode != "shadow":
             return None
-        situation_id = ""
+        selected_situation_id = str(situation_id or "")
         try:
-            situation = self._situation_for_event(event)
+            situation = (
+                self.situation_evaluator.get(
+                    selected_situation_id,
+                    user_id=event.source.user_id,
+                    session_id=event.source.session_id,
+                )
+                if selected_situation_id
+                else self._situation_for_event(event)
+            )
             if not isinstance(situation, dict):
-                return None
-            situation_id = str(situation.get("situation_id") or "")
+                # A foreground/background interleaving or a repaired intake can
+                # leave no lookup result for the delivered id. Observation is
+                # idempotent, so upsert the source event rather than dropping
+                # the already-made decision and outcome.
+                situation = self.situation_evaluator.observe(
+                    event,
+                    salience_components=self._explicit_salience(event),
+                )
+            selected_situation_id = str(situation.get("situation_id") or "")
             trace_id = str(trace.get("trace_id") or "")
             trace_ref = {
                 "ref_id": trace_id,
@@ -160,25 +217,11 @@ class ShadowAwarenessRuntime:
                     if key in authoritative_verification
                 },
             }
-            if self._matches_existing_outcome(
-                situation,
-                outcome_value,
-                is_fact=verified_outcome,
-            ):
-                return self._situation_summary(situation)
-            decision = self.situation_evaluator.record_decision(
-                situation_id,
-                {
-                    "route": result.route.value,
-                    "status": result.status,
-                    "risk_level": result.risk_level.value,
-                },
-                user_id=event.source.user_id,
-                session_id=event.source.session_id,
-                evidence_refs=[trace_ref],
-                source="veyra_policy",
-                status=self._decision_status(result),
-            )
+            decision_value = {
+                "route": result.route.value,
+                "status": result.status,
+                "risk_level": result.risk_level.value,
+            }
             verification_ref = {
                 "ref_id": (
                     f"execution_trace:{execution_trace_id}:verification"
@@ -193,28 +236,60 @@ class ShadowAwarenessRuntime:
                 ),
                 "is_fact": verified_outcome,
             }
-            outcome = self.situation_evaluator.record_outcome(
-                situation_id,
-                outcome_value,
-                user_id=event.source.user_id,
-                session_id=event.source.session_id,
-                evidence_refs=[trace_ref, verification_ref] if verification else [trace_ref],
-                source="verifier" if verified_outcome else "runtime_result",
-                evidence_verified=verified_outcome,
-                status=self._outcome_status(result),
+            resolution_key = self._resolution_key(
+                event_id=str(canonical_event_id or event.event_id),
+                decision=decision_value,
+                outcome=outcome_value,
+                outcome_is_fact=verified_outcome,
             )
+            resolved: dict[str, Any] | None = None
+            last_error: Exception | None = None
+            # The combined mutation is idempotent, so one immediate retry safely
+            # repairs transient atomic-write failures without duplicate history.
+            for _ in range(2):
+                try:
+                    resolved = self.situation_evaluator.record_resolution(
+                        selected_situation_id,
+                        idempotency_key=resolution_key,
+                        decision=decision_value,
+                        outcome=outcome_value,
+                        user_id=event.source.user_id,
+                        session_id=event.source.session_id,
+                        decision_evidence_refs=[trace_ref],
+                        outcome_evidence_refs=(
+                            [trace_ref, verification_ref]
+                            if verification
+                            else [trace_ref]
+                        ),
+                        decision_source="veyra_policy",
+                        outcome_source=(
+                            "verifier"
+                            if verified_outcome
+                            else "runtime_result"
+                        ),
+                        outcome_evidence_verified=verified_outcome,
+                        decision_status=self._decision_status(result),
+                        outcome_status=self._outcome_status(result),
+                    )
+                    break
+                except Exception as exc:
+                    last_error = exc
+            if resolved is None:
+                if last_error is not None:
+                    raise last_error
+                raise RuntimeError("situation resolution did not return state")
             return {
-                "situation_id": situation_id,
-                "correlation_id": outcome.get("correlation_id"),
-                "status": outcome.get("status"),
+                "situation_id": selected_situation_id,
+                "correlation_id": resolved.get("correlation_id"),
+                "status": resolved.get("status"),
                 "decision_id": (
-                    decision.get("decision", {}).get("decision_id")
-                    if isinstance(decision.get("decision"), dict)
+                    resolved.get("decision", {}).get("decision_id")
+                    if isinstance(resolved.get("decision"), dict)
                     else None
                 ),
                 "outcome_id": (
-                    outcome.get("outcome", {}).get("outcome_id")
-                    if isinstance(outcome.get("outcome"), dict)
+                    resolved.get("outcome", {}).get("outcome_id")
+                    if isinstance(resolved.get("outcome"), dict)
                     else None
                 ),
                 "shadow_only": True,
@@ -224,56 +299,36 @@ class ShadowAwarenessRuntime:
                 "shadow_awareness_finalize_error",
                 event.event_id,
                 exc,
-                situation_id=situation_id,
+                situation_id=selected_situation_id,
             )
             return {
-                "situation_id": situation_id or None,
+                "situation_id": selected_situation_id or None,
                 "status": "degraded",
                 "error_type": type(exc).__name__,
                 "shadow_only": True,
             }
 
     @staticmethod
-    def _matches_existing_outcome(
-        situation: dict[str, Any],
-        outcome_value: dict[str, Any],
+    def _resolution_key(
         *,
-        is_fact: bool,
-    ) -> bool:
-        outcome = (
-            situation.get("outcome")
-            if isinstance(situation.get("outcome"), dict)
-            else {}
-        )
-        value = outcome.get("value") if isinstance(outcome.get("value"), dict) else {}
-        return bool(
-            outcome
-            and value.get("route") == outcome_value.get("route")
-            and value.get("status") == outcome_value.get("status")
-            and value.get("verification") == outcome_value.get("verification")
-            and bool(outcome.get("is_fact")) is bool(is_fact)
-        )
-
-    @staticmethod
-    def _situation_summary(situation: dict[str, Any]) -> dict[str, Any]:
-        decision = (
-            situation.get("decision")
-            if isinstance(situation.get("decision"), dict)
-            else {}
-        )
-        outcome = (
-            situation.get("outcome")
-            if isinstance(situation.get("outcome"), dict)
-            else {}
-        )
-        return {
-            "situation_id": situation.get("situation_id"),
-            "correlation_id": situation.get("correlation_id"),
-            "status": situation.get("status"),
-            "decision_id": decision.get("decision_id"),
-            "outcome_id": outcome.get("outcome_id"),
-            "shadow_only": True,
-        }
+        event_id: str,
+        decision: dict[str, Any],
+        outcome: dict[str, Any],
+        outcome_is_fact: bool,
+    ) -> str:
+        encoded = json.dumps(
+            {
+                "event_id": event_id,
+                "decision": decision,
+                "outcome": outcome,
+                "outcome_is_fact": bool(outcome_is_fact),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return f"sires_{hashlib.sha256(encoded).hexdigest()[:32]}"
 
     def process_pending(self, *, limit: int = 20) -> dict[str, Any]:
         """Project pending background events into situations, never actions."""
@@ -290,6 +345,16 @@ class ShadowAwarenessRuntime:
         processed: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
         consumer_id = "awareness-shadow-background"
+        trace_recovery_error: str | None = None
+        try:
+            self.situation_evaluator.flush_trace_outbox()
+        except Exception as exc:
+            trace_recovery_error = type(exc).__name__
+            self._record_error(
+                "situation_trace_recovery_error",
+                "",
+                exc,
+            )
         for _ in range(max(0, min(int(limit), 100))):
             claimed = self.event_inbox.claim(consumer_id, lease_seconds=60)
             if not isinstance(claimed, dict):
@@ -297,8 +362,7 @@ class ShadowAwarenessRuntime:
             event_id = str(claimed.get("event_id") or "")
             try:
                 event = VeyraEvent.from_dict(claimed)
-                existing = self._situation_for_event(event)
-                situation = existing or self.situation_evaluator.observe(
+                situation = self.situation_evaluator.observe(
                     event,
                     salience_components=self._explicit_salience(event),
                 )
@@ -327,11 +391,19 @@ class ShadowAwarenessRuntime:
                     }
                 )
         return {
-            "status": "success" if not failed else "degraded",
+            "status": (
+                "success"
+                if not failed and trace_recovery_error is None
+                else "degraded"
+            ),
             "processed_count": len(processed),
             "failed_count": len(failed),
             "processed": processed,
             "failed": failed,
+            "trace_recovery": {
+                "status": "success" if trace_recovery_error is None else "degraded",
+                "error_type": trace_recovery_error,
+            },
             "inbox": self.event_inbox.stats(),
         }
 

@@ -49,7 +49,8 @@ class EventInbox:
     ``claim`` and ``claim_by_id`` return only that envelope so source,
     user/session isolation, privacy, correlation and evidence fields survive
     across persistence and crash recovery. Free-form ``payload.text`` is
-    represented by hash/length metadata instead of being duplicated at rest.
+    represented by redaction/length metadata instead of being duplicated at
+    rest.
     """
 
     def __init__(
@@ -77,11 +78,15 @@ class EventInbox:
         available_at: datetime | str | None = None,
     ) -> dict[str, Any]:
         """Persist an event once and return its queue admission result."""
-        envelope = self._event_envelope(event)
+        envelope, immutable_fingerprint = self._prepared_event(event)
         event_id = str(envelope.get("event_id") or "").strip()
         if not event_id:
             raise ValueError("event envelope requires event_id")
-        attempts_limit = int(max_attempts or self.default_max_attempts)
+        attempts_limit = int(
+            self.default_max_attempts
+            if max_attempts is None
+            else max_attempts
+        )
         if attempts_limit < 1:
             raise ValueError("max_attempts must be at least 1")
         now = self._now()
@@ -91,73 +96,109 @@ class EventInbox:
 
         def admit(document: dict[str, Any]) -> dict[str, Any]:
             self._require_document(document)
-            events = document["events"]
-            dedupe_index = document["dedupe_index"]
-            existing = events.get(event_id)
-            if isinstance(existing, dict):
-                existing_envelope = existing.get("envelope")
-                if self._canonical(existing_envelope) != self._canonical(envelope):
-                    raise EventInboxConflictError(
-                        f"event id {event_id} is already bound to a different envelope"
-                    )
-                selected.update(
-                    status="duplicate",
-                    event_id=event_id,
-                    envelope=copy.deepcopy(existing_envelope),
-                )
-                return document
-
-            duplicate_id = str(dedupe_index.get(identity) or "")
-            duplicate = events.get(duplicate_id)
-            if duplicate_id and isinstance(duplicate, dict):
-                selected.update(
-                    status="duplicate",
-                    event_id=duplicate_id,
-                    duplicate_of=duplicate_id,
-                    envelope=copy.deepcopy(duplicate.get("envelope")),
-                )
-                return document
-
-            evicted = self._prune_terminal(document, reserve=1)
-            events = document["events"]
-            dedupe_index = document["dedupe_index"]
-            if len(events) >= self.max_records:
-                raise EventInboxError(
-                    "event inbox capacity is exhausted by active events; "
-                    "consumer recovery or operator intervention is required"
-                )
-            record = {
-                "event_id": event_id,
-                "envelope": copy.deepcopy(envelope),
-                "dedupe_identity": identity,
-                "status": "pending",
-                "attempts": 0,
-                "max_attempts": attempts_limit,
-                "available_at": self._iso(available),
-                "enqueued_at": self._iso(now),
-                "claimed_by": None,
-                "claimed_at": None,
-                "lease_expires_at": None,
-                "completed_by": None,
-                "completed_at": None,
-                "failed_by": None,
-                "failed_at": None,
-                "last_error": None,
-                "lease_expirations": 0,
-            }
-            events[event_id] = record
-            dedupe_index[identity] = event_id
-            document["events"] = events
-            document["dedupe_index"] = dedupe_index
             selected.update(
-                status="enqueued",
-                event_id=event_id,
-                envelope=copy.deepcopy(envelope),
-                evicted_terminal_event_ids=evicted,
+                self._admit(
+                    document,
+                    envelope=envelope,
+                    event_id=event_id,
+                    identity=identity,
+                    immutable_fingerprint=immutable_fingerprint,
+                    attempts_limit=attempts_limit,
+                    available=available,
+                    now=now,
+                )
             )
             return document
 
         self.store.mutate_json(EVENT_INBOX_FILE, admit)
+        return copy.deepcopy(selected)
+
+    def enqueue_and_claim(
+        self,
+        event: VeyraEvent | Mapping[str, Any],
+        consumer_id: str,
+        lease_seconds: float = 60.0,
+        *,
+        max_attempts: int | None = None,
+        available_at: datetime | str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically admit an event and acquire its foreground consumer lease.
+
+        ``status`` retains the normal admission status (``enqueued`` or
+        ``duplicate``). ``canonical_event_id`` and ``canonical_envelope`` are
+        always the dedupe-resolved durable record. ``claimed`` and
+        ``claimed_envelope`` separately report whether this consumer owns the
+        lease. The canonical id can differ from the delivered id when a
+        user-scoped dedupe key resolves to an existing record.
+        """
+
+        envelope, immutable_fingerprint = self._prepared_event(event)
+        event_id = str(envelope.get("event_id") or "").strip()
+        if not event_id:
+            raise ValueError("event envelope requires event_id")
+        consumer = self._consumer(consumer_id)
+        lease = self._lease_seconds(lease_seconds)
+        attempts_limit = int(
+            self.default_max_attempts
+            if max_attempts is None
+            else max_attempts
+        )
+        if attempts_limit < 1:
+            raise ValueError("max_attempts must be at least 1")
+        now = self._now()
+        available = self._coerce_time(available_at, default=now)
+        identity = self._dedupe_identity(envelope)
+        selected: dict[str, Any] = {}
+
+        def admit_and_claim(document: dict[str, Any]) -> dict[str, Any]:
+            self._require_document(document)
+            self._recover_expired(document, now)
+            admission = self._admit(
+                document,
+                envelope=envelope,
+                event_id=event_id,
+                identity=identity,
+                immutable_fingerprint=immutable_fingerprint,
+                attempts_limit=attempts_limit,
+                available=available,
+                now=now,
+            )
+            canonical_id = str(admission.get("event_id") or event_id)
+            record = document["events"].get(canonical_id)
+            claimed_envelope: dict[str, Any] | None = None
+            claim_status = "unavailable"
+            if isinstance(record, dict):
+                if record.get("status") == "claimed" and record.get("claimed_by") == consumer:
+                    candidate = record.get("envelope")
+                    if isinstance(candidate, dict):
+                        claimed_envelope = copy.deepcopy(candidate)
+                        claim_status = "already_claimed"
+                elif (
+                    record.get("status") == "pending"
+                    and self._available(record, now)
+                    and isinstance(record.get("envelope"), dict)
+                ):
+                    self._claim_record(
+                        record,
+                        consumer=consumer,
+                        lease_seconds=lease,
+                        now=now,
+                    )
+                    candidate = record.get("envelope")
+                    if isinstance(candidate, dict):
+                        claimed_envelope = copy.deepcopy(candidate)
+                        claim_status = "claimed"
+            selected.update(admission)
+            selected.update(
+                canonical_event_id=canonical_id,
+                canonical_envelope=copy.deepcopy(admission.get("envelope")),
+                claimed=claimed_envelope is not None,
+                claim_status=claim_status,
+                claimed_envelope=claimed_envelope,
+            )
+            return document
+
+        self.store.mutate_json(EVENT_INBOX_FILE, admit_and_claim)
         return copy.deepcopy(selected)
 
     def claim(
@@ -408,20 +449,30 @@ class EventInbox:
         counts["total"] = len(events)
         return counts
 
-    def _event_envelope(self, event: VeyraEvent | Mapping[str, Any]) -> dict[str, Any]:
+    def _prepared_event(
+        self,
+        event: VeyraEvent | Mapping[str, Any],
+    ) -> tuple[dict[str, Any], str]:
         if isinstance(event, VeyraEvent):
-            envelope = event.to_dict()
+            raw_envelope = event.to_dict()
         elif isinstance(event, Mapping):
-            envelope = copy.deepcopy(dict(event))
+            raw_envelope = copy.deepcopy(dict(event))
         else:
             raise TypeError("event must be VeyraEvent or a mapping")
-        if not isinstance(envelope.get("source"), dict):
+        if not isinstance(raw_envelope.get("source"), dict):
             raise ValueError("event envelope requires a source mapping")
-        if not isinstance(envelope.get("payload"), dict):
+        if not isinstance(raw_envelope.get("payload"), dict):
             raise ValueError("event envelope requires a payload mapping")
-        envelope = self._redact_free_text(envelope)
+        self._json_value(raw_envelope)
+        envelope = self._redact_free_text(raw_envelope)
         envelope = redact_sensitive(envelope, max_string=4000, max_list=100)
         self._json_value(envelope)
+        # Never persist an unsalted digest derived from raw free text or
+        # secret-bearing fields: short values could be brute-forced. The
+        # fingerprint deliberately sees only the minimized durable envelope.
+        # Consequently, equal-length replacements of redacted free text are
+        # indistinguishable; structured immutable fields still detect conflict.
+        immutable_fingerprint = self._immutable_fingerprint(envelope)
         envelope_size = len(
             json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         )
@@ -429,6 +480,10 @@ class EventInbox:
             raise ValueError(
                 f"event envelope exceeds the {MAX_ENVELOPE_BYTES}-byte durable inbox limit"
             )
+        return envelope, immutable_fingerprint
+
+    def _event_envelope(self, event: VeyraEvent | Mapping[str, Any]) -> dict[str, Any]:
+        envelope, _ = self._prepared_event(event)
         return envelope
 
     @classmethod
@@ -452,6 +507,139 @@ class EventInbox:
 
         result = sanitize(envelope)
         return result if isinstance(result, dict) else {}
+
+    def _admit(
+        self,
+        document: dict[str, Any],
+        *,
+        envelope: dict[str, Any],
+        event_id: str,
+        identity: str,
+        immutable_fingerprint: str,
+        attempts_limit: int,
+        available: datetime,
+        now: datetime,
+    ) -> dict[str, Any]:
+        events = document["events"]
+        dedupe_index = document["dedupe_index"]
+        received_at = self._delivery_received_at(envelope, now)
+        existing = events.get(event_id)
+        if isinstance(existing, dict):
+            existing_envelope = existing.get("envelope")
+            existing_fingerprint = str(existing.get("immutable_fingerprint") or "")
+            if existing_fingerprint:
+                matches = existing_fingerprint == immutable_fingerprint
+            else:
+                matches = self._canonical(
+                    self._immutable_projection(existing_envelope)
+                ) == self._canonical(self._immutable_projection(envelope))
+            if not matches:
+                raise EventInboxConflictError(
+                    f"event id {event_id} is already bound to a different envelope"
+                )
+            if not existing_fingerprint:
+                existing["immutable_fingerprint"] = immutable_fingerprint
+            delivery_count = self._record_delivery(existing, received_at=received_at)
+            return {
+                "status": "duplicate",
+                "event_id": event_id,
+                "envelope": copy.deepcopy(existing_envelope),
+                "delivery_count": delivery_count,
+            }
+
+        duplicate_id = str(dedupe_index.get(identity) or "")
+        duplicate = events.get(duplicate_id)
+        if duplicate_id and isinstance(duplicate, dict):
+            delivery_count = self._record_delivery(duplicate, received_at=received_at)
+            return {
+                "status": "duplicate",
+                "event_id": duplicate_id,
+                "duplicate_of": duplicate_id,
+                "envelope": copy.deepcopy(duplicate.get("envelope")),
+                "delivery_count": delivery_count,
+            }
+
+        evicted = self._prune_terminal(document, reserve=1)
+        events = document["events"]
+        dedupe_index = document["dedupe_index"]
+        if len(events) >= self.max_records:
+            raise EventInboxError(
+                "event inbox capacity is exhausted by active events; "
+                "consumer recovery or operator intervention is required"
+            )
+        record = {
+            "event_id": event_id,
+            "envelope": copy.deepcopy(envelope),
+            "dedupe_identity": identity,
+            "immutable_fingerprint": immutable_fingerprint,
+            "status": "pending",
+            "attempts": 0,
+            "max_attempts": attempts_limit,
+            "available_at": self._iso(available),
+            "enqueued_at": self._iso(now),
+            "first_received_at": received_at,
+            "last_received_at": received_at,
+            "delivery_count": 1,
+            "claimed_by": None,
+            "claimed_at": None,
+            "lease_expires_at": None,
+            "completed_by": None,
+            "completed_at": None,
+            "failed_by": None,
+            "failed_at": None,
+            "last_error": None,
+            "lease_expirations": 0,
+        }
+        events[event_id] = record
+        dedupe_index[identity] = event_id
+        document["events"] = events
+        document["dedupe_index"] = dedupe_index
+        return {
+            "status": "enqueued",
+            "event_id": event_id,
+            "envelope": copy.deepcopy(envelope),
+            "delivery_count": 1,
+            "evicted_terminal_event_ids": evicted,
+        }
+
+    @staticmethod
+    def _immutable_projection(envelope: Any) -> Any:
+        if not isinstance(envelope, dict):
+            return envelope
+        projected = copy.deepcopy(envelope)
+        projected.pop("received_at", None)
+        return projected
+
+    @classmethod
+    def _immutable_fingerprint(cls, envelope: dict[str, Any]) -> str:
+        canonical = cls._canonical(cls._immutable_projection(envelope))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _delivery_received_at(self, envelope: dict[str, Any], now: datetime) -> str:
+        received_at = str(envelope.get("received_at") or "").strip()
+        return received_at or self._iso(now)
+
+    @staticmethod
+    def _record_delivery(record: dict[str, Any], *, received_at: str) -> int:
+        existing_envelope = record.get("envelope")
+        original_received_at = (
+            str(existing_envelope.get("received_at") or "").strip()
+            if isinstance(existing_envelope, dict)
+            else ""
+        )
+        record["first_received_at"] = str(
+            record.get("first_received_at")
+            or original_received_at
+            or record.get("enqueued_at")
+            or received_at
+        )
+        record["last_received_at"] = received_at
+        try:
+            previous_count = max(1, int(record.get("delivery_count") or 1))
+        except (TypeError, ValueError):
+            previous_count = 1
+        record["delivery_count"] = previous_count + 1
+        return int(record["delivery_count"])
 
     def _recover_expired(
         self,

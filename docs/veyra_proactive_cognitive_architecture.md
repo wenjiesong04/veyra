@@ -2,7 +2,7 @@
 
 > 状态：目标架构与实施蓝图
 >
-> 基线：2026-07-25，代码基线 `f166b8551aa8`
+> 设计核验基线：2026-07-25，架构审计起点 `f166b8551aa8`；第一阶段实现起点 `57d985d`
 >
 > 适用范围：Veyra 本地控制面、选定 Agent Runtime、主动感知、长期任务、治理执行与学习闭环
 >
@@ -42,16 +42,22 @@ Veyra 更新世界状态、承诺、经验和下一次主动行为
 本文基线之后已经实现一个受控的“事件—情境候选”基础切片：
 
 - `VeyraEvent` 已扩展 observation、state change、task progress/completion、commitment due、component degraded 和 user feedback，并加入 correlation、causation、evidence、dedupe、时间与 privacy scope；
-- `EventInbox` 已提供有限持久去重、租约 claim、重试、崩溃恢复、用户边界、容量上限，以及只淘汰终态记录的保留策略；
+- `EventInbox` 已提供有限持久去重、租约 claim、重试、崩溃恢复、用户边界、容量上限，以及只淘汰终态记录的保留策略；同一事件重投把 transport `received_at` 作为 delivery metadata，不再误判为业务冲突；
+- foreground shadow admission 与 claim 已合并为一次原子状态变更，并始终返回 dedupe 后的 canonical event identity，后台消费者不能再从两步操作之间抢走事件；
 - EventInbox 会递归最小化常见自由文本和 secret-like 字段；默认不会再保存消息原文或可用于短文本反推的无盐摘要；
 - `SituationEvaluator` 当前把每个事件投影为一个 `situation_candidate`，并关联用户、会话、目标、承诺、证据、显著性、决策和结果；它还不是多事件聚合的 Situation Engine；
+- 同源精确 replay 是 state/trace no-op；同源信息更新可以增加 observation revision，但不能把已终结 Situation 重新变成 due；
+- Situation 状态转换和完整 trace entry 先在同一个 JSON 状态变更中进入有条目数、单条序列化字节数和总字节数上限的 durable outbox，再投递到 append-only JSONL；append 前失败和 append 后、ack 前中断都可按确定性 `transition_id` 修复且不重复，持续故障达到上限时会在未审计转换提交前施加背压；
+- foreground decision 与 outcome 通过稳定 resolution key 在一次状态变更中原子提交；临时失败可立即重试，重复 delivery 可以修复未完成 resolution，但不会重复 lifecycle history；
+- `situation_trace` 有 pending outbox 时 retention 必须延期；先完成 append/ack 去重，再 archive-before-truncate，避免已归档 transition 被恢复逻辑重复补写；
 - 默认 `record_only` 模式只在 foreground turn 做一次有界 admission，情境候选投影由 `ActiveRuntimeLoop` 后台完成；显式 `shadow` 模式只用于评测完整生命周期；
 - `disabled / record_only / shadow` 可以通过本地控制 API 切换，默认 `record_only`，并且公开响应不新增 Situation artifact；
 - 入站 evidence ref 一律是非事实指针；只有解析到同一事件的持久 `execution_trace`、验证状态和证据后，enclosing outcome 才能成为 factual outcome；
 - Situation/Event Inbox 调试读取必须显式提供 `user_id`，通用 `/state` 不返回这些集合；这只防止无意枚举，当前 loopback 管理面尚未把认证身份绑定到 user_id，不能宣传为安全多租户 API；
-- 已增加故障注入、伪造 trace、跨用户、后台 tick、崩溃租约和响应等价 smoke。当前机器 100 次短问候测得：`disabled` 中位数约 4.9 ms、默认 `record_only` 约 7.9 ms，增加约 3.0 ms；同步完整 `shadow` 约 48.7 ms，因此不作为默认生产路径。
+- 已增加故障注入、伪造 trace、跨用户、后台 tick、组合崩溃恢复、并发 claim、专属 trace retention，以及 direct/probe/agent/ask-user/review 全路由响应等价 smoke；最终本机 30 次/路由/模式样本中 `record_only` 相对 `disabled` 的 p50 增量为 1.240–1.956 ms、p95 增量为 1.853–2.730 ms，完整 `shadow` 的 p50 增量为 19.127–25.701 ms、p95 增量为 31.809–39.803 ms。该 wall-clock benchmark 可复跑但只作诊断，不作为 CI 硬阈值；
+- 当前生产接线只自动把 user-message intake 发布到 EventInbox；其余扩展事件类型已有 envelope、admission 和测试契约，但仍需要各 component/task/commitment 的真实 producer 显式调用 `publish_event()`，不能宣传为已接通的事件源。
 
-这意味着第一阶段解决的是“事件先可靠进入、关系可以在后台投影、事实不能由模型或 artifact 自我认证”的基础问题。它**尚未**实现无限历史、长期 dedupe tombstone、多事件 Situation 聚合、主动决策、Attention 调度、Durable Case、Veyra-Agent 多轮协商、真实 pre-tool enforcement 或自动自愈；这些能力必须按后续阶段和非弱化门槛逐步启用。
+这意味着 Phase 1 已完成“事件先可靠进入、关系可以在后台投影、失败可恢复且可审计、事实不能由模型或 artifact 自我认证”的有界基础切片。它**尚未**实现无限历史、长期 dedupe tombstone、多事件 Situation 聚合、主动决策、Attention 调度、Durable Case、Veyra-Agent 多轮协商、真实 pre-tool enforcement 或自动自愈；这些能力必须按后续阶段和非弱化门槛逐步启用。
 
 ## 2. “像贾维斯”在本项目中的可实现含义
 
@@ -1304,15 +1310,18 @@ apps/openclaw/veyra-governance/
 
 - `disabled / record_only / shadow` 控制；
 - 默认 foreground 单次 admission、后台候选投影；
-- 有界 inbox、租约、重试和崩溃恢复；
+- 有界 inbox、原子 foreground admission+claim、租约、重投 delivery metadata、重试和崩溃恢复；
+- terminal replay 单调、exact replay 幂等，以及 state+trace outbox 组合恢复；
 - inference/prediction/evidence ref 不可自我升级为事实；
 - 持久 execution trace 绑定后才允许 factual outcome；
-- 主响应等价、故障 fail-open、短消息延迟基线。
+- direct/probe/agent/ask-user/review 主响应等价、故障 fail-open、分路由 p50/p95 诊断；
+- `situation_trace.jsonl` 专属 dry-run、archive-before-truncate、gzip 归档与顺序完整性验收。
 
 `PARTIAL`：
 
 - canonical event 字段已经落地，但显式 `schema_version / reliability / sensitivity` 尚未加入 envelope；
 - inspect 已按调用参数 `user_id/session_id` 做逻辑过滤，但身份尚未从认证上下文派生，因此不是安全多租户隔离。
+- 非 user-message 事件类型尚未接入真实 component/task/commitment producer；只有显式 `publish_event()` 调用和测试覆盖。
 
 本切片没有执行权，不创建主动建议。
 
@@ -1381,8 +1390,8 @@ Phase 1–2 的新链严格 `record_only / shadow / read-only / sandbox`。任�
 
 ### Phase 1：有界 EventInbox + SituationCandidate
 
-- 完成本次 record-only/background projection 基础；
-- 增加组合级崩溃恢复、更多 route 等价矩阵和专属 trace retention；
+- 已完成 record-only/background projection 基础；
+- 已完成组合级崩溃恢复、全路由等价矩阵、可复跑分路由 p50/p95 诊断和专属 trace retention；
 - 不创建主动建议，不获得执行权。
 
 ### Phase 2：单一 Project Guardian + Attention

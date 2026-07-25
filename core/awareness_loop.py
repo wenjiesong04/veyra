@@ -183,7 +183,9 @@ class AwarenessLoop:
             {
                 "phase": "event_fabric_shadow",
                 "status": shadow_intake.get("status", "unavailable"),
+                "event_id": shadow_intake.get("event_id"),
                 "situation_id": shadow_intake.get("situation_id"),
+                "finalize_allowed": bool(shadow_intake.get("finalize_allowed")),
             }
         )
 
@@ -774,7 +776,26 @@ class AwarenessLoop:
             "final_route": trace["final_route"],
         }
         try:
-            self.event_awareness.finalize(event, result, trace)
+            shadow_entry = next(
+                (
+                    entry
+                    for entry in reversed(route_trace)
+                    if entry.get("phase") == "event_fabric_shadow"
+                ),
+                {},
+            )
+            if shadow_entry.get("finalize_allowed"):
+                self.event_awareness.finalize(
+                    event,
+                    result,
+                    trace,
+                    situation_id=(
+                        str(shadow_entry.get("situation_id") or "") or None
+                    ),
+                    canonical_event_id=(
+                        str(shadow_entry.get("event_id") or "") or None
+                    ),
+                )
         except Exception:
             # Event/situation projection is observational. It must never make an
             # otherwise completed user turn fail.

@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import gzip
+import json
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event, Thread
 from typing import Any
 
 from fastapi import FastAPI
@@ -16,11 +20,21 @@ if str(ROOT) not in sys.path:
 from core.awareness_loop import AwarenessLoop  # noqa: E402
 from core.definitions import RiskLevel  # noqa: E402
 from core.runtime_entity import RuntimeEntity  # noqa: E402
+from core.situation_evaluator import SituationEvaluator  # noqa: E402
+from core.understanding_core import TurnUnderstanding  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
+from interface.agent_adapter import AgentAdapter, ExecutionResult  # noqa: E402
 from interface.event_normalizer import EventNormalizer  # noqa: E402
-from interface.event_schema import EventType, LoopResult, Route  # noqa: E402
+from interface.event_schema import (  # noqa: E402
+    Decision,
+    EventType,
+    LoopResult,
+    Route,
+    VeyraTaskPacket,
+)
 from routers.debug_audit import build_debug_audit_router  # noqa: E402
 from runtime.active_loop import ActiveRuntimeLoop  # noqa: E402
+from runtime.retention_policy import RetentionPolicy  # noqa: E402
 
 
 def expect(condition: bool, label: str, detail: Any = None) -> None:
@@ -43,6 +57,267 @@ def build_loop(root: Path, *, mode: str = "shadow") -> AwarenessLoop:
         ),
     )
     return AwarenessLoop(store, RuntimeEntity(store))
+
+
+@dataclass(frozen=True, slots=True)
+class OfflineRouteCase:
+    case_id: str
+    text: str
+    route: Route
+    risk_level: RiskLevel
+    expected_status: str
+    response: str | None
+    selected_probe: str | None = None
+
+
+OFFLINE_ROUTE_CASES = (
+    OfflineRouteCase(
+        case_id="direct",
+        text="Explain the offline fixture with sufficient context.",
+        route=Route.DIRECT_ANSWER,
+        risk_level=RiskLevel.R0,
+        expected_status="success",
+        response="Offline direct answer.",
+    ),
+    OfflineRouteCase(
+        case_id="probe",
+        text="Read the offline fixture status.",
+        route=Route.PROBE,
+        risk_level=RiskLevel.R1,
+        expected_status="verified_success",
+        response="Offline probe observation.",
+        selected_probe="system",
+    ),
+    OfflineRouteCase(
+        case_id="agent",
+        text="Analyze the offline fixture and return a bounded plan.",
+        route=Route.AGENT,
+        risk_level=RiskLevel.R1,
+        expected_status="partially_success",
+        response="Offline Agent returned a bounded plan.",
+    ),
+    OfflineRouteCase(
+        case_id="ask_user",
+        text="Use the referenced target.",
+        route=Route.ASK_USER,
+        risk_level=RiskLevel.R0,
+        expected_status="needs_user_input",
+        response=None,
+    ),
+    OfflineRouteCase(
+        case_id="human_review",
+        text="Apply the offline fixture change after review.",
+        route=Route.HUMAN_REVIEW,
+        risk_level=RiskLevel.R3,
+        expected_status="needs_confirmation",
+        response=None,
+    ),
+)
+
+
+class OfflineModelClient:
+    """Fail-fast model boundary for route equivalence and latency diagnostics."""
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "enabled": False,
+            "configured": False,
+            "status": "isolated_for_event_awareness_validation",
+            "decision_mode": "disabled",
+        }
+
+    def complete_json(self, *, system: str, user: str, purpose: str) -> dict[str, Any]:
+        del system, user
+        return {
+            "status": "disabled_for_event_awareness_validation",
+            "purpose": purpose,
+        }
+
+
+class OfflineProbe:
+    def run(self, text: str = "", **kwargs: Any) -> dict[str, Any]:
+        del text, kwargs
+        return {
+            "probe": "system",
+            "source": "offline_fixture",
+            "target": "offline-system",
+            "observed_at": "2026-01-01T00:00:00+00:00",
+            "status": "ok",
+            "summary": "Offline probe observation.",
+            "confidence": 1.0,
+            "ttl_seconds": 60,
+            "details": {"fixture": True},
+        }
+
+
+@dataclass
+class OfflineAgentAdapter(AgentAdapter):
+    executor: str = "offline-agent"
+    sent_packets: list[dict[str, Any]] = field(default_factory=list)
+
+    def send_task(self, task_packet: VeyraTaskPacket) -> ExecutionResult:
+        self.sent_packets.append(task_packet.to_dict())
+        return ExecutionResult(
+            task_id=task_packet.task_id,
+            executor=self.executor,
+            status="success",
+            result="Offline Agent returned a bounded plan.",
+            raw={
+                "agent_response": {
+                    "answer_or_plan": "Offline Agent returned a bounded plan.",
+                    "proposed_actions": [],
+                },
+                "offline_fixture": True,
+            },
+        )
+
+    def fetch_task_status(self, task_id: str) -> ExecutionResult:
+        return ExecutionResult(
+            task_id=task_id,
+            executor=self.executor,
+            status="success",
+            result="Offline Agent returned a bounded plan.",
+            raw={"offline_fixture": True},
+        )
+
+    def fetch_capabilities(self) -> dict[str, Any]:
+        return {
+            "runtime": self.executor,
+            "status": "available",
+            "connected": True,
+            "offline_fixture": True,
+        }
+
+    def connection_status(self) -> dict[str, Any]:
+        return self.fetch_capabilities()
+
+    def fetch_memory_summary(self, session_id: str) -> dict[str, Any]:
+        return {
+            "session_id": session_id,
+            "summary": "",
+            "freshness": "fresh",
+            "trust": "offline_fixture",
+        }
+
+
+def offline_result_signature(result: LoopResult) -> dict[str, str]:
+    return {
+        "route": result.route.value,
+        "status": result.status,
+        "response": result.response,
+        "risk_level": result.risk_level.value,
+    }
+
+
+def build_offline_route_loop(
+    root: Path,
+    *,
+    mode: str,
+    case: OfflineRouteCase,
+) -> AwarenessLoop:
+    """Build the real turn pipeline with every external boundary replaced locally."""
+
+    loop = build_loop(root, mode=mode)
+    loop.core_reasoning.client = OfflineModelClient()  # type: ignore[assignment]
+    selected_agent = loop.agent_registry.selected_name()
+    loop.agent_registry._adapters[selected_agent] = OfflineAgentAdapter()
+    loop.agent_adapter = loop.agent_registry.selected()
+    loop.probes["system"] = OfflineProbe()
+
+    def fixed_understanding(**kwargs: Any) -> TurnUnderstanding:
+        del kwargs
+        return TurnUnderstanding(
+            intent="offline_validation",
+            task_summary=case.text,
+            user_goal=case.text,
+            what_user_really_needs="validate event awareness non-interference",
+            task_type="offline_validation",
+            explicit_request=case.text,
+            hidden_need="validate event awareness non-interference",
+            suggested_mode=case.route.value,
+            confidence=1.0,
+            reason="scripted offline fixture",
+            source="offline_fixture",
+        )
+
+    def fixed_decision(*args: Any, **kwargs: Any) -> Decision:
+        del args, kwargs
+        semantic_policy = {
+            "preferred_route": case.route.value,
+            "requires_clarification": case.route == Route.ASK_USER,
+            "clarification_reason": (
+                "the referenced target is unresolved"
+                if case.route == Route.ASK_USER
+                else ""
+            ),
+            "selected_probe": case.selected_probe,
+            "allowed_capabilities": (
+                ["system_probe"]
+                if case.route == Route.PROBE
+                else ["selected_agent_runtime"]
+                if case.route == Route.AGENT
+                else ["native_answer"]
+                if case.route == Route.DIRECT_ANSWER
+                else ["human_review"]
+                if case.route == Route.HUMAN_REVIEW
+                else ["ask_user"]
+            ),
+            "allowed_effects": (
+                ["agent.execute"]
+                if case.route == Route.AGENT
+                else []
+            ),
+            "denied_effects": [],
+        }
+        return Decision(
+            route=case.route,
+            risk_level=case.risk_level,
+            reason="scripted offline event awareness validation",
+            requires_confirmation=case.route == Route.HUMAN_REVIEW,
+            selected_probe=case.selected_probe,
+            intent="offline_validation",
+            complexity="complex" if case.route == Route.AGENT else "simple",
+            capability=(
+                "selected_agent_runtime"
+                if case.route == Route.AGENT
+                else "probe"
+                if case.route == Route.PROBE
+                else "human_review"
+                if case.route == Route.HUMAN_REVIEW
+                else "ask_user"
+                if case.route == Route.ASK_USER
+                else "native_answer"
+            ),
+            needs_probe=case.route == Route.PROBE,
+            needs_agent=case.route == Route.AGENT,
+            needs_user_confirmation=case.route == Route.HUMAN_REVIEW,
+            memory_policy="forget",
+            reasoning_mode=(
+                "execution"
+                if case.route in {Route.AGENT, Route.HUMAN_REVIEW}
+                else "direct"
+            ),
+            required_capabilities=list(semantic_policy["allowed_capabilities"]),
+            model_assist={
+                "status": "offline_fixture",
+                "draft_response": case.response,
+                "semantic_policy": semantic_policy,
+            },
+        )
+
+    loop.understanding_core.build = fixed_understanding  # type: ignore[method-assign]
+    loop.decision_core.decide = fixed_decision  # type: ignore[method-assign]
+    loop._direct_answer = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: str(case.response or "")
+    )
+    loop._low_latency_short_response = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    loop._conversation_followup_result = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    loop._early_awareness_response = lambda *args, **kwargs: {}  # type: ignore[method-assign]
+    loop._process_commitment_turn = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    loop._sync_user_awareness_from_text = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    loop._persist_conversation_slots = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    loop._render_final_user_messages = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    return loop
 
 
 class HealthyRuntimeDependency:
@@ -182,11 +457,17 @@ def test_user_turn_shadow_equivalence(base: Path) -> None:
             raise OSError("injected alert storage failure")
         original_append(name, payload)
 
-    def fail_enqueue(event: Any, **kwargs: Any) -> dict[str, Any]:
+    def fail_enqueue_and_claim(
+        event: Any,
+        consumer_id: str,
+        lease_seconds: float = 60.0,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del event, consumer_id, lease_seconds, kwargs
         raise OSError("injected inbox failure")
 
     failing.state_store.append_jsonl = fail_alert_only  # type: ignore[method-assign]
-    failing.event_awareness.event_inbox.enqueue = fail_enqueue  # type: ignore[method-assign]
+    failing.event_awareness.event_inbox.enqueue_and_claim = fail_enqueue_and_claim  # type: ignore[method-assign]
     failure_event = normalizer.user_message(
         "你好",
         "api",
@@ -250,6 +531,371 @@ def test_user_turn_shadow_equivalence(base: Path) -> None:
     )
 
 
+def test_offline_route_equivalence_matrix(base: Path) -> None:
+    normalizer = EventNormalizer()
+    modes = ("disabled", "record_only", "shadow")
+    matrix: list[dict[str, Any]] = []
+    for case in OFFLINE_ROUTE_CASES:
+        signatures: dict[str, dict[str, str]] = {}
+        loops: dict[str, AwarenessLoop] = {}
+        for mode in modes:
+            loop = build_offline_route_loop(
+                base / case.case_id / mode,
+                mode=mode,
+                case=case,
+            )
+            event = normalizer.user_message(
+                case.text,
+                "offline-matrix",
+                "matrix-user",
+                f"matrix-{case.case_id}",
+                event_id=f"evt_matrix_{case.case_id}_{mode}",
+                correlation_id=f"corr-matrix-{case.case_id}",
+            )
+            result = loop.handle_event(event)
+            signatures[mode] = offline_result_signature(result)
+            loops[mode] = loop
+
+        baseline = signatures["disabled"]
+        expect(
+            baseline["route"] == case.route.value
+            and baseline["status"] == case.expected_status
+            and bool(baseline["response"])
+            and (case.response is None or baseline["response"] == case.response)
+            and baseline["risk_level"] == case.risk_level.value,
+            f"{case.case_id} offline fixture exercises its intended route",
+            baseline,
+        )
+        expect(
+            signatures["record_only"] == baseline
+            and signatures["shadow"] == baseline,
+            f"{case.case_id} disabled, record-only, and shadow outputs are equivalent",
+            signatures,
+        )
+        expect(
+            loops["disabled"].event_inbox.stats().get("total") == 0
+            and loops["record_only"].event_inbox.stats().get("pending") == 1
+            and loops["shadow"].event_inbox.stats().get("completed") == 1,
+            f"{case.case_id} mode changes observation state only",
+            {
+                mode: loop.event_inbox.stats()
+                for mode, loop in loops.items()
+            },
+        )
+        matrix.append({"case": case.case_id, "signatures": signatures})
+
+    expect(
+        len(matrix) == len(OFFLINE_ROUTE_CASES),
+        "offline equivalence matrix covers direct, probe, Agent, ask-user, and review",
+        matrix,
+    )
+
+
+def test_situation_trace_retention(base: Path) -> None:
+    store = WorldStateStore(
+        base / "situation-trace-retention",
+        exclusive_writer=True,
+        writer_owner="situation-trace-retention",
+    )
+    seeded = [
+        {
+            "trace_type": "situation_observed",
+            "schema_version": "veyra.situation_trace.v1",
+            "situation_id": f"sit_retention_{index}",
+            "sequence": index,
+        }
+        for index in range(8)
+    ]
+    for row in seeded:
+        store.append_jsonl("situation_trace.jsonl", row)
+
+    policy = RetentionPolicy(store, limits={"situation_trace.jsonl": 3})
+    summary_row = next(
+        item
+        for item in policy.summary()["files"]
+        if item["file"] == "situation_trace.jsonl"
+    )
+    before = store.path_for("situation_trace.jsonl").read_bytes()
+    preview = policy.enforce(dry_run=True)
+    preview_row = next(
+        item
+        for item in preview["files"]
+        if item["file"] == "situation_trace.jsonl"
+    )
+    expect(
+        "situation_trace.jsonl" in RetentionPolicy.DEFAULT_LIMITS
+        and summary_row["target_limit"] == 3
+        and summary_row["status"] == "over_limit"
+        and preview_row["status"] == "would_rotate"
+        and store.path_for("situation_trace.jsonl").read_bytes() == before
+        and not (store.root / preview_row["archive_path"]).exists(),
+        "situation trace retention preview is explicit and non-mutating",
+        {"summary": summary_row, "preview": preview_row},
+    )
+
+    enforced = policy.enforce()
+    enforced_row = next(
+        item
+        for item in enforced["files"]
+        if item["file"] == "situation_trace.jsonl"
+    )
+    retained = store.read_jsonl("situation_trace.jsonl", limit=20)
+    archive_path = store.root / enforced_row["archive_path"]
+    with gzip.open(archive_path, "rt", encoding="utf-8") as handle:
+        archived = [
+            json.loads(line)
+            for line in handle.read().splitlines()
+            if line.strip()
+        ]
+    expect(
+        enforced_row["status"] == "rotated"
+        and enforced_row["archive_compression"] == "gzip"
+        and enforced_row["pruned_entries"] == 5
+        and [row["sequence"] for row in retained] == [5, 6, 7]
+        and [row["sequence"] for row in archived] == [0, 1, 2, 3, 4]
+        and [row["sequence"] for row in archived + retained] == list(range(8))
+        and all(
+            row["schema_version"] == "veyra.situation_trace.v1"
+            for row in archived + retained
+        ),
+        "situation trace archives before truncation and preserves ordered lifecycle history",
+        {
+            "rotation": enforced_row,
+            "archived": archived,
+            "retained": retained,
+        },
+    )
+
+
+def test_retention_defers_pending_trace_outbox(base: Path) -> None:
+    store = WorldStateStore(
+        base / "pending-outbox-retention",
+        exclusive_writer=True,
+        writer_owner="pending-outbox-retention",
+    )
+    evaluator = SituationEvaluator(store)
+    event = EventNormalizer().normalize(
+        EventType.OBSERVATION,
+        {"component": "retention-recovery-fixture"},
+        channel="runtime",
+        user_id="retention-user",
+        session_id="retention-session",
+        event_id="evt_retention_pending_outbox",
+        correlation_id="corr-retention-pending-outbox",
+    )
+    original_append = store.append_jsonl
+    interrupted = False
+
+    def interrupt_after_trace_append(
+        name: str,
+        payload: dict[str, Any],
+    ) -> None:
+        nonlocal interrupted
+        original_append(name, payload)
+        if name == "situation_trace.jsonl" and not interrupted:
+            interrupted = True
+            raise OSError("injected interruption before trace outbox ack")
+
+    store.append_jsonl = interrupt_after_trace_append  # type: ignore[method-assign]
+    try:
+        evaluator.observe(event)
+    finally:
+        store.append_jsonl = original_append  # type: ignore[method-assign]
+    pending_state = store.read_json("situation_state.json")
+    pending_entry = pending_state.get("trace_outbox", [])[0]
+    pending_transition_id = str(pending_entry.get("transition_id") or "")
+    for index in range(7):
+        store.append_jsonl(
+            "situation_trace.jsonl",
+            {
+                "schema_version": "veyra.situation_trace.v1",
+                "transition_id": f"sitxn_retention_fixture_{index}",
+                "trace_type": "situation_observed",
+                "sequence": index,
+            },
+        )
+
+    policy = RetentionPolicy(store, limits={"situation_trace.jsonl": 3})
+    before = store.path_for("situation_trace.jsonl").read_bytes()
+    deferred = policy.enforce()
+    deferred_row = next(
+        item
+        for item in deferred["files"]
+        if item["file"] == "situation_trace.jsonl"
+    )
+    expect(
+        interrupted
+        and pending_state.get("trace_outbox_count") == 1
+        and deferred_row.get("status") == "deferred_pending_outbox"
+        and deferred_row.get("pending_trace_outbox") == 1
+        and store.path_for("situation_trace.jsonl").read_bytes() == before,
+        "retention cannot rotate a trace that still awaits outbox acknowledgement",
+        {
+            "state": pending_state,
+            "retention": deferred_row,
+        },
+    )
+
+    repair = evaluator.flush_trace_outbox()
+    enforced = policy.enforce()
+    enforced_row = next(
+        item
+        for item in enforced["files"]
+        if item["file"] == "situation_trace.jsonl"
+    )
+    live = store.read_jsonl("situation_trace.jsonl", limit=20)
+    archive_path = store.root / enforced_row["archive_path"]
+    with gzip.open(archive_path, "rt", encoding="utf-8") as handle:
+        archived = [
+            json.loads(line)
+            for line in handle.read().splitlines()
+            if line.strip()
+        ]
+    all_rows = archived + live
+    expect(
+        repair.get("deduplicated") == 1
+        and repair.get("pending") == 0
+        and enforced_row.get("status") == "rotated"
+        and sum(
+            row.get("transition_id") == pending_transition_id
+            for row in all_rows
+        )
+        == 1,
+        "outbox acknowledgement precedes retention and preserves one transition",
+        {
+            "repair": repair,
+            "retention": enforced_row,
+            "transition_id": pending_transition_id,
+            "rows": all_rows,
+        },
+    )
+
+
+def test_retention_rotation_is_atomic_with_trace_delivery(base: Path) -> None:
+    store = WorldStateStore(
+        base / "atomic-retention",
+        exclusive_writer=True,
+        writer_owner="atomic-retention",
+    )
+    for index in range(8):
+        store.append_jsonl(
+            "situation_trace.jsonl",
+            {
+                "schema_version": "veyra.situation_trace.v1",
+                "transition_id": f"sitxn_atomic_retention_seed_{index}",
+                "trace_type": "situation_observed",
+                "sequence": index,
+            },
+        )
+    evaluator = SituationEvaluator(store)
+    event = EventNormalizer().normalize(
+        EventType.OBSERVATION,
+        {"component": "atomic-retention-fixture"},
+        channel="runtime",
+        user_id="atomic-retention-user",
+        session_id="atomic-retention-session",
+        event_id="evt_atomic_retention",
+        correlation_id="corr-atomic-retention",
+    )
+    original_append = store.append_jsonl
+    original_rotate = store.rotate_jsonl
+    worker_started = Event()
+    worker_finished = Event()
+    worker_threads: list[Thread] = []
+    blocked_while_locked = False
+    interrupted = False
+
+    def interrupt_target_after_append(
+        name: str,
+        payload: dict[str, Any],
+    ) -> None:
+        nonlocal interrupted
+        original_append(name, payload)
+        if (
+            name == "situation_trace.jsonl"
+            and payload.get("source_event_id") == event.event_id
+            and not interrupted
+        ):
+            interrupted = True
+            raise OSError("injected concurrent interruption before ack")
+
+    def observe_during_rotation() -> None:
+        worker_started.set()
+        evaluator.observe(event)
+        worker_finished.set()
+
+    def rotate_with_concurrent_delivery(
+        name: str,
+        *,
+        limit: int,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        nonlocal blocked_while_locked
+        if name == "situation_trace.jsonl":
+            worker = Thread(
+                target=observe_during_rotation,
+                name="atomic-retention-observer",
+                daemon=True,
+            )
+            worker_threads.append(worker)
+            worker.start()
+            worker_started.wait(timeout=2)
+            blocked_while_locked = not worker_finished.wait(timeout=0.05)
+        return original_rotate(name, limit=limit, dry_run=dry_run)
+
+    store.append_jsonl = interrupt_target_after_append  # type: ignore[method-assign]
+    store.rotate_jsonl = rotate_with_concurrent_delivery  # type: ignore[method-assign]
+    try:
+        policy = RetentionPolicy(
+            store,
+            limits={"situation_trace.jsonl": 3},
+        )
+        enforced = policy.enforce()
+    finally:
+        store.rotate_jsonl = original_rotate  # type: ignore[method-assign]
+        for worker in worker_threads:
+            worker.join(timeout=5)
+        store.append_jsonl = original_append  # type: ignore[method-assign]
+
+    enforced_row = next(
+        item
+        for item in enforced["files"]
+        if item["file"] == "situation_trace.jsonl"
+    )
+    pending_state = store.read_json("situation_state.json")
+    pending_entry = pending_state.get("trace_outbox", [])[0]
+    transition_id = str(pending_entry.get("transition_id") or "")
+    repair = evaluator.flush_trace_outbox()
+    live = store.read_jsonl("situation_trace.jsonl", limit=20)
+    archive_path = store.root / enforced_row["archive_path"]
+    with gzip.open(archive_path, "rt", encoding="utf-8") as handle:
+        archived = [
+            json.loads(line)
+            for line in handle.read().splitlines()
+            if line.strip()
+        ]
+    expect(
+        blocked_while_locked
+        and worker_finished.is_set()
+        and interrupted
+        and enforced_row.get("status") == "rotated"
+        and pending_state.get("trace_outbox_count") == 1
+        and repair.get("deduplicated") == 1
+        and sum(
+            row.get("transition_id") == transition_id
+            for row in archived + live
+        )
+        == 1,
+        "retention check and rotation serialize against concurrent trace delivery",
+        {
+            "retention": enforced_row,
+            "pending_state": pending_state,
+            "repair": repair,
+            "transition_id": transition_id,
+        },
+    )
+
+
 def test_default_record_only_contract(base: Path) -> None:
     store = WorldStateStore(
         base / "default-record-only",
@@ -275,6 +921,246 @@ def test_default_record_only_contract(base: Path) -> None:
             "mode": loop.event_awareness.mode,
             "result": result.to_dict(),
             "inbox": loop.event_inbox.get_record(event.event_id),
+        },
+    )
+
+
+def test_shadow_foreground_atomic_claim(base: Path) -> None:
+    loop = build_loop(base / "atomic-foreground", mode="shadow")
+    event = EventNormalizer().user_message(
+        "foreground atomic claim fixture",
+        "offline-race",
+        "atomic-user",
+        "atomic-session",
+        event_id="evt_atomic_foreground",
+    )
+    original_atomic = loop.event_inbox.enqueue_and_claim
+    atomic_calls: list[dict[str, Any]] = []
+    background_claims: list[dict[str, Any] | None] = []
+
+    def atomic_with_background_probe(
+        incoming: Any,
+        consumer_id: str,
+        lease_seconds: float = 60.0,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        admission = original_atomic(
+            incoming,
+            consumer_id,
+            lease_seconds,
+            **kwargs,
+        )
+        atomic_calls.append(admission)
+        # The atomic mutation has returned, but foreground still has not
+        # observed or completed the event. A background consumer must not be
+        # able to acquire the already-leased record in this window.
+        background_claims.append(
+            loop.event_inbox.claim(
+                "awareness-shadow-background-race",
+                lease_seconds=60,
+            )
+        )
+        return admission
+
+    def legacy_split_call_forbidden(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise AssertionError("shadow foreground used legacy split enqueue/claim")
+
+    loop.event_inbox.enqueue_and_claim = atomic_with_background_probe  # type: ignore[method-assign]
+    loop.event_inbox.enqueue = legacy_split_call_forbidden  # type: ignore[method-assign]
+    loop.event_inbox.claim_by_id = legacy_split_call_forbidden  # type: ignore[method-assign]
+    observed = loop.event_awareness.begin(event)
+    record = loop.event_inbox.get_record(event.event_id)
+    expect(
+        len(atomic_calls) == 1
+        and atomic_calls[0].get("claimed") is True
+        and background_claims == [None]
+        and observed.get("status") == "observed"
+        and isinstance(record, dict)
+        and record.get("status") == "completed"
+        and record.get("attempts") == 1,
+        "shadow foreground atomically admits and claims before background can race",
+        {
+            "admission": atomic_calls,
+            "background_claims": background_claims,
+            "observed": observed,
+            "record": record,
+        },
+    )
+
+
+def test_duplicate_foreground_skips_finalize(base: Path) -> None:
+    loop = build_loop(base / "duplicate-foreground", mode="shadow")
+    event = EventNormalizer().user_message(
+        "你好",
+        "api",
+        "duplicate-user",
+        "duplicate-session",
+        event_id="evt_duplicate_foreground",
+        correlation_id="corr-duplicate-foreground",
+    )
+    first = loop.handle_event(event)
+    first_situation = loop.situation_evaluator.list(
+        user_id="duplicate-user",
+        session_id="duplicate-session",
+        correlation_id="corr-duplicate-foreground",
+    )[0]
+    second = loop.handle_event(event)
+    second_situation = loop.situation_evaluator.list(
+        user_id="duplicate-user",
+        session_id="duplicate-session",
+        correlation_id="corr-duplicate-foreground",
+    )[0]
+    record = loop.event_inbox.get_record(event.event_id)
+    expect(
+        offline_result_signature(first) == offline_result_signature(second)
+        and isinstance(record, dict)
+        and record.get("status") == "completed"
+        and record.get("delivery_count") == 2
+        and len(first_situation.get("decision_history") or []) == 1
+        and len(first_situation.get("outcome_history") or []) == 1
+        and len(second_situation.get("decision_history") or []) == 1
+        and len(second_situation.get("outcome_history") or []) == 1,
+        "duplicate foreground delivery does not finalize the same outcome twice",
+        {
+            "first": first.to_dict(),
+            "second": second.to_dict(),
+            "record": record,
+            "situation": second_situation,
+        },
+    )
+
+
+def test_duplicate_foreground_repairs_failed_resolution(base: Path) -> None:
+    loop = build_loop(base / "duplicate-resolution-repair", mode="shadow")
+    event = EventNormalizer().user_message(
+        "你好",
+        "api",
+        "resolution-repair-user",
+        "resolution-repair-session",
+        event_id="evt_resolution_repair",
+        correlation_id="corr-resolution-repair",
+    )
+    original_resolution = loop.situation_evaluator.record_resolution
+    attempts = 0
+
+    def fail_first_finalize_attempts(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise OSError("injected resolution persistence failure")
+        return original_resolution(*args, **kwargs)
+
+    loop.situation_evaluator.record_resolution = fail_first_finalize_attempts  # type: ignore[method-assign]
+    first = loop.handle_event(event)
+    incomplete = loop.situation_evaluator.list(
+        user_id="resolution-repair-user",
+        session_id="resolution-repair-session",
+        correlation_id="corr-resolution-repair",
+    )[0]
+    second = loop.handle_event(event)
+    repaired = loop.situation_evaluator.list(
+        user_id="resolution-repair-user",
+        session_id="resolution-repair-session",
+        correlation_id="corr-resolution-repair",
+    )[0]
+    expect(
+        offline_result_signature(first) == offline_result_signature(second)
+        and attempts == 3
+        and len(incomplete.get("decision_history") or []) == 0
+        and len(incomplete.get("outcome_history") or []) == 0
+        and len(repaired.get("decision_history") or []) == 1
+        and len(repaired.get("outcome_history") or []) == 1,
+        "duplicate foreground delivery repairs an atomic resolution that previously failed",
+        {
+            "attempts": attempts,
+            "incomplete": incomplete,
+            "repaired": repaired,
+        },
+    )
+
+
+def test_background_trace_failure_recovery(base: Path) -> None:
+    loop = build_loop(base / "trace-recovery", mode="record_only")
+    event = EventNormalizer().normalize(
+        EventType.COMPONENT_DEGRADED,
+        {
+            "component": "offline-trace-fixture",
+            "observed_status": "degraded",
+            "salience_components": {"impact": 0.7},
+        },
+        channel="runtime",
+        user_id="trace-recovery-user",
+        session_id="trace-recovery-session",
+        event_id="evt_trace_recovery",
+        correlation_id="corr-trace-recovery",
+    )
+    admitted = loop.publish_event(event)
+    original_append = loop.state_store.append_jsonl
+    injected_failures = 0
+
+    def fail_first_situation_trace(name: str, payload: dict[str, Any]) -> None:
+        nonlocal injected_failures
+        if name == "situation_trace.jsonl" and injected_failures == 0:
+            injected_failures += 1
+            raise OSError("injected transient situation trace append failure")
+        original_append(name, payload)
+
+    loop.state_store.append_jsonl = fail_first_situation_trace  # type: ignore[method-assign]
+    try:
+        first = loop.process_event_inbox(limit=1)
+    finally:
+        loop.state_store.append_jsonl = original_append  # type: ignore[method-assign]
+    first_record = loop.event_inbox.get_record(event.event_id)
+    pending_state = loop.state_store.read_json("situation_state.json")
+    pending_trace = loop.state_store.read_jsonl("situation_trace.jsonl", limit=20)
+    expect(
+        admitted.get("status") == "enqueued"
+        and injected_failures == 1
+        and first.get("processed_count") == 1
+        and first.get("failed_count") == 0
+        and isinstance(first_record, dict)
+        and first_record.get("status") == "completed"
+        and pending_state.get("trace_outbox_count") == 1
+        and pending_trace == [],
+        "trace append failure completes durable state while retaining a trace outbox",
+        {
+            "first": first,
+            "record": first_record,
+            "state": pending_state,
+            "trace": pending_trace,
+        },
+    )
+
+    # A later background tick performs a strict outbox flush before looking for
+    # queue work. Recovery therefore does not depend on illegally retrying an
+    # already-completed event.
+    second = loop.process_event_inbox(limit=1)
+    completed_record = loop.event_inbox.get_record(event.event_id)
+    recovered_state = loop.state_store.read_json("situation_state.json")
+    recovered_trace = loop.state_store.read_jsonl("situation_trace.jsonl", limit=20)
+    situations = loop.situation_evaluator.list(
+        user_id=event.source.user_id,
+        session_id=event.source.session_id,
+        correlation_id=event.correlation_id,
+    )
+    expect(
+        second.get("processed_count") == 0
+        and second.get("failed_count") == 0
+        and isinstance(completed_record, dict)
+        and completed_record.get("status") == "completed"
+        and recovered_state.get("trace_outbox_count") == 0
+        and len(recovered_trace) == 1
+        and recovered_trace[0].get("source_event_id") == event.event_id
+        and recovered_trace[0].get("trace_type") == "situation_observed"
+        and len(situations) == 1,
+        "the next background tick repairs trace delivery for the completed event",
+        {
+            "second": second,
+            "record": completed_record,
+            "state": recovered_state,
+            "trace": recovered_trace,
+            "situations": situations,
         },
     )
 
@@ -661,7 +1547,23 @@ def main() -> int:
     with TemporaryDirectory() as tmp:
         test_user_turn_shadow_equivalence(Path(tmp))
     with TemporaryDirectory() as tmp:
+        test_offline_route_equivalence_matrix(Path(tmp))
+    with TemporaryDirectory() as tmp:
+        test_situation_trace_retention(Path(tmp))
+    with TemporaryDirectory() as tmp:
+        test_retention_defers_pending_trace_outbox(Path(tmp))
+    with TemporaryDirectory() as tmp:
+        test_retention_rotation_is_atomic_with_trace_delivery(Path(tmp))
+    with TemporaryDirectory() as tmp:
         test_default_record_only_contract(Path(tmp))
+    with TemporaryDirectory() as tmp:
+        test_shadow_foreground_atomic_claim(Path(tmp))
+    with TemporaryDirectory() as tmp:
+        test_duplicate_foreground_skips_finalize(Path(tmp))
+    with TemporaryDirectory() as tmp:
+        test_duplicate_foreground_repairs_failed_resolution(Path(tmp))
+    with TemporaryDirectory() as tmp:
+        test_background_trace_failure_recovery(Path(tmp))
     with TemporaryDirectory() as tmp:
         test_background_event_projection(Path(tmp))
     with TemporaryDirectory() as tmp:
