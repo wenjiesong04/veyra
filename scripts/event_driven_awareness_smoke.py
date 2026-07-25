@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import copy
 import gzip
 import json
+import math
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from itertools import combinations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
@@ -89,6 +93,29 @@ OFFLINE_ROUTE_CASES = (
         selected_probe="system",
     ),
     OfflineRouteCase(
+        case_id="native_tool",
+        text="Prepare the offline native tool boundary.",
+        route=Route.NATIVE_TOOL,
+        risk_level=RiskLevel.R2,
+        expected_status="needs_action_proposal",
+        response=(
+            "Native tool execution must be submitted as a structured "
+            "ActionProposal or routed through Tool Proxy."
+        ),
+    ),
+    OfflineRouteCase(
+        case_id="skill",
+        text="Summarize the offline fixture logs.",
+        route=Route.SKILL,
+        risk_level=RiskLevel.R1,
+        expected_status="needs_more_probe",
+        response=(
+            "Log summarization skill is ready; provide a log path through "
+            "log_probe for real summaries."
+        ),
+        selected_probe="summarize_logs",
+    ),
+    OfflineRouteCase(
         case_id="agent",
         text="Analyze the offline fixture and return a bounded plan.",
         route=Route.AGENT,
@@ -111,6 +138,25 @@ OFFLINE_ROUTE_CASES = (
         risk_level=RiskLevel.R3,
         expected_status="needs_confirmation",
         response=None,
+    ),
+    OfflineRouteCase(
+        case_id="block",
+        text="Exercise the controlled offline blocked route.",
+        route=Route.BLOCK,
+        risk_level=RiskLevel.R5,
+        expected_status="blocked",
+        response=(
+            "Blocked by Guardian: destructive or forbidden action requires "
+            "a safer plan and explicit review."
+        ),
+    ),
+    OfflineRouteCase(
+        case_id="rollback",
+        text="Inspect rollback request snap_abcdef without executing it.",
+        route=Route.ROLLBACK,
+        risk_level=RiskLevel.R1,
+        expected_status="needs_confirmation",
+        response="Rollback restore requires review approval before execution.",
     ),
 )
 
@@ -200,13 +246,417 @@ class OfflineAgentAdapter(AgentAdapter):
         }
 
 
-def offline_result_signature(result: LoopResult) -> dict[str, str]:
-    return {
-        "route": result.route.value,
-        "status": result.status,
-        "response": result.response,
-        "risk_level": result.risk_level.value,
-    }
+_RUNTIME_TRACE_ID_PATH = ("artifacts", "runtime_trace", "trace_id")
+_EXECUTION_TRACE_ID_PATH = ("artifacts", "execution_trace", "trace_id")
+_REVIEW_ID_PATH = ("artifacts", "review", "review_id")
+_LATENCY_PATH = ("artifacts", "runtime_trace", "latency_ms")
+_AGENT_TASK_ID_PATHS = {
+    ("artifacts", "execution_result", "task_id"),
+    ("artifacts", "execution_trace", "execution_result", "task_id"),
+    ("artifacts", "execution_trace", "task_id"),
+    ("artifacts", "execution_trace", "verification", "evidence", "task_id"),
+    ("artifacts", "interpreted_result", "evidence", "task_id"),
+    (
+        "artifacts",
+        "task_packet",
+        "policy_patch",
+        "tool_proxy_contract",
+        "task_id",
+    ),
+    ("artifacts", "task_packet", "task_id"),
+    ("artifacts", "verification", "evidence", "task_id"),
+}
+_AGENT_SESSION_ID_PATHS = {
+    ("artifacts", "agent_session", "agent_execution_session_id"),
+    ("artifacts", "task_packet", "agent_execution_session_id"),
+}
+_RUNTIME_TIMESTAMP_PATHS = {
+    ("artifacts", "conversation_slots", "updated_at"),
+    ("artifacts", "execution_trace", "recorded_at"),
+    ("artifacts", "review", "created_at"),
+    (
+        "artifacts",
+        "task_packet",
+        "context_patch",
+        "executor_state",
+        "updated_at",
+    ),
+    (
+        "artifacts",
+        "task_packet",
+        "context_patch",
+        "relevant_world_state",
+        "external",
+        "updated_at",
+    ),
+    (
+        "artifacts",
+        "task_packet",
+        "context_patch",
+        "relevant_world_state",
+        "local",
+        "updated_at",
+    ),
+    (
+        "artifacts",
+        "task_packet",
+        "context_patch",
+        "relevant_world_state",
+        "user",
+        "updated_at",
+    ),
+    (
+        "artifacts",
+        "task_packet",
+        "context_patch",
+        "risk_state",
+        "updated_at",
+    ),
+    (
+        "artifacts",
+        "task_packet",
+        "context_patch",
+        "task_state",
+        "updated_at",
+    ),
+}
+_BELIEF_CLAIM_PREFIX = (
+    "artifacts",
+    "task_packet",
+    "context_patch",
+    "belief_state",
+    "fresh_claims",
+)
+
+
+def _public_result_dict(result: LoopResult | dict[str, Any]) -> dict[str, Any]:
+    return result.to_dict() if isinstance(result, LoopResult) else copy.deepcopy(result)
+
+
+def _valid_generated_id(value: Any, prefix: str) -> bool:
+    if not isinstance(value, str) or not value.startswith(prefix):
+        return False
+    suffix = value[len(prefix) :]
+    return len(suffix) == 12 and all(
+        character in "0123456789abcdef" for character in suffix
+    )
+
+
+def _generated_id_rule(
+    path: tuple[str, ...],
+    *,
+    route: str,
+) -> tuple[str, str] | None:
+    if path == _RUNTIME_TRACE_ID_PATH:
+        return ("runtime_trace_id", "rt_")
+    if path == _EXECUTION_TRACE_ID_PATH:
+        return ("execution_trace_id", "exec_")
+    if path == _REVIEW_ID_PATH:
+        return ("review_id", "rev_")
+    if route == Route.AGENT.value and path in _AGENT_TASK_ID_PATHS:
+        return ("task_id", "task_")
+    if route == Route.AGENT.value and path in _AGENT_SESSION_ID_PATHS:
+        return ("agent_execution_session_id", "agent-exec:task_")
+    return None
+
+
+def _is_belief_claim_path(
+    path: tuple[str, ...],
+    fields: set[str],
+) -> bool:
+    return (
+        len(path) == len(_BELIEF_CLAIM_PREFIX) + 2
+        and path[: len(_BELIEF_CLAIM_PREFIX)] == _BELIEF_CLAIM_PREFIX
+        and path[-2].isdigit()
+        and path[-1] in fields
+    )
+
+
+def _timestamp_tolerance_seconds(path: tuple[str, ...]) -> float | None:
+    if path in _RUNTIME_TIMESTAMP_PATHS:
+        return 2.0
+    if _is_belief_claim_path(
+        path,
+        {"expires_at", "observed_at", "updated_at"},
+    ):
+        return 2.0
+    return None
+
+
+def _relative_time_tolerance(path: tuple[str, ...]) -> float | None:
+    if _is_belief_claim_path(
+        path,
+        {"age_seconds", "ttl_remaining_seconds"},
+    ):
+        return 2.0
+    return None
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.utcoffset() is not None else None
+
+
+def _value_at(document: dict[str, Any], path: tuple[str, ...]) -> Any:
+    selected: Any = document
+    for part in path:
+        if isinstance(selected, dict) and part in selected:
+            selected = selected[part]
+            continue
+        if (
+            isinstance(selected, list)
+            and part.isdigit()
+            and int(part) < len(selected)
+        ):
+            selected = selected[int(part)]
+            continue
+        if not isinstance(selected, (dict, list)):
+            return None
+        return None
+    return selected
+
+
+def _validate_agent_id_bindings(
+    document: dict[str, Any],
+    *,
+    side: str,
+    differences: list[str],
+) -> None:
+    if document.get("route") != Route.AGENT.value:
+        return
+    task_ids = [_value_at(document, path) for path in _AGENT_TASK_ID_PATHS]
+    if (
+        any(not _valid_generated_id(value, "task_") for value in task_ids)
+        or len(set(task_ids)) != 1
+    ):
+        differences.append(f"{side}: agent task_id bindings are incomplete or inconsistent")
+        return
+    task_id = str(task_ids[0])
+    session_ids = [
+        _value_at(document, path)
+        for path in _AGENT_SESSION_ID_PATHS
+    ]
+    if (
+        any(
+            not _valid_generated_id(value, "agent-exec:task_")
+            for value in session_ids
+        )
+        or len(set(session_ids)) != 1
+        or session_ids[0] != f"agent-exec:{task_id}"
+    ):
+        differences.append(
+            f"{side}: agent execution session is not bound to its task_id"
+        )
+
+
+def offline_public_outputs_equivalent(
+    left: LoopResult | dict[str, Any],
+    right: LoopResult | dict[str, Any],
+    *,
+    require_distinct_generated_ids: bool,
+) -> tuple[bool, list[str]]:
+    """Compare every public field while permitting bounded runtime-only variance."""
+
+    left_document = _public_result_dict(left)
+    right_document = _public_result_dict(right)
+    route = str(left_document.get("route") or "")
+    differences: list[str] = []
+    id_bindings: dict[str, dict[str, str]] = {}
+    reverse_id_bindings: dict[str, dict[str, str]] = {}
+    _validate_agent_id_bindings(
+        left_document,
+        side="left",
+        differences=differences,
+    )
+    _validate_agent_id_bindings(
+        right_document,
+        side="right",
+        differences=differences,
+    )
+
+    def compare(left_value: Any, right_value: Any, path: tuple[str, ...]) -> None:
+        if len(differences) >= 20:
+            return
+        generated_id = _generated_id_rule(path, route=route)
+        if generated_id is not None:
+            kind, prefix = generated_id
+            if not _valid_generated_id(left_value, prefix) or not _valid_generated_id(
+                right_value,
+                prefix,
+            ):
+                differences.append(
+                    f"{'.'.join(path)}: generated IDs are missing or malformed"
+                )
+                return
+            if require_distinct_generated_ids and left_value == right_value:
+                differences.append(
+                    f"{'.'.join(path)}: isolated runs reused one generated ID"
+                )
+                return
+            forward = id_bindings.setdefault(kind, {})
+            reverse = reverse_id_bindings.setdefault(kind, {})
+            if left_value in forward and forward[left_value] != right_value:
+                differences.append(
+                    f"{'.'.join(path)}: generated ID binding diverged"
+                )
+                return
+            if right_value in reverse and reverse[right_value] != left_value:
+                differences.append(
+                    f"{'.'.join(path)}: generated ID binding collapsed"
+                )
+                return
+            forward[left_value] = right_value
+            reverse[right_value] = left_value
+            return
+
+        timestamp_tolerance = _timestamp_tolerance_seconds(path)
+        if timestamp_tolerance is not None:
+            left_time = _parse_timestamp(left_value)
+            right_time = _parse_timestamp(right_value)
+            if left_time is None or right_time is None:
+                differences.append(
+                    f"{'.'.join(path)}: timestamp is missing or invalid"
+                )
+            elif abs((left_time - right_time).total_seconds()) > timestamp_tolerance:
+                differences.append(
+                    f"{'.'.join(path)}: timestamps exceed runtime tolerance"
+                )
+            return
+
+        relative_tolerance = _relative_time_tolerance(path)
+        if relative_tolerance is not None:
+            valid_left = isinstance(left_value, (int, float)) and not isinstance(
+                left_value,
+                bool,
+            )
+            valid_right = isinstance(right_value, (int, float)) and not isinstance(
+                right_value,
+                bool,
+            )
+            if (
+                not valid_left
+                or not valid_right
+                or not math.isfinite(float(left_value))
+                or not math.isfinite(float(right_value))
+                or abs(float(left_value) - float(right_value)) > relative_tolerance
+            ):
+                differences.append(
+                    f"{'.'.join(path)}: relative time differs beyond tolerance"
+                )
+            return
+
+        if path == _LATENCY_PATH:
+            if (
+                not isinstance(left_value, (int, float))
+                or isinstance(left_value, bool)
+                or float(left_value) < 0
+                or not math.isfinite(float(left_value))
+                or not isinstance(right_value, (int, float))
+                or isinstance(right_value, bool)
+                or float(right_value) < 0
+                or not math.isfinite(float(right_value))
+            ):
+                differences.append(
+                    f"{'.'.join(path)}: latency must be a non-negative number"
+                )
+            return
+
+        if type(left_value) is not type(right_value):
+            differences.append(
+                f"{'.'.join(path)}: type {type(left_value).__name__} != "
+                f"{type(right_value).__name__}"
+            )
+            return
+        if isinstance(left_value, dict):
+            if set(left_value) != set(right_value):
+                differences.append(
+                    f"{'.'.join(path)}: object keys differ "
+                    f"{sorted(left_value)} != {sorted(right_value)}"
+                )
+                return
+            for key in sorted(left_value):
+                compare(
+                    left_value[key],
+                    right_value[key],
+                    path + (str(key),),
+                )
+            return
+        if isinstance(left_value, list):
+            if len(left_value) != len(right_value):
+                differences.append(
+                    f"{'.'.join(path)}: list lengths differ "
+                    f"{len(left_value)} != {len(right_value)}"
+                )
+                return
+            for index, (left_item, right_item) in enumerate(
+                zip(left_value, right_value)
+            ):
+                compare(left_item, right_item, path + (str(index),))
+            return
+        if left_value != right_value:
+            differences.append(
+                f"{'.'.join(path)}: {left_value!r} != {right_value!r}"
+            )
+
+    compare(left_document, right_document, ())
+    return not differences, differences
+
+
+def offline_result_signature(
+    result: LoopResult | dict[str, Any],
+) -> dict[str, Any]:
+    """Render one full result with only validated runtime scalars canonicalized."""
+
+    document = _public_result_dict(result)
+    route = str(document.get("route") or "")
+    id_tokens: dict[str, dict[str, str]] = {}
+
+    def normalize(value: Any, path: tuple[str, ...]) -> Any:
+        generated_id = _generated_id_rule(path, route=route)
+        if generated_id is not None:
+            kind, prefix = generated_id
+            if not _valid_generated_id(value, prefix):
+                return value
+            tokens = id_tokens.setdefault(kind, {})
+            if value not in tokens:
+                tokens[value] = f"<{kind}:{len(tokens)}>"
+            return tokens[value]
+        if _timestamp_tolerance_seconds(path) is not None:
+            return "<timestamp>" if _parse_timestamp(value) is not None else value
+        if _relative_time_tolerance(path) is not None:
+            return (
+                "<relative_seconds>"
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+                else value
+            )
+        if path == _LATENCY_PATH:
+            return (
+                "<latency_ms>"
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+                else value
+            )
+        if isinstance(value, dict):
+            return {
+                str(key): normalize(item, path + (str(key),))
+                for key, item in sorted(
+                    value.items(),
+                    key=lambda pair: str(pair[0]),
+                )
+            }
+        if isinstance(value, list):
+            return [
+                normalize(item, path + (str(index),))
+                for index, item in enumerate(value)
+            ]
+        return value
+
+    normalized = normalize(document, ())
+    return normalized if isinstance(normalized, dict) else {}
 
 
 def build_offline_route_loop(
@@ -242,6 +692,28 @@ def build_offline_route_loop(
 
     def fixed_decision(*args: Any, **kwargs: Any) -> Decision:
         del args, kwargs
+        route_capabilities = {
+            Route.DIRECT_ANSWER: ["native_answer"],
+            Route.PROBE: ["system_probe"],
+            Route.NATIVE_TOOL: ["safe_file_read"],
+            Route.SKILL: ["summarize_logs_skill"],
+            Route.AGENT: ["selected_agent_runtime"],
+            Route.ASK_USER: ["ask_user"],
+            Route.HUMAN_REVIEW: ["human_review"],
+            Route.BLOCK: ["guardian"],
+            Route.ROLLBACK: ["rollback_audit"],
+        }
+        route_capability = {
+            Route.DIRECT_ANSWER: "native_answer",
+            Route.PROBE: "probe",
+            Route.NATIVE_TOOL: "safe_file_read",
+            Route.SKILL: "skill",
+            Route.AGENT: "selected_agent_runtime",
+            Route.ASK_USER: "ask_user",
+            Route.HUMAN_REVIEW: "human_review",
+            Route.BLOCK: "guardian",
+            Route.ROLLBACK: "rollback_audit",
+        }
         semantic_policy = {
             "preferred_route": case.route.value,
             "requires_clarification": case.route == Route.ASK_USER,
@@ -251,17 +723,7 @@ def build_offline_route_loop(
                 else ""
             ),
             "selected_probe": case.selected_probe,
-            "allowed_capabilities": (
-                ["system_probe"]
-                if case.route == Route.PROBE
-                else ["selected_agent_runtime"]
-                if case.route == Route.AGENT
-                else ["native_answer"]
-                if case.route == Route.DIRECT_ANSWER
-                else ["human_review"]
-                if case.route == Route.HUMAN_REVIEW
-                else ["ask_user"]
-            ),
+            "allowed_capabilities": route_capabilities[case.route],
             "allowed_effects": (
                 ["agent.execute"]
                 if case.route == Route.AGENT
@@ -277,24 +739,21 @@ def build_offline_route_loop(
             selected_probe=case.selected_probe,
             intent="offline_validation",
             complexity="complex" if case.route == Route.AGENT else "simple",
-            capability=(
-                "selected_agent_runtime"
-                if case.route == Route.AGENT
-                else "probe"
-                if case.route == Route.PROBE
-                else "human_review"
-                if case.route == Route.HUMAN_REVIEW
-                else "ask_user"
-                if case.route == Route.ASK_USER
-                else "native_answer"
-            ),
+            capability=route_capability[case.route],
             needs_probe=case.route == Route.PROBE,
             needs_agent=case.route == Route.AGENT,
             needs_user_confirmation=case.route == Route.HUMAN_REVIEW,
             memory_policy="forget",
             reasoning_mode=(
                 "execution"
-                if case.route in {Route.AGENT, Route.HUMAN_REVIEW}
+                if case.route
+                in {
+                    Route.AGENT,
+                    Route.HUMAN_REVIEW,
+                    Route.NATIVE_TOOL,
+                    Route.ROLLBACK,
+                    Route.SKILL,
+                }
                 else "direct"
             ),
             required_capabilities=list(semantic_policy["allowed_capabilities"]),
@@ -535,25 +994,35 @@ def test_offline_route_equivalence_matrix(base: Path) -> None:
     normalizer = EventNormalizer()
     modes = ("disabled", "record_only", "shadow")
     matrix: list[dict[str, Any]] = []
+    expect(
+        {case.route for case in OFFLINE_ROUTE_CASES} == set(Route),
+        "offline fixtures cover every Route enum member",
+        {
+            "expected": [route.value for route in Route],
+            "covered": [case.route.value for case in OFFLINE_ROUTE_CASES],
+        },
+    )
     for case in OFFLINE_ROUTE_CASES:
-        signatures: dict[str, dict[str, str]] = {}
+        signatures: dict[str, dict[str, Any]] = {}
+        results: dict[str, LoopResult] = {}
         loops: dict[str, AwarenessLoop] = {}
+        event = normalizer.user_message(
+            case.text,
+            "offline-matrix",
+            "matrix-user",
+            f"matrix-{case.case_id}",
+            event_id=f"evt_matrix_{case.case_id}",
+            correlation_id=f"corr-matrix-{case.case_id}",
+        )
         for mode in modes:
             loop = build_offline_route_loop(
                 base / case.case_id / mode,
                 mode=mode,
                 case=case,
             )
-            event = normalizer.user_message(
-                case.text,
-                "offline-matrix",
-                "matrix-user",
-                f"matrix-{case.case_id}",
-                event_id=f"evt_matrix_{case.case_id}_{mode}",
-                correlation_id=f"corr-matrix-{case.case_id}",
-            )
             result = loop.handle_event(event)
             signatures[mode] = offline_result_signature(result)
+            results[mode] = result
             loops[mode] = loop
 
         baseline = signatures["disabled"]
@@ -566,11 +1035,22 @@ def test_offline_route_equivalence_matrix(base: Path) -> None:
             f"{case.case_id} offline fixture exercises its intended route",
             baseline,
         )
+        pair_differences: dict[str, list[str]] = {}
+        for left_mode, right_mode in combinations(modes, 2):
+            equivalent, differences = offline_public_outputs_equivalent(
+                results[left_mode],
+                results[right_mode],
+                require_distinct_generated_ids=True,
+            )
+            if not equivalent:
+                pair_differences[f"{left_mode}:{right_mode}"] = differences
         expect(
-            signatures["record_only"] == baseline
-            and signatures["shadow"] == baseline,
-            f"{case.case_id} disabled, record-only, and shadow outputs are equivalent",
-            signatures,
+            not pair_differences,
+            (
+                f"{case.case_id} disabled, record-only, and shadow complete "
+                "public outputs are equivalent"
+            ),
+            pair_differences,
         )
         expect(
             loops["disabled"].event_inbox.stats().get("total") == 0
@@ -585,9 +1065,157 @@ def test_offline_route_equivalence_matrix(base: Path) -> None:
         matrix.append({"case": case.case_id, "signatures": signatures})
 
     expect(
-        len(matrix) == len(OFFLINE_ROUTE_CASES),
-        "offline equivalence matrix covers direct, probe, Agent, ask-user, and review",
+        len(matrix) == len(Route) == 9,
+        "offline equivalence matrix validates all nine Route branches",
         matrix,
+    )
+
+
+def test_public_output_comparison_sensitivity(base: Path) -> None:
+    case = next(
+        item for item in OFFLINE_ROUTE_CASES if item.route == Route.AGENT
+    )
+    event = EventNormalizer().user_message(
+        case.text,
+        "offline-matrix",
+        "matrix-user",
+        "matrix-comparison-sensitivity",
+        event_id="evt_matrix_comparison_sensitivity",
+        correlation_id="corr-matrix-comparison-sensitivity",
+    )
+    left = build_offline_route_loop(
+        base / "disabled",
+        mode="disabled",
+        case=case,
+    ).handle_event(event)
+    right = build_offline_route_loop(
+        base / "shadow",
+        mode="shadow",
+        case=case,
+    ).handle_event(event)
+    baseline_equal, baseline_differences = offline_public_outputs_equivalent(
+        left,
+        right,
+        require_distinct_generated_ids=True,
+    )
+    right_document = right.to_dict()
+
+    def set_path(
+        document: dict[str, Any],
+        path: tuple[str, ...],
+        value: Any,
+    ) -> None:
+        selected: Any = document
+        for part in path[:-1]:
+            selected = (
+                selected[int(part)]
+                if isinstance(selected, list)
+                else selected[part]
+            )
+        if isinstance(selected, list):
+            selected[int(path[-1])] = value
+        else:
+            selected[path[-1]] = value
+
+    missing_task = copy.deepcopy(right_document)
+    set_path(
+        missing_task,
+        ("artifacts", "execution_result", "task_id"),
+        None,
+    )
+    missing_task_equal, _ = offline_public_outputs_equivalent(
+        left,
+        missing_task,
+        require_distinct_generated_ids=True,
+    )
+
+    mismatched_task = copy.deepcopy(right_document)
+    set_path(
+        mismatched_task,
+        ("artifacts", "execution_result", "task_id"),
+        "task_aaaaaaaaaaaa",
+    )
+    mismatched_task_equal, _ = offline_public_outputs_equivalent(
+        left,
+        mismatched_task,
+        require_distinct_generated_ids=True,
+    )
+
+    stale_evidence = copy.deepcopy(right_document)
+    observed_path = _BELIEF_CLAIM_PREFIX + ("0", "observed_at")
+    observed_at = _parse_timestamp(_value_at(stale_evidence, observed_path))
+    expect(
+        observed_at is not None,
+        "offline fixture exposes a valid evidence timestamp",
+        _value_at(stale_evidence, observed_path),
+    )
+    set_path(
+        stale_evidence,
+        observed_path,
+        (observed_at - timedelta(hours=1)).isoformat(),
+    )
+    stale_equal, _ = offline_public_outputs_equivalent(
+        left,
+        stale_evidence,
+        require_distinct_generated_ids=True,
+    )
+
+    shared_session = copy.deepcopy(right_document)
+    left_document = left.to_dict()
+    left_task_id = _value_at(
+        left_document,
+        ("artifacts", "task_packet", "task_id"),
+    )
+    left_agent_session_id = _value_at(
+        left_document,
+        ("artifacts", "task_packet", "agent_execution_session_id"),
+    )
+    for path in _AGENT_TASK_ID_PATHS:
+        set_path(shared_session, path, left_task_id)
+    for path in _AGENT_SESSION_ID_PATHS:
+        set_path(shared_session, path, left_agent_session_id)
+    shared_session_equal, _ = offline_public_outputs_equivalent(
+        left,
+        shared_session,
+        require_distinct_generated_ids=True,
+    )
+
+    weakened_artifact = copy.deepcopy(right_document)
+    set_path(
+        weakened_artifact,
+        ("artifacts", "controller", "status"),
+        "degraded",
+    )
+    weakened_artifact_equal, _ = offline_public_outputs_equivalent(
+        left,
+        weakened_artifact,
+        require_distinct_generated_ids=True,
+    )
+    invalid_latency = copy.deepcopy(right_document)
+    set_path(invalid_latency, _LATENCY_PATH, float("nan"))
+    invalid_latency_equal, _ = offline_public_outputs_equivalent(
+        left,
+        invalid_latency,
+        require_distinct_generated_ids=True,
+    )
+    expect(
+        baseline_equal
+        and not missing_task_equal
+        and not mismatched_task_equal
+        and not stale_equal
+        and not shared_session_equal
+        and not weakened_artifact_equal
+        and not invalid_latency_equal,
+        "complete-output comparison detects binding, freshness, isolation, and artifact weakening",
+        {
+            "baseline": baseline_differences,
+            "missing_task_equal": missing_task_equal,
+            "mismatched_task_equal": mismatched_task_equal,
+            "stale_equal": stale_equal,
+            "shared_session_equal": shared_session_equal,
+            "weakened_artifact_equal": weakened_artifact_equal,
+            "invalid_latency_equal": invalid_latency_equal,
+        },
     )
 
 
@@ -989,6 +1617,185 @@ def test_shadow_foreground_atomic_claim(base: Path) -> None:
     )
 
 
+def test_cross_event_resolution_binding(base: Path) -> None:
+    loop = build_loop(base / "cross-event-binding", mode="shadow")
+    normalizer = EventNormalizer()
+    event_a = normalizer.user_message(
+        "event A",
+        "api",
+        "binding-user",
+        "binding-session",
+        event_id="evt_binding_a",
+        correlation_id="corr-binding-a",
+    )
+    event_b = normalizer.user_message(
+        "event B",
+        "api",
+        "binding-user",
+        "binding-session",
+        event_id="evt_binding_b",
+        correlation_id="corr-binding-b",
+    )
+    begin_a = loop.event_awareness.begin(event_a)
+    begin_b = loop.event_awareness.begin(event_b)
+    result_b = LoopResult(
+        event_id=event_b.event_id,
+        route=Route.DIRECT_ANSWER,
+        status="success",
+        response="result B",
+        risk_level=RiskLevel.R0,
+    )
+    rejected = loop.event_awareness.finalize(
+        event_b,
+        result_b,
+        {"trace_id": "rt_binding_b_rejected"},
+        situation_id=str(begin_a.get("situation_id") or ""),
+        canonical_event_id=event_b.event_id,
+    )
+    state_a = loop.situation_evaluator.get(
+        str(begin_a.get("situation_id") or ""),
+        user_id="binding-user",
+        session_id="binding-session",
+    )
+    state_b_before = loop.situation_evaluator.get(
+        str(begin_b.get("situation_id") or ""),
+        user_id="binding-user",
+        session_id="binding-session",
+    )
+    accepted = loop.event_awareness.finalize(
+        event_b,
+        result_b,
+        {"trace_id": "rt_binding_b"},
+        situation_id=str(begin_b.get("situation_id") or ""),
+        canonical_event_id=event_b.event_id,
+    )
+    state_b_after = loop.situation_evaluator.get(
+        str(begin_b.get("situation_id") or ""),
+        user_id="binding-user",
+        session_id="binding-session",
+    )
+    expect(
+        isinstance(rejected, dict)
+        and rejected.get("status") == "degraded"
+        and isinstance(state_a, dict)
+        and state_a.get("outcome") is None
+        and isinstance(state_b_before, dict)
+        and state_b_before.get("outcome") is None
+        and isinstance(accepted, dict)
+        and accepted.get("situation_id") == begin_b.get("situation_id")
+        and isinstance(state_b_after, dict)
+        and state_b_after.get("source_event_id") == event_b.event_id
+        and state_b_after.get("outcome", {}).get("value", {}).get("status")
+        == "success",
+        "event B cannot write its resolution into event A's Situation",
+        {
+            "rejected": rejected,
+            "accepted": accepted,
+            "event_a": state_a,
+            "event_b_before": state_b_before,
+            "event_b_after": state_b_after,
+        },
+    )
+
+    canonical = normalizer.user_message(
+        "same delivery",
+        "api",
+        "dedupe-binding-user",
+        "dedupe-binding-session",
+        event_id="evt_dedupe_canonical",
+        correlation_id="corr-dedupe-canonical",
+        dedupe_key="provider-delivery-1",
+    )
+    suppressed = normalizer.user_message(
+        "same delivery",
+        "api",
+        "dedupe-binding-user",
+        "dedupe-binding-session",
+        event_id="evt_dedupe_suppressed",
+        correlation_id="corr-dedupe-suppressed",
+        dedupe_key="provider-delivery-1",
+    )
+    canonical_begin = loop.event_awareness.begin(canonical)
+    suppressed_begin = loop.event_awareness.begin(suppressed)
+    suppressed_result = LoopResult(
+        event_id=suppressed.event_id,
+        route=Route.BLOCK,
+        status="blocked",
+        response="suppressed result",
+        risk_level=RiskLevel.R5,
+    )
+    suppressed_finalize = loop.event_awareness.finalize(
+        suppressed,
+        suppressed_result,
+        {"trace_id": "rt_dedupe_suppressed"},
+        situation_id=str(suppressed_begin.get("situation_id") or ""),
+        canonical_event_id=str(suppressed_begin.get("event_id") or ""),
+    )
+    canonical_state = loop.situation_evaluator.get(
+        str(canonical_begin.get("situation_id") or ""),
+        user_id="dedupe-binding-user",
+        session_id="dedupe-binding-session",
+    )
+    expect(
+        canonical_begin.get("finalize_allowed") is True
+        and suppressed_begin.get("event_id") == canonical.event_id
+        and suppressed_begin.get("finalize_allowed") is False
+        and isinstance(suppressed_finalize, dict)
+        and suppressed_finalize.get("status") == "degraded"
+        and isinstance(canonical_state, dict)
+        and canonical_state.get("outcome") is None,
+        "a different event suppressed by shared dedupe cannot finalize the canonical Situation",
+        {
+            "canonical_begin": canonical_begin,
+            "suppressed_begin": suppressed_begin,
+            "suppressed_finalize": suppressed_finalize,
+            "canonical_state": canonical_state,
+        },
+    )
+
+    pending_canonical = normalizer.user_message(
+        "pending canonical delivery",
+        "api",
+        "pending-dedupe-user",
+        "pending-dedupe-session",
+        event_id="evt_pending_canonical",
+        correlation_id="corr-pending-canonical",
+        dedupe_key="provider-delivery-pending",
+    )
+    pending_suppressed = normalizer.user_message(
+        "pending canonical delivery",
+        "api",
+        "pending-dedupe-user",
+        "pending-dedupe-session",
+        event_id="evt_pending_suppressed",
+        correlation_id="corr-pending-suppressed",
+        dedupe_key="provider-delivery-pending",
+    )
+    loop.event_awareness.publish(pending_canonical)
+    pending_suppressed_begin = loop.event_awareness.begin(pending_suppressed)
+    pending_record = loop.event_inbox.get_record(pending_canonical.event_id)
+    pending_state = loop.situation_evaluator.get(
+        str(pending_suppressed_begin.get("situation_id") or ""),
+        user_id="pending-dedupe-user",
+        session_id="pending-dedupe-session",
+    )
+    expect(
+        pending_suppressed_begin.get("event_id") == pending_canonical.event_id
+        and pending_suppressed_begin.get("finalize_allowed") is False
+        and isinstance(pending_record, dict)
+        and pending_record.get("status") == "completed"
+        and isinstance(pending_state, dict)
+        and pending_state.get("source_event_id") == pending_canonical.event_id
+        and pending_state.get("outcome") is None,
+        "claiming a pending canonical event never authorizes the suppressed event to finalize",
+        {
+            "begin": pending_suppressed_begin,
+            "record": pending_record,
+            "situation": pending_state,
+        },
+    )
+
+
 def test_duplicate_foreground_skips_finalize(base: Path) -> None:
     loop = build_loop(base / "duplicate-foreground", mode="shadow")
     event = EventNormalizer().user_message(
@@ -1012,8 +1819,13 @@ def test_duplicate_foreground_skips_finalize(base: Path) -> None:
         correlation_id="corr-duplicate-foreground",
     )[0]
     record = loop.event_inbox.get_record(event.event_id)
+    outputs_equal, output_differences = offline_public_outputs_equivalent(
+        first,
+        second,
+        require_distinct_generated_ids=True,
+    )
     expect(
-        offline_result_signature(first) == offline_result_signature(second)
+        outputs_equal
         and isinstance(record, dict)
         and record.get("status") == "completed"
         and record.get("delivery_count") == 2
@@ -1027,6 +1839,7 @@ def test_duplicate_foreground_skips_finalize(base: Path) -> None:
             "second": second.to_dict(),
             "record": record,
             "situation": second_situation,
+            "output_differences": output_differences,
         },
     )
 
@@ -1064,8 +1877,13 @@ def test_duplicate_foreground_repairs_failed_resolution(base: Path) -> None:
         session_id="resolution-repair-session",
         correlation_id="corr-resolution-repair",
     )[0]
+    outputs_equal, output_differences = offline_public_outputs_equivalent(
+        first,
+        second,
+        require_distinct_generated_ids=True,
+    )
     expect(
-        offline_result_signature(first) == offline_result_signature(second)
+        outputs_equal
         and attempts == 3
         and len(incomplete.get("decision_history") or []) == 0
         and len(incomplete.get("outcome_history") or []) == 0
@@ -1076,6 +1894,7 @@ def test_duplicate_foreground_repairs_failed_resolution(base: Path) -> None:
             "attempts": attempts,
             "incomplete": incomplete,
             "repaired": repaired,
+            "output_differences": output_differences,
         },
     )
 
@@ -1322,9 +2141,27 @@ def test_verification_truth_boundary(base: Path) -> None:
         user_id="user-a",
         correlation_id=forged_event.event_id,
     )[0]
+    forged_due = loop.situation_evaluator.due_candidates(
+        user_id="user-a",
+        session_id="session-a",
+    )
     expect(
-        forged.get("outcome", {}).get("is_fact") is False,
-        "unresolved or mismatched execution trace cannot promote an outcome to fact",
+        forged.get("status") == "monitoring"
+        and forged.get("decision", {}).get("value", {}).get("status")
+        == "verification_pending"
+        and forged.get("outcome", {}).get("is_fact") is False
+        and forged.get("outcome", {}).get("value", {}).get("status")
+        == "verification_pending"
+        and forged.get("outcome", {})
+        .get("value", {})
+        .get("verification", {})
+        .get("claimed_status")
+        == "verified_success"
+        and any(
+            item.get("situation_id") == forged.get("situation_id")
+            for item in forged_due
+        ),
+        "unpersisted verification stays non-factual and open for reevaluation",
         forged,
     )
 
@@ -1376,9 +2213,22 @@ def test_verification_truth_boundary(base: Path) -> None:
         user_id="user-a",
         correlation_id=route_mismatch_event.event_id,
     )[0]
+    route_mismatch_due = loop.situation_evaluator.due_candidates(
+        user_id="user-a",
+        session_id="session-a",
+    )
     expect(
-        route_mismatch.get("outcome", {}).get("is_fact") is False,
-        "a persisted trace from another route cannot certify a forged outcome",
+        route_mismatch.get("status") == "monitoring"
+        and route_mismatch.get("decision", {}).get("value", {}).get("status")
+        == "verification_pending"
+        and route_mismatch.get("outcome", {}).get("is_fact") is False
+        and route_mismatch.get("outcome", {}).get("value", {}).get("status")
+        == "verification_pending"
+        and any(
+            item.get("situation_id") == route_mismatch.get("situation_id")
+            for item in route_mismatch_due
+        ),
+        "a mismatched persisted trace cannot certify or close an outcome",
         route_mismatch,
     )
 
@@ -1429,6 +2279,10 @@ def test_verification_truth_boundary(base: Path) -> None:
     trace_count_before_replay = len(
         loop.state_store.read_jsonl("situation_trace.jsonl", limit=100)
     )
+    verified_due = loop.situation_evaluator.due_candidates(
+        user_id="user-a",
+        session_id="session-a",
+    )
     loop.event_awareness.finalize(
         verified_event,
         verified_result,
@@ -1437,9 +2291,42 @@ def test_verification_truth_boundary(base: Path) -> None:
     trace_count_after_replay = len(
         loop.state_store.read_jsonl("situation_trace.jsonl", limit=100)
     )
+    original_read_jsonl = loop.state_store.read_jsonl
+
+    def execution_trace_temporarily_unavailable(
+        name: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        if name == "execution_trace.jsonl":
+            return []
+        return original_read_jsonl(name, *args, **kwargs)
+
+    loop.state_store.read_jsonl = (  # type: ignore[method-assign]
+        execution_trace_temporarily_unavailable
+    )
+    try:
+        loop.event_awareness.finalize(
+            verified_event,
+            verified_result,
+            {"trace_id": "rt_verified_unavailable_replay"},
+        )
+    finally:
+        loop.state_store.read_jsonl = original_read_jsonl  # type: ignore[method-assign]
+    verified_after_unavailable_replay = loop.situation_evaluator.list(
+        user_id="user-a",
+        correlation_id=verified_event.event_id,
+    )[0]
+    trace_count_after_unavailable_replay = len(
+        loop.state_store.read_jsonl("situation_trace.jsonl", limit=100)
+    )
     expect(
         verified.get("status") == "resolved"
         and verified.get("outcome", {}).get("is_fact") is True
+        and not any(
+            item.get("situation_id") == verified.get("situation_id")
+            for item in verified_due
+        )
         and verified.get("outcome", {}).get("evidence_refs", [])[1].get("source")
         == "execution_trace",
         "verified outcome becomes factual only through a persisted execution trace",
@@ -1451,6 +2338,23 @@ def test_verification_truth_boundary(base: Path) -> None:
         {
             "before": trace_count_before_replay,
             "after": trace_count_after_replay,
+        },
+    )
+    expect(
+        verified_after_unavailable_replay.get("status") == "resolved"
+        and verified_after_unavailable_replay.get("outcome", {}).get("is_fact")
+        is True
+        and len(
+            verified_after_unavailable_replay.get("outcome_history") or []
+        )
+        == len(verified.get("outcome_history") or [])
+        and trace_count_after_unavailable_replay == trace_count_after_replay,
+        "temporary execution-ledger unavailability cannot downgrade a persisted verified fact",
+        {
+            "before": verified,
+            "after": verified_after_unavailable_replay,
+            "trace_count_before": trace_count_after_replay,
+            "trace_count_after": trace_count_after_unavailable_replay,
         },
     )
 
@@ -1549,6 +2453,8 @@ def main() -> int:
     with TemporaryDirectory() as tmp:
         test_offline_route_equivalence_matrix(Path(tmp))
     with TemporaryDirectory() as tmp:
+        test_public_output_comparison_sensitivity(Path(tmp))
+    with TemporaryDirectory() as tmp:
         test_situation_trace_retention(Path(tmp))
     with TemporaryDirectory() as tmp:
         test_retention_defers_pending_trace_outbox(Path(tmp))
@@ -1558,6 +2464,8 @@ def main() -> int:
         test_default_record_only_contract(Path(tmp))
     with TemporaryDirectory() as tmp:
         test_shadow_foreground_atomic_claim(Path(tmp))
+    with TemporaryDirectory() as tmp:
+        test_cross_event_resolution_binding(Path(tmp))
     with TemporaryDirectory() as tmp:
         test_duplicate_foreground_skips_finalize(Path(tmp))
     with TemporaryDirectory() as tmp:

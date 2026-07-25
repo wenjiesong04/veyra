@@ -468,6 +468,8 @@ class SituationEvaluator:
         situation_id: str,
         *,
         idempotency_key: str,
+        expected_source_event_id: str,
+        expected_correlation_id: str,
         decision: Any,
         outcome: Any,
         user_id: str | None = None,
@@ -490,10 +492,22 @@ class SituationEvaluator:
 
         selected_id = str(situation_id or "").strip()
         selected_key = self._text(idempotency_key, max_length=240).strip()
+        selected_source_event_id = self._text(
+            expected_source_event_id,
+            max_length=240,
+        ).strip()
+        selected_correlation_id = self._text(
+            expected_correlation_id,
+            max_length=240,
+        ).strip()
         if not selected_id:
             raise ValueError("situation_id must be non-empty")
         if not selected_key:
             raise ValueError("idempotency_key must be non-empty")
+        if not selected_source_event_id:
+            raise ValueError("expected_source_event_id must be non-empty")
+        if not selected_correlation_id:
+            raise ValueError("expected_correlation_id must be non-empty")
         self._try_flush_trace_outbox()
         decision_evidence = self._normalize_refs(
             decision_evidence_refs,
@@ -515,6 +529,11 @@ class SituationEvaluator:
         )
         if existing is None:
             raise KeyError(f"unknown situation: {selected_id}")
+        self._assert_event_binding(
+            existing,
+            source_event_id=selected_source_event_id,
+            correlation_id=selected_correlation_id,
+        )
         prediction = (
             existing.get("prediction")
             if isinstance(existing.get("prediction"), dict)
@@ -548,6 +567,11 @@ class SituationEvaluator:
                 user_id=user_id,
                 session_id=session_id,
             )
+            self._assert_event_binding(
+                target,
+                source_event_id=selected_source_event_id,
+                correlation_id=selected_correlation_id,
+            )
             resolution_keys = [
                 str(item)
                 for item in (
@@ -558,6 +582,19 @@ class SituationEvaluator:
                 if str(item)
             ]
             if selected_key in resolution_keys:
+                persisted = copy.deepcopy(target)
+                return state
+            current_outcome = (
+                target.get("outcome")
+                if isinstance(target.get("outcome"), dict)
+                else {}
+            )
+            if (
+                current_outcome.get("is_fact") is True
+                and outcome_record.get("is_fact") is not True
+            ):
+                # A transient ledger read failure or replay without evidence
+                # cannot downgrade an already persisted verified fact.
                 persisted = copy.deepcopy(target)
                 return state
 
@@ -1091,6 +1128,18 @@ class SituationEvaluator:
             raise SituationAccessError("situation belongs to a different user")
         if session_id is not None and str(item.get("session_id") or "") != str(session_id):
             raise SituationAccessError("situation belongs to a different session")
+
+    @staticmethod
+    def _assert_event_binding(
+        item: dict[str, Any],
+        *,
+        source_event_id: str,
+        correlation_id: str,
+    ) -> None:
+        if str(item.get("source_event_id") or "") != str(source_event_id):
+            raise ValueError("situation belongs to a different source event")
+        if str(item.get("correlation_id") or "") != str(correlation_id):
+            raise ValueError("situation belongs to a different correlation")
 
     def _normalize_salience(self, components: dict[str, Any]) -> dict[str, Any]:
         normalized: dict[str, float] = {}

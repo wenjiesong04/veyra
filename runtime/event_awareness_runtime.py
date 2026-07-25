@@ -12,6 +12,9 @@ from interface.event_schema import LoopResult, Route, VeyraEvent, utc_now_iso
 from runtime.event_inbox import EventInbox
 
 
+VERIFIED_RESULT_STATUSES = {"verified_failed", "verified_success"}
+
+
 class ShadowAwarenessRuntime:
     """Connect durable events to evidence-linked situations without authority.
 
@@ -90,6 +93,7 @@ class ShadowAwarenessRuntime:
                 salience_components=self._explicit_salience(observed_event),
             )
             situation_id = str(situation.get("situation_id") or "")
+            same_event_delivery = canonical_event_id == event.event_id
             if not claimed:
                 return {
                     "status": str(admission.get("status") or "duplicate"),
@@ -97,8 +101,10 @@ class ShadowAwarenessRuntime:
                     "situation_id": situation_id,
                     # Resolution writes are atomically idempotent. A duplicate
                     # can repair an earlier failed finalize without duplicating
-                    # lifecycle history under concurrent callers.
-                    "finalize_allowed": True,
+                    # lifecycle history under concurrent callers, but a
+                    # different event suppressed by a shared dedupe key must
+                    # never project its result into the canonical event.
+                    "finalize_allowed": same_event_delivery,
                 }
             self.event_inbox.complete(
                 canonical_event_id,
@@ -112,7 +118,7 @@ class ShadowAwarenessRuntime:
                 "status": "observed",
                 "event_id": canonical_event_id,
                 "situation_id": situation_id,
-                "finalize_allowed": True,
+                "finalize_allowed": same_event_delivery,
             }
         except Exception as exc:
             if claimed:
@@ -128,7 +134,11 @@ class ShadowAwarenessRuntime:
                 "situation_id": situation_id or None,
                 # If observation committed before a later inbox completion
                 # failure, preserve this turn's decision/outcome projection.
-                "finalize_allowed": bool(situation_id and claimed),
+                "finalize_allowed": bool(
+                    situation_id
+                    and claimed
+                    and canonical_event_id == event.event_id
+                ),
                 "error_type": type(exc).__name__,
             }
 
@@ -147,6 +157,15 @@ class ShadowAwarenessRuntime:
             return None
         selected_situation_id = str(situation_id or "")
         try:
+            if result.event_id != event.event_id:
+                raise ValueError("result event does not match the finalized event")
+            if (
+                canonical_event_id is not None
+                and str(canonical_event_id) != event.event_id
+            ):
+                raise ValueError(
+                    "canonical event does not match the finalized event"
+                )
             situation = (
                 self.situation_evaluator.get(
                     selected_situation_id,
@@ -156,6 +175,13 @@ class ShadowAwarenessRuntime:
                 if selected_situation_id
                 else self._situation_for_event(event)
             )
+            if (
+                isinstance(situation, dict)
+                and not self._situation_matches_event(situation, event)
+            ):
+                raise ValueError(
+                    "situation does not belong to the finalized event"
+                )
             if not isinstance(situation, dict):
                 # A foreground/background interleaving or a repaired intake can
                 # leave no lookup result for the delivered id. Observation is
@@ -164,6 +190,10 @@ class ShadowAwarenessRuntime:
                 situation = self.situation_evaluator.observe(
                     event,
                     salience_components=self._explicit_salience(event),
+                )
+            if not self._situation_matches_event(situation, event):
+                raise ValueError(
+                    "observed situation does not belong to the finalized event"
                 )
             selected_situation_id = str(situation.get("situation_id") or "")
             trace_id = str(trace.get("trace_id") or "")
@@ -200,6 +230,34 @@ class ShadowAwarenessRuntime:
                 and isinstance(persisted_verification.get("verification"), dict)
                 else verification
             )
+            claimed_verification_status = next(
+                (
+                    status
+                    for status in (
+                        str(result.status or ""),
+                        str(verification.get("status") or ""),
+                    )
+                    if status in VERIFIED_RESULT_STATUSES
+                ),
+                "",
+            )
+            verification_pending = bool(
+                claimed_verification_status and not verified_outcome
+            )
+            verification_summary = (
+                {
+                    "status": "verification_pending",
+                    "claimed_status": claimed_verification_status,
+                    "verdict": "persisted_execution_evidence_missing",
+                    "next_action": "continue_evaluation",
+                }
+                if verification_pending
+                else {
+                    key: authoritative_verification.get(key)
+                    for key in ("status", "verdict", "next_action")
+                    if key in authoritative_verification
+                }
+            )
             outcome_value = {
                 "route": (
                     str(persisted_verification.get("route") or "")
@@ -209,17 +267,19 @@ class ShadowAwarenessRuntime:
                 "status": (
                     str(persisted_verification.get("status") or "")
                     if verified_outcome
+                    else "verification_pending"
+                    if verification_pending
                     else result.status
                 ),
-                "verification": {
-                    key: authoritative_verification.get(key)
-                    for key in ("status", "verdict", "next_action")
-                    if key in authoritative_verification
-                },
+                "verification": verification_summary,
             }
             decision_value = {
                 "route": result.route.value,
-                "status": result.status,
+                "status": (
+                    "verification_pending"
+                    if verification_pending
+                    else result.status
+                ),
                 "risk_level": result.risk_level.value,
             }
             verification_ref = {
@@ -251,6 +311,10 @@ class ShadowAwarenessRuntime:
                     resolved = self.situation_evaluator.record_resolution(
                         selected_situation_id,
                         idempotency_key=resolution_key,
+                        expected_source_event_id=event.event_id,
+                        expected_correlation_id=(
+                            event.correlation_id or event.event_id
+                        ),
                         decision=decision_value,
                         outcome=outcome_value,
                         user_id=event.source.user_id,
@@ -269,7 +333,11 @@ class ShadowAwarenessRuntime:
                         ),
                         outcome_evidence_verified=verified_outcome,
                         decision_status=self._decision_status(result),
-                        outcome_status=self._outcome_status(result),
+                        outcome_status=(
+                            "monitoring"
+                            if verification_pending
+                            else self._outcome_status(result)
+                        ),
                     )
                     break
                 except Exception as exc:
@@ -421,6 +489,17 @@ class ShadowAwarenessRuntime:
                 if str(item.get("source_event_id") or "") == event.event_id
             ),
             None,
+        )
+
+    @staticmethod
+    def _situation_matches_event(
+        situation: dict[str, Any],
+        event: VeyraEvent,
+    ) -> bool:
+        return (
+            str(situation.get("source_event_id") or "") == event.event_id
+            and str(situation.get("correlation_id") or "")
+            == str(event.correlation_id or event.event_id)
         )
 
     def _fail_claim(

@@ -8,6 +8,7 @@ import platform
 import statistics
 import sys
 import time
+from itertools import combinations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -17,11 +18,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from interface.event_normalizer import EventNormalizer  # noqa: E402
-from interface.event_schema import VeyraEvent  # noqa: E402
+from interface.event_schema import Route, VeyraEvent  # noqa: E402
 from scripts.event_driven_awareness_smoke import (  # noqa: E402
     OFFLINE_ROUTE_CASES,
     OfflineRouteCase,
     build_offline_route_loop,
+    offline_public_outputs_equivalent,
     offline_result_signature,
 )
 
@@ -78,7 +80,6 @@ def event_for(
     normalizer: EventNormalizer,
     *,
     case: OfflineRouteCase,
-    mode: str,
     index: int,
     warmup: bool,
 ) -> VeyraEvent:
@@ -87,9 +88,9 @@ def event_for(
         case.text,
         "offline-benchmark",
         "benchmark-user",
-        f"benchmark-{case.case_id}-{mode}",
-        event_id=f"evt_benchmark_{case.case_id}_{mode}_{phase}_{index}",
-        correlation_id=f"corr-benchmark-{case.case_id}-{mode}-{phase}-{index}",
+        f"benchmark-{case.case_id}",
+        event_id=f"evt_benchmark_{case.case_id}_{phase}_{index}",
+        correlation_id=f"corr-benchmark-{case.case_id}-{phase}-{index}",
     )
 
 
@@ -109,48 +110,52 @@ def run_case(
         )
         for mode in MODES
     }
-    signatures: dict[str, dict[str, str]] = {}
-    for mode, loop in loops.items():
-        for index in range(warmup):
-            result = loop.handle_event(
-                event_for(
-                    normalizer,
-                    case=case,
-                    mode=mode,
-                    index=index,
-                    warmup=True,
-                )
-            )
-            signatures[mode] = offline_result_signature(result)
+    signatures: dict[str, dict[str, Any]] = {}
+    for index in range(warmup):
+        event = event_for(
+            normalizer,
+            case=case,
+            index=index,
+            warmup=True,
+        )
+        for loop in loops.values():
+            loop.handle_event(event)
 
     samples_by_mode: dict[str, list[float]] = {mode: [] for mode in MODES}
     for index in range(iterations):
         # Rotate first position to reduce systematic ordering bias.
         offset = index % len(MODES)
         ordered_modes = MODES[offset:] + MODES[:offset]
+        event = event_for(
+            normalizer,
+            case=case,
+            index=index,
+            warmup=False,
+        )
+        sample_results: dict[str, Any] = {}
         for mode in ordered_modes:
-            event = event_for(
-                normalizer,
-                case=case,
-                mode=mode,
-                index=index,
-                warmup=False,
-            )
             started = time.perf_counter_ns()
             result = loops[mode].handle_event(event)
             elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
             samples_by_mode[mode].append(elapsed_ms)
-            signature = offline_result_signature(result)
-            previous = signatures.get(mode)
-            if previous is not None and signature != previous:
+            sample_results[mode] = result
+        for left_mode, right_mode in combinations(MODES, 2):
+            equivalent, differences = offline_public_outputs_equivalent(
+                sample_results[left_mode],
+                sample_results[right_mode],
+                require_distinct_generated_ids=True,
+            )
+            if not equivalent:
                 raise AssertionError(
-                    f"{case.case_id}/{mode} public result changed during benchmark: "
-                    f"{previous!r} != {signature!r}"
+                    f"{case.case_id}/{left_mode}:{right_mode} public result "
+                    f"differs at sample {index}: {differences!r}"
                 )
-            signatures[mode] = signature
+        signatures = {
+            mode: offline_result_signature(result)
+            for mode, result in sample_results.items()
+        }
 
-    baseline = signatures["disabled"]
-    equivalent = all(signature == baseline for signature in signatures.values())
+    equivalent = True
     disabled_p50 = percentile(samples_by_mode["disabled"], 0.50)
     disabled_p95 = percentile(samples_by_mode["disabled"], 0.95)
     rows: list[dict[str, Any]] = []
@@ -207,7 +212,14 @@ def main() -> int:
             results.extend(rows)
             equivalence.append(comparison)
 
-    passed = all(item["equivalent"] for item in equivalence)
+    catalog_routes = {case.route for case in OFFLINE_ROUTE_CASES}
+    selected_routes = {case.route for case in selected}
+    fixture_catalog_complete = catalog_routes == set(Route)
+    selected_run_complete = selected_routes == set(Route)
+    equivalence_passed = len(equivalence) == len(selected) and all(
+        item["equivalent"] for item in equivalence
+    )
+    passed = fixture_catalog_complete and equivalence_passed
     output = {
         "schema": "veyra.event_awareness_benchmark.v1",
         "status": "passed" if passed else "failed",
@@ -229,6 +241,13 @@ def main() -> int:
                 "repeatable p50/p95 diagnostics and exact output equivalence, but "
                 "does not impose a CI latency threshold."
             ),
+            "route_enum_total": len(Route),
+            "route_fixture_total": len(catalog_routes),
+            "fixture_catalog_complete": fixture_catalog_complete,
+            "selected_route_total": len(selected_routes),
+            "selected_run_complete": selected_run_complete,
+            "all_routes_covered": selected_run_complete,
+            "full_matrix_passed": selected_run_complete and equivalence_passed,
         },
         "environment": {
             "python": platform.python_version(),
@@ -244,7 +263,7 @@ def main() -> int:
         "summary": {
             "route_cases": len(selected),
             "measurements": len(results),
-            "public_output_equivalence_passed": passed,
+            "public_output_equivalence_passed": equivalence_passed,
         },
         "equivalence": equivalence,
         "results": results,

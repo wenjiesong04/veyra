@@ -763,6 +763,8 @@ def test_atomic_resolution_is_retryable_and_idempotent(root: Path) -> None:
     )
     kwargs = {
         "idempotency_key": "resolution-key-1",
+        "expected_source_event_id": "evt-resolution",
+        "expected_correlation_id": "corr-resolution",
         "decision": {
             "route": "direct_answer",
             "status": "success",
@@ -782,6 +784,31 @@ def test_atomic_resolution_is_retryable_and_idempotent(root: Path) -> None:
         "decision_status": "decided",
         "outcome_status": "resolved",
     }
+    wrong_binding_rejected = False
+    try:
+        evaluator.record_resolution(
+            observed["situation_id"],
+            **{
+                **kwargs,
+                "idempotency_key": "resolution-key-wrong-event",
+                "expected_source_event_id": "evt-other",
+            },
+        )
+    except ValueError:
+        wrong_binding_rejected = True
+    after_rejection = evaluator.get(
+        observed["situation_id"],
+        user_id="user-resolution",
+        session_id="session-resolution",
+    )
+    expect(
+        wrong_binding_rejected
+        and isinstance(after_rejection, dict)
+        and after_rejection.get("decision") is None
+        and after_rejection.get("outcome") is None,
+        "atomic resolution rejects a mismatched source event before mutation",
+        after_rejection,
+    )
     store.state_mutation_failures = 1
     failed = False
     try:
