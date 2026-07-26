@@ -481,12 +481,13 @@ class ProjectGuardianAttentionScheduler:
             "decision_context": self._decision_context_binding(policy_context),
         }
         policy_revision = f"pgap_{self._digest(policy_binding)[:20]}"
+        assessment_binding = {
+            "candidate_id": candidate["candidate_id"],
+            "candidate_revision": candidate["candidate_revision"],
+            "policy_revision": policy_revision,
+        }
         assessment_id = (
-            f"pga_{self._digest({
-                'candidate_id': candidate['candidate_id'],
-                'candidate_revision': candidate['candidate_revision'],
-                'policy_revision': policy_revision,
-            })[:20]}"
+            f"pga_{self._digest(assessment_binding)[:20]}"
         )
         assessment = {
             "schema_version": self.ASSESSMENT_SCHEMA_VERSION,
