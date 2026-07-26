@@ -17,6 +17,11 @@ from uuid import uuid4
 from awareness.project_guardian import ProjectGuardianEvaluator
 from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
+from runtime.project_guardian_github_ci import (
+    GitHubActionsCIProvider,
+    GitHubCIContractError,
+    GitHubCIUnknown,
+)
 
 
 class ProjectGuardianGoalConflict(ValueError):
@@ -26,15 +31,17 @@ class ProjectGuardianGoalConflict(ValueError):
 class ProjectGuardianProducerRuntime:
     """Trusted, read-only signal producers for the Project Guardian.
 
-    The first production slice intentionally supports only a local Git fact.
-    CI and deployment-intent producers remain absent until they have their own
-    provider/semantic authority boundaries.
+    Local Git and an optional GitHub Actions poller provide factual signals.
+    Deployment intent is accepted only as an explicit structured local-control
+    transition; it is never inferred by a scheduled tick, model, or text rule.
     """
 
     STATE_FILE = "project_guardian_producer_state.json"
     SCHEMA_VERSION = "veyra.project_guardian_producers.v1"
     GOAL_SOURCE = ProjectGuardianEvaluator.GOAL_SOURCE
     MAX_BINDINGS = 128
+    MAX_CI_BINDINGS = 8
+    MAX_INTENT_OPERATIONS = 512
     MAX_RELEASE_GOALS = 64
     MAX_RUNS = 100
     ALLOWED_GOAL_STATUSES = {"active", "paused", "completed"}
@@ -44,11 +51,19 @@ class ProjectGuardianProducerRuntime:
         *,
         state_store: WorldStateStore,
         publish_git_observation: Callable[..., dict[str, Any]],
+        publish_ci_observation: Callable[..., dict[str, Any]] | None = None,
+        publish_deployment_intent: (
+            Callable[..., dict[str, Any]] | None
+        ) = None,
+        ci_provider: GitHubActionsCIProvider | None = None,
         clock: Callable[[], datetime] | None = None,
         command_timeout_seconds: float = 4.0,
     ) -> None:
         self.state_store = state_store
         self.publish_git_observation = publish_git_observation
+        self.publish_ci_observation = publish_ci_observation
+        self.publish_deployment_intent = publish_deployment_intent
+        self.ci_provider = ci_provider
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.command_timeout_seconds = max(
             0.5,
@@ -70,8 +85,22 @@ class ProjectGuardianProducerRuntime:
         active_until: str | None = None,
         goal_id: str | None = None,
         expected_state_revision: int | None = None,
+        github_actions_workflow: str | None = None,
+        github_actions_required_jobs: list[str] | None = None,
+        github_actions_app_id: int | None = None,
     ) -> dict[str, Any]:
         now = self._aware_now()
+        if (
+            expected_state_revision is not None
+            and (
+                not isinstance(expected_state_revision, int)
+                or isinstance(expected_state_revision, bool)
+                or expected_state_revision < 1
+            )
+        ):
+            raise ValueError(
+                "expected_state_revision must be a positive integer"
+            )
         selected_user = self._required_text(user_id, "user_id", 240)
         selected_goal_id = (
             self._required_text(goal_id, "goal_id", 240)
@@ -125,6 +154,13 @@ class ProjectGuardianProducerRuntime:
         goals_state = self.state_store.read_json("user_goals.json")
         self._require_healthy(goals_state, "user_goals.json")
         existing = self._goal_by_id(goals_state, selected_goal_id)
+        producer_state = self.state_store.read_json(self.STATE_FILE)
+        self._require_healthy(producer_state, self.STATE_FILE)
+        existing_binding = self._binding_for(
+            selected_goal_id,
+            str((existing or {}).get("revision") or ""),
+            state=producer_state,
+        )
         current_state_revision = 0
         if existing is not None:
             if (
@@ -154,6 +190,72 @@ class ProjectGuardianProducerRuntime:
                 "expected_state_revision was provided for a new release Goal"
             )
         next_state_revision = current_state_revision + 1
+        ci_inputs = (
+            github_actions_workflow,
+            github_actions_required_jobs,
+            github_actions_app_id,
+        )
+        ci_configured = any(value is not None for value in ci_inputs)
+        if ci_configured and not all(value is not None for value in ci_inputs):
+            raise ValueError(
+                "GitHub Actions workflow, required jobs, and app id must "
+                "be configured together"
+            )
+        retains_ci_policy = (
+            isinstance(existing_binding, dict)
+            and isinstance(existing_binding.get("github_actions"), dict)
+        )
+        if (
+            ci_configured or retains_ci_policy
+        ) and repository.get("github_repo_id") != selected_repo:
+            raise ValueError(
+                "GitHub Actions requires origin to be the exact matching "
+                "github.com repository"
+            )
+        ci_policy: dict[str, Any] | None = None
+        if ci_configured:
+            if self.ci_provider is None or self.publish_ci_observation is None:
+                raise ValueError("GitHub Actions CI producer is unavailable")
+            if not isinstance(github_actions_required_jobs, list):
+                raise ValueError(
+                    "GitHub Actions required jobs must be a list"
+                )
+            if (
+                isinstance(github_actions_app_id, bool)
+                or not isinstance(github_actions_app_id, int)
+                or github_actions_app_id < 1
+            ):
+                raise ValueError(
+                    "GitHub Actions app id must be a positive integer"
+                )
+            other_ci_bindings = self._ci_binding_reservation_count(
+                producer_state=producer_state,
+                goals_state=goals_state,
+                excluding_goal_id=selected_goal_id,
+                reference_time=now,
+            )
+            if (
+                ends_at >= now
+                and other_ci_bindings >= self.MAX_CI_BINDINGS
+            ):
+                raise ProjectGuardianGoalConflict(
+                    "Project Guardian GitHub CI binding capacity exhausted"
+                )
+            try:
+                ci_policy = self.ci_provider.bind_policy(
+                    repo_id=selected_repo,
+                    workflow_path=str(github_actions_workflow or ""),
+                    required_jobs=list(github_actions_required_jobs or []),
+                    expected_app_id=github_actions_app_id,
+                )
+            except GitHubCIContractError as exc:
+                raise ValueError(str(exc)) from exc
+        elif isinstance(existing_binding, dict) and isinstance(
+            existing_binding.get("github_actions"),
+            dict,
+        ):
+            ci_policy = copy.deepcopy(existing_binding["github_actions"])
+        ci_policy_digest = str((ci_policy or {}).get("policy_digest") or "")
 
         revision = self._goal_revision(
             goal_id=selected_goal_id,
@@ -164,6 +266,7 @@ class ProjectGuardianProducerRuntime:
             remote_origin_digest=repository["remote_origin_digest"],
             active_from=starts_at.isoformat(),
             active_until=ends_at.isoformat(),
+            ci_policy_digest=ci_policy_digest,
         )
         binding = {
             "binding_id": self._binding_id(
@@ -174,6 +277,7 @@ class ProjectGuardianProducerRuntime:
                 target_ref=selected_ref,
                 target_sha=repository["target_sha"],
                 remote_origin_digest=repository["remote_origin_digest"],
+                ci_policy_digest=ci_policy_digest,
             ),
             "goal_id": selected_goal_id,
             "user_id": selected_user,
@@ -186,6 +290,8 @@ class ProjectGuardianProducerRuntime:
             "canonical_path": repository["canonical_path"],
             "registered_at": now.isoformat(),
         }
+        if ci_policy is not None:
+            binding["github_actions"] = copy.deepcopy(ci_policy)
         goal = {
             "schema_version": ProjectGuardianEvaluator.GOAL_SCHEMA,
             "goal_id": selected_goal_id,
@@ -228,6 +334,27 @@ class ProjectGuardianProducerRuntime:
                 raise ProjectGuardianGoalConflict(
                     "release Goal changed during registration"
                 )
+            current_producer_state = self.state_store.read_json(
+                self.STATE_FILE
+            )
+            self._require_healthy(
+                current_producer_state,
+                self.STATE_FILE,
+            )
+            if (
+                ci_policy is not None
+                and ends_at >= now
+                and self._ci_binding_reservation_count(
+                    producer_state=current_producer_state,
+                    goals_state=current_goals,
+                    excluding_goal_id=selected_goal_id,
+                    reference_time=now,
+                )
+                >= self.MAX_CI_BINDINGS
+            ):
+                raise ProjectGuardianGoalConflict(
+                    "Project Guardian GitHub CI binding capacity exhausted"
+                )
             self._store_binding(binding)
             self._store_goal(goal, existing=current_existing)
         self.state_store.append_jsonl(
@@ -244,6 +371,7 @@ class ProjectGuardianProducerRuntime:
                     "target_ref": selected_ref,
                     "target_environment": selected_environment,
                     "release_cycle": selected_cycle,
+                    "github_actions_configured": ci_policy is not None,
                     "project_read_only": True,
                 },
             },
@@ -265,19 +393,20 @@ class ProjectGuardianProducerRuntime:
         )
         selected_user = self._required_text(user_id, "user_id", 240)
         selected_goal = self._required_text(goal_id, "goal_id", 240)
-        try:
-            if isinstance(expected_state_revision, bool):
-                raise ValueError
-            selected_state_revision = int(expected_state_revision)
-        except (TypeError, ValueError) as exc:
+        if (
+            not isinstance(expected_state_revision, int)
+            or isinstance(expected_state_revision, bool)
+        ):
             raise ValueError(
                 "expected_state_revision must be a positive integer"
-            ) from exc
+            )
+        selected_state_revision = expected_state_revision
         if selected_state_revision < 1:
             raise ValueError(
                 "expected_state_revision must be a positive integer"
             )
         updated: dict[str, Any] | None = None
+        transition_time = self._aware_now()
 
         def mutate(state: dict[str, Any]) -> None:
             nonlocal updated
@@ -312,21 +441,56 @@ class ProjectGuardianProducerRuntime:
                         "expected_state_revision does not match the current "
                         "release Goal"
                     )
-                if selected_status == "active":
+                current_status = str(raw.get("status") or "")
+                producer_state: dict[str, Any] | None = None
+                binding: dict[str, Any] | None = None
+                if selected_status in {"active", "paused"}:
+                    producer_state = self.state_store.read_json(
+                        self.STATE_FILE
+                    )
+                    self._require_healthy(
+                        producer_state,
+                        self.STATE_FILE,
+                    )
                     binding = self._binding_for(
                         selected_goal,
                         str(raw.get("revision") or ""),
+                        state=producer_state,
                     )
-                    if binding is None:
+                    if selected_status == "active" and binding is None:
                         raise ProjectGuardianGoalConflict(
                             "release Goal workspace binding is unavailable"
                         )
+                    if (
+                        current_status not in {"active", "paused"}
+                        and binding is not None
+                        and isinstance(
+                            binding.get("github_actions"),
+                            dict,
+                        )
+                        and self._goal_reserves_ci_capacity(
+                            raw,
+                            status=selected_status,
+                            reference_time=transition_time,
+                        )
+                        and self._ci_binding_reservation_count(
+                            producer_state=producer_state,
+                            goals_state=state,
+                            excluding_goal_id=selected_goal,
+                            reference_time=transition_time,
+                        )
+                        >= self.MAX_CI_BINDINGS
+                    ):
+                        raise ProjectGuardianGoalConflict(
+                            "Project Guardian GitHub CI binding capacity "
+                            "exhausted"
+                        )
                 replacement = copy.deepcopy(raw)
-                if str(raw.get("status") or "") != selected_status:
+                if current_status != selected_status:
                     replacement.update(
                         status=selected_status,
                         state_revision=current_state_revision + 1,
-                        updated_at=self._aware_now().isoformat(),
+                        updated_at=transition_time.isoformat(),
                     )
                 goals[index] = replacement
                 state["goals"] = goals
@@ -353,6 +517,310 @@ class ProjectGuardianProducerRuntime:
             },
         )
         return copy.deepcopy(updated)
+
+    def record_deployment_intent(
+        self,
+        *,
+        user_id: str,
+        goal_id: str,
+        goal_revision: str,
+        expected_goal_state_revision: int,
+        target_sha: str,
+        target_environment: str,
+        transition: str,
+        operation_id: str,
+        occurred_at: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """Record one explicit local-control deployment intent transition.
+
+        This entrypoint never infers intent from text, Goal registration, a
+        model, or a scheduled producer tick. The caller must bind the command
+        to the exact Goal state it observed and provide a stable operation id
+        and occurrence time for transport retries.
+        """
+
+        selected_user = self._required_text(user_id, "user_id", 240)
+        selected_goal = self._required_text(goal_id, "goal_id", 240)
+        selected_revision = self._required_text(
+            goal_revision,
+            "goal_revision",
+            120,
+        )
+        selected_session = self._required_text(
+            session_id,
+            "session_id",
+            240,
+        )
+        selected_environment = self._required_text(
+            target_environment,
+            "target_environment",
+            240,
+        )
+        selected_transition = str(transition or "").strip().lower()
+        if selected_transition not in {"declare", "withdraw"}:
+            raise ValueError("transition must be declare or withdraw")
+        selected_operation = self._required_text(
+            operation_id,
+            "operation_id",
+            240,
+        )
+        if any(
+            character
+            not in (
+                "abcdefghijklmnopqrstuvwxyz"
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                "0123456789._:-"
+            )
+            for character in selected_operation
+        ):
+            raise ValueError(
+                "operation_id may contain only letters, digits, . _ : -"
+            )
+        selected_occurred_at = self._time(occurred_at)
+        if selected_occurred_at is None:
+            raise ValueError("occurred_at must be timezone-aware")
+        if (
+            not isinstance(expected_goal_state_revision, int)
+            or isinstance(expected_goal_state_revision, bool)
+        ):
+            raise ValueError(
+                "expected_goal_state_revision must be a positive integer"
+            )
+        selected_state_revision = expected_goal_state_revision
+        if selected_state_revision < 1:
+            raise ValueError(
+                "expected_goal_state_revision must be a positive integer"
+            )
+        selected_sha = str(target_sha or "").strip().lower()
+        if (
+            len(selected_sha) not in {40, 64}
+            or any(
+                character not in "0123456789abcdef"
+                for character in selected_sha
+            )
+        ):
+            raise ValueError("target_sha must be a full hexadecimal Git SHA")
+        operation_digest = self._digest(
+            {
+                "user_id": selected_user,
+                "operation_id": selected_operation,
+            }
+        )
+        operation_ref = f"pgio_{operation_digest[:24]}"
+        signal_state = (
+            "present" if selected_transition == "declare" else "clear"
+        )
+        semantic_core = {
+            "user_id": selected_user,
+            "goal_id": selected_goal,
+            "goal_revision": selected_revision,
+            "expected_goal_state_revision": selected_state_revision,
+            "target_sha": selected_sha,
+            "target_environment": selected_environment,
+            "transition": selected_transition,
+            "occurred_at": selected_occurred_at.isoformat(),
+            "session_id": selected_session,
+        }
+        semantic_digest = self._digest(semantic_core)
+
+        with self.state_store.writer_transaction():
+            mode = self._mode()
+            fabric_mode = self._event_awareness_mode()
+            if mode == "disabled":
+                return {
+                    "status": "disabled",
+                    "mode": mode,
+                    "reason": "project_guardian_disabled",
+                    "operation_ref": operation_ref,
+                    "transition": selected_transition,
+                    "signal_state": signal_state,
+                    "committed": False,
+                }
+            if fabric_mode == "disabled":
+                return {
+                    "status": "disabled",
+                    "mode": mode,
+                    "reason": "event_fabric_disabled",
+                    "operation_ref": operation_ref,
+                    "transition": selected_transition,
+                    "signal_state": signal_state,
+                    "committed": False,
+                }
+            if self.publish_deployment_intent is None:
+                raise ValueError(
+                    "Project Guardian deployment intent producer is unavailable"
+                )
+
+            producer_state = self.state_store.read_json(self.STATE_FILE)
+            self._require_healthy(producer_state, self.STATE_FILE)
+            operations = (
+                producer_state.get("intent_operations")
+                if isinstance(
+                    producer_state.get("intent_operations"),
+                    dict,
+                )
+                else {}
+            )
+            existing_operation = operations.get(operation_digest)
+            if isinstance(existing_operation, dict):
+                if (
+                    str(existing_operation.get("semantic_digest") or "")
+                    != semantic_digest
+                ):
+                    raise ProjectGuardianGoalConflict(
+                        "operation_id is already bound to different semantics"
+                    )
+                operation = copy.deepcopy(existing_operation)
+                if str(operation.get("status") or "") == "committed":
+                    return {
+                        "status": "duplicate",
+                        "mode": mode,
+                        "operation_ref": operation_ref,
+                        "intent_status": "committed",
+                        "transition": selected_transition,
+                        "signal_state": signal_state,
+                        "event_id": operation.get("event_id"),
+                        "signal_ledger_status": operation.get(
+                            "signal_ledger_status"
+                        ),
+                        "occurred_at": operation.get("occurred_at"),
+                        "committed": True,
+                    }
+            else:
+                accepted_at = self._aware_now()
+                if (
+                    selected_occurred_at
+                    < accepted_at - timedelta(minutes=2)
+                    or selected_occurred_at
+                    > accepted_at + timedelta(minutes=2)
+                ):
+                    raise ValueError(
+                        "occurred_at must be within the command acceptance "
+                        "window"
+                    )
+                goals_state = self.state_store.read_json("user_goals.json")
+                self._require_healthy(goals_state, "user_goals.json")
+                goal = self._intent_goal(
+                    goals_state,
+                    user_id=selected_user,
+                    goal_id=selected_goal,
+                    goal_revision=selected_revision,
+                    expected_state_revision=selected_state_revision,
+                    target_sha=selected_sha,
+                    target_environment=selected_environment,
+                    occurred_at=selected_occurred_at,
+                    accepted_at=accepted_at,
+                )
+                if goal is None:
+                    raise ProjectGuardianGoalConflict(
+                        "deployment intent does not match an active release Goal"
+                    )
+                binding = self._binding_for(
+                    selected_goal,
+                    selected_revision,
+                    state=producer_state,
+                )
+                if (
+                    binding is None
+                    or not self._binding_matches_goal(binding, goal)
+                ):
+                    raise ProjectGuardianGoalConflict(
+                        "deployment intent workspace binding is unavailable"
+                    )
+                operation = {
+                    "schema_version": (
+                        "veyra.project_guardian_deployment_intent_operation.v1"
+                    ),
+                    "operation_ref": operation_ref,
+                    "operation_digest": operation_digest,
+                    "semantic_digest": semantic_digest,
+                    "goal_id": selected_goal,
+                    "goal_revision": selected_revision,
+                    "goal_state_revision": selected_state_revision,
+                    "target_sha": selected_sha,
+                    "target_environment": selected_environment,
+                    "transition": selected_transition,
+                    "occurred_at": selected_occurred_at.isoformat(),
+                    "session_digest": self._digest(selected_session),
+                    "signal_state": signal_state,
+                    "status": "pending",
+                    "created_at": accepted_at.isoformat(),
+                    "updated_at": accepted_at.isoformat(),
+                    "attempt_count": 0,
+                }
+                self._store_intent_operation(operation)
+
+            try:
+                admission = self.publish_deployment_intent(
+                    user_id=selected_user,
+                    goal_id=selected_goal,
+                    goal_revision=selected_revision,
+                    expected_goal_state_revision=selected_state_revision,
+                    target_sha=selected_sha,
+                    target_environment=selected_environment,
+                    transition=selected_transition,
+                    operation_digest=operation_digest,
+                    occurred_at=selected_occurred_at.isoformat(),
+                    session_id=selected_session,
+                )
+            except Exception as exc:
+                admission = {
+                    "status": "degraded",
+                    "reason": "signal_ingress_failed",
+                    "error_type": type(exc).__name__,
+                }
+            if not isinstance(admission, dict):
+                admission = {
+                    "status": "degraded",
+                    "reason": "signal_ingress_invalid",
+                }
+            admission_status = str(admission.get("status") or "unknown")
+            ledger_status = str(
+                admission.get("signal_ledger_status") or "unknown"
+            )
+            committed = (
+                admission_status in {"enqueued", "duplicate"}
+                and ledger_status in {"recorded", "stale"}
+            )
+            operation.update(
+                status="committed" if committed else "pending",
+                updated_at=self._aware_now().isoformat(),
+                attempt_count=int(operation.get("attempt_count") or 0) + 1,
+                ingress_status=admission_status,
+                signal_ledger_status=ledger_status,
+                event_id=admission.get("event_id"),
+                last_reason=(
+                    None
+                    if committed
+                    else str(
+                        admission.get("reason")
+                        or "signal_ledger_not_committed"
+                    )
+                ),
+            )
+            self._store_intent_operation(operation)
+
+        return {
+            "status": admission_status if committed else "degraded",
+            "mode": mode,
+            "reason": (
+                None
+                if committed
+                else str(
+                    admission.get("reason")
+                    or "signal_ledger_not_committed"
+                )
+            ),
+            "operation_ref": operation_ref,
+            "intent_status": operation["status"],
+            "transition": selected_transition,
+            "signal_state": signal_state,
+            "event_id": admission.get("event_id"),
+            "signal_ledger_status": ledger_status,
+            "occurred_at": selected_occurred_at.isoformat(),
+            "committed": committed,
+        }
 
     def list_release_goals(
         self,
@@ -400,6 +868,33 @@ class ProjectGuardianProducerRuntime:
             if isinstance(state.get("bindings"), dict)
             else {}
         )
+        ci_binding_count = sum(
+            1
+            for binding in bindings.values()
+            if isinstance(binding, dict)
+            and isinstance(binding.get("github_actions"), dict)
+        )
+        enabled_producers: list[str] = []
+        if mode in {"record_only", "shadow"}:
+            enabled_producers.append("git_dirty")
+            if (
+                ci_binding_count
+                and self.ci_provider is not None
+                and self.publish_ci_observation is not None
+            ):
+                enabled_producers.append("ci_failed")
+            if self.publish_deployment_intent is not None:
+                enabled_producers.append("deployment_intent")
+        pending_producers: list[str] = []
+        if "ci_failed" not in enabled_producers:
+            pending_producers.append("ci_failed")
+        if "deployment_intent" not in enabled_producers:
+            pending_producers.append("deployment_intent")
+        intent_operations = (
+            state.get("intent_operations")
+            if isinstance(state.get("intent_operations"), dict)
+            else {}
+        )
         last_run = (
             self._public_run_result(state.get("last_run"))
             if isinstance(state.get("last_run"), dict)
@@ -409,16 +904,22 @@ class ProjectGuardianProducerRuntime:
             "status": "success",
             "mode": mode,
             "producer_contract": self.SCHEMA_VERSION,
-            "enabled_producers": (
-                ["git_dirty"] if mode in {"record_only", "shadow"} else []
-            ),
-            "pending_producers": ["ci_failed", "deployment_intent"],
+            "enabled_producers": enabled_producers,
+            "pending_producers": pending_producers,
             "binding_count": len(bindings),
+            "ci_binding_count": ci_binding_count,
+            "intent_operation_count": len(intent_operations),
             "last_run": last_run,
             "contracts": {
-                "background_only": True,
+                "scheduled_pollers_background_only": True,
                 "read_only": True,
+                "deployment_intent_trigger": (
+                    "explicit_local_control_only"
+                ),
+                "goal_registration_is_deployment_intent": False,
                 "raw_git_output_persisted": False,
+                "raw_provider_output_persisted": False,
+                "raw_operation_id_persisted": False,
                 "agent_invoked": False,
                 "notifications": False,
                 "project_mutation": False,
@@ -476,6 +977,8 @@ class ProjectGuardianProducerRuntime:
         observations: list[dict[str, Any]] = []
         published_count = 0
         failed_count = 0
+        producers = ["git_dirty"]
+        ci_targets: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for goal in goals:
             raw_goal = self._goal_by_id(
                 goals_state,
@@ -501,101 +1004,34 @@ class ProjectGuardianProducerRuntime:
                     }
                 )
                 continue
-            try:
-                repository = self._inspect_repository(
-                    str(binding["canonical_path"]),
-                    expected_repo_id=str(binding["repo_id"]),
-                    expected_ref=str(binding["target_ref"]),
-                    expected_sha=str(binding["target_sha"]),
-                    expected_remote_origin_digest=str(
-                        binding["remote_origin_digest"]
-                    ),
-                )
-            except Exception as exc:
-                failed_count += 1
-                observations.append(
-                    {
-                        "goal_id": str(goal["goal_id"]),
-                        "goal_revision": str(goal["revision"]),
-                        "status": "degraded",
-                        "reason": "git_probe_failed",
-                        "error_type": type(exc).__name__,
-                    }
-                )
-                continue
+            git_observation = self._run_git_observation(
+                goal=goal,
+                binding=binding,
+            )
+            published_count += int(git_observation.pop("_published"))
+            failed_count += int(git_observation.pop("_failed"))
+            observations.append(git_observation)
 
-            repository_fact = {
-                "repo_id": repository["repo_id"],
-                "target_ref": repository["target_ref"],
-                "target_sha": repository["target_sha"],
-                "remote_origin_digest": repository[
-                    "remote_origin_digest"
-                ],
-                "dirty": repository["dirty"],
-                "observed_at": repository["observed_at"],
-                "index_flags_digest": repository[
-                    "index_flags_digest"
-                ],
-                "index_stage_digest": repository[
-                    "index_stage_digest"
-                ],
-                "probe_digest": repository["probe_digest"],
-            }
-            try:
-                admission = self.publish_git_observation(
-                    user_id=str(goal["user_id"]),
-                    goal_id=str(goal["goal_id"]),
-                    goal_revision=str(goal["revision"]),
-                    repository_fact=repository_fact,
-                )
-            except Exception as exc:
-                admission = {
-                    "status": "degraded",
-                    "reason": "signal_ingress_failed",
-                    "error_type": type(exc).__name__,
-                }
-            admission_status = str(admission.get("status") or "unknown")
-            ledger_status = str(
-                admission.get("signal_ledger_status") or "unknown"
+            if isinstance(binding.get("github_actions"), dict):
+                if "ci_failed" not in producers:
+                    producers.append("ci_failed")
+                ci_targets.append((goal, binding))
+
+        for goal, binding in ci_targets:
+            ci_observation = self._run_ci_observation(
+                goal=goal,
+                binding=binding,
             )
-            committed = (
-                admission_status in {"enqueued", "duplicate"}
-                and ledger_status in {"recorded", "stale"}
-            )
-            if admission_status == "enqueued" and committed:
-                published_count += 1
-            if not committed:
-                failed_count += 1
-            observations.append(
-                {
-                    "goal_id": str(goal["goal_id"]),
-                    "goal_revision": str(goal["revision"]),
-                    "status": (
-                        admission_status if committed else "degraded"
-                    ),
-                    "reason": (
-                        None
-                        if committed
-                        else "signal_ledger_not_committed"
-                    ),
-                    "ingress_status": admission_status,
-                    "signal_state": (
-                        "present" if repository["dirty"] else "clear"
-                    ),
-                    "repo_id": repository["repo_id"],
-                    "target_ref": repository["target_ref"],
-                    "target_sha": repository["target_sha"],
-                    "probe_digest": repository["probe_digest"],
-                    "event_id": admission.get("event_id"),
-                    "signal_ledger_status": ledger_status,
-                }
-            )
+            published_count += int(ci_observation.pop("_published"))
+            failed_count += int(ci_observation.pop("_failed"))
+            observations.append(ci_observation)
 
         result = {
             "status": "degraded" if failed_count else "success",
             "mode": mode,
             "reason": reason,
             "producer": "git_dirty",
+            "producers": producers,
             "active_goal_count": len(goals),
             "observed_count": len(observations),
             "published_count": published_count,
@@ -605,6 +1041,222 @@ class ProjectGuardianProducerRuntime:
         }
         self._persist_run(result)
         return result
+
+    def _run_git_observation(
+        self,
+        *,
+        goal: dict[str, Any],
+        binding: dict[str, Any],
+    ) -> dict[str, Any]:
+        base = {
+            "producer": "git_dirty",
+            "goal_id": str(goal["goal_id"]),
+            "goal_revision": str(goal["revision"]),
+        }
+        try:
+            repository = self._inspect_repository(
+                str(binding["canonical_path"]),
+                expected_repo_id=str(binding["repo_id"]),
+                expected_ref=str(binding["target_ref"]),
+                expected_sha=str(binding["target_sha"]),
+                expected_remote_origin_digest=str(
+                    binding["remote_origin_digest"]
+                ),
+                expected_github_repo_id=(
+                    str(binding["repo_id"])
+                    if isinstance(binding.get("github_actions"), dict)
+                    else None
+                ),
+            )
+        except Exception as exc:
+            return {
+                **base,
+                "status": "degraded",
+                "reason": "git_probe_failed",
+                "error_type": type(exc).__name__,
+                "_published": False,
+                "_failed": True,
+            }
+        repository_fact = {
+            "repo_id": repository["repo_id"],
+            "target_ref": repository["target_ref"],
+            "target_sha": repository["target_sha"],
+            "remote_origin_digest": repository[
+                "remote_origin_digest"
+            ],
+            "dirty": repository["dirty"],
+            "observed_at": repository["observed_at"],
+            "index_flags_digest": repository["index_flags_digest"],
+            "index_stage_digest": repository["index_stage_digest"],
+            "probe_digest": repository["probe_digest"],
+        }
+        try:
+            admission = self.publish_git_observation(
+                user_id=str(goal["user_id"]),
+                goal_id=str(goal["goal_id"]),
+                goal_revision=str(goal["revision"]),
+                repository_fact=repository_fact,
+            )
+        except Exception as exc:
+            admission = {
+                "status": "degraded",
+                "reason": "signal_ingress_failed",
+                "error_type": type(exc).__name__,
+            }
+        return self._producer_admission_observation(
+            base=base,
+            admission=admission,
+            signal_state=(
+                "present" if repository["dirty"] else "clear"
+            ),
+            fact={
+                "repo_id": repository["repo_id"],
+                "target_ref": repository["target_ref"],
+                "target_sha": repository["target_sha"],
+                "probe_digest": repository["probe_digest"],
+            },
+        )
+
+    def _run_ci_observation(
+        self,
+        *,
+        goal: dict[str, Any],
+        binding: dict[str, Any],
+    ) -> dict[str, Any]:
+        base = {
+            "producer": "ci_failed",
+            "goal_id": str(goal["goal_id"]),
+            "goal_revision": str(goal["revision"]),
+        }
+        policy = binding.get("github_actions")
+        if (
+            not isinstance(policy, dict)
+            or self.ci_provider is None
+            or self.publish_ci_observation is None
+        ):
+            return {
+                **base,
+                "status": "degraded",
+                "reason": "ci_producer_unavailable",
+                "_published": False,
+                "_failed": True,
+            }
+        try:
+            fact = self.ci_provider.observe(
+                binding=policy,
+                target_ref=str(binding["target_ref"]),
+                target_sha=str(binding["target_sha"]),
+                now=self._aware_now(),
+            )
+            if not isinstance(fact, dict):
+                raise GitHubCIUnknown("ci_fact_invalid")
+            try:
+                signal_state = str(fact["signal_state"])
+                integer_fields = {
+                    key: fact[key]
+                    for key in ("workflow_id", "run_id", "run_attempt")
+                }
+                if any(
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 1
+                    for value in integer_fields.values()
+                ):
+                    raise GitHubCIUnknown("ci_fact_invalid")
+                fact_summary = {
+                    "repo_id": str(fact["repo_id"]),
+                    "target_ref": str(fact["target_ref"]),
+                    "target_sha": str(fact["target_sha"]),
+                    **integer_fields,
+                    "probe_digest": str(fact["probe_digest"]),
+                }
+            except (KeyError, TypeError, ValueError) as exc:
+                raise GitHubCIUnknown("ci_fact_invalid") from exc
+            if (
+                signal_state not in {"present", "clear"}
+                or any(
+                    fact_summary[key] < 1
+                    for key in ("workflow_id", "run_id", "run_attempt")
+                )
+                or len(fact_summary["probe_digest"]) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in fact_summary["probe_digest"]
+                )
+            ):
+                raise GitHubCIUnknown("ci_fact_invalid")
+        except GitHubCIUnknown as exc:
+            return {
+                **base,
+                "status": "unknown",
+                "reason": exc.reason,
+                "_published": False,
+                "_failed": True,
+            }
+        except Exception as exc:
+            return {
+                **base,
+                "status": "degraded",
+                "reason": "ci_probe_failed",
+                "error_type": type(exc).__name__,
+                "_published": False,
+                "_failed": True,
+            }
+        try:
+            admission = self.publish_ci_observation(
+                user_id=str(goal["user_id"]),
+                goal_id=str(goal["goal_id"]),
+                goal_revision=str(goal["revision"]),
+                ci_fact=fact,
+            )
+        except Exception as exc:
+            admission = {
+                "status": "degraded",
+                "reason": "signal_ingress_failed",
+                "error_type": type(exc).__name__,
+            }
+        return self._producer_admission_observation(
+            base=base,
+            admission=admission,
+            signal_state=signal_state,
+            fact=fact_summary,
+        )
+
+    @staticmethod
+    def _producer_admission_observation(
+        *,
+        base: dict[str, Any],
+        admission: dict[str, Any],
+        signal_state: str,
+        fact: dict[str, Any],
+    ) -> dict[str, Any]:
+        admission_status = str(admission.get("status") or "unknown")
+        ledger_status = str(
+            admission.get("signal_ledger_status") or "unknown"
+        )
+        committed = (
+            admission_status in {"enqueued", "duplicate"}
+            and ledger_status in {"recorded", "stale"}
+        )
+        return {
+            **base,
+            "status": admission_status if committed else "degraded",
+            "reason": (
+                None
+                if committed
+                else str(
+                    admission.get("reason")
+                    or "signal_ledger_not_committed"
+                )
+            ),
+            "ingress_status": admission_status,
+            "signal_state": signal_state,
+            **copy.deepcopy(fact),
+            "event_id": admission.get("event_id"),
+            "signal_ledger_status": ledger_status,
+            "_published": admission_status == "enqueued" and committed,
+            "_failed": not committed,
+        }
 
     def _store_binding(self, binding: dict[str, Any]) -> None:
         def update(state: dict[str, Any]) -> None:
@@ -640,6 +1292,65 @@ class ProjectGuardianProducerRuntime:
             state["schema_version"] = self.SCHEMA_VERSION
             state["bindings"] = bindings
             state["binding_count"] = len(bindings)
+            state["updated_at"] = utc_now_iso()
+
+        self.state_store.mutate_json(self.STATE_FILE, update)
+
+    def _store_intent_operation(
+        self,
+        operation: dict[str, Any],
+    ) -> None:
+        operation_digest = str(operation.get("operation_digest") or "")
+        if (
+            len(operation_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in operation_digest
+            )
+        ):
+            raise ValueError("deployment intent operation digest is invalid")
+
+        def update(state: dict[str, Any]) -> None:
+            self._require_healthy(state, self.STATE_FILE)
+            operations = (
+                state.get("intent_operations")
+                if isinstance(state.get("intent_operations"), dict)
+                else {}
+            )
+            operations = {
+                str(key): copy.deepcopy(value)
+                for key, value in operations.items()
+                if isinstance(value, dict)
+            }
+            operations[operation_digest] = copy.deepcopy(operation)
+            if len(operations) > self.MAX_INTENT_OPERATIONS:
+                evictable = sorted(
+                    (
+                        (key, value)
+                        for key, value in operations.items()
+                        if key != operation_digest
+                        and str(value.get("status") or "") == "committed"
+                    ),
+                    key=lambda item: (
+                        str(item[1].get("updated_at") or ""),
+                        item[0],
+                    ),
+                )
+                while (
+                    len(operations) > self.MAX_INTENT_OPERATIONS
+                    and evictable
+                ):
+                    stale_digest, _ = evictable.pop(0)
+                    operations.pop(stale_digest, None)
+            if len(operations) > self.MAX_INTENT_OPERATIONS:
+                raise ProjectGuardianGoalConflict(
+                    "Project Guardian deployment intent operation capacity "
+                    "exhausted"
+                )
+            state["schema_version"] = self.SCHEMA_VERSION
+            state.setdefault("bindings", {})
+            state["intent_operations"] = operations
+            state["intent_operation_count"] = len(operations)
             state["updated_at"] = utc_now_iso()
 
         self.state_store.mutate_json(self.STATE_FILE, update)
@@ -721,6 +1432,141 @@ class ProjectGuardianProducerRuntime:
             return None
         return copy.deepcopy(binding)
 
+    def _event_awareness_mode(self) -> str:
+        config = self.state_store.read_json("ops_config.json")
+        if config.get("_state_corrupt") is True:
+            return "disabled"
+        section = (
+            config.get("event_awareness")
+            if isinstance(config.get("event_awareness"), dict)
+            else {}
+        )
+        mode = str(section.get("mode") or "disabled").strip().lower()
+        return (
+            mode
+            if mode in {"disabled", "record_only", "shadow"}
+            else "disabled"
+        )
+
+    @classmethod
+    def _intent_goal(
+        cls,
+        goals_state: dict[str, Any],
+        *,
+        user_id: str,
+        goal_id: str,
+        goal_revision: str,
+        expected_state_revision: int,
+        target_sha: str,
+        target_environment: str,
+        occurred_at: datetime,
+        accepted_at: datetime,
+    ) -> dict[str, Any] | None:
+        goals = (
+            goals_state.get("goals")
+            if isinstance(goals_state.get("goals"), list)
+            else []
+        )
+        matches = [
+            raw
+            for raw in goals
+            if isinstance(raw, dict)
+            and str(raw.get("goal_id") or "") == goal_id
+            and str(raw.get("kind") or "")
+            == ProjectGuardianEvaluator.GOAL_KIND
+        ]
+        if len(matches) != 1:
+            return None
+        goal = matches[0]
+        scope = (
+            goal.get("scope")
+            if isinstance(goal.get("scope"), dict)
+            else {}
+        )
+        active_from = cls._time(goal.get("active_from"))
+        active_until = cls._time(goal.get("active_until"))
+        if (
+            str(goal.get("schema_version") or "")
+            != ProjectGuardianEvaluator.GOAL_SCHEMA
+            or str(goal.get("source") or "") != cls.GOAL_SOURCE
+            or str(goal.get("status") or "") != "active"
+            or str(goal.get("user_id") or "") != user_id
+            or str(goal.get("revision") or "") != goal_revision
+            or cls._state_revision(goal) != expected_state_revision
+            or str(goal.get("target_sha") or "").strip().lower()
+            != target_sha
+            or str(scope.get("target_environment") or "")
+            != target_environment
+            or any(
+                not str(scope.get(key) or "")
+                for key in ProjectGuardianEvaluator.SCOPE_FIELDS
+            )
+            or active_from is None
+            or active_until is None
+            or not (active_from <= occurred_at <= active_until)
+            or not (active_from <= accepted_at <= active_until)
+        ):
+            return None
+        return copy.deepcopy(goal)
+
+    @classmethod
+    def _ci_binding_reservation_count(
+        cls,
+        *,
+        producer_state: dict[str, Any],
+        goals_state: dict[str, Any],
+        excluding_goal_id: str | None = None,
+        reference_time: datetime,
+    ) -> int:
+        bindings = (
+            producer_state.get("bindings")
+            if isinstance(producer_state.get("bindings"), dict)
+            else {}
+        )
+        goals = (
+            goals_state.get("goals")
+            if isinstance(goals_state.get("goals"), list)
+            else []
+        )
+        controlled_goals = {
+            str(goal.get("goal_id") or ""): goal
+            for goal in goals
+            if isinstance(goal, dict)
+            and str(goal.get("schema_version") or "")
+            == ProjectGuardianEvaluator.GOAL_SCHEMA
+            and str(goal.get("source") or "") == cls.GOAL_SOURCE
+            and cls._goal_reserves_ci_capacity(
+                goal,
+                status=str(goal.get("status") or ""),
+                reference_time=reference_time,
+            )
+        }
+        return sum(
+            1
+            for goal_id, binding in bindings.items()
+            if str(goal_id) != str(excluding_goal_id or "")
+            and isinstance(binding, dict)
+            and isinstance(binding.get("github_actions"), dict)
+            and str(goal_id) in controlled_goals
+            and str(binding.get("goal_revision") or "")
+            == str(
+                controlled_goals[str(goal_id)].get("revision") or ""
+            )
+        )
+
+    @classmethod
+    def _goal_reserves_ci_capacity(
+        cls,
+        goal: dict[str, Any],
+        *,
+        status: str,
+        reference_time: datetime,
+    ) -> bool:
+        if str(status or "") not in {"active", "paused"}:
+            return False
+        active_until = cls._time(goal.get("active_until"))
+        return active_until is None or active_until >= reference_time
+
     @staticmethod
     def _binding_matches_goal(
         binding: dict[str, Any],
@@ -757,6 +1603,7 @@ class ProjectGuardianProducerRuntime:
         expected_ref: str,
         expected_sha: str | None = None,
         expected_remote_origin_digest: str | None = None,
+        expected_github_repo_id: str | None = None,
     ) -> dict[str, Any]:
         selected_path = Path(
             self._required_text(workspace_path, "workspace_path", 4096)
@@ -785,6 +1632,15 @@ class ProjectGuardianProducerRuntime:
         repo_id = self._repo_id_from_remote(remote)
         if repo_id != self._normalize_repo_id(expected_repo_id):
             raise ValueError("Git remote does not match the release Goal repo_id")
+        github_repo_id = self._github_repo_id_from_remote(remote)
+        if (
+            expected_github_repo_id
+            and github_repo_id
+            != self._normalize_repo_id(expected_github_repo_id)
+        ):
+            raise ValueError(
+                "Git origin is not the expected github.com repository"
+            )
         if (
             expected_remote_origin_digest
             and remote_origin_digest
@@ -955,6 +1811,7 @@ class ProjectGuardianProducerRuntime:
         return {
             "canonical_path": str(git_root),
             "repo_id": repo_id,
+            "github_repo_id": github_repo_id,
             "target_ref": target_ref,
             "target_sha": target_sha,
             "remote_origin_digest": remote_origin_digest,
@@ -1298,6 +2155,48 @@ class ProjectGuardianProducerRuntime:
         name = parts[-1][:-4] if parts[-1].endswith(".git") else parts[-1]
         return cls._normalize_repo_id(f"{parts[-2]}/{name}")
 
+    @classmethod
+    def _github_repo_id_from_remote(cls, value: str) -> str:
+        """Return owner/repo only for an exact canonical github.com origin."""
+
+        remote = str(value or "").strip()
+        if not remote:
+            return ""
+        path = ""
+        if "://" in remote:
+            parsed = urlsplit(remote)
+            if (
+                parsed.scheme.lower() not in {"https", "ssh"}
+                or str(parsed.hostname or "").lower() != "github.com"
+                or parsed.query
+                or parsed.fragment
+                or (
+                    parsed.scheme.lower() == "ssh"
+                    and str(parsed.username or "") != "git"
+                )
+            ):
+                return ""
+            path = parsed.path
+        elif "@" in remote and ":" in remote:
+            authority, path = remote.split(":", 1)
+            try:
+                username, host = authority.rsplit("@", 1)
+            except ValueError:
+                return ""
+            if username != "git" or host.lower() != "github.com":
+                return ""
+        else:
+            return ""
+        parts = [
+            item
+            for item in path.replace("\\", "/").strip("/").split("/")
+            if item
+        ]
+        if len(parts) != 2:
+            return ""
+        name = parts[-1][:-4] if parts[-1].endswith(".git") else parts[-1]
+        return cls._normalize_repo_id(f"{parts[0]}/{name}")
+
     @staticmethod
     def _normalize_repo_id(value: Any) -> str:
         text = str(value or "").strip().strip("/")
@@ -1329,6 +2228,7 @@ class ProjectGuardianProducerRuntime:
         remote_origin_digest: str,
         active_from: str,
         active_until: str,
+        ci_policy_digest: str = "",
     ) -> str:
         return "pgrg_" + cls._digest(
             {
@@ -1342,6 +2242,7 @@ class ProjectGuardianProducerRuntime:
                         "remote_origin_digest": remote_origin_digest,
                     }
                 ),
+                "ci_policy_digest": ci_policy_digest,
                 "active_from": active_from,
                 "active_until": active_until,
             }
@@ -1358,6 +2259,7 @@ class ProjectGuardianProducerRuntime:
         target_ref: str,
         target_sha: str,
         remote_origin_digest: str,
+        ci_policy_digest: str = "",
     ) -> str:
         return "pgwb_" + cls._digest(
             {
@@ -1368,6 +2270,7 @@ class ProjectGuardianProducerRuntime:
                 "target_ref": target_ref,
                 "target_sha": target_sha,
                 "remote_origin_digest": remote_origin_digest,
+                "ci_policy_digest": ci_policy_digest,
             }
         )[:24]
 
@@ -1399,6 +2302,7 @@ class ProjectGuardianProducerRuntime:
             "mode",
             "reason",
             "producer",
+            "producers",
             "active_goal_count",
             "observed_count",
             "published_count",

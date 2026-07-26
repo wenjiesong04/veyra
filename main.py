@@ -52,9 +52,13 @@ from runtime.external_runtime_probe import ExternalRuntimeProbe
 from runtime.ops_monitor import OpsMonitor
 from runtime.proactive_checks import ProactiveChecks
 from runtime.project_guardian import ProjectGuardianRuntime
+from runtime.project_guardian_attention_runtime import (
+    ProjectGuardianAttentionRuntime,
+)
 from runtime.project_guardian_producers import (
     ProjectGuardianProducerRuntime,
 )
+from runtime.project_guardian_github_ci import GitHubActionsCIProvider
 from runtime.retention_policy import RetentionPolicy
 from runtime.routing_metrics import RoutingMetrics
 from runtime.runtime_matrix import RuntimeMatrix
@@ -217,6 +221,14 @@ project_guardian_producers = ProjectGuardianProducerRuntime(
     publish_git_observation=(
         awareness_loop.event_awareness.issue_project_guardian_git_publisher()
     ),
+    publish_ci_observation=(
+        awareness_loop.event_awareness.issue_project_guardian_ci_publisher()
+    ),
+    publish_deployment_intent=(
+        awareness_loop.event_awareness
+        .issue_project_guardian_deployment_intent_publisher()
+    ),
+    ci_provider=GitHubActionsCIProvider(),
 )
 project_guardian = ProjectGuardianRuntime(
     state_store=state_store,
@@ -225,6 +237,9 @@ project_guardian = ProjectGuardianRuntime(
         "mode": awareness_loop.event_awareness.mode,
         "mode_epoch": awareness_loop.event_awareness.mode_epoch,
     },
+)
+project_guardian_attention = ProjectGuardianAttentionRuntime(
+    state_store=state_store,
 )
 
 
@@ -265,6 +280,7 @@ active_loop = ActiveRuntimeLoop(
     event_consumer=awareness_loop.process_event_inbox,
     project_guardian_producers=project_guardian_producers.run_once,
     project_guardian=project_guardian.run_once,
+    project_guardian_attention=project_guardian_attention.run_once,
 )
 runtime_cron = Cron(state_store=state_store, active_loop=active_loop, commitment_push=commitment_push)
 agent_orchestrator = AgentOrchestrator(
@@ -630,6 +646,9 @@ app.include_router(
                 "project_guardian": lambda: project_guardian,
                 "project_guardian_producers": (
                     lambda: project_guardian_producers
+                ),
+                "project_guardian_attention": (
+                    lambda: project_guardian_attention
                 ),
             }
         )

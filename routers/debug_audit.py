@@ -1,14 +1,18 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+from starlette.concurrency import run_in_threadpool
 
 from core.definitions import RiskLevel, lifecycle_statuses, operational_modes, risk_catalog
 from core.model_client import redact_sensitive
 from interface.event_schema import utc_now_iso
 from runtime.project_guardian_producers import ProjectGuardianGoalConflict
+from runtime.project_guardian_attention_runtime import (
+    ProjectGuardianAttentionConflict,
+)
 
 
 class ReviewDecisionRequest(BaseModel):
@@ -60,6 +64,8 @@ class ProjectGuardianConfigRequest(BaseModel):
 
 
 class ProjectReleaseGoalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     user_id: str
     workspace_id: str
     repo_id: str
@@ -71,12 +77,63 @@ class ProjectReleaseGoalRequest(BaseModel):
     active_until: str | None = None
     goal_id: str | None = None
     expected_state_revision: int | None = None
+    github_actions_workflow: str | None = None
+    github_actions_required_jobs: list[str] | None = None
+    github_actions_app_id: int | None = None
 
 
 class ProjectReleaseGoalStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     user_id: str
     expected_state_revision: int
     status: str
+
+
+class ProjectDeploymentIntentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal[
+        "veyra.project_guardian_deployment_intent_command.v1"
+    ]
+    user_id: str
+    session_id: str
+    goal_revision: str
+    expected_goal_state_revision: int
+    target_sha: str
+    target_environment: str
+    transition: Literal["declare", "withdraw"]
+    operation_id: str
+    occurred_at: str
+
+
+class ProjectGuardianAttentionPolicyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal[
+        "veyra.project_guardian_attention_policy_command.v1"
+    ]
+    user_id: str
+    goal_revision: str
+    expected_goal_state_revision: int
+    attention_group_id: str
+    goal_priority: float
+    deadline_at: str
+    timezone: str
+    notifications_paused: bool
+    quiet_hours: dict[str, Any]
+    daily_notification_budget: int
+    expected_policy_revision: str | None = None
+
+
+class ProjectGuardianAttentionDismissalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal[
+        "veyra.project_guardian_attention_dismissal_command.v1"
+    ]
+    user_id: str
+    dismissed: bool
 
 
 def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
@@ -388,7 +445,10 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
 
     @router.post("/awareness/project-guardian/run-once")
     async def project_guardian_run_once() -> dict[str, Any]:
-        return deps["project_guardian"].run_once(reason="debug_api")
+        return await run_in_threadpool(
+            deps["project_guardian"].run_once,
+            reason="debug_api",
+        )
 
     @router.get("/awareness/project-guardian/producers/status")
     async def project_guardian_producers_status() -> dict[str, Any]:
@@ -396,8 +456,9 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
 
     @router.post("/awareness/project-guardian/producers/run-once")
     async def project_guardian_producers_run_once() -> dict[str, Any]:
-        return deps["project_guardian_producers"].public_run_once(
-            reason="debug_api"
+        return await run_in_threadpool(
+            deps["project_guardian_producers"].public_run_once,
+            reason="debug_api",
         )
 
     @router.post("/awareness/project-guardian/release-goals")
@@ -405,9 +466,10 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
         request: ProjectReleaseGoalRequest,
     ) -> dict[str, Any]:
         try:
-            item = deps[
-                "project_guardian_producers"
-            ].register_release_goal(**request.model_dump())
+            item = await run_in_threadpool(
+                deps["project_guardian_producers"].register_release_goal,
+                **request.model_dump(),
+            )
         except ProjectGuardianGoalConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
@@ -422,9 +484,8 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
         request: ProjectReleaseGoalStatusRequest,
     ) -> dict[str, Any]:
         try:
-            item = deps[
-                "project_guardian_producers"
-            ].set_release_goal_status(
+            item = await run_in_threadpool(
+                deps["project_guardian_producers"].set_release_goal_status,
                 goal_id=goal_id,
                 **request.model_dump(),
             )
@@ -435,6 +496,117 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"status": "updated", "item": item}
+
+    @router.post(
+        "/awareness/project-guardian/release-goals/"
+        "{goal_id}/deployment-intent"
+    )
+    async def project_guardian_deployment_intent(
+        goal_id: str,
+        request: ProjectDeploymentIntentRequest,
+    ) -> dict[str, Any]:
+        command = request.model_dump(exclude={"schema_version"})
+        try:
+            return await run_in_threadpool(
+                deps["project_guardian_producers"].record_deployment_intent,
+                goal_id=goal_id,
+                **command,
+            )
+        except ProjectGuardianGoalConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.get("/awareness/project-guardian/attention/status")
+    async def project_guardian_attention_status() -> dict[str, Any]:
+        return deps["project_guardian_attention"].status()
+
+    @router.post("/awareness/project-guardian/attention/run-once")
+    async def project_guardian_attention_run_once() -> dict[str, Any]:
+        return await run_in_threadpool(
+            deps["project_guardian_attention"].run_once,
+            reason="debug_api",
+        )
+
+    @router.post(
+        "/awareness/project-guardian/release-goals/"
+        "{goal_id}/attention-policy"
+    )
+    async def project_guardian_attention_policy(
+        goal_id: str,
+        request: ProjectGuardianAttentionPolicyRequest,
+    ) -> dict[str, Any]:
+        command = request.model_dump(exclude={"schema_version"})
+        command["timezone_name"] = command.pop("timezone")
+        try:
+            item = await run_in_threadpool(
+                deps["project_guardian_attention"].set_policy,
+                goal_id=goal_id,
+                **command,
+            )
+        except ProjectGuardianAttentionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"status": "updated", "item": item}
+
+    @router.post(
+        "/awareness/project-guardian/attention/dismissals/"
+        "{suppression_key}"
+    )
+    async def project_guardian_attention_dismissal(
+        suppression_key: str,
+        request: ProjectGuardianAttentionDismissalRequest,
+    ) -> dict[str, Any]:
+        try:
+            return await run_in_threadpool(
+                deps["project_guardian_attention"].set_dismissal,
+                suppression_key=suppression_key,
+                user_id=request.user_id,
+                dismissed=request.dismissed,
+            )
+        except ProjectGuardianAttentionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.get("/awareness/project-guardian/attention/assessments")
+    async def project_guardian_attention_assessments(
+        user_id: str,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        try:
+            items = deps["project_guardian_attention"].list_assessments(
+                user_id=user_id,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"status": "success", "count": len(items), "items": items}
+
+    @router.get(
+        "/awareness/project-guardian/attention/general-situations"
+    )
+    async def project_guardian_attention_general_situations(
+        user_id: str,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        try:
+            items = deps[
+                "project_guardian_attention"
+            ].list_general_situations(
+                user_id=user_id,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"status": "success", "count": len(items), "items": items}
 
     @router.get("/awareness/project-guardian/release-goals")
     async def project_guardian_release_goals(
@@ -613,6 +785,7 @@ def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
     public.pop("project_guardian_state", None)
     public.pop("project_guardian_signal_state", None)
     public.pop("project_guardian_producer_state", None)
+    public.pop("project_guardian_attention_state", None)
     agent_config = public.get("agent_config") if isinstance(public.get("agent_config"), dict) else {}
     if isinstance(agent_config, dict):
         core_model = agent_config.get("core_model") if isinstance(agent_config.get("core_model"), dict) else {}

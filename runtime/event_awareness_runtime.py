@@ -21,6 +21,7 @@ from interface.event_schema import (
 )
 from runtime.event_inbox import EventInbox
 from runtime.project_guardian import ProjectGuardianRuntime
+from runtime.project_guardian_github_ci import GitHubActionsCIProvider
 from runtime.project_guardian_signal_ledger import ProjectGuardianSignalLedger
 
 
@@ -58,6 +59,10 @@ class ShadowAwarenessRuntime:
         self.project_guardian_signals = ProjectGuardianSignalLedger(state_store)
         self._project_guardian_git_ingress_capability = object()
         self._project_guardian_git_publisher_issued = False
+        self._project_guardian_ci_ingress_capability = object()
+        self._project_guardian_ci_publisher_issued = False
+        self._project_guardian_intent_ingress_capability = object()
+        self._project_guardian_intent_publisher_issued = False
 
     def configure(self, mode: str) -> dict[str, Any]:
         selected = str(mode or "").strip().lower()
@@ -161,6 +166,47 @@ class ShadowAwarenessRuntime:
 
         def publish(**kwargs: Any) -> dict[str, Any]:
             return self._publish_project_guardian_git_observation(
+                ingress_capability=capability,
+                **kwargs,
+            )
+
+        return publish
+
+    def issue_project_guardian_ci_publisher(
+        self,
+    ) -> Callable[..., dict[str, Any]]:
+        """Issue the single trusted CI producer capability for this runtime."""
+
+        if self._project_guardian_ci_publisher_issued:
+            raise RuntimeError(
+                "Project Guardian CI publisher capability was already issued"
+            )
+        self._project_guardian_ci_publisher_issued = True
+        capability = self._project_guardian_ci_ingress_capability
+
+        def publish(**kwargs: Any) -> dict[str, Any]:
+            return self._publish_project_guardian_ci_observation(
+                ingress_capability=capability,
+                **kwargs,
+            )
+
+        return publish
+
+    def issue_project_guardian_deployment_intent_publisher(
+        self,
+    ) -> Callable[..., dict[str, Any]]:
+        """Issue the single structured deployment-intent capability."""
+
+        if self._project_guardian_intent_publisher_issued:
+            raise RuntimeError(
+                "Project Guardian deployment-intent publisher capability "
+                "was already issued"
+            )
+        self._project_guardian_intent_publisher_issued = True
+        capability = self._project_guardian_intent_ingress_capability
+
+        def publish(**kwargs: Any) -> dict[str, Any]:
+            return self._publish_project_guardian_deployment_intent(
                 ingress_capability=capability,
                 **kwargs,
             )
@@ -446,6 +492,711 @@ class ShadowAwarenessRuntime:
                 return {
                     "status": "ignored",
                     "reason": "repository_fact_observation_time_invalid",
+                }
+            return self._admit_project_guardian_signal(event)
+
+    def _publish_project_guardian_ci_observation(
+        self,
+        *,
+        ingress_capability: object,
+        user_id: str,
+        goal_id: str,
+        goal_revision: str,
+        ci_fact: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Admit one bound GitHub Actions fact through the reserved channel."""
+
+        if (
+            ingress_capability
+            is not self._project_guardian_ci_ingress_capability
+        ):
+            return {
+                "status": "ignored",
+                "reason": "untrusted_project_guardian_ci_ingress",
+            }
+        observed_at = ProjectGuardianSignalLedger._time(
+            ci_fact.get("observed_at")
+        )
+        with self.state_store.writer_transaction():
+            admitted_at = datetime.now(timezone.utc)
+            if not self._project_guardian_ci_observation_time_valid(
+                observed_at,
+                admitted_at,
+            ):
+                return {
+                    "status": "ignored",
+                    "reason": "ci_fact_observation_time_invalid",
+                }
+            fabric = self._fabric_snapshot()
+            guardian = self._project_guardian_snapshot()
+            if guardian["mode"] == "disabled":
+                return {
+                    "status": "disabled",
+                    "reason": "project_guardian_disabled",
+                }
+            if fabric["mode"] == "disabled":
+                return {
+                    "status": "disabled",
+                    "reason": "event_fabric_disabled",
+                }
+            if fabric["mode"] not in self.MODES:
+                return {
+                    "status": "degraded",
+                    "reason": "event_fabric_unavailable",
+                }
+
+            goals_state = self.state_store.read_json("user_goals.json")
+            if goals_state.get("_state_corrupt") is True:
+                return {
+                    "status": "degraded",
+                    "reason": "user_goals_state_corrupt",
+                }
+            goal = self._active_release_goal(
+                goals_state,
+                user_id=user_id,
+                goal_id=goal_id,
+                goal_revision=goal_revision,
+                observed_at=observed_at,
+            )
+            if goal is None:
+                return {
+                    "status": "ignored",
+                    "reason": "release_goal_not_active_or_mismatched",
+                }
+            scope = (
+                goal.get("scope")
+                if isinstance(goal.get("scope"), dict)
+                else {}
+            )
+
+            producer_state = self.state_store.read_json(
+                "project_guardian_producer_state.json"
+            )
+            if producer_state.get("_state_corrupt") is True:
+                return {
+                    "status": "degraded",
+                    "reason": "project_guardian_producer_state_corrupt",
+                }
+            bindings = (
+                producer_state.get("bindings")
+                if isinstance(producer_state.get("bindings"), dict)
+                else {}
+            )
+            binding = bindings.get(goal_id)
+            policy = (
+                binding.get("github_actions")
+                if isinstance(binding, dict)
+                and isinstance(binding.get("github_actions"), dict)
+                else {}
+            )
+            required_jobs = (
+                sorted(
+                    str(item)
+                    for item in policy.get("required_jobs", [])
+                    if isinstance(item, str)
+                )
+                if isinstance(policy.get("required_jobs"), list)
+                else []
+            )
+
+            def positive_int(value: Any) -> int:
+                if not isinstance(value, int) or isinstance(value, bool):
+                    return 0
+                return value if value >= 1 else 0
+
+            policy_core = {
+                "schema_version": str(
+                    policy.get("schema_version") or ""
+                ),
+                "provider": str(policy.get("provider") or ""),
+                "api_origin": str(policy.get("api_origin") or ""),
+                "repo_id": str(policy.get("repo_id") or ""),
+                "repository_id": positive_int(
+                    policy.get("repository_id")
+                ),
+                "workflow_id": positive_int(policy.get("workflow_id")),
+                "workflow_path": str(policy.get("workflow_path") or ""),
+                "event": str(policy.get("event") or ""),
+                "expected_app_id": positive_int(
+                    policy.get("expected_app_id")
+                ),
+                "required_jobs": required_jobs,
+            }
+            expected_policy_digest = hashlib.sha256(
+                json.dumps(
+                    policy_core,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            expected_required_jobs_digest = hashlib.sha256(
+                json.dumps(
+                    required_jobs,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+
+            fact_core = {
+                "provider": str(ci_fact.get("provider") or ""),
+                "repo_id": str(ci_fact.get("repo_id") or ""),
+                "repository_id": positive_int(
+                    ci_fact.get("repository_id")
+                ),
+                "target_ref": str(ci_fact.get("target_ref") or ""),
+                "target_sha": str(ci_fact.get("target_sha") or ""),
+                "workflow_id": positive_int(ci_fact.get("workflow_id")),
+                "workflow_path": str(
+                    ci_fact.get("workflow_path") or ""
+                ),
+                "required_jobs_digest": str(
+                    ci_fact.get("required_jobs_digest") or ""
+                ),
+                "expected_app_id": positive_int(
+                    ci_fact.get("expected_app_id")
+                ),
+                "run_id": positive_int(ci_fact.get("run_id")),
+                "run_number": positive_int(ci_fact.get("run_number")),
+                "run_attempt": positive_int(ci_fact.get("run_attempt")),
+                "check_suite_id": positive_int(
+                    ci_fact.get("check_suite_id")
+                ),
+                "signal_state": str(ci_fact.get("signal_state") or ""),
+                "observed_at": (
+                    observed_at.isoformat() if observed_at else ""
+                ),
+                "checks_digest": str(
+                    ci_fact.get("checks_digest") or ""
+                ),
+                "policy_digest": str(
+                    ci_fact.get("policy_digest") or ""
+                ),
+            }
+            expected_probe_digest = hashlib.sha256(
+                json.dumps(
+                    fact_core,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            checks_digest = fact_core["checks_digest"]
+            expected_sha = str(goal.get("target_sha") or "")
+            if (
+                not isinstance(binding, dict)
+                or str(binding.get("user_id") or "") != str(user_id)
+                or str(binding.get("goal_revision") or "")
+                != str(goal_revision)
+                or str(binding.get("workspace_id") or "")
+                != str(scope.get("workspace_id") or "")
+                or str(binding.get("repo_id") or "")
+                != str(scope.get("repo_id") or "")
+                or str(binding.get("target_ref") or "")
+                != str(scope.get("target_ref") or "")
+                or str(binding.get("target_sha") or "") != expected_sha
+                or policy_core["schema_version"]
+                != GitHubActionsCIProvider.CONTRACT
+                or policy_core["provider"]
+                != GitHubActionsCIProvider.PROVIDER
+                or policy_core["api_origin"]
+                != GitHubActionsCIProvider.API_ORIGIN
+                or policy_core["event"] != "push"
+                or not required_jobs
+                or any(
+                    policy_core[key] < 1
+                    for key in (
+                        "repository_id",
+                        "workflow_id",
+                        "expected_app_id",
+                    )
+                )
+                or str(policy.get("policy_digest") or "")
+                != expected_policy_digest
+                or fact_core["policy_digest"] != expected_policy_digest
+                or fact_core["provider"]
+                != GitHubActionsCIProvider.PROVIDER
+                or fact_core["repo_id"] != policy_core["repo_id"]
+                or fact_core["repo_id"]
+                != str(scope.get("repo_id") or "")
+                or fact_core["repository_id"]
+                != policy_core["repository_id"]
+                or fact_core["target_ref"]
+                != str(scope.get("target_ref") or "")
+                or fact_core["target_sha"] != expected_sha
+                or fact_core["workflow_id"] != policy_core["workflow_id"]
+                or fact_core["workflow_path"]
+                != policy_core["workflow_path"]
+                or fact_core["required_jobs_digest"]
+                != expected_required_jobs_digest
+                or fact_core["expected_app_id"]
+                != policy_core["expected_app_id"]
+                or fact_core["signal_state"] not in {"present", "clear"}
+                or any(
+                    fact_core[key] < 1
+                    for key in (
+                        "run_id",
+                        "run_number",
+                        "run_attempt",
+                        "check_suite_id",
+                    )
+                )
+                or len(checks_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in checks_digest
+                )
+                or str(ci_fact.get("probe_digest") or "")
+                != expected_probe_digest
+            ):
+                return {
+                    "status": "ignored",
+                    "reason": "ci_fact_binding_mismatch",
+                }
+
+            kind = "ci_failed"
+            component = ProjectGuardianEvaluator.SIGNAL_COMPONENTS[kind]
+            producer = ProjectGuardianEvaluator.SIGNAL_PRODUCERS[kind]
+            policy_identity = hashlib.sha256(
+                expected_policy_digest.encode("utf-8")
+            ).hexdigest()[:20]
+            provenance_root = (
+                f"{component}:github_actions_policy_{policy_identity}"
+            )
+            evidence_id = "pgce_" + hashlib.sha256(
+                json.dumps(
+                    {
+                        "producer_id": producer["producer_id"],
+                        "goal_id": goal_id,
+                        "goal_revision": goal_revision,
+                        **fact_core,
+                        "probe_digest": expected_probe_digest,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()[:24]
+            occurred_at = observed_at.isoformat()
+            valid_until = (
+                observed_at + timedelta(minutes=30)
+            ).isoformat()
+            session_id = (
+                f"project-guardian-ci-{policy_identity[:12]}"
+            )
+            receipt_id = ProjectGuardianEvaluator.producer_receipt_id_for(
+                kind=kind,
+                state=fact_core["signal_state"],
+                source_component=component,
+                provenance_root=provenance_root,
+                evidence_id=evidence_id,
+                goal_id=goal_id,
+                goal_revision=goal_revision,
+                scope=scope,
+                valid_until=valid_until,
+                producer_id=str(producer["producer_id"]),
+                trust_class=str(producer["trust_class"]),
+                user_id=user_id,
+                session_id=session_id,
+                occurred_at=occurred_at,
+            )
+            event_id = "pgse_" + hashlib.sha256(
+                f"{receipt_id}:{occurred_at}".encode("utf-8")
+            ).hexdigest()[:24]
+            event = VeyraEvent(
+                type=EventType.OBSERVATION,
+                source=EventSource(
+                    channel=ProjectGuardianEvaluator.SIGNAL_CHANNEL,
+                    user_id=user_id,
+                    session_id=session_id,
+                ),
+                payload={
+                    "schema_version": ProjectGuardianEvaluator.SIGNAL_SCHEMA,
+                    "project_guardian_signal": {
+                        "kind": kind,
+                        "state": fact_core["signal_state"],
+                        "source_component": component,
+                        "provenance_root": provenance_root,
+                        "evidence_id": evidence_id,
+                        "goal_id": goal_id,
+                        "goal_revision": goal_revision,
+                        "scope": {
+                            key: str(scope.get(key) or "")
+                            for key in ProjectGuardianEvaluator.SCOPE_FIELDS
+                        },
+                        "valid_until": valid_until,
+                        "producer_attestation": {
+                            "schema_version": (
+                                ProjectGuardianEvaluator
+                                .PRODUCER_ATTESTATION_SCHEMA
+                            ),
+                            "producer_id": str(producer["producer_id"]),
+                            "trust_class": str(producer["trust_class"]),
+                            "admission_source": (
+                                "project_guardian_signal_ingress"
+                            ),
+                            "receipt_id": receipt_id,
+                        },
+                    },
+                },
+                event_id=event_id,
+                timestamp=occurred_at,
+                occurred_at=occurred_at,
+                evidence_refs=[
+                    {
+                        "ref_id": evidence_id,
+                        "source": component,
+                        "is_fact": True,
+                    }
+                ],
+                privacy_scope="user",
+            )
+            commit_time = datetime.now(timezone.utc)
+            if not self._project_guardian_ci_observation_time_valid(
+                observed_at,
+                commit_time,
+            ):
+                return {
+                    "status": "ignored",
+                    "reason": "ci_fact_observation_time_invalid",
+                }
+            return self._admit_project_guardian_signal(event)
+
+    def _publish_project_guardian_deployment_intent(
+        self,
+        *,
+        ingress_capability: object,
+        user_id: str,
+        goal_id: str,
+        goal_revision: str,
+        expected_goal_state_revision: int,
+        target_sha: str,
+        target_environment: str,
+        transition: str,
+        operation_digest: str,
+        occurred_at: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """Admit one explicit, Goal-bound local deployment-intent command."""
+
+        if (
+            ingress_capability
+            is not self._project_guardian_intent_ingress_capability
+        ):
+            return {
+                "status": "ignored",
+                "reason": "untrusted_project_guardian_intent_ingress",
+            }
+
+        observed_at = ProjectGuardianSignalLedger._time(occurred_at)
+        selected_user = str(user_id or "").strip()
+        selected_goal = str(goal_id or "").strip()
+        selected_revision = str(goal_revision or "").strip()
+        selected_environment = str(target_environment or "").strip()
+        selected_transition = str(transition or "").strip().lower()
+        selected_sha = str(target_sha or "").strip().lower()
+        selected_operation_digest = str(operation_digest or "").strip().lower()
+        selected_session = str(session_id or "").strip()
+        selected_state_revision = (
+            expected_goal_state_revision
+            if isinstance(expected_goal_state_revision, int)
+            and not isinstance(expected_goal_state_revision, bool)
+            else 0
+        )
+
+        with self.state_store.writer_transaction():
+            admitted_at = datetime.now(timezone.utc)
+            if not self._project_guardian_intent_time_valid(
+                observed_at,
+                admitted_at,
+            ):
+                return {
+                    "status": "ignored",
+                    "reason": "deployment_intent_time_invalid",
+                }
+            fabric = self._fabric_snapshot()
+            guardian = self._project_guardian_snapshot()
+            if guardian["mode"] == "disabled":
+                return {
+                    "status": "disabled",
+                    "reason": "project_guardian_disabled",
+                }
+            if fabric["mode"] == "disabled":
+                return {
+                    "status": "disabled",
+                    "reason": "event_fabric_disabled",
+                }
+            if fabric["mode"] not in self.MODES:
+                return {
+                    "status": "degraded",
+                    "reason": "event_fabric_unavailable",
+                }
+            if (
+                not selected_user
+                or len(selected_user) > 240
+                or "\x00" in selected_user
+                or not selected_goal
+                or len(selected_goal) > 240
+                or "\x00" in selected_goal
+                or not selected_revision
+                or len(selected_revision) > 120
+                or "\x00" in selected_revision
+                or not selected_environment
+                or len(selected_environment) > 240
+                or "\x00" in selected_environment
+                or not selected_session
+                or len(selected_session) > 240
+                or "\x00" in selected_session
+                or selected_transition not in {"declare", "withdraw"}
+                or selected_state_revision < 1
+                or len(selected_sha) not in {40, 64}
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in selected_sha
+                )
+                or len(selected_operation_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in selected_operation_digest
+                )
+            ):
+                return {
+                    "status": "ignored",
+                    "reason": "deployment_intent_command_invalid",
+                }
+
+            goals_state = self.state_store.read_json("user_goals.json")
+            if goals_state.get("_state_corrupt") is True:
+                return {
+                    "status": "degraded",
+                    "reason": "user_goals_state_corrupt",
+                }
+            goal = self._active_release_goal(
+                goals_state,
+                user_id=selected_user,
+                goal_id=selected_goal,
+                goal_revision=selected_revision,
+                observed_at=observed_at,
+            )
+            if goal is None:
+                return {
+                    "status": "ignored",
+                    "reason": "release_goal_not_active_or_mismatched",
+                }
+            active_from = ProjectGuardianSignalLedger._time(
+                goal.get("active_from")
+            )
+            active_until = ProjectGuardianSignalLedger._time(
+                goal.get("active_until")
+            )
+            if (
+                active_from is None
+                or active_until is None
+                or not (active_from <= admitted_at <= active_until)
+                or self._nonnegative_int(goal.get("state_revision"))
+                != selected_state_revision
+                or str(goal.get("target_sha") or "").strip().lower()
+                != selected_sha
+            ):
+                return {
+                    "status": "ignored",
+                    "reason": "deployment_intent_goal_state_mismatch",
+                }
+            scope = (
+                goal.get("scope")
+                if isinstance(goal.get("scope"), dict)
+                else {}
+            )
+            if (
+                str(scope.get("target_environment") or "")
+                != selected_environment
+                or any(
+                    not str(scope.get(key) or "")
+                    for key in ProjectGuardianEvaluator.SCOPE_FIELDS
+                )
+            ):
+                return {
+                    "status": "ignored",
+                    "reason": "deployment_intent_scope_mismatch",
+                }
+
+            producer_state = self.state_store.read_json(
+                "project_guardian_producer_state.json"
+            )
+            if producer_state.get("_state_corrupt") is True:
+                return {
+                    "status": "degraded",
+                    "reason": "project_guardian_producer_state_corrupt",
+                }
+            bindings = (
+                producer_state.get("bindings")
+                if isinstance(producer_state.get("bindings"), dict)
+                else {}
+            )
+            binding = bindings.get(selected_goal)
+            binding_id = (
+                str(binding.get("binding_id") or "")
+                if isinstance(binding, dict)
+                else ""
+            )
+            remote_origin_digest = (
+                str(binding.get("remote_origin_digest") or "")
+                if isinstance(binding, dict)
+                else ""
+            )
+            if (
+                not isinstance(binding, dict)
+                or not binding_id.startswith("pgwb_")
+                or str(binding.get("goal_id") or "") != selected_goal
+                or str(binding.get("user_id") or "") != selected_user
+                or str(binding.get("goal_revision") or "")
+                != selected_revision
+                or str(binding.get("workspace_id") or "")
+                != str(scope.get("workspace_id") or "")
+                or str(binding.get("repo_id") or "")
+                != str(scope.get("repo_id") or "")
+                or str(binding.get("target_ref") or "")
+                != str(scope.get("target_ref") or "")
+                or str(binding.get("target_sha") or "") != selected_sha
+                or len(remote_origin_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in remote_origin_digest
+                )
+            ):
+                return {
+                    "status": "ignored",
+                    "reason": "deployment_intent_binding_mismatch",
+                }
+
+            valid_until_time = min(
+                observed_at + timedelta(minutes=30),
+                active_until,
+            )
+            if valid_until_time < admitted_at:
+                return {
+                    "status": "ignored",
+                    "reason": "deployment_intent_expired",
+                }
+            kind = "deployment_intent"
+            signal_state = (
+                "present"
+                if selected_transition == "declare"
+                else "clear"
+            )
+            component = ProjectGuardianEvaluator.SIGNAL_COMPONENTS[kind]
+            producer = ProjectGuardianEvaluator.SIGNAL_PRODUCERS[kind]
+            binding_identity = hashlib.sha256(
+                binding_id.encode("utf-8")
+            ).hexdigest()[:20]
+            provenance_root = (
+                f"{component}:local_control_binding_{binding_identity}"
+            )
+            evidence_id = "pgie_" + hashlib.sha256(
+                json.dumps(
+                    {
+                        "producer_id": producer["producer_id"],
+                        "goal_id": selected_goal,
+                        "goal_revision": selected_revision,
+                        "goal_state_revision": selected_state_revision,
+                        "target_sha": selected_sha,
+                        "target_environment": selected_environment,
+                        "transition": selected_transition,
+                        "operation_digest": selected_operation_digest,
+                        "occurred_at": observed_at.isoformat(),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()[:24]
+            occurred_at_text = observed_at.isoformat()
+            valid_until = valid_until_time.isoformat()
+            source_session = (
+                "project-guardian-intent-"
+                + hashlib.sha256(
+                    selected_session.encode("utf-8")
+                ).hexdigest()[:12]
+            )
+            receipt_id = ProjectGuardianEvaluator.producer_receipt_id_for(
+                kind=kind,
+                state=signal_state,
+                source_component=component,
+                provenance_root=provenance_root,
+                evidence_id=evidence_id,
+                goal_id=selected_goal,
+                goal_revision=selected_revision,
+                scope=scope,
+                valid_until=valid_until,
+                producer_id=str(producer["producer_id"]),
+                trust_class=str(producer["trust_class"]),
+                user_id=selected_user,
+                session_id=source_session,
+                occurred_at=occurred_at_text,
+            )
+            event_id = "pgse_" + hashlib.sha256(
+                f"{receipt_id}:{occurred_at_text}".encode("utf-8")
+            ).hexdigest()[:24]
+            event = VeyraEvent(
+                type=EventType.OBSERVATION,
+                source=EventSource(
+                    channel=ProjectGuardianEvaluator.SIGNAL_CHANNEL,
+                    user_id=selected_user,
+                    session_id=source_session,
+                ),
+                payload={
+                    "schema_version": ProjectGuardianEvaluator.SIGNAL_SCHEMA,
+                    "project_guardian_signal": {
+                        "kind": kind,
+                        "state": signal_state,
+                        "source_component": component,
+                        "provenance_root": provenance_root,
+                        "evidence_id": evidence_id,
+                        "goal_id": selected_goal,
+                        "goal_revision": selected_revision,
+                        "scope": {
+                            key: str(scope.get(key) or "")
+                            for key in ProjectGuardianEvaluator.SCOPE_FIELDS
+                        },
+                        "valid_until": valid_until,
+                        "producer_attestation": {
+                            "schema_version": (
+                                ProjectGuardianEvaluator
+                                .PRODUCER_ATTESTATION_SCHEMA
+                            ),
+                            "producer_id": str(producer["producer_id"]),
+                            "trust_class": str(producer["trust_class"]),
+                            "admission_source": (
+                                "project_guardian_signal_ingress"
+                            ),
+                            "receipt_id": receipt_id,
+                        },
+                    },
+                },
+                event_id=event_id,
+                timestamp=occurred_at_text,
+                occurred_at=occurred_at_text,
+                evidence_refs=[
+                    {
+                        "ref_id": evidence_id,
+                        "source": component,
+                        "is_fact": True,
+                    }
+                ],
+                privacy_scope="user",
+            )
+            commit_time = datetime.now(timezone.utc)
+            if (
+                not self._project_guardian_intent_time_valid(
+                    observed_at,
+                    commit_time,
+                )
+                or commit_time > valid_until_time
+            ):
+                return {
+                    "status": "ignored",
+                    "reason": "deployment_intent_time_invalid",
                 }
             return self._admit_project_guardian_signal(event)
 
@@ -1413,6 +2164,28 @@ class ShadowAwarenessRuntime:
         return (
             observed_at is not None
             and observed_at >= reference_time - timedelta(minutes=2)
+            and observed_at <= reference_time + timedelta(minutes=2)
+        )
+
+    @staticmethod
+    def _project_guardian_ci_observation_time_valid(
+        observed_at: datetime | None,
+        reference_time: datetime,
+    ) -> bool:
+        return (
+            observed_at is not None
+            and observed_at >= reference_time - timedelta(minutes=30)
+            and observed_at <= reference_time + timedelta(minutes=2)
+        )
+
+    @staticmethod
+    def _project_guardian_intent_time_valid(
+        observed_at: datetime | None,
+        reference_time: datetime,
+    ) -> bool:
+        return (
+            observed_at is not None
+            and observed_at >= reference_time - timedelta(minutes=30)
             and observed_at <= reference_time + timedelta(minutes=2)
         )
 

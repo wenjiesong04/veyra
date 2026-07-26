@@ -44,6 +44,7 @@ def main() -> int:
         "VEYRA_CORE_MODEL_ENABLED": True,
         "FEISHU_APP_SECRET": "new-secret",
         "OPENCLAW_BASE_URL": "http://127.0.0.1:18789",
+        "VEYRA_GITHUB_TOKEN": "github-read-token",
     }
     merged = _merge_env_text(original, updates)
     expect("VEYRA_CORE_MODEL_ENABLED=1" in merged, "boolean env values are normalized")
@@ -53,6 +54,7 @@ def main() -> int:
     injected = _merge_env_text("VEYRA_CORE_MODEL=old\n", {"VEYRA_CORE_MODEL": "safe\rINJECTED=1"})
     expect("\nINJECTED=1" not in injected, "carriage returns cannot inject additional env lines", injected)
     expect(_redact_env_value("FEISHU_APP_SECRET", "new-secret") == "***", "secrets are redacted")
+    expect(_redact_env_value("VEYRA_GITHUB_TOKEN", "github-read-token") == "***", "GitHub token is redacted")
     expect(_redact_env_value("VEYRA_ALERT_WEBHOOK_URL", "https://secret.example/hook") == "***", "webhook credentials are redacted")
     expect(_redact_env_value("OPENCLAW_BASE_URL", "http://127.0.0.1:18789").startswith("http"), "non-secret values remain visible")
     cwd = Path.cwd()
@@ -64,6 +66,7 @@ def main() -> int:
             chdir(cwd)
     expect("VEYRA_CORE_MODEL_ENABLED=0" in fallback, "fallback env template is available without .env.example")
     expect("OPENCLAW_BASE_URL=http://127.0.0.1:18789" in fallback, "fallback env template includes default OpenClaw URL")
+    expect("VEYRA_GITHUB_TOKEN=" in fallback, "fallback env template includes optional GitHub token")
 
     try:
         _validate_env_updates({"PATH": "/tmp"})

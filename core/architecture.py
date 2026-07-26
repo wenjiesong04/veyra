@@ -79,6 +79,7 @@ CORE_MODULES: list[dict[str, str]] = [
     {"id": "active_runtime_loop", "path": "runtime/active_loop.py", "status": "p8_continuous_entity"},
     {"id": "runtime_cron", "path": "runtime/cron.py", "status": "p9_runtime_scheduler"},
     {"id": "attention_core", "path": "awareness/attention_core.py", "status": "mvp_foundation"},
+    {"id": "project_guardian_attention", "path": "runtime/project_guardian_attention_runtime.py", "status": "phase2_shadow"},
     {"id": "belief_uncertainty_core", "path": "awareness/belief_core.py", "status": "p8_deep_ttl"},
     {"id": "world_state", "path": "core/world_state.py", "status": "mvp_foundation"},
     {"id": "core_model_client", "path": "core/model_client.py", "status": "p6_model_assisted"},
@@ -172,6 +173,13 @@ STATE_DEFINITIONS: list[dict[str, Any]] = [
         "owner": "AttentionCore",
         "purpose": "Current focus slice, ignored noise, and context scope hints.",
         "freshness": "event_scoped",
+    },
+    {
+        "id": "project_guardian_attention_state",
+        "file": "state/runtime/project_guardian_attention_state.json",
+        "owner": "ProjectGuardianAttentionRuntime",
+        "purpose": "Bound Attention policies, counterfactual assessments, dismissals, and grouped shadow situations.",
+        "freshness": "revision_backed",
     },
     {
         "id": "executor_state",
