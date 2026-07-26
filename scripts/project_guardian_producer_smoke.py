@@ -1215,10 +1215,42 @@ def test_git_ignorecase_config_cannot_hide_case_renames(root: Path) -> None:
         "--porcelain=v1",
         "--untracked-files=normal",
     )
-    result = runtime.run_once(reason="ignorecase_config_override")
+    isolated_status_outputs: list[str] = []
+    original_isolated_status = runtime._isolated_status_output
+
+    def capture_isolated_status(worktree: Path) -> str:
+        output = original_isolated_status(worktree)
+        isolated_status_outputs.append(output)
+        return output
+
+    runtime._isolated_status_output = (  # type: ignore[method-assign]
+        capture_isolated_status
+    )
+    try:
+        result = runtime.run_once(reason="ignorecase_config_override")
+    finally:
+        runtime._isolated_status_output = (  # type: ignore[method-assign]
+            original_isolated_status
+        )
+    hidden_lines = {
+        line for line in hidden_status.splitlines() if line
+    }
+    honest_lines = {
+        line for line in honest_status.splitlines() if line
+    }
+    isolated_line_sets = [
+        {line for line in output.splitlines() if line}
+        for output in isolated_status_outputs
+    ]
     expect(
-        hidden_status == ""
-        and honest_status
+        hidden_lines < honest_lines
+        and "?? Tracked.txt" in honest_lines
+        and "?? Tracked.txt" not in hidden_lines
+        and len(isolated_line_sets) == 2
+        and all(
+            "?? Tracked.txt" in lines
+            for lines in isolated_line_sets
+        )
         and result["status"] == "success"
         and result["observations"][0]["signal_state"] == "present",
         (
@@ -1228,6 +1260,7 @@ def test_git_ignorecase_config_cannot_hide_case_renames(root: Path) -> None:
         {
             "hidden_status": hidden_status,
             "honest_status": honest_status,
+            "isolated_status_outputs": isolated_status_outputs,
             "run": result,
         },
     )
