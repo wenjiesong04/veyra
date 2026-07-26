@@ -2241,11 +2241,13 @@ def test_fault_non_interference_for_all_routes(root: Path) -> None:
     normalizer = EventNormalizer()
     failures: dict[str, Any] = {}
     for case in OFFLINE_ROUTE_CASES:
+        baseline_started_at = datetime.now(timezone.utc)
         baseline_loop = build_offline_route_loop(
             root / "routes" / case.case_id / "baseline",
             mode="record_only",
             case=case,
         )
+        fault_started_at = datetime.now(timezone.utc)
         fault_loop = build_offline_route_loop(
             root / "routes" / case.case_id / "fault",
             mode="record_only",
@@ -2313,11 +2315,21 @@ def test_fault_non_interference_for_all_routes(root: Path) -> None:
             correlation_id=f"corr-producer-matrix-{case.case_id}",
         )
         baseline_result = baseline_loop.handle_event(event)
+        baseline_runtime_window = (
+            baseline_started_at,
+            datetime.now(timezone.utc),
+        )
         fault_result = fault_loop.handle_event(event)
+        fault_runtime_window = (
+            fault_started_at,
+            datetime.now(timezone.utc),
+        )
         equivalent, differences = offline_public_outputs_equivalent(
             baseline_result,
             fault_result,
             require_distinct_generated_ids=True,
+            left_runtime_window=baseline_runtime_window,
+            right_runtime_window=fault_runtime_window,
         )
         if (
             not equivalent

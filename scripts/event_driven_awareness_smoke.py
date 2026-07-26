@@ -7,7 +7,7 @@ import json
 import math
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from itertools import combinations
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -421,6 +421,198 @@ def _value_at(document: dict[str, Any], path: tuple[str, ...]) -> Any:
     return selected
 
 
+def _timestamp_in_runtime_window(
+    value: Any,
+    *,
+    document: dict[str, Any],
+    path: tuple[str, ...],
+    window: tuple[datetime, datetime],
+) -> bool:
+    parsed = _parse_timestamp(value)
+    started_at, completed_at = window
+    if (
+        parsed is None
+        or started_at.utcoffset() is None
+        or completed_at.utcoffset() is None
+        or completed_at < started_at
+    ):
+        return False
+    if _is_belief_claim_path(path, {"expires_at"}):
+        observed_at = _parse_timestamp(
+            _value_at(
+                document,
+                path[:-1] + ("observed_at",),
+            )
+        )
+        ttl_seconds = _value_at(
+            document,
+            path[:-1] + ("ttl_seconds",),
+        )
+        if (
+            observed_at is None
+            or not isinstance(ttl_seconds, (int, float))
+            or isinstance(ttl_seconds, bool)
+            or not math.isfinite(float(ttl_seconds))
+            or float(ttl_seconds) < 0
+        ):
+            return False
+        return (
+            started_at <= observed_at <= completed_at
+            and parsed
+            == observed_at + timedelta(seconds=float(ttl_seconds))
+        )
+    return started_at <= parsed <= completed_at
+
+
+def _relative_time_in_runtime_window(
+    value: Any,
+    *,
+    document: dict[str, Any],
+    path: tuple[str, ...],
+    window: tuple[datetime, datetime],
+) -> bool:
+    if not isinstance(value, int) or isinstance(value, bool):
+        return False
+    started_at, completed_at = window
+    observed_at = _parse_timestamp(
+        _value_at(
+            document,
+            path[:-1] + ("observed_at",),
+        )
+    )
+    expires_at = _parse_timestamp(
+        _value_at(
+            document,
+            path[:-1] + ("expires_at",),
+        )
+    )
+    if (
+        observed_at is None
+        or expires_at is None
+        or started_at.utcoffset() is None
+        or completed_at.utcoffset() is None
+        or completed_at < started_at
+    ):
+        return False
+    if path[-1] == "age_seconds":
+        minimum = max(
+            0,
+            int((started_at - observed_at).total_seconds()),
+        )
+        maximum = max(
+            0,
+            int((completed_at - observed_at).total_seconds()),
+        )
+    elif path[-1] == "ttl_remaining_seconds":
+        minimum = int((expires_at - completed_at).total_seconds())
+        maximum = int((expires_at - started_at).total_seconds())
+    else:
+        return False
+    return minimum <= value <= maximum
+
+
+def _belief_relative_times_share_refresh(
+    *,
+    document: dict[str, Any],
+    path: tuple[str, ...],
+    window: tuple[datetime, datetime],
+) -> bool:
+    claim_path = path[:-1]
+    observed_at = _parse_timestamp(
+        _value_at(document, claim_path + ("observed_at",))
+    )
+    expires_at = _parse_timestamp(
+        _value_at(document, claim_path + ("expires_at",))
+    )
+    ttl_seconds = _value_at(document, claim_path + ("ttl_seconds",))
+    age_seconds = _value_at(document, claim_path + ("age_seconds",))
+    ttl_remaining_seconds = _value_at(
+        document,
+        claim_path + ("ttl_remaining_seconds",),
+    )
+    started_at, completed_at = window
+    integer_fields = (ttl_seconds, age_seconds, ttl_remaining_seconds)
+    if (
+        observed_at is None
+        or expires_at is None
+        or any(
+            not isinstance(value, int) or isinstance(value, bool)
+            for value in integer_fields
+        )
+        or ttl_seconds < 0
+        or age_seconds < 0
+        or started_at.utcoffset() is None
+        or completed_at.utcoffset() is None
+        or completed_at < started_at
+        or not started_at <= observed_at <= completed_at
+        or expires_at
+        != observed_at + timedelta(seconds=ttl_seconds)
+    ):
+        return False
+
+    lower_bounds = [
+        (started_at, True),
+        (observed_at, True),
+        (observed_at + timedelta(seconds=age_seconds), True),
+    ]
+    upper_bounds = [
+        (completed_at, True),
+        (
+            observed_at + timedelta(seconds=age_seconds + 1),
+            False,
+        ),
+    ]
+    if ttl_remaining_seconds > 0:
+        lower_bounds.append(
+            (
+                expires_at
+                - timedelta(seconds=ttl_remaining_seconds + 1),
+                False,
+            )
+        )
+        upper_bounds.append(
+            (
+                expires_at - timedelta(seconds=ttl_remaining_seconds),
+                True,
+            )
+        )
+    elif ttl_remaining_seconds == 0:
+        lower_bounds.append((expires_at - timedelta(seconds=1), False))
+        upper_bounds.append((expires_at + timedelta(seconds=1), False))
+    else:
+        lower_bounds.append(
+            (
+                expires_at - timedelta(seconds=ttl_remaining_seconds),
+                True,
+            )
+        )
+        upper_bounds.append(
+            (
+                expires_at
+                - timedelta(seconds=ttl_remaining_seconds - 1),
+                False,
+            )
+        )
+
+    lower_time = max(value for value, _ in lower_bounds)
+    upper_time = min(value for value, _ in upper_bounds)
+    lower_inclusive = all(
+        inclusive
+        for value, inclusive in lower_bounds
+        if value == lower_time
+    )
+    upper_inclusive = all(
+        inclusive
+        for value, inclusive in upper_bounds
+        if value == upper_time
+    )
+    return lower_time < upper_time or (
+        lower_time == upper_time
+        and lower_inclusive
+        and upper_inclusive
+    )
+
+
 def _validate_agent_id_bindings(
     document: dict[str, Any],
     *,
@@ -459,9 +651,13 @@ def offline_public_outputs_equivalent(
     right: LoopResult | dict[str, Any],
     *,
     require_distinct_generated_ids: bool,
+    left_runtime_window: tuple[datetime, datetime] | None = None,
+    right_runtime_window: tuple[datetime, datetime] | None = None,
 ) -> tuple[bool, list[str]]:
     """Compare every public field while permitting bounded runtime-only variance."""
 
+    if (left_runtime_window is None) != (right_runtime_window is None):
+        raise ValueError("runtime timestamp windows must be supplied as a pair")
     left_document = _public_result_dict(left)
     right_document = _public_result_dict(right)
     route = str(left_document.get("route") or "")
@@ -522,6 +718,30 @@ def offline_public_outputs_equivalent(
                 differences.append(
                     f"{'.'.join(path)}: timestamp is missing or invalid"
                 )
+            elif (
+                left_runtime_window is not None
+                and right_runtime_window is not None
+            ):
+                if not _timestamp_in_runtime_window(
+                    left_value,
+                    document=left_document,
+                    path=path,
+                    window=left_runtime_window,
+                ):
+                    differences.append(
+                        f"{'.'.join(path)}: left timestamp is outside its "
+                        "runtime window"
+                    )
+                if not _timestamp_in_runtime_window(
+                    right_value,
+                    document=right_document,
+                    path=path,
+                    window=right_runtime_window,
+                ):
+                    differences.append(
+                        f"{'.'.join(path)}: right timestamp is outside its "
+                        "runtime window"
+                    )
             elif abs((left_time - right_time).total_seconds()) > timestamp_tolerance:
                 differences.append(
                     f"{'.'.join(path)}: timestamps exceed runtime tolerance"
@@ -543,7 +763,64 @@ def offline_public_outputs_equivalent(
                 or not valid_right
                 or not math.isfinite(float(left_value))
                 or not math.isfinite(float(right_value))
-                or abs(float(left_value) - float(right_value)) > relative_tolerance
+            ):
+                differences.append(
+                    f"{'.'.join(path)}: relative time is missing or invalid"
+                )
+            elif (
+                left_runtime_window is not None
+                and right_runtime_window is not None
+            ):
+                left_relative_valid = _relative_time_in_runtime_window(
+                    left_value,
+                    document=left_document,
+                    path=path,
+                    window=left_runtime_window,
+                )
+                right_relative_valid = _relative_time_in_runtime_window(
+                    right_value,
+                    document=right_document,
+                    path=path,
+                    window=right_runtime_window,
+                )
+                if not left_relative_valid:
+                    differences.append(
+                        f"{'.'.join(path)}: left relative time is outside "
+                        "its runtime window"
+                    )
+                if not right_relative_valid:
+                    differences.append(
+                        f"{'.'.join(path)}: right relative time is outside "
+                        "its runtime window"
+                    )
+                if path[-1] == "age_seconds":
+                    if (
+                        left_relative_valid
+                        and not _belief_relative_times_share_refresh(
+                            document=left_document,
+                            path=path,
+                            window=left_runtime_window,
+                        )
+                    ):
+                        differences.append(
+                            f"{'.'.join(path)}: left belief times cannot "
+                            "share one refresh instant"
+                        )
+                    if (
+                        right_relative_valid
+                        and not _belief_relative_times_share_refresh(
+                            document=right_document,
+                            path=path,
+                            window=right_runtime_window,
+                        )
+                    ):
+                        differences.append(
+                            f"{'.'.join(path)}: right belief times cannot "
+                            "share one refresh instant"
+                        )
+            elif (
+                abs(float(left_value) - float(right_value))
+                > relative_tolerance
             ):
                 differences.append(
                     f"{'.'.join(path)}: relative time differs beyond tolerance"
@@ -1006,6 +1283,7 @@ def test_offline_route_equivalence_matrix(base: Path) -> None:
         signatures: dict[str, dict[str, Any]] = {}
         results: dict[str, LoopResult] = {}
         loops: dict[str, AwarenessLoop] = {}
+        runtime_windows: dict[str, tuple[datetime, datetime]] = {}
         event = normalizer.user_message(
             case.text,
             "offline-matrix",
@@ -1015,6 +1293,7 @@ def test_offline_route_equivalence_matrix(base: Path) -> None:
             correlation_id=f"corr-matrix-{case.case_id}",
         )
         for mode in modes:
+            started_at = datetime.now(timezone.utc)
             loop = build_offline_route_loop(
                 base / case.case_id / mode,
                 mode=mode,
@@ -1024,6 +1303,10 @@ def test_offline_route_equivalence_matrix(base: Path) -> None:
             signatures[mode] = offline_result_signature(result)
             results[mode] = result
             loops[mode] = loop
+            runtime_windows[mode] = (
+                started_at,
+                datetime.now(timezone.utc),
+            )
 
         baseline = signatures["disabled"]
         expect(
@@ -1041,6 +1324,8 @@ def test_offline_route_equivalence_matrix(base: Path) -> None:
                 results[left_mode],
                 results[right_mode],
                 require_distinct_generated_ids=True,
+                left_runtime_window=runtime_windows[left_mode],
+                right_runtime_window=runtime_windows[right_mode],
             )
             if not equivalent:
                 pair_differences[f"{left_mode}:{right_mode}"] = differences
@@ -1083,20 +1368,32 @@ def test_public_output_comparison_sensitivity(base: Path) -> None:
         event_id="evt_matrix_comparison_sensitivity",
         correlation_id="corr-matrix-comparison-sensitivity",
     )
+    left_started_at = datetime.now(timezone.utc)
     left = build_offline_route_loop(
         base / "disabled",
         mode="disabled",
         case=case,
     ).handle_event(event)
+    left_runtime_window = (
+        left_started_at,
+        datetime.now(timezone.utc),
+    )
+    right_started_at = datetime.now(timezone.utc)
     right = build_offline_route_loop(
         base / "shadow",
         mode="shadow",
         case=case,
     ).handle_event(event)
+    right_runtime_window = (
+        right_started_at,
+        datetime.now(timezone.utc),
+    )
     baseline_equal, baseline_differences = offline_public_outputs_equivalent(
         left,
         right,
         require_distinct_generated_ids=True,
+        left_runtime_window=left_runtime_window,
+        right_runtime_window=right_runtime_window,
     )
     right_document = right.to_dict()
 
@@ -1117,17 +1414,27 @@ def test_public_output_comparison_sensitivity(base: Path) -> None:
         else:
             selected[path[-1]] = value
 
+    def compare_candidate(
+        candidate: dict[str, Any],
+        *,
+        runtime_window: tuple[datetime, datetime] = right_runtime_window,
+    ) -> bool:
+        equivalent, _ = offline_public_outputs_equivalent(
+            left,
+            candidate,
+            require_distinct_generated_ids=True,
+            left_runtime_window=left_runtime_window,
+            right_runtime_window=runtime_window,
+        )
+        return equivalent
+
     missing_task = copy.deepcopy(right_document)
     set_path(
         missing_task,
         ("artifacts", "execution_result", "task_id"),
         None,
     )
-    missing_task_equal, _ = offline_public_outputs_equivalent(
-        left,
-        missing_task,
-        require_distinct_generated_ids=True,
-    )
+    missing_task_equal = compare_candidate(missing_task)
 
     mismatched_task = copy.deepcopy(right_document)
     set_path(
@@ -1135,11 +1442,7 @@ def test_public_output_comparison_sensitivity(base: Path) -> None:
         ("artifacts", "execution_result", "task_id"),
         "task_aaaaaaaaaaaa",
     )
-    mismatched_task_equal, _ = offline_public_outputs_equivalent(
-        left,
-        mismatched_task,
-        require_distinct_generated_ids=True,
-    )
+    mismatched_task_equal = compare_candidate(mismatched_task)
 
     stale_evidence = copy.deepcopy(right_document)
     observed_path = _BELIEF_CLAIM_PREFIX + ("0", "observed_at")
@@ -1154,10 +1457,92 @@ def test_public_output_comparison_sensitivity(base: Path) -> None:
         observed_path,
         (observed_at - timedelta(hours=1)).isoformat(),
     )
-    stale_equal, _ = offline_public_outputs_equivalent(
-        left,
-        stale_evidence,
-        require_distinct_generated_ids=True,
+    stale_equal = compare_candidate(stale_evidence)
+
+    invalid_expiry = copy.deepcopy(right_document)
+    expiry_path = _BELIEF_CLAIM_PREFIX + ("0", "expires_at")
+    expires_at = _parse_timestamp(
+        _value_at(invalid_expiry, expiry_path)
+    )
+    age_path = _BELIEF_CLAIM_PREFIX + ("0", "age_seconds")
+    ttl_remaining_path = _BELIEF_CLAIM_PREFIX + (
+        "0",
+        "ttl_remaining_seconds",
+    )
+    age_seconds = _value_at(invalid_expiry, age_path)
+    ttl_remaining_seconds = _value_at(
+        invalid_expiry,
+        ttl_remaining_path,
+    )
+    ttl_path = _BELIEF_CLAIM_PREFIX + ("0", "ttl_seconds")
+    ttl_seconds = _value_at(invalid_expiry, ttl_path)
+    expect(
+        expires_at is not None
+        and isinstance(age_seconds, int)
+        and not isinstance(age_seconds, bool)
+        and isinstance(ttl_remaining_seconds, int)
+        and not isinstance(ttl_remaining_seconds, bool)
+        and isinstance(ttl_seconds, int)
+        and not isinstance(ttl_seconds, bool),
+        "offline fixture exposes internally checkable belief timing",
+        {
+            "expires_at": expires_at,
+            "age_seconds": age_seconds,
+            "ttl_remaining_seconds": ttl_remaining_seconds,
+            "ttl_seconds": ttl_seconds,
+        },
+    )
+    set_path(
+        invalid_expiry,
+        expiry_path,
+        (expires_at + timedelta(seconds=1)).isoformat(),
+    )
+    invalid_expiry_equal = compare_candidate(invalid_expiry)
+
+    invalid_age = copy.deepcopy(right_document)
+    maximum_age = max(
+        0,
+        int(
+            (
+                right_runtime_window[1] - observed_at
+            ).total_seconds()
+        ),
+    )
+    set_path(invalid_age, age_path, maximum_age + 1)
+    invalid_age_equal = compare_candidate(invalid_age)
+
+    invalid_ttl_remaining = copy.deepcopy(right_document)
+    minimum_ttl_remaining = int(
+        (
+            expires_at - right_runtime_window[1]
+        ).total_seconds()
+    )
+    set_path(
+        invalid_ttl_remaining,
+        ttl_remaining_path,
+        minimum_ttl_remaining - 1,
+    )
+    invalid_ttl_remaining_equal = compare_candidate(
+        invalid_ttl_remaining
+    )
+
+    inconsistent_refresh = copy.deepcopy(right_document)
+    set_path(inconsistent_refresh, age_path, 3)
+    set_path(
+        inconsistent_refresh,
+        ttl_remaining_path,
+        ttl_seconds - 1,
+    )
+    inconsistent_runtime_window = (
+        right_runtime_window[0],
+        max(
+            right_runtime_window[1],
+            observed_at + timedelta(seconds=3, milliseconds=500),
+        ),
+    )
+    inconsistent_refresh_equal = compare_candidate(
+        inconsistent_refresh,
+        runtime_window=inconsistent_runtime_window,
     )
 
     shared_session = copy.deepcopy(right_document)
@@ -1174,11 +1559,7 @@ def test_public_output_comparison_sensitivity(base: Path) -> None:
         set_path(shared_session, path, left_task_id)
     for path in _AGENT_SESSION_ID_PATHS:
         set_path(shared_session, path, left_agent_session_id)
-    shared_session_equal, _ = offline_public_outputs_equivalent(
-        left,
-        shared_session,
-        require_distinct_generated_ids=True,
-    )
+    shared_session_equal = compare_candidate(shared_session)
 
     weakened_artifact = copy.deepcopy(right_document)
     set_path(
@@ -1186,23 +1567,19 @@ def test_public_output_comparison_sensitivity(base: Path) -> None:
         ("artifacts", "controller", "status"),
         "degraded",
     )
-    weakened_artifact_equal, _ = offline_public_outputs_equivalent(
-        left,
-        weakened_artifact,
-        require_distinct_generated_ids=True,
-    )
+    weakened_artifact_equal = compare_candidate(weakened_artifact)
     invalid_latency = copy.deepcopy(right_document)
     set_path(invalid_latency, _LATENCY_PATH, float("nan"))
-    invalid_latency_equal, _ = offline_public_outputs_equivalent(
-        left,
-        invalid_latency,
-        require_distinct_generated_ids=True,
-    )
+    invalid_latency_equal = compare_candidate(invalid_latency)
     expect(
         baseline_equal
         and not missing_task_equal
         and not mismatched_task_equal
         and not stale_equal
+        and not invalid_expiry_equal
+        and not invalid_age_equal
+        and not invalid_ttl_remaining_equal
+        and not inconsistent_refresh_equal
         and not shared_session_equal
         and not weakened_artifact_equal
         and not invalid_latency_equal,
@@ -1212,6 +1589,12 @@ def test_public_output_comparison_sensitivity(base: Path) -> None:
             "missing_task_equal": missing_task_equal,
             "mismatched_task_equal": mismatched_task_equal,
             "stale_equal": stale_equal,
+            "invalid_expiry_equal": invalid_expiry_equal,
+            "invalid_age_equal": invalid_age_equal,
+            "invalid_ttl_remaining_equal": (
+                invalid_ttl_remaining_equal
+            ),
+            "inconsistent_refresh_equal": inconsistent_refresh_equal,
             "shared_session_equal": shared_session_equal,
             "weakened_artifact_equal": weakened_artifact_equal,
             "invalid_latency_equal": invalid_latency_equal,

@@ -2845,7 +2845,9 @@ def test_nine_route_public_output_equivalence(root: Path) -> None:
         )
         results: dict[str, Any] = {}
         run_results: dict[str, dict[str, Any]] = {}
+        runtime_windows: dict[str, tuple[datetime, datetime]] = {}
         for scenario in scenarios:
+            started_at = datetime.now(timezone.utc)
             loop = build_offline_route_loop(
                 root / case.case_id / scenario,
                 mode="shadow",
@@ -2882,6 +2884,10 @@ def test_nine_route_public_output_equivalence(root: Path) -> None:
                 reason=f"route_matrix_{scenario}"
             )
             results[scenario] = loop.handle_event(event)
+            runtime_windows[scenario] = (
+                started_at,
+                datetime.now(timezone.utc),
+            )
 
         expect(
             run_results["disabled"]["status"] == "disabled"
@@ -2898,6 +2904,8 @@ def test_nine_route_public_output_equivalence(root: Path) -> None:
                 results[left],
                 results[right],
                 require_distinct_generated_ids=True,
+                left_runtime_window=runtime_windows[left],
+                right_runtime_window=runtime_windows[right],
             )
             if not equivalent:
                 differences[f"{left}:{right}"] = pair_differences
