@@ -52,6 +52,9 @@ from runtime.external_runtime_probe import ExternalRuntimeProbe
 from runtime.ops_monitor import OpsMonitor
 from runtime.proactive_checks import ProactiveChecks
 from runtime.project_guardian import ProjectGuardianRuntime
+from runtime.project_guardian_producers import (
+    ProjectGuardianProducerRuntime,
+)
 from runtime.retention_policy import RetentionPolicy
 from runtime.routing_metrics import RoutingMetrics
 from runtime.runtime_matrix import RuntimeMatrix
@@ -209,6 +212,12 @@ replay_runtime = ReplayRuntime(
     foresight_engine=foresight_engine,
     action_executor=action_executor,
 )
+project_guardian_producers = ProjectGuardianProducerRuntime(
+    state_store=state_store,
+    publish_git_observation=(
+        awareness_loop.event_awareness.issue_project_guardian_git_publisher()
+    ),
+)
 project_guardian = ProjectGuardianRuntime(
     state_store=state_store,
     publish_event=awareness_loop.publish_event,
@@ -254,6 +263,7 @@ active_loop = ActiveRuntimeLoop(
     replay_runtime=replay_runtime,
     commitment_push=commitment_push,
     event_consumer=awareness_loop.process_event_inbox,
+    project_guardian_producers=project_guardian_producers.run_once,
     project_guardian=project_guardian.run_once,
 )
 runtime_cron = Cron(state_store=state_store, active_loop=active_loop, commitment_push=commitment_push)
@@ -618,6 +628,9 @@ app.include_router(
                 "diff_tracker": lambda: diff_tracker,
                 "architecture_snapshot": lambda: architecture_snapshot,
                 "project_guardian": lambda: project_guardian,
+                "project_guardian_producers": (
+                    lambda: project_guardian_producers
+                ),
             }
         )
     )

@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from core.definitions import RiskLevel, lifecycle_statuses, operational_modes, risk_catalog
 from core.model_client import redact_sensitive
 from interface.event_schema import utc_now_iso
+from runtime.project_guardian_producers import ProjectGuardianGoalConflict
 
 
 class ReviewDecisionRequest(BaseModel):
@@ -56,6 +57,26 @@ class EventAwarenessConfigRequest(BaseModel):
 
 class ProjectGuardianConfigRequest(BaseModel):
     mode: str
+
+
+class ProjectReleaseGoalRequest(BaseModel):
+    user_id: str
+    workspace_id: str
+    repo_id: str
+    target_ref: str
+    target_environment: str
+    release_cycle: str
+    workspace_path: str
+    active_from: str | None = None
+    active_until: str | None = None
+    goal_id: str | None = None
+    expected_state_revision: int | None = None
+
+
+class ProjectReleaseGoalStatusRequest(BaseModel):
+    user_id: str
+    expected_state_revision: int
+    status: str
 
 
 def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
@@ -369,6 +390,69 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     async def project_guardian_run_once() -> dict[str, Any]:
         return deps["project_guardian"].run_once(reason="debug_api")
 
+    @router.get("/awareness/project-guardian/producers/status")
+    async def project_guardian_producers_status() -> dict[str, Any]:
+        return deps["project_guardian_producers"].status()
+
+    @router.post("/awareness/project-guardian/producers/run-once")
+    async def project_guardian_producers_run_once() -> dict[str, Any]:
+        return deps["project_guardian_producers"].public_run_once(
+            reason="debug_api"
+        )
+
+    @router.post("/awareness/project-guardian/release-goals")
+    async def project_guardian_register_release_goal(
+        request: ProjectReleaseGoalRequest,
+    ) -> dict[str, Any]:
+        try:
+            item = deps[
+                "project_guardian_producers"
+            ].register_release_goal(**request.model_dump())
+        except ProjectGuardianGoalConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"status": "registered", "item": item}
+
+    @router.post(
+        "/awareness/project-guardian/release-goals/{goal_id}/status"
+    )
+    async def project_guardian_release_goal_status(
+        goal_id: str,
+        request: ProjectReleaseGoalStatusRequest,
+    ) -> dict[str, Any]:
+        try:
+            item = deps[
+                "project_guardian_producers"
+            ].set_release_goal_status(
+                goal_id=goal_id,
+                **request.model_dump(),
+            )
+        except ProjectGuardianGoalConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"status": "updated", "item": item}
+
+    @router.get("/awareness/project-guardian/release-goals")
+    async def project_guardian_release_goals(
+        user_id: str,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        try:
+            items = deps[
+                "project_guardian_producers"
+            ].list_release_goals(user_id=user_id, limit=limit)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "status": "success",
+            "count": len(items),
+            "items": items,
+        }
+
     @router.get("/awareness/project-guardian/candidates")
     async def project_guardian_candidates(
         user_id: str,
@@ -528,6 +612,7 @@ def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
     public.pop("situation_state", None)
     public.pop("project_guardian_state", None)
     public.pop("project_guardian_signal_state", None)
+    public.pop("project_guardian_producer_state", None)
     agent_config = public.get("agent_config") if isinstance(public.get("agent_config"), dict) else {}
     if isinstance(agent_config, dict):
         core_model = agent_config.get("core_model") if isinstance(agent_config.get("core_model"), dict) else {}

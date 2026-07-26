@@ -3,13 +3,22 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable
 from uuid import uuid4
 
+from awareness.project_guardian import ProjectGuardianEvaluator
 from core.situation_evaluator import SituationEvaluator
 from core.world_state import WorldStateStore
 from interface.agent_contract import NON_TERMINAL_STATUSES
-from interface.event_schema import EventType, LoopResult, Route, VeyraEvent, utc_now_iso
+from interface.event_schema import (
+    EventSource,
+    EventType,
+    LoopResult,
+    Route,
+    VeyraEvent,
+    utc_now_iso,
+)
 from runtime.event_inbox import EventInbox
 from runtime.project_guardian import ProjectGuardianRuntime
 from runtime.project_guardian_signal_ledger import ProjectGuardianSignalLedger
@@ -47,6 +56,8 @@ class ShadowAwarenessRuntime:
         self.event_inbox = EventInbox(state_store)
         self.situation_evaluator = SituationEvaluator(state_store)
         self.project_guardian_signals = ProjectGuardianSignalLedger(state_store)
+        self._project_guardian_git_ingress_capability = object()
+        self._project_guardian_git_publisher_issued = False
 
     def configure(self, mode: str) -> dict[str, Any]:
         selected = str(mode or "").strip().lower()
@@ -101,6 +112,12 @@ class ShadowAwarenessRuntime:
     def publish(self, event: VeyraEvent) -> dict[str, Any]:
         """Durably admit an internal or external event without processing it."""
 
+        if self._is_project_guardian_signal(event):
+            return {
+                "status": "disabled",
+                "event_id": event.event_id,
+                "reason": "reserved_project_guardian_signal_ingress",
+            }
         with self.state_store.writer_transaction():
             fabric = self._fabric_snapshot()
             if fabric["mode"] == "disabled":
@@ -128,31 +145,334 @@ class ShadowAwarenessRuntime:
                         "event_id": event.event_id,
                         "reason": "stale_project_guardian_mode_epoch",
                     }
-            admission = self.event_inbox.enqueue(event)
-            if self._is_project_guardian_signal(event):
-                envelope = (
-                    admission.get("envelope")
-                    if isinstance(admission.get("envelope"), dict)
-                    else {}
+            return self.event_inbox.enqueue(event)
+
+    def issue_project_guardian_git_publisher(
+        self,
+    ) -> Callable[..., dict[str, Any]]:
+        """Issue the single trusted Git producer capability for this runtime."""
+
+        if self._project_guardian_git_publisher_issued:
+            raise RuntimeError(
+                "Project Guardian Git publisher capability was already issued"
+            )
+        self._project_guardian_git_publisher_issued = True
+        capability = self._project_guardian_git_ingress_capability
+
+        def publish(**kwargs: Any) -> dict[str, Any]:
+            return self._publish_project_guardian_git_observation(
+                ingress_capability=capability,
+                **kwargs,
+            )
+
+        return publish
+
+    def _publish_project_guardian_git_observation(
+        self,
+        *,
+        ingress_capability: object,
+        user_id: str,
+        goal_id: str,
+        goal_revision: str,
+        repository_fact: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Admit one in-process Git fact through the reserved signal channel.
+
+        Scope, component identity, factual evidence, timestamps and the ingress
+        receipt are derived here. Callers cannot provide a pre-built envelope.
+        """
+
+        if (
+            ingress_capability
+            is not self._project_guardian_git_ingress_capability
+        ):
+            return {
+                "status": "ignored",
+                "reason": "untrusted_project_guardian_git_ingress",
+            }
+        observed_at = ProjectGuardianSignalLedger._time(
+            repository_fact.get("observed_at")
+        )
+        with self.state_store.writer_transaction():
+            admitted_at = datetime.now(timezone.utc).replace(microsecond=0)
+            if not self._project_guardian_observation_time_valid(
+                observed_at,
+                admitted_at,
+            ):
+                return {
+                    "status": "ignored",
+                    "reason": "repository_fact_observation_time_invalid",
+                }
+            fabric = self._fabric_snapshot()
+            guardian = self._project_guardian_snapshot()
+            if guardian["mode"] == "disabled":
+                return {
+                    "status": "disabled",
+                    "reason": "project_guardian_disabled",
+                }
+            if fabric["mode"] == "disabled":
+                return {
+                    "status": "disabled",
+                    "reason": "event_fabric_disabled",
+                }
+            if fabric["mode"] not in self.MODES:
+                return {
+                    "status": "degraded",
+                    "reason": "event_fabric_unavailable",
+                }
+
+            goals_state = self.state_store.read_json("user_goals.json")
+            if goals_state.get("_state_corrupt") is True:
+                return {
+                    "status": "degraded",
+                    "reason": "user_goals_state_corrupt",
+                }
+            goal = self._active_release_goal(
+                goals_state,
+                user_id=user_id,
+                goal_id=goal_id,
+                goal_revision=goal_revision,
+                observed_at=observed_at,
+            )
+            if goal is None:
+                return {
+                    "status": "ignored",
+                    "reason": "release_goal_not_active_or_mismatched",
+                }
+
+            scope = (
+                goal.get("scope")
+                if isinstance(goal.get("scope"), dict)
+                else {}
+            )
+            producer_state = self.state_store.read_json(
+                "project_guardian_producer_state.json"
+            )
+            if producer_state.get("_state_corrupt") is True:
+                return {
+                    "status": "degraded",
+                    "reason": "project_guardian_producer_state_corrupt",
+                }
+            bindings = (
+                producer_state.get("bindings")
+                if isinstance(producer_state.get("bindings"), dict)
+                else {}
+            )
+            binding = bindings.get(goal_id)
+            repo_id = str(repository_fact.get("repo_id") or "")
+            target_ref = str(repository_fact.get("target_ref") or "")
+            target_sha = str(repository_fact.get("target_sha") or "")
+            remote_origin_digest = str(
+                repository_fact.get("remote_origin_digest") or ""
+            )
+            expected_sha = str(goal.get("target_sha") or "")
+            dirty = repository_fact.get("dirty")
+            observed_at_text = observed_at.isoformat()
+            index_flags_digest = str(
+                repository_fact.get("index_flags_digest") or ""
+            )
+            index_stage_digest = str(
+                repository_fact.get("index_stage_digest") or ""
+            )
+            probe_digest = str(repository_fact.get("probe_digest") or "")
+            expected_probe_digest = hashlib.sha256(
+                json.dumps(
+                    {
+                        "repo_id": repo_id,
+                        "target_ref": target_ref,
+                        "target_sha": target_sha,
+                        "remote_origin_digest": remote_origin_digest,
+                        "dirty": dirty,
+                        "observed_at": observed_at_text,
+                        "index_flags_digest": index_flags_digest,
+                        "index_stage_digest": index_stage_digest,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                not isinstance(binding, dict)
+                or str(binding.get("user_id") or "") != str(user_id)
+                or str(binding.get("goal_revision") or "")
+                != str(goal_revision)
+                or str(binding.get("workspace_id") or "")
+                != str(scope.get("workspace_id") or "")
+                or str(binding.get("repo_id") or "") != repo_id
+                or str(binding.get("target_ref") or "") != target_ref
+                or str(binding.get("target_sha") or "") != target_sha
+                or str(binding.get("remote_origin_digest") or "")
+                != remote_origin_digest
+                or not isinstance(dirty, bool)
+                or repo_id != str(scope.get("repo_id") or "")
+                or target_ref != str(scope.get("target_ref") or "")
+                or not expected_sha
+                or target_sha != expected_sha
+                or len(remote_origin_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in remote_origin_digest
                 )
-                try:
-                    signal_result = (
-                        self.project_guardian_signals.record_envelope(
-                            envelope
-                        )
-                    )
-                    admission["signal_ledger_status"] = (
-                        signal_result.get("status")
-                    )
-                except Exception as exc:
-                    admission["signal_ledger_status"] = "degraded"
-                    admission["signal_ledger_error_type"] = type(exc).__name__
-                    self._record_error(
-                        "project_guardian_signal_ledger_error",
-                        event.event_id,
-                        exc,
-                    )
-            return admission
+                or len(index_flags_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in index_flags_digest
+                )
+                or len(index_stage_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in index_stage_digest
+                )
+                or probe_digest != expected_probe_digest
+            ):
+                return {
+                    "status": "ignored",
+                    "reason": "repository_fact_binding_mismatch",
+                }
+
+            kind = "git_dirty"
+            signal_state = "present" if dirty else "clear"
+            component = ProjectGuardianEvaluator.SIGNAL_COMPONENTS[kind]
+            producer = ProjectGuardianEvaluator.SIGNAL_PRODUCERS[kind]
+            binding_ref = str(binding.get("binding_id") or "")
+            if not binding_ref.startswith("pgwb_"):
+                return {
+                    "status": "ignored",
+                    "reason": "repository_binding_identity_missing",
+                }
+            binding_id = hashlib.sha256(
+                binding_ref.encode("utf-8")
+            ).hexdigest()[:20]
+            provenance_root = f"{component}:binding_{binding_id}"
+            evidence_id = "pgge_" + hashlib.sha256(
+                json.dumps(
+                    {
+                        "producer_id": producer["producer_id"],
+                        "goal_id": goal_id,
+                        "goal_revision": goal_revision,
+                        "repo_id": repo_id,
+                        "target_ref": target_ref,
+                        "target_sha": target_sha,
+                        "remote_origin_digest": remote_origin_digest,
+                        "dirty": dirty,
+                        "observed_at": observed_at_text,
+                        "index_flags_digest": index_flags_digest,
+                        "index_stage_digest": index_stage_digest,
+                        "probe_digest": probe_digest,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()[:24]
+            occurred_at = observed_at_text
+            valid_until = (
+                observed_at + timedelta(minutes=6)
+            ).isoformat()
+            session_id = f"project-guardian-git-{binding_id[:12]}"
+            receipt_id = ProjectGuardianEvaluator.producer_receipt_id_for(
+                kind=kind,
+                state=signal_state,
+                source_component=component,
+                provenance_root=provenance_root,
+                evidence_id=evidence_id,
+                goal_id=goal_id,
+                goal_revision=goal_revision,
+                scope=scope,
+                valid_until=valid_until,
+                producer_id=str(producer["producer_id"]),
+                trust_class=str(producer["trust_class"]),
+                user_id=user_id,
+                session_id=session_id,
+                occurred_at=occurred_at,
+            )
+            event_id = "pgse_" + hashlib.sha256(
+                f"{receipt_id}:{occurred_at}".encode("utf-8")
+            ).hexdigest()[:24]
+            event = VeyraEvent(
+                type=EventType.OBSERVATION,
+                source=EventSource(
+                    channel=ProjectGuardianEvaluator.SIGNAL_CHANNEL,
+                    user_id=user_id,
+                    session_id=session_id,
+                ),
+                payload={
+                    "schema_version": ProjectGuardianEvaluator.SIGNAL_SCHEMA,
+                    "project_guardian_signal": {
+                        "kind": kind,
+                        "state": signal_state,
+                        "source_component": component,
+                        "provenance_root": provenance_root,
+                        "evidence_id": evidence_id,
+                        "goal_id": goal_id,
+                        "goal_revision": goal_revision,
+                        "scope": {
+                            key: str(scope.get(key) or "")
+                            for key in ProjectGuardianEvaluator.SCOPE_FIELDS
+                        },
+                        "valid_until": valid_until,
+                        "producer_attestation": {
+                            "schema_version": (
+                                ProjectGuardianEvaluator
+                                .PRODUCER_ATTESTATION_SCHEMA
+                            ),
+                            "producer_id": str(producer["producer_id"]),
+                            "trust_class": str(producer["trust_class"]),
+                            "admission_source": (
+                                "project_guardian_signal_ingress"
+                            ),
+                            "receipt_id": receipt_id,
+                        },
+                    },
+                },
+                event_id=event_id,
+                timestamp=occurred_at,
+                occurred_at=occurred_at,
+                evidence_refs=[
+                    {
+                        "ref_id": evidence_id,
+                        "source": component,
+                        "is_fact": True,
+                    }
+                ],
+                privacy_scope="user",
+            )
+            commit_time = datetime.now(timezone.utc).replace(microsecond=0)
+            if not self._project_guardian_observation_time_valid(
+                observed_at,
+                commit_time,
+            ):
+                return {
+                    "status": "ignored",
+                    "reason": "repository_fact_observation_time_invalid",
+                }
+            return self._admit_project_guardian_signal(event)
+
+    def _admit_project_guardian_signal(
+        self,
+        event: VeyraEvent,
+    ) -> dict[str, Any]:
+        admission = self.event_inbox.enqueue(event)
+        envelope = (
+            admission.get("envelope")
+            if isinstance(admission.get("envelope"), dict)
+            else {}
+        )
+        try:
+            signal_result = self.project_guardian_signals.record_envelope(
+                envelope
+            )
+            admission["signal_ledger_status"] = signal_result.get("status")
+        except Exception as exc:
+            admission["signal_ledger_status"] = "degraded"
+            admission["signal_ledger_error_type"] = type(exc).__name__
+            self._record_error(
+                "project_guardian_signal_ledger_error",
+                event.event_id,
+                exc,
+            )
+        return admission
 
     def begin(self, event: VeyraEvent) -> dict[str, Any]:
         """Claim and observe a foreground event before the existing turn runs."""
@@ -169,6 +489,20 @@ class ShadowAwarenessRuntime:
         *,
         mode: str,
     ) -> dict[str, Any]:
+        if self._is_project_guardian_signal(event):
+            return {
+                "status": "suppressed",
+                "event_id": event.event_id,
+                "reason": "reserved_project_guardian_signal_ingress",
+                "finalize_allowed": False,
+            }
+        if self._is_project_guardian_event(event):
+            return {
+                "status": "suppressed",
+                "event_id": event.event_id,
+                "reason": "reserved_project_guardian_projection_ingress",
+                "finalize_allowed": False,
+            }
         if mode == "disabled":
             return {"status": "disabled"}
         if mode == "record_only":
@@ -600,6 +934,52 @@ class ShadowAwarenessRuntime:
                         break
                     event_id = str(claimed.get("event_id") or "")
                     event = VeyraEvent.from_dict(claimed)
+                    if self._is_project_guardian_signal(event):
+                        signal_result = (
+                            self.project_guardian_signals.record_envelope(
+                                claimed
+                            )
+                        )
+                        signal_status = str(
+                            signal_result.get("status") or "ignored"
+                        )
+                        if signal_status not in {"recorded", "stale"}:
+                            self.event_inbox.complete(
+                                event_id,
+                                consumer_id,
+                                {
+                                    "status": "suppressed",
+                                    "reason": (
+                                        "invalid_project_guardian_signal"
+                                    ),
+                                },
+                            )
+                            suppressed.append(
+                                {
+                                    "event_id": event_id,
+                                    "status": "suppressed",
+                                    "reason": (
+                                        "invalid_project_guardian_signal"
+                                    ),
+                                }
+                            )
+                            continue
+                        self.event_inbox.complete(
+                            event_id,
+                            consumer_id,
+                            {
+                                "status": "signal_recorded",
+                                "signal_ledger_status": signal_status,
+                            },
+                        )
+                        processed.append(
+                            {
+                                "event_id": event_id,
+                                "situation_id": None,
+                                "status": "signal_recorded",
+                            }
+                        )
+                        continue
                     if self._is_project_guardian_event(event):
                         binding = ProjectGuardianRuntime.validate_projection_event(
                             event
@@ -912,13 +1292,77 @@ class ShadowAwarenessRuntime:
 
     @staticmethod
     def _is_project_guardian_signal(event: VeyraEvent) -> bool:
-        payload = event.payload if isinstance(event.payload, dict) else {}
-        return (
-            str(event.source.channel or "") == "project_guardian_signal"
-            and str(payload.get("schema_version") or "")
-            == "veyra.project_guardian_signal.v1"
-            and isinstance(payload.get("project_guardian_signal"), dict)
+        # The channel itself is reserved. Invalid envelopes on it are rejected
+        # or suppressed instead of falling through to generic Situation
+        # projection.
+        return str(event.source.channel or "") == "project_guardian_signal"
+
+    @staticmethod
+    def _active_release_goal(
+        goals_state: dict[str, Any],
+        *,
+        user_id: str,
+        goal_id: str,
+        goal_revision: str,
+        observed_at: datetime,
+    ) -> dict[str, Any] | None:
+        goals = (
+            goals_state.get("goals")
+            if isinstance(goals_state.get("goals"), list)
+            else []
         )
+        for raw in goals:
+            if not isinstance(raw, dict):
+                continue
+            scope = (
+                raw.get("scope")
+                if isinstance(raw.get("scope"), dict)
+                else {}
+            )
+            active_from = ProjectGuardianSignalLedger._time(
+                raw.get("active_from")
+            )
+            active_until = ProjectGuardianSignalLedger._time(
+                raw.get("active_until")
+            )
+            target_sha = str(raw.get("target_sha") or "").strip().lower()
+            try:
+                state_revision = (
+                    0
+                    if isinstance(raw.get("state_revision"), bool)
+                    else int(raw.get("state_revision"))
+                )
+            except (TypeError, ValueError):
+                state_revision = 0
+            if (
+                str(raw.get("schema_version") or "")
+                != ProjectGuardianEvaluator.GOAL_SCHEMA
+                or str(raw.get("source") or "")
+                != ProjectGuardianEvaluator.GOAL_SOURCE
+                or str(raw.get("kind") or "")
+                != ProjectGuardianEvaluator.GOAL_KIND
+                or str(raw.get("status") or "") != "active"
+                or str(raw.get("user_id") or "") != str(user_id)
+                or str(raw.get("goal_id") or "") != str(goal_id)
+                or str(raw.get("revision") or "")
+                != str(goal_revision)
+                or active_from is None
+                or active_until is None
+                or not (active_from <= observed_at <= active_until)
+                or state_revision < 1
+                or len(target_sha) not in {40, 64}
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in target_sha
+                )
+                or any(
+                    not str(scope.get(key) or "")
+                    for key in ProjectGuardianEvaluator.SCOPE_FIELDS
+                )
+            ):
+                continue
+            return copy.deepcopy(raw)
+        return None
 
     @staticmethod
     def _explicit_situation_status(event: VeyraEvent) -> str:
@@ -960,6 +1404,17 @@ class ShadowAwarenessRuntime:
             return max(0, int(value))
         except (TypeError, ValueError):
             return 0
+
+    @staticmethod
+    def _project_guardian_observation_time_valid(
+        observed_at: datetime | None,
+        reference_time: datetime,
+    ) -> bool:
+        return (
+            observed_at is not None
+            and observed_at >= reference_time - timedelta(minutes=2)
+            and observed_at <= reference_time + timedelta(minutes=2)
+        )
 
     @staticmethod
     def _decision_status(result: LoopResult) -> str:

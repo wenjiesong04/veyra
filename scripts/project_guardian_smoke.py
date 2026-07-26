@@ -75,14 +75,18 @@ def goal(
     active_until: datetime | None = None,
 ) -> dict[str, Any]:
     return {
+        "schema_version": ProjectGuardianEvaluator.GOAL_SCHEMA,
         "goal_id": goal_id,
         "kind": kind,
         "status": status,
         "user_id": user_id,
         "revision": revision,
+        "state_revision": 1,
         "scope": copy.deepcopy(scope or SCOPE),
+        "target_sha": "a" * 40,
         "active_from": (active_from or NOW - timedelta(hours=1)).isoformat(),
         "active_until": (active_until or NOW + timedelta(hours=1)).isoformat(),
+        "source": ProjectGuardianEvaluator.GOAL_SOURCE,
     }
 
 
@@ -138,10 +142,74 @@ def enqueue_signal(
     privacy_scope: str = "user",
     received_at: datetime | None = None,
     include_evidence: bool = True,
+    include_attestation: bool = True,
+    producer_id: str | None = None,
+    trust_class: str | None = None,
+    admission_source: str = "project_guardian_signal_ingress",
+    receipt_id: str | None = None,
     enqueue: bool = True,
 ) -> VeyraEvent:
     observed = occurred_at or NOW - timedelta(minutes=5)
     evidence = evidence_id or f"evidence:{event_id}"
+    selected_component = source_component or COMPONENTS[kind]
+    selected_provenance = (
+        provenance_root or f"{selected_component}:{event_id}"
+    )
+    selected_scope = copy.deepcopy(scope or SCOPE)
+    selected_valid_until = valid_until or NOW + timedelta(minutes=10)
+    expected_producer = ProjectGuardianEvaluator.SIGNAL_PRODUCERS[kind]
+    selected_producer = producer_id or str(
+        expected_producer["producer_id"]
+    )
+    selected_trust = trust_class or str(
+        expected_producer["trust_class"]
+    )
+    selected_receipt = (
+        receipt_id
+        or ProjectGuardianEvaluator.producer_receipt_id_for(
+            kind=kind,
+            state=state,
+            source_component=selected_component,
+            provenance_root=selected_provenance,
+            evidence_id=evidence,
+            goal_id=goal_id,
+            goal_revision=goal_revision,
+            scope=selected_scope,
+            valid_until=selected_valid_until.isoformat(),
+            producer_id=selected_producer,
+            trust_class=selected_trust,
+            user_id=user_id,
+            session_id=session_id,
+            occurred_at=observed.isoformat(),
+        )
+    )
+    signal_payload = {
+        "kind": kind,
+        "state": state,
+        "source_component": selected_component,
+        "provenance_root": selected_provenance,
+        "evidence_id": evidence,
+        "goal_id": goal_id,
+        "goal_revision": goal_revision,
+        "scope": selected_scope,
+        "valid_until": selected_valid_until.isoformat(),
+        # Deliberately ignored by the evaluator/runtime.
+        "details": {
+            "short_status": [" M /private/repo/secret.py"],
+            "raw_log": "must-not-enter-guardian-candidate",
+            "user_text": "deploy this now",
+        },
+    }
+    if include_attestation:
+        signal_payload["producer_attestation"] = {
+            "schema_version": (
+                ProjectGuardianEvaluator.PRODUCER_ATTESTATION_SCHEMA
+            ),
+            "producer_id": selected_producer,
+            "trust_class": selected_trust,
+            "admission_source": admission_source,
+            "receipt_id": selected_receipt,
+        }
     event = VeyraEvent(
         type=EventType.OBSERVATION,
         source=EventSource(
@@ -151,25 +219,7 @@ def enqueue_signal(
         ),
         payload={
             "schema_version": ProjectGuardianEvaluator.SIGNAL_SCHEMA,
-            "project_guardian_signal": {
-                "kind": kind,
-                "state": state,
-                "source_component": source_component or COMPONENTS[kind],
-                "provenance_root": provenance_root or f"{COMPONENTS[kind]}:{event_id}",
-                "evidence_id": evidence,
-                "goal_id": goal_id,
-                "goal_revision": goal_revision,
-                "scope": copy.deepcopy(scope or SCOPE),
-                "valid_until": (
-                    valid_until or NOW + timedelta(minutes=10)
-                ).isoformat(),
-                # Deliberately ignored by the evaluator/runtime.
-                "details": {
-                    "short_status": [" M /private/repo/secret.py"],
-                    "raw_log": "must-not-enter-guardian-candidate",
-                    "user_text": "deploy this now",
-                },
-            },
+            "project_guardian_signal": signal_payload,
         },
         event_id=event_id,
         timestamp=observed.isoformat(),
@@ -179,7 +229,7 @@ def enqueue_signal(
             [
                 {
                     "ref_id": evidence_ref_id or evidence,
-                    "source": evidence_source or source_component or COMPONENTS[kind],
+                    "source": evidence_source or selected_component,
                     "is_fact": evidence_is_fact,
                 }
             ]
@@ -308,6 +358,25 @@ def test_negative_and_correlation_cases(root: Path) -> None:
     enqueue_signal(inactive, kind="git_dirty", event_id="evt_i_git")
     enqueue_signal(inactive, kind="ci_failed", event_id="evt_i_ci")
     expect(evaluate(inactive)["candidate_count"] == 0, "inactive Goal never qualifies")
+
+    uncontrolled = WorldStateStore(root / "uncontrolled-goal")
+    uncontrolled_goal = goal()
+    uncontrolled_goal["source"] = "caller_declared_goal"
+    seed_goal(uncontrolled, uncontrolled_goal)
+    enqueue_signal(
+        uncontrolled,
+        kind="git_dirty",
+        event_id="evt_uncontrolled_git",
+    )
+    enqueue_signal(
+        uncontrolled,
+        kind="ci_failed",
+        event_id="evt_uncontrolled_ci",
+    )
+    expect(
+        evaluate(uncontrolled)["candidate_count"] == 0,
+        "caller-declared release Goal cannot enter qualification",
+    )
 
     single = WorldStateStore(root / "single")
     seed_goal(single)
@@ -2272,7 +2341,11 @@ def test_signal_ledger_recovers_after_partial_publish(root: Path) -> None:
             enqueue=False,
         ),
     ]
-    admissions = [fabric.publish(event) for event in signal_events]
+    with store.writer_transaction():
+        admissions = [
+            fabric._admit_project_guardian_signal(event)
+            for event in signal_events
+        ]
     before_repair = ProjectGuardianSignalLedger(store).evaluation_state()
     expect(
         all(
@@ -2356,7 +2429,8 @@ def test_missing_goal_signals_cannot_evict_active_frontier(
         ),
     ]
     for event in true_signals:
-        admission = fabric.publish(event)
+        with store.writer_transaction():
+            admission = fabric._admit_project_guardian_signal(event)
         expect(
             admission.get("signal_ledger_status") == "recorded",
             "active Goal signal enters the bounded frontier",
@@ -2397,7 +2471,8 @@ def test_missing_goal_signals_cannot_evict_active_frontier(
             + timedelta(milliseconds=index),
             enqueue=False,
         )
-        fabric.publish(junk)
+        with store.writer_transaction():
+            fabric._admit_project_guardian_signal(junk)
 
     pressure_run = runtime.run_once(reason="missing_goal_pressure")
     signal_state = ProjectGuardianSignalLedger(store).evaluation_state()

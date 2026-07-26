@@ -218,6 +218,23 @@ class ProjectGuardianSignalLedger:
                     "goal_revision": str(signal["goal_revision"]),
                     "scope": copy.deepcopy(signal["scope"]),
                     "valid_until": signal["valid_until"].isoformat(),
+                    "producer_attestation": {
+                        "schema_version": (
+                            ProjectGuardianEvaluator.PRODUCER_ATTESTATION_SCHEMA
+                        ),
+                        "producer_id": str(signal["producer_id"]),
+                        "trust_class": str(
+                            ProjectGuardianEvaluator.SIGNAL_PRODUCERS[
+                                str(signal["kind"])
+                            ]["trust_class"]
+                        ),
+                        "admission_source": (
+                            "project_guardian_signal_ingress"
+                        ),
+                        "receipt_id": str(
+                            signal["producer_receipt_id"]
+                        ),
+                    },
                 },
             },
             "evidence_refs": [

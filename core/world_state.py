@@ -80,6 +80,7 @@ STATE_FILE_LAYOUT: dict[str, str] = {
     "situation_state.json": f"{STATE_RUNTIME}/situation_state.json",
     "project_guardian_state.json": f"{STATE_RUNTIME}/project_guardian_state.json",
     "project_guardian_signal_state.json": f"{STATE_RUNTIME}/project_guardian_signal_state.json",
+    "project_guardian_producer_state.json": f"{STATE_RUNTIME}/project_guardian_producer_state.json",
     "rollback_state.json": f"{STATE_RUNTIME}/rollback_state.json",
     "replay_runtime_state.json": f"{STATE_RUNTIME}/replay_runtime_state.json",
     "ops_soak_state.json": f"{STATE_RUNTIME}/ops_soak_state.json",
@@ -123,6 +124,7 @@ STATE_METADATA: dict[str, dict[str, Any]] = {
     "situation_state.json": {"source": "situation_evaluator", "ttl_seconds": 86400, "confidence": 0.78},
     "project_guardian_state.json": {"source": "project_guardian", "ttl_seconds": 0, "confidence": 0.82},
     "project_guardian_signal_state.json": {"source": "project_guardian_signal_ledger", "ttl_seconds": 0, "confidence": 0.9},
+    "project_guardian_producer_state.json": {"source": "project_guardian_producers", "ttl_seconds": 0, "confidence": 0.95},
     "feishu_ws_state.json": {"source": "feishu_ws_runner", "ttl_seconds": 600, "confidence": 0.65},
     "ops_runtime_matrix.json": {"source": "runtime_matrix", "ttl_seconds": 1800, "confidence": 0.74},
     "ops_config.json": {"source": "ops_config", "ttl_seconds": 0, "confidence": 0.8},
@@ -137,6 +139,7 @@ DURABLE_STATE_FILES = CONFIG_STATE_FILES | {
     "event_inbox.json",
     "project_guardian_state.json",
     "project_guardian_signal_state.json",
+    "project_guardian_producer_state.json",
 }
 
 _ROOT_LOCKS_GUARD = threading.Lock()
@@ -514,6 +517,14 @@ class WorldStateStore:
                 "schema_version": "veyra.project_guardian_signal_frontier.v1",
                 "signals": {},
                 "signal_count": 0,
+                "updated_at": None,
+            },
+            "project_guardian_producer_state.json": {
+                "schema_version": "veyra.project_guardian_producers.v1",
+                "bindings": {},
+                "binding_count": 0,
+                "runs": [],
+                "last_run": None,
                 "updated_at": None,
             },
             "feishu_ws_state.json": {"status": "stopped", "last_event_at": None},

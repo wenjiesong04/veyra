@@ -1933,6 +1933,7 @@ class ProjectGuardianRuntime:
                 key: copy.deepcopy(evaluation.get(key))
                 for key in (
                     "schema_version",
+                    "ruleset_version",
                     "status",
                     "evaluated_at",
                     "active_goal_count",

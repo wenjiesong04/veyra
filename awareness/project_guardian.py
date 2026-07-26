@@ -14,14 +14,34 @@ class ProjectGuardianEvaluator:
     """
 
     SIGNAL_SCHEMA = "veyra.project_guardian_signal.v1"
+    PRODUCER_ATTESTATION_SCHEMA = (
+        "veyra.project_guardian_producer_attestation.v1"
+    )
     CANDIDATE_SCHEMA = "veyra.project_guardian_candidate.v1"
     CANDIDATE_KIND = "project_release_risk"
+    EVALUATOR_RULESET_VERSION = "veyra.project_guardian_ruleset.v1"
     GOAL_KIND = "project_release"
+    GOAL_SCHEMA = "veyra.project_guardian_release_goal.v1"
+    GOAL_SOURCE = "project_guardian_release_goal_registry"
     SIGNAL_CHANNEL = "project_guardian_signal"
     SIGNAL_COMPONENTS = {
         "git_dirty": "git_probe",
         "ci_failed": "ci_provider",
         "deployment_intent": "semantic_intent",
+    }
+    SIGNAL_PRODUCERS = {
+        "git_dirty": {
+            "producer_id": "veyra.project_guardian.git_probe.v1",
+            "trust_class": "local_read_only_probe",
+        },
+        "ci_failed": {
+            "producer_id": "veyra.project_guardian.ci_provider.v1",
+            "trust_class": "provider_read_only",
+        },
+        "deployment_intent": {
+            "producer_id": "veyra.project_guardian.semantic_intent.v1",
+            "trust_class": "authoritative_semantic_observer",
+        },
     }
     SIGNAL_STATES = {"present", "clear"}
     SCOPE_FIELDS = (
@@ -84,6 +104,8 @@ class ProjectGuardianEvaluator:
             positive.sort(key=lambda item: (item["kind"], item["event_id"]))
             if len(positive) < 2:
                 continue
+            if len({item["producer_id"] for item in positive}) < 2:
+                continue
             if len({item["provenance_lineage"] for item in positive}) < 2:
                 continue
             occurred = [item["occurred_at"] for item in positive]
@@ -103,6 +125,7 @@ class ProjectGuardianEvaluator:
         candidates.sort(key=lambda item: item["candidate_id"])
         return {
             "schema_version": "veyra.project_guardian_evaluation.v1",
+            "ruleset_version": self.EVALUATOR_RULESET_VERSION,
             "status": "qualified" if candidates else "no_candidate",
             "evaluated_at": self._iso(evaluated_at),
             "active_goal_count": len(goals),
@@ -140,8 +163,19 @@ class ProjectGuardianEvaluator:
             scope = self._scope(raw.get("scope"))
             active_from = self._time(raw.get("active_from"))
             active_until = self._time(raw.get("active_until"))
+            target_sha = self._text(raw.get("target_sha"), 64).lower()
+            try:
+                state_revision = (
+                    0
+                    if isinstance(raw.get("state_revision"), bool)
+                    else int(raw.get("state_revision"))
+                )
+            except (TypeError, ValueError):
+                state_revision = 0
             if (
-                not goal_id
+                str(raw.get("schema_version") or "") != self.GOAL_SCHEMA
+                or str(raw.get("source") or "") != self.GOAL_SOURCE
+                or not goal_id
                 or not user_id
                 or not revision
                 or scope is None
@@ -149,6 +183,12 @@ class ProjectGuardianEvaluator:
                 or active_until is None
                 or active_until < active_from
                 or not (active_from <= now <= active_until)
+                or state_revision < 1
+                or len(target_sha) not in {40, 64}
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in target_sha
+                )
             ):
                 rejected += 1
                 continue
@@ -157,7 +197,9 @@ class ProjectGuardianEvaluator:
                     "goal_id": goal_id,
                     "user_id": user_id,
                     "revision": revision,
+                    "state_revision": state_revision,
                     "scope": scope,
+                    "target_sha": target_sha,
                     "active_from": active_from,
                     "active_until": active_until,
                 }
@@ -225,9 +267,47 @@ class ProjectGuardianEvaluator:
             occurred_at = self._time(envelope.get("occurred_at") or envelope.get("timestamp"))
             valid_until = self._time(raw_signal.get("valid_until"))
             evidence_refs = self._evidence_refs(envelope.get("evidence_refs"))
+            producer_attestation = (
+                raw_signal.get("producer_attestation")
+                if isinstance(raw_signal.get("producer_attestation"), dict)
+                else {}
+            )
+            expected_producer = self.SIGNAL_PRODUCERS.get(kind, {})
+            producer_id = self._text(
+                producer_attestation.get("producer_id"),
+                200,
+            )
+            trust_class = self._text(
+                producer_attestation.get("trust_class"),
+                120,
+            )
+            receipt_id = self._text(
+                producer_attestation.get("receipt_id"),
+                240,
+            )
             provenance_lineage = (
                 provenance_root[len(component) + 1 :]
                 if provenance_root.startswith(f"{component}:")
+                else ""
+            )
+            expected_receipt = (
+                self.producer_receipt_id_for(
+                    kind=kind,
+                    state=state_value,
+                    source_component=component,
+                    provenance_root=provenance_root,
+                    evidence_id=evidence_id,
+                    goal_id=goal_id,
+                    goal_revision=goal_revision,
+                    scope=scope or {},
+                    valid_until=self._iso(valid_until) if valid_until else "",
+                    producer_id=producer_id,
+                    trust_class=trust_class,
+                    user_id=user_id,
+                    session_id=session_id,
+                    occurred_at=self._iso(occurred_at) if occurred_at else "",
+                )
+                if scope is not None and occurred_at is not None and valid_until is not None
                 else ""
             )
             if (
@@ -249,6 +329,16 @@ class ProjectGuardianEvaluator:
                 or source_channel != self.SIGNAL_CHANNEL
                 or str(envelope.get("privacy_scope") or "") != "user"
                 or not provenance_lineage
+                or str(producer_attestation.get("schema_version") or "")
+                != self.PRODUCER_ATTESTATION_SCHEMA
+                or str(producer_attestation.get("admission_source") or "")
+                != "project_guardian_signal_ingress"
+                or producer_id
+                != str(expected_producer.get("producer_id") or "")
+                or trust_class
+                != str(expected_producer.get("trust_class") or "")
+                or not receipt_id
+                or receipt_id != expected_receipt
                 or not self._has_bound_evidence(
                     envelope.get("evidence_refs"),
                     evidence_id=evidence_id,
@@ -273,6 +363,8 @@ class ProjectGuardianEvaluator:
                 "source_component": component,
                 "provenance_root": provenance_root,
                 "provenance_lineage": provenance_lineage,
+                "producer_id": producer_id,
+                "producer_receipt_id": receipt_id,
                 "evidence_id": evidence_id,
                 "goal_id": goal_id,
                 "goal_revision": goal_revision,
@@ -290,6 +382,8 @@ class ProjectGuardianEvaluator:
                 goal_revision,
                 *(scope[key] for key in self.SCOPE_FIELDS),
                 kind,
+                producer_id,
+                receipt_id,
                 provenance_root,
                 evidence_id,
             )
@@ -330,6 +424,9 @@ class ProjectGuardianEvaluator:
             {
                 "kind": signal["kind"],
                 "source_component": signal["source_component"],
+                "producer_ref": (
+                    f"producer_{self._digest(signal['producer_id'])[:16]}"
+                ),
                 "provenance_ref": f"prov_{self._digest(signal['provenance_lineage'])[:16]}",
                 "evidence_ref": f"pgev_{self._digest(signal['evidence_id'])[:16]}",
                 "event_id": signal["event_id"],
@@ -344,6 +441,9 @@ class ProjectGuardianEvaluator:
                 "state": signal["state"],
                 "fresh": bool(signal["fresh"]),
                 "source_component": signal["source_component"],
+                "producer_ref": (
+                    f"producer_{self._digest(signal['producer_id'])[:16]}"
+                ),
                 "provenance_ref": (
                     f"prov_{self._digest(signal['provenance_lineage'])[:16]}"
                 ),
@@ -485,6 +585,53 @@ class ProjectGuardianEvaluator:
             "qualified_at": str(candidate.get("qualified_at") or ""),
         }
         return f"pgr_{cls._digest(semantics)[:20]}"
+
+    @classmethod
+    def producer_receipt_id_for(
+        cls,
+        *,
+        kind: str,
+        state: str,
+        source_component: str,
+        provenance_root: str,
+        evidence_id: str,
+        goal_id: str,
+        goal_revision: str,
+        scope: dict[str, Any],
+        valid_until: str,
+        producer_id: str,
+        trust_class: str,
+        user_id: str,
+        session_id: str,
+        occurred_at: str,
+    ) -> str:
+        """Bind a persisted signal to the dedicated in-process ingress.
+
+        This receipt is an integrity/binding identifier inside Veyra's trusted
+        local state boundary, not a cryptographic provider signature.
+        """
+
+        binding = {
+            "schema_version": cls.SIGNAL_SCHEMA,
+            "kind": str(kind),
+            "state": str(state),
+            "source_component": str(source_component),
+            "provenance_root": str(provenance_root),
+            "evidence_id": str(evidence_id),
+            "goal_id": str(goal_id),
+            "goal_revision": str(goal_revision),
+            "scope": {
+                key: str(scope.get(key) or "")
+                for key in cls.SCOPE_FIELDS
+            },
+            "valid_until": str(valid_until),
+            "producer_id": str(producer_id),
+            "trust_class": str(trust_class),
+            "user_id": str(user_id),
+            "session_id": str(session_id),
+            "occurred_at": str(occurred_at),
+        }
+        return f"pgsr_{cls._digest(binding)[:24]}"
 
     def _scope(self, value: Any) -> dict[str, str] | None:
         if not isinstance(value, dict):
