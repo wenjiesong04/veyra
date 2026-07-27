@@ -161,7 +161,7 @@ Guardian、授权系统、Tool Proxy、Verifier、审计、密钥管理、签名
 - `PARTIAL`：只覆盖目标的一部分，不能按完整能力宣传；
 - `TARGET`：设计目标，尚未实现。
 
-特别是 `Durable Case`、`CapabilityGrant`、100% pre-tool enforcement、多事件 Situation Engine、Foresight v2 和自治自愈目前都是 `TARGET`，不是当前安全不变量。
+特别是 `Durable Case`、完整可执行的 `CapabilityGrant`、100% pre-tool enforcement、多事件 Situation Engine、Foresight v2 和自治自愈目前都是 `TARGET`，不是当前安全不变量。Phase 3 第一切片只实现了 CapabilityGrant 的核心身份/digest 合同和 deny-only ledger，不能等同于真实授权已经接通。
 
 | 能力 | 当前代码 | 已有价值 | 主要差距 |
 |---|---|---|---|
@@ -177,7 +177,7 @@ Guardian、授权系统、Tool Proxy、Verifier、审计、密钥管理、签名
 | Agent 委托 | `task_packet_builder.py`、`delegation_policy.py`、`openclaw_adapter.py` | 已能向选定 Agent 下发独立任务并等待结果 | 主要是 Veyra 单向发包；缺少类型化的质疑、证据请求、方案协商和逐步授权 |
 | 持久任务 | `runtime/agent_task_tracker.py`、`core/state_proposal.py` | 已有任务上下文、digest、revision、过期、幂等和 indeterminate 处理 | 还没有承载整个情境生命周期的 Durable Case 状态机 |
 | 执行治理 | `guardian/`、`tool_proxy/`、`execution/` | 风险、Review、Safe Tool 和合同存在 | 当前 Agent 执行仍未证明所有真实 tool call 必经 Veyra；事后自报不能代替执行前拦截 |
-| 验证/恢复 | `core/verifier.py`、`rollback_audit/` | 有结构化验证、snapshot、trace、restore 基础 | 缺少基于真实 Tool ledger 的独立效果验证；rollback 不能被概括为通用能力 |
+| 验证/恢复 | `core/verifier.py`、`rollback_audit/` | 有结构化验证、snapshot、trace、restore，以及 contract-only 权威 receipt/effect 投影合同 | 尚未接入真实 hook 和独立 effect verifier；rollback 不能被概括为通用能力 |
 | 学习/自改进 | `runtime/self_improvement.py`、`memory_bridge/` | 能记录能力缺口，默认不自行改源码是正确边界 | 没有统一的 outcome learning、预测校准、策略候选晋级和安全扩展生命周期 |
 
 目标不是删除这些部件，而是让它们成为同一个闭环的投影、策略和执行器。
@@ -1488,12 +1488,12 @@ Phase 1–2 的新链严格 `record_only / shadow / read-only / sandbox`。任�
 
 ### Phase 3：真实 Tool Proxy 与 CapabilityGrant
 
-- 先冻结 OpenClaw `before_tool_call / after_tool_call` 插件合同和权威 pre/post tool ledger；
-- Grant 精确绑定 user/workspace/Agent/session/case/step/tool-call、tool、args digest、derived target、环境、有效期、使用次数、审批与 registry revision；
-- 明确 cancel/revoke、过期、参数变化、重放和跨 user/workspace 的失效语义；
-- SafeFile/SafeShell sandbox、workspace jail、timeout 和数据流策略；治理不可达时写操作 fail closed；
-- governed session pre-tool coverage 必须为 100%，无 Grant、参数篡改、过期、重放和跨 scope 成功数必须为 0；
-- 真实 canary 阻断证明完成前保持 `tool_proxy_enforced=false`。HMAC、归档索引、密钥轮换和数据库迁移仍不进入本阶段。
+- `IMPLEMENTED / CONTRACT ONLY`：已冻结第一切片的严格身份与 digest 核心合同：`GovernedSessionBinding / ToolInvocation / CapabilityGrant / PreflightDecision / ToolObservation / AuthoritativeToolReceipt / VerifiedToolEffect`；Grant 精确绑定 user/workspace/Agent/session/channel/case/step/run/tool-call、tool、risk、args digest、derived target、环境、有效期、单次使用、审批引用、policy 与 registry revision。完整合同中的 input provenance、requested scope、expected effects、idempotency key、费用/token/输出/重试预算和 verification plan 仍待 sandbox/executor 切片补齐；
+- `IMPLEMENTED / DENY-ONLY`：已增加 Veyra 私有权威 pre/post ledger，Grant claim 与 `authorized_not_observed` 在一个原子状态写中完成；cancel/revoke、过期、参数变化、顺序/并发重放、跨 user/workspace/session/run/call 均失效，claim 后崩溃保持 indeterminate 且不自动重放；原始 capability/reservation token 不持久化，公开 `/state` 不暴露该 ledger；
+- `IMPLEMENTED`：Agent 自报 trace/proposal/review/evidence 不再能建立执行 authority；receipt ref 必须逐条绑定 run、tool-call、invocation digest、报告索引和规范 tool name。contract-only issuer 对第一切片已支持的结构化字段执行确定性下限：已知 file/browser/API 的参数目标必须与唯一 derived target 精确一致，API method 必须显式、URL 必须是无歧义且无控制字符的 HTTP(S) host，headers/query/body 一并进入风险判断。SafeShell 尚未实现，因此 shell Grant 目前只接受无 target、direct argv 的已知 R0 无副作用命令；command 字符串、wrapper、pipeline、重定向、多命令和其他 executable 全部 fail closed，不用继续扩张 shell 关键词或正则。R5、tool-kind/字段矛盾和低于下限的请求都不能签发，Verifier 也会让低于可见下限的 receipt 失去 coverage。统一 registry-derived risk policy 仍须在真实 hook 前接通。`verified_success` 要求每个权威 observed receipt 都有一份 Veyra `VerifiedToolEffect`，逐条绑定 receipt/run/call/tool/invocation/result/targets digest，并携带可重算 targets digest 的授权目标原像；effect 不得早于 receipt observation 或超出允许的未来时钟偏差，changed files 只能是授权目标的精确成员，Agent 自报 changed files 还必须与全部权威投影并集一致。面向用户和记忆的已验证摘要只来自权威投影，不回退到 Agent 文本。当前 contract-only issuer 只记录审批引用，不把它伪装为已验证审批。重复/并发 review approve 采用 claim-before-effect，ReviewQueue 没有 claim token 不能记录执行结果，同一 review 至多一个执行者，崩溃后不自动重放；
+- `PENDING`：SafeFile/SafeShell sandbox、workspace jail、clean env、timeout、可信 shell target derivation、显式 directory/prefix scope 类型和完整数据流策略；当前文件 effect 只接受精确目标成员，不猜测目录、prefix 或 glob，当前 shell Grant 不接受任何 derived target，后续也不能把 Agent 声明直接当作已验证路径范围。治理不可达时写操作 fail closed；
+- `PENDING`：真实 OpenClaw `before_tool_call / after_tool_call` 插件接入、dispatch 前 governed-session 注册、真实 hook 分母对账和 scoped sandbox canary；完成后 governed session pre-tool coverage 必须为 100%，无 Grant、参数篡改、过期、重放和跨 scope 成功数必须为 0；
+- `HONESTY LOCK`：上述真实 canary 阻断证明完成前保持 `tool_proxy_enforced=false`，当前合同的 `execute_allowed` 固定为 `false`。HMAC、归档索引、密钥轮换和数据库迁移仍不进入本阶段。
 
 ### Phase 4：Durable Case + 有界 Agent 协商
 

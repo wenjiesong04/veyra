@@ -41,6 +41,7 @@ from routers.debug_audit import build_debug_audit_router
 from routers.local_setup import build_local_setup_router
 from routers.ops_runtime import build_ops_runtime_router
 from routers.runtime_observability import build_runtime_observability_router
+from routers.tool_governance import build_tool_governance_router
 from runtime.active_loop import ActiveRuntimeLoop
 from runtime.commitment_push import CommitmentPushRuntime
 from runtime.agent_orchestrator import AgentOrchestrator
@@ -64,6 +65,7 @@ from runtime.routing_metrics import RoutingMetrics
 from runtime.runtime_matrix import RuntimeMatrix
 from runtime.soak_runner import SoakRunner
 from runtime.state_refresh import StateRefresh
+from runtime.tool_governance_runtime import ToolGovernanceRuntime
 from tool_proxy.safe_api import SafeAPI
 from tool_proxy.safe_browser import SafeBrowser
 from tool_proxy.safe_file import SafeFile
@@ -103,9 +105,11 @@ def _env_hosts(name: str) -> list[str] | None:
 
 
 state_store = WorldStateStore(exclusive_writer=True, writer_owner="veyra-api")
+tool_governance = ToolGovernanceRuntime(state_store)
 runtime_entity = RuntimeEntity(state_store=state_store)
 commitment_core = CommitmentCore(state_store)
 awareness_loop = AwarenessLoop(state_store=state_store, runtime_entity=runtime_entity, commitment_core=commitment_core)
+awareness_loop.verifier.tool_receipt_resolver = tool_governance.resolve_receipt
 commitment_core.memory_bridge = awareness_loop.memory_bridge
 commitment_push = CommitmentPushRuntime(
     state_store=state_store,
@@ -601,6 +605,7 @@ app.include_router(
         metrics=routing_metrics,
     )
 )
+app.include_router(build_tool_governance_router(tool_governance))
 app.include_router(
     build_agent_memory_router(
         _DynamicDeps(
