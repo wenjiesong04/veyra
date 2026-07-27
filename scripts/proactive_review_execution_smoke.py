@@ -160,8 +160,20 @@ def main() -> None:
         for label, execution_result, expected_audit_status, replay_candidate in status_cases:
             event_id = f"review-status-{label}"
             review = review_queue.create(event_id, f"status matrix {label}", "R2", {}, {})
-            review_queue.decide(review["review_id"], "approved", "status matrix")
-            review_queue.update_execution(review["review_id"], execution_result)
+            _, claim_token = review_queue.approve_and_claim(
+                review["review_id"],
+                "status matrix",
+            )
+            expect(
+                bool(claim_token),
+                f"{label} obtains one execution claim",
+                review,
+            )
+            review_queue.update_execution(
+                review["review_id"],
+                execution_result,
+                claim_token=claim_token,
+            )
             execution_rows = [
                 item
                 for item in store.read_jsonl("action_record.jsonl", limit=500)

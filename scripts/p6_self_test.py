@@ -254,7 +254,12 @@ def main() -> int:
                 },
             )
         )
-        expect(proxied["status"] == "verified_success", "verifier accepts approved high-risk agent tool call", proxied)
+        expect(
+            proxied["status"] == "needs_more_probe"
+            and proxied["verdict"] == "tool_proxy_bypass_suspected",
+            "caller-reported approval and trace cannot verify a high-risk agent tool call",
+            proxied,
+        )
         forbidden = verifier.verify_execution_result(
             ExecutionResult(task_id="tool_forbidden", executor="fake", status="success", result="deleted", tool_calls=["rm -rf /tmp/veyra-danger"])
         )

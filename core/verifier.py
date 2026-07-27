@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+from pydantic import ValidationError
 
 from core.definitions import RiskLevel
 from interface.agent_adapter import ExecutionResult
-from tool_proxy.agent_tool_contract import AgentToolCompliance
+from tool_proxy.agent_tool_contract import AgentToolCompliance, ToolReceiptResolver
+from tool_proxy.governance_contract import VerifiedToolEffect, canonical_json
 
 
 EXECUTION_FAILURE_MARKERS = (
@@ -13,11 +18,22 @@ EXECUTION_FAILURE_MARKERS = (
     "model turn failed",
     "no assistant content",
 )
+MAX_EFFECT_CLOCK_SKEW = timedelta(minutes=5)
 
 
 class Verifier:
-    def __init__(self) -> None:
-        self.agent_tool_compliance = AgentToolCompliance()
+    def __init__(self, tool_receipt_resolver: ToolReceiptResolver | None = None) -> None:
+        self._tool_receipt_resolver = tool_receipt_resolver
+        self.agent_tool_compliance = AgentToolCompliance(tool_receipt_resolver)
+
+    @property
+    def tool_receipt_resolver(self) -> ToolReceiptResolver | None:
+        return self._tool_receipt_resolver
+
+    @tool_receipt_resolver.setter
+    def tool_receipt_resolver(self, resolver: ToolReceiptResolver | None) -> None:
+        self._tool_receipt_resolver = resolver
+        self.agent_tool_compliance.receipt_resolver = resolver
 
     def verify_probe_result(self, probe_result: dict[str, Any]) -> dict[str, Any]:
         raw_status = str(probe_result.get("status") or "unknown")
@@ -70,6 +86,17 @@ class Verifier:
                 "needs_memory_patch": False,
             }
 
+        if status == "success" and structured_evidence["authoritative_failure_observed"]:
+            return {
+                "status": "verified_failed",
+                "verdict": "authoritative_tool_receipt_reported_failure",
+                "confidence": 0.9,
+                "evidence": evidence,
+                "next_action": "inspect_tool_failure_or_reconcile_execution",
+                "needs_rollback": bool(changed_files),
+                "needs_memory_patch": False,
+                "risk_level": tool_proxy_compliance.get("max_risk"),
+            }
         if tool_proxy_compliance["status"] == "blocked":
             return {
                 "status": "verified_failed",
@@ -114,9 +141,37 @@ class Verifier:
                 "needs_rollback": True,
                 "needs_memory_patch": False,
             }
+        if (
+            status == "success"
+            and structured_evidence["authoritative_effect_evidence_invalid"]
+        ):
+            return {
+                "status": "needs_more_probe",
+                "verdict": "authoritative_effect_evidence_invalid",
+                "confidence": 0.26,
+                "evidence": evidence,
+                "next_action": "reconcile_effect_evidence_with_tool_receipt",
+                "needs_rollback": bool(changed_files),
+                "needs_memory_patch": False,
+                "risk_level": tool_proxy_compliance.get("max_risk"),
+            }
+        if (
+            status == "success"
+            and structured_evidence["caller_projection_mismatch"]
+        ):
+            return {
+                "status": "needs_more_probe",
+                "verdict": "caller_outcome_projection_mismatch",
+                "confidence": 0.25,
+                "evidence": evidence,
+                "next_action": "use_authoritative_projection_and_reconcile_agent_report",
+                "needs_rollback": bool(changed_files),
+                "needs_memory_patch": False,
+                "risk_level": tool_proxy_compliance.get("max_risk"),
+            }
 
         if status == "success" and structured_evidence["sufficient"]:
-            return {
+            verified = {
                 "status": "verified_success",
                 "verdict": "execution_success_supported_by_structured_evidence",
                 "confidence": 0.84 if tool_proxy_compliance.get("enforcement_observed") else 0.72,
@@ -125,6 +180,16 @@ class Verifier:
                 "needs_rollback": False,
                 "needs_memory_patch": True,
             }
+            if execution_result.tool_calls:
+                verified.update(
+                    {
+                        "claim_scope": "authoritative_verified_projection_only",
+                        "verified_projection": structured_evidence[
+                            "authoritative_projection"
+                        ],
+                    }
+                )
+            return verified
         if status == "success" and structured_evidence["agent_plan_only"]:
             return {
                 "status": "partially_success",
@@ -217,45 +282,134 @@ class Verifier:
     ) -> dict[str, Any]:
         """Identify outcome evidence without treating arbitrary text/raw presence as proof."""
         raw = execution_result.raw if isinstance(execution_result.raw, dict) else {}
-        sources: list[str] = []
+        outcome_sources: list[str] = []
+        reported_sources: list[str] = []
+        reported_outcome_sources: list[str] = []
 
         for key in ("evidence", "evidence_used", "verification_evidence", "post_execution_evidence"):
             if self._is_evidence_container(raw.get(key)):
-                sources.append(f"raw.{key}")
+                if key == "post_execution_evidence":
+                    outcome_sources.append(f"raw.{key}")
+                else:
+                    reported_sources.append(f"raw.{key}")
+                    if self._is_outcome_evidence_container(raw.get(key)):
+                        reported_outcome_sources.append(f"raw.{key}")
 
         probe_result = raw.get("probe_result")
         if isinstance(probe_result, dict) and any(probe_result.get(key) for key in ("source", "probe", "observed_at", "details")):
-            sources.append("raw.probe_result")
+            outcome_sources.append("raw.probe_result")
 
+        # A nested caller-reported verification verdict is not verification.
         verification = raw.get("verification")
         if isinstance(verification, dict) and str(verification.get("status") or "").startswith("verified"):
-            sources.append("raw.verification")
+            reported_sources.append("raw.verification")
 
         execution = raw.get("execution_result")
         if self._has_observed_execution_payload(execution):
-            sources.append("raw.execution_result")
+            outcome_sources.append("raw.execution_result")
 
         agent_response = raw.get("agent_response")
         if isinstance(agent_response, dict):
             if self._is_evidence_container(agent_response.get("evidence_used")):
-                sources.append("raw.agent_response.evidence_used")
-
-        proxy_evidence = tool_proxy_compliance.get("proxy_evidence")
-        if (
-            isinstance(proxy_evidence, dict)
-            and proxy_evidence.get("tool_trace")
-            and tool_proxy_compliance.get("status") == "compliant"
-        ):
-            sources.append("raw.tool_proxy_traces")
+                outcome_sources.append("raw.agent_response.evidence_used")
 
         raw_change_evidence = any(
             self._is_evidence_container(raw.get(key))
             for key in ("diff", "snapshot", "checksums", "file_verification")
         )
         if execution_result.changed_files and raw_change_evidence:
-            sources.append("changed_files_with_verification")
+            outcome_sources.append("changed_files_with_verification")
 
-        unique_sources = list(dict.fromkeys(sources))
+        proxy_evidence = tool_proxy_compliance.get("proxy_evidence")
+        resolved_receipts = (
+            proxy_evidence.get("authoritative_receipts", [])
+            if isinstance(proxy_evidence, dict)
+            else []
+        )
+        authoritative_receipts = sorted(
+            resolved_receipts,
+            key=lambda receipt: int(
+                receipt.get("_reported_call_index", 0)
+                if isinstance(receipt, Mapping)
+                else 0
+            ),
+        )
+        authoritative_failure_observed = any(
+            isinstance(receipt, Mapping)
+            and str(receipt.get("ledger_state") or "").strip().lower()
+            == "observed_failure"
+            for receipt in authoritative_receipts
+        )
+        authority_observed = bool(
+            execution_result.tool_calls
+            and tool_proxy_compliance.get("status") == "compliant"
+            and authoritative_receipts
+            and not authoritative_failure_observed
+        )
+        authoritative_effects: list[dict[str, Any]] = []
+        authoritative_effect_errors: list[dict[str, str]] = []
+        missing_authoritative_effects = 0
+        for receipt in authoritative_receipts:
+            if not isinstance(receipt, Mapping):
+                authoritative_effect_errors.append(
+                    {"reason": "authoritative_receipt_is_not_a_mapping"}
+                )
+                continue
+            if not isinstance(receipt.get("effect_evidence"), Mapping):
+                missing_authoritative_effects += 1
+                continue
+            effect, error = self._validated_authoritative_effect(receipt)
+            if effect is None:
+                authoritative_effect_errors.append(
+                    {
+                        "receipt_id": str(receipt.get("receipt_id") or ""),
+                        "tool_call_id": str(
+                            receipt.get("tool_call_id") or ""
+                        ),
+                        "reason": error
+                        or "authoritative_effect_evidence_invalid",
+                    }
+                )
+                continue
+            authoritative_effects.append(effect)
+        authoritative_effect_sources = [
+            str(effect["source"]) for effect in authoritative_effects
+        ]
+        authoritative_projection = self._authoritative_projection(
+            authoritative_effects
+        )
+        authoritative_effects_complete = bool(authoritative_receipts) and (
+            len(authoritative_effects) == len(authoritative_receipts)
+            and not authoritative_effect_errors
+            and missing_authoritative_effects == 0
+        )
+        caller_projection_mismatch = bool(
+            execution_result.tool_calls
+            and authoritative_effects_complete
+            and not self._changed_files_match_projection(
+                execution_result.changed_files,
+                authoritative_projection.get("changed_files", []),
+            )
+        )
+        unique_outcome_sources = list(dict.fromkeys(outcome_sources))
+        unique_reported_sources = list(dict.fromkeys(reported_sources))
+        unique_reported_outcome_sources = list(dict.fromkeys(reported_outcome_sources))
+        # Caller/Agent raw fields remain diagnostic even after an observed tool
+        # receipt. A persistent effect is independently verified only when the
+        # Veyra-owned receipt resolver attaches a verified effect-evidence record.
+        # The contract-only Phase 3 runtime deliberately does not create one.
+        independent_outcome_observed = (
+            authoritative_effects_complete
+            if execution_result.tool_calls
+            else bool(unique_outcome_sources)
+        )
+        sufficient = (
+            authority_observed
+            and independent_outcome_observed
+            and not caller_projection_mismatch
+            if execution_result.tool_calls
+            else bool(unique_outcome_sources)
+        )
         agent_plan_only = bool(
             isinstance(agent_response, dict)
             and (
@@ -264,14 +418,35 @@ class Verifier:
             )
             and not execution_result.tool_calls
             and not execution_result.changed_files
-            and not unique_sources
+            and not unique_outcome_sources
+            and not unique_reported_sources
         )
         return {
-            "sufficient": bool(unique_sources),
-            "sources": unique_sources,
+            "sufficient": sufficient,
+            "sources": unique_outcome_sources,
+            "reported_sources": unique_reported_sources,
+            "reported_outcome_sources": unique_reported_outcome_sources,
+            "authoritative_effect_sources": authoritative_effect_sources,
+            "authoritative_effect_count": len(authoritative_effects),
+            "authoritative_effect_missing_count": missing_authoritative_effects,
+            "authoritative_effect_errors": authoritative_effect_errors,
+            "authoritative_effect_evidence_invalid": bool(
+                authoritative_effect_errors
+            ),
+            "authoritative_projection": authoritative_projection,
+            "caller_projection_mismatch": caller_projection_mismatch,
+            "caller_result_authenticated": False,
+            "authority_observed": authority_observed,
+            "authoritative_failure_observed": authoritative_failure_observed,
+            "authoritative_receipt_count": len(authoritative_receipts),
+            "independent_outcome_observed": independent_outcome_observed,
             "agent_plan_only": agent_plan_only,
-            "result_text_only": bool(execution_result.result.strip()) and not unique_sources,
-            "raw_metadata_only": bool(raw) and not unique_sources,
+            "result_text_only": bool(execution_result.result.strip())
+            and not unique_outcome_sources
+            and not unique_reported_sources,
+            "raw_metadata_only": bool(raw)
+            and not unique_outcome_sources
+            and not unique_reported_sources,
         }
 
     def _is_evidence_container(self, value: Any) -> bool:
@@ -281,6 +456,136 @@ class Verifier:
             return any(
                 isinstance(item, dict) and bool(item)
                 or isinstance(item, str) and bool(item.strip())
+                for item in value
+            )
+        return False
+
+    def _validated_authoritative_effect(
+        self,
+        receipt: Mapping[str, Any],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        raw_effect = receipt.get("effect_evidence")
+        if not isinstance(raw_effect, Mapping):
+            return None, "authoritative_effect_evidence_missing"
+        try:
+            effect = VerifiedToolEffect.model_validate_json(
+                canonical_json(dict(raw_effect)),
+                strict=True,
+            )
+        except (TypeError, ValueError, ValidationError):
+            return None, "authoritative_effect_contract_invalid"
+
+        bindings = {
+            "receipt_id": receipt.get("receipt_id"),
+            "run_id": receipt.get("run_id"),
+            "tool_call_id": receipt.get("tool_call_id"),
+            "tool_name": receipt.get("tool_name"),
+            "invocation_digest": receipt.get("invocation_digest"),
+            "result_digest": receipt.get("result_digest"),
+            "targets_digest": receipt.get("targets_digest"),
+        }
+        for field_name, expected in bindings.items():
+            if getattr(effect, field_name) != expected:
+                return None, f"authoritative_effect_{field_name}_mismatch"
+        receipt_observed_at = self._aware_datetime(
+            receipt.get("observed_at")
+        )
+        if receipt_observed_at is None:
+            return None, "authoritative_receipt_observed_at_invalid"
+        if effect.observed_at < receipt_observed_at:
+            return None, "authoritative_effect_predates_receipt_observation"
+        if effect.observed_at > datetime.now(timezone.utc) + MAX_EFFECT_CLOCK_SKEW:
+            return None, "authoritative_effect_observed_at_in_future"
+        return effect.model_dump(mode="json"), None
+
+    def _authoritative_projection(
+        self,
+        effects: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        summaries: list[str] = []
+        changed_files: list[str] = []
+        tool_calls: list[str] = []
+        receipt_ids: list[str] = []
+        seen_files: set[str] = set()
+        for effect in effects:
+            summaries.append(str(effect["summary"]))
+            tool_calls.append(str(effect["tool_name"]))
+            receipt_ids.append(str(effect["receipt_id"]))
+            for path in effect.get("changed_files", []):
+                normalized = str(path)
+                if normalized not in seen_files:
+                    seen_files.add(normalized)
+                    changed_files.append(normalized)
+        return {
+            "summary": "; ".join(summaries),
+            "changed_files": changed_files,
+            "tool_calls": tool_calls,
+            "receipt_ids": receipt_ids,
+            "source": "veyra_authoritative_tool_effects",
+        }
+
+    def _changed_files_match_projection(
+        self,
+        caller_files: list[str],
+        authoritative_files: Any,
+    ) -> bool:
+        if not isinstance(authoritative_files, list):
+            return False
+        normalized_caller: list[str] = []
+        for path in caller_files:
+            if (
+                not isinstance(path, str)
+                or not path
+                or path != path.strip()
+                or "\x00" in path
+            ):
+                return False
+            normalized_caller.append(path)
+        if len(normalized_caller) != len(set(normalized_caller)):
+            return False
+        return set(normalized_caller) == set(authoritative_files)
+
+    def _aware_datetime(self, value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str) and value.strip():
+            try:
+                parsed = datetime.fromisoformat(
+                    value.strip().replace("Z", "+00:00")
+                )
+            except ValueError:
+                return None
+        else:
+            return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+
+    def _is_outcome_evidence_container(self, value: Any) -> bool:
+        outcome_keys = {
+            "source",
+            "observed_at",
+            "path",
+            "checksum",
+            "source_checksum",
+            "target_checksum",
+            "exit_code",
+            "returncode",
+            "stdout",
+            "stderr",
+            "changed",
+            "result",
+            "outcome",
+        }
+        if isinstance(value, dict):
+            return any(key in value and value.get(key) is not None for key in outcome_keys)
+        if isinstance(value, (list, tuple)):
+            return any(
+                isinstance(item, dict)
+                and any(
+                    key in item and item.get(key) is not None
+                    for key in outcome_keys
+                )
                 for item in value
             )
         return False

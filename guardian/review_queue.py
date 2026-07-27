@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -53,6 +55,21 @@ _FAILED_EXECUTION_STATUSES = {
     "timeout",
     "verified_failed",
 }
+
+
+def _canonical_digest(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _claim_token_digest(claim_token: str) -> str:
+    return hashlib.sha256(claim_token.encode("utf-8")).hexdigest()
 
 
 def _normalize_execution_status(value: Any) -> str:
@@ -230,6 +247,89 @@ class ReviewQueue:
             )
         return selected
 
+    def approve_and_claim(
+        self,
+        review_id: str,
+        reason: str = "",
+    ) -> tuple[dict[str, Any], str | None]:
+        """Approve a review and reserve its side effect for exactly one caller.
+
+        The raw claim token is returned once and is never persisted. A claim left
+        without an execution observation remains indeterminate and cannot be
+        claimed again automatically.
+        """
+
+        claim_token = secrets.token_urlsafe(32)
+        token_digest = _claim_token_digest(claim_token)
+        selected: dict[str, Any] | None = None
+        approved = False
+        claimed = False
+
+        def approve_and_reserve(state: dict[str, Any]) -> None:
+            nonlocal selected, approved, claimed
+            items = state.setdefault("items", [])
+            if not isinstance(items, list):
+                state["items"] = items = []
+            for item in items:
+                if not isinstance(item, dict) or item.get("review_id") != review_id:
+                    continue
+                status = str(item.get("status") or "")
+                if status == "pending":
+                    item["status"] = "approved"
+                    item["decided_at"] = utc_now_iso()
+                    item["decision_reason"] = reason
+                    approved = True
+                    status = "approved"
+                if (
+                    status == "approved"
+                    and item.get("execution_result") is None
+                    and not isinstance(item.get("execution_claim"), dict)
+                ):
+                    item["execution_claim"] = {
+                        "token_digest": token_digest,
+                        "proposal_digest": _canonical_digest(item.get("proposal")),
+                        "claimed_at": utc_now_iso(),
+                        "state": "indeterminate",
+                    }
+                    claimed = True
+                selected = dict(item)
+                return
+            raise KeyError(f"Review not found: {review_id}")
+
+        self.state_store.mutate_json("review_queue.json", approve_and_reserve)
+        if selected is None:
+            raise KeyError(f"Review not found: {review_id}")
+        if approved:
+            self.state_store.append_jsonl(
+                "action_record.jsonl",
+                {
+                    "event_id": selected.get("event_id"),
+                    "route": "human_review",
+                    "status": "approved",
+                    "artifacts": {"review_id": review_id, "reason": reason},
+                },
+            )
+            self.state_store.patch_json(
+                "risk_state.json",
+                {"current_risk": selected.get("risk_level", "R0")},
+            )
+        if claimed:
+            self.state_store.append_jsonl(
+                "action_record.jsonl",
+                {
+                    "event_id": selected.get("event_id"),
+                    "route": "human_review_execution",
+                    "status": "execution_claimed",
+                    "artifacts": {
+                        "review_id": review_id,
+                        "proposal_digest": selected["execution_claim"][
+                            "proposal_digest"
+                        ],
+                    },
+                },
+            )
+        return selected, claim_token if claimed else None
+
     def mark_resolved(self, review_id: str, reason: str = "") -> dict[str, Any]:
         return self._set_terminal_status(review_id, "resolved", reason or "marked resolved by runtime hygiene")
 
@@ -260,18 +360,63 @@ class ReviewQueue:
         )
         return review
 
-    def update_execution(self, review_id: str, execution_result: dict[str, Any]) -> dict[str, Any]:
+    def update_execution(
+        self,
+        review_id: str,
+        execution_result: dict[str, Any],
+        *,
+        claim_token: str | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(execution_result, dict) or not execution_result:
+            raise ValueError("execution_result must be a non-empty object")
+        incoming_result_digest = _canonical_digest(execution_result)
+        audit_status = _execution_audit_status(execution_result)
         selected: dict[str, Any] | None = None
+        changed = False
 
         def apply_execution(state: dict[str, Any]) -> None:
-            nonlocal selected
+            nonlocal selected, changed
             items = state.setdefault("items", [])
             if not isinstance(items, list):
                 state["items"] = items = []
             for item in items:
                 if not isinstance(item, dict) or item.get("review_id") != review_id:
                     continue
+                claim = item.get("execution_claim")
+                if not isinstance(claim, dict) or not claim_token:
+                    raise PermissionError(
+                        f"Execution claim token required for review: {review_id}"
+                    )
+                expected_digest = str(claim.get("token_digest") or "")
+                if not secrets.compare_digest(
+                    expected_digest,
+                    _claim_token_digest(claim_token),
+                ):
+                    raise PermissionError(
+                        f"Execution claim token does not match review: {review_id}"
+                    )
+                proposal_digest = _canonical_digest(item.get("proposal"))
+                if not secrets.compare_digest(
+                    str(claim.get("proposal_digest") or ""),
+                    proposal_digest,
+                ):
+                    raise ValueError(
+                        f"Review proposal changed after execution claim: {review_id}"
+                    )
+                existing_result = item.get("execution_result")
+                if isinstance(existing_result, dict):
+                    if _canonical_digest(existing_result) != (
+                        incoming_result_digest
+                    ):
+                        raise ValueError(
+                            f"Execution result already recorded for review: {review_id}"
+                        )
+                    selected = dict(item)
+                    return
                 item["execution_result"] = execution_result
+                claim["state"] = "observed"
+                claim["observed_at"] = utc_now_iso()
+                changed = True
                 selected = dict(item)
                 return
             raise KeyError(f"Review not found: {review_id}")
@@ -279,7 +424,8 @@ class ReviewQueue:
         self.state_store.mutate_json("review_queue.json", apply_execution)
         if selected is None:
             raise KeyError(f"Review not found: {review_id}")
-        audit_status = _execution_audit_status(execution_result)
+        if not changed:
+            return selected
         self.state_store.append_jsonl(
             "action_record.jsonl",
             {

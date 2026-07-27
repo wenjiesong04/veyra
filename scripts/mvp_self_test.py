@@ -185,7 +185,11 @@ def main() -> int:
             raw={"evidence": [{"source": "mvp_self_test", "observed_at": "test_runtime"}]},
         )
     )
-    expect(verified_success.get("status") == "verified_success", "verifier success evidence", verified_success)
+    expect(
+        verified_success.get("status") == "needs_more_probe",
+        "caller-reported raw evidence is not verifier authority",
+        verified_success,
+    )
     submitted = verifier.verify_execution_result(
         ExecutionResult(task_id="v_submitted", executor="self-test", status="submitted", result="queued")
     )

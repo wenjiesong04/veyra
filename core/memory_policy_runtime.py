@@ -195,7 +195,10 @@ class MemoryPolicyRuntime:
             ),
             "executor": str(getattr(execution, "executor", "") or task_context.get("executor") or ""),
             "status": str(getattr(execution, "status", "") or ""),
-            "result": redact_sensitive(str(getattr(execution, "result", "") or ""), max_string=1200),
+            "result": redact_sensitive(
+                self._trusted_execution_summary(execution, verification),
+                max_string=1200,
+            ),
             "freshness": "fresh",
             "trust": "verified",
             "verification_status": "verified_success",
@@ -385,7 +388,10 @@ class MemoryPolicyRuntime:
             "route": str(task_context.get("route") or "agent"),
             "status": str(getattr(execution, "status", "") or ""),
             "verification_status": str(verification.get("status") or "missing"),
-            "summary": redact_sensitive(str(getattr(execution, "result", "") or ""), max_string=800),
+            "summary": redact_sensitive(
+                self._trusted_execution_summary(execution, verification),
+                max_string=800,
+            ),
             "created_at": utc_now_iso(),
             "expires_at": expires_at,
             "memory_class": "soft",
@@ -405,6 +411,25 @@ class MemoryPolicyRuntime:
 
         self.state_store.mutate_json("task_state.json", update_short_term)
         return {**base, "status": "written", "item": item}
+
+    @staticmethod
+    def _trusted_execution_summary(
+        execution: Any,
+        verification: dict[str, Any],
+    ) -> str:
+        projection = verification.get("verified_projection")
+        if (
+            verification.get("status") == "verified_success"
+            and verification.get("claim_scope")
+            == "authoritative_verified_projection_only"
+            and isinstance(projection, dict)
+        ):
+            summary = str(projection.get("summary") or "").strip()
+            return (
+                summary
+                or "Tool effects were verified by Veyra authoritative evidence."
+            )
+        return str(getattr(execution, "result", "") or "")
 
     def _is_expired(self, item: dict[str, Any], now: datetime) -> bool:
         value = str(item.get("expires_at") or "")

@@ -338,9 +338,37 @@ class ReplayRuntime:
             return {"status": "needs_confirmation", "reason": "R4 restore auto-execute is not allowed by request/config.", "review": review}
         if self.action_executor is None:
             return {"status": "needs_confirmation", "reason": "ActionExecutor is not attached to ReplayRuntime.", "review": review}
-        approved = self.review_queue.decide(str(review.get("review_id")), "approved", "auto-approved by ReplayRuntime explicit policy")
+        approved, claim_token = self.review_queue.approve_and_claim(
+            str(review.get("review_id")),
+            "auto-approved by ReplayRuntime explicit policy",
+        )
+        if claim_token is None:
+            existing_result = (
+                approved.get("execution_result")
+                if isinstance(approved.get("execution_result"), dict)
+                else None
+            )
+            if existing_result is not None:
+                return {
+                    "status": existing_result.get("status", "observed"),
+                    "review": approved,
+                    "execution_result": existing_result,
+                    "replayed": True,
+                }
+            return {
+                "status": "indeterminate",
+                "reason": (
+                    "Review execution was already claimed; automatic replay is "
+                    "forbidden until the prior attempt is reconciled."
+                ),
+                "review": approved,
+            }
         execution_result = self.action_executor.execute_review(approved)
-        updated_review = self.review_queue.update_execution(str(review.get("review_id")), execution_result)
+        updated_review = self.review_queue.update_execution(
+            str(review.get("review_id")),
+            execution_result,
+            claim_token=claim_token,
+        )
         self.state_store.append_jsonl(
             "action_record.jsonl",
             {

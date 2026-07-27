@@ -183,7 +183,13 @@ def main() -> int:
     )
     expect(read_file.get("status") == "ok", "file read allowed", read_file)
     expect(read_file.get("tool_trace", {}).get("trace_id"), "file read tool trace", read_file)
-    expect(read_file.get("verification", {}).get("status") == "verified_success", "file read verifier", read_file)
+    expect(
+        read_file.get("verification", {}).get("status") == "needs_more_probe"
+        and read_file.get("verification", {}).get("verdict")
+        == "tool_proxy_trace_missing",
+        "legacy file read trace is not upgraded without an authoritative Grant receipt",
+        read_file,
+    )
 
     write_file = proposal(
         {
@@ -198,7 +204,13 @@ def main() -> int:
     expect(write_file.get("status") == "ok", "file write allowed with policy", write_file)
     expect(write_file.get("execution_result", {}).get("snapshot", {}).get("snapshot_id"), "file write snapshot", write_file)
     expect(write_file.get("tool_trace", {}).get("snapshot_id"), "file write trace snapshot", write_file)
-    expect(write_file.get("verification", {}).get("status") == "verified_success", "file write verifier", write_file)
+    expect(
+        write_file.get("verification", {}).get("status") == "needs_more_probe"
+        and write_file.get("verification", {}).get("verdict")
+        == "tool_proxy_trace_missing",
+        "legacy file write trace is not upgraded without an authoritative Grant receipt",
+        write_file,
+    )
 
     rm_rf = proposal(
         {

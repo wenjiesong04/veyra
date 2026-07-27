@@ -13,23 +13,51 @@ class ResultInterpreter:
     def interpret_execution(self, execution: ExecutionResult, verification: dict[str, Any]) -> dict[str, Any]:
         raw = execution.raw if isinstance(execution.raw, dict) else {}
         result_text = execution.result.strip()
-        extracted = self._extract_structured_result(raw)
-        summary = extracted or self._compact_text(result_text)
+        projection = (
+            verification.get("verified_projection")
+            if verification.get("status") == "verified_success"
+            and verification.get("claim_scope")
+            == "authoritative_verified_projection_only"
+            and isinstance(verification.get("verified_projection"), dict)
+            else None
+        )
+        if projection is not None:
+            summary = str(projection.get("summary") or "").strip()
+            if not summary:
+                summary = "工具执行效果已由 Veyra 的权威证据确认。"
+            changed_files = [
+                str(item)
+                for item in projection.get("changed_files", [])
+                if isinstance(item, str)
+            ]
+            tool_calls = [
+                str(item)
+                for item in projection.get("tool_calls", [])
+                if isinstance(item, str)
+            ]
+            raw_result_type = "authoritative_tool_projection"
+        else:
+            extracted = self._extract_structured_result(raw)
+            summary = extracted or self._compact_text(result_text)
+            changed_files = execution.changed_files
+            tool_calls = execution.tool_calls
+            raw_result_type = self._raw_result_type(raw, result_text)
         return {
             "status": execution.status,
             "executor": execution.executor,
             "summary": summary,
             "evidence": {
                 "task_id": execution.task_id,
-                "changed_files": execution.changed_files,
-                "tool_calls": execution.tool_calls,
+                "changed_files": changed_files,
+                "tool_calls": tool_calls,
                 "verification_status": verification.get("status"),
                 "verification_verdict": verification.get("verdict"),
                 "raw_keys": sorted(raw.keys()),
+                "caller_result_ignored": projection is not None,
             },
             "failure_reason": self._failure_reason(execution, verification),
             "next_action": verification.get("next_action"),
-            "raw_result_type": self._raw_result_type(raw, result_text),
+            "raw_result_type": raw_result_type,
         }
 
     def _extract_structured_result(self, raw: dict[str, Any]) -> str:

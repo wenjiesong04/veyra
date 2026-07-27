@@ -246,11 +246,33 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     @router.post("/reviews/{review_id}/approve")
     async def approve_review(review_id: str, request: ReviewDecisionRequest) -> dict[str, Any]:
         try:
-            review = deps["review_queue"].decide(review_id, "approved", request.reason)
-            execution = deps["action_executor"].execute_review(review)
-            return deps["review_queue"].update_execution(review_id, execution)
+            review, claim_token = deps["review_queue"].approve_and_claim(
+                review_id,
+                request.reason,
+            )
+            if claim_token is None:
+                if review.get("status") != "approved":
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Review cannot be approved from terminal status "
+                            f"{review.get('status')!r}."
+                        ),
+                    )
+                return review
+            execution = await run_in_threadpool(
+                deps["action_executor"].execute_review,
+                review,
+            )
+            return deps["review_queue"].update_execution(
+                review_id,
+                execution,
+                claim_token=claim_token,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PermissionError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post("/reviews/{review_id}/reject")
     async def reject_review(review_id: str, request: ReviewDecisionRequest) -> dict[str, Any]:
