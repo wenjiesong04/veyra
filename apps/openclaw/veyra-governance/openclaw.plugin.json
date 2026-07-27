@@ -1,0 +1,49 @@
+{
+  "id": "veyra-governance",
+  "activation": {
+    "onStartup": true
+  },
+  "name": "Veyra Governance",
+  "description": "Routes explicitly governed OpenClaw tool calls through Veyra.",
+  "contracts": {
+    "tools": [
+      "veyra_file_read",
+      "veyra_file_write",
+      "veyra_shell_probe"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:8000"
+      },
+      "requestTimeoutMs": {
+        "type": "integer",
+        "minimum": 100,
+        "maximum": 30000,
+        "default": 5000
+      },
+      "maxRequestBytes": {
+        "type": "integer",
+        "minimum": 4096,
+        "maximum": 4194304,
+        "default": 1179648
+      },
+      "maxResponseBytes": {
+        "type": "integer",
+        "minimum": 4096,
+        "maximum": 4194304,
+        "default": 524288
+      },
+      "maxToolResultBytes": {
+        "type": "integer",
+        "minimum": 4096,
+        "maximum": 1048576,
+        "default": 131072
+      }
+    }
+  }
+}

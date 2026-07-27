@@ -65,6 +65,10 @@ from runtime.routing_metrics import RoutingMetrics
 from runtime.runtime_matrix import RuntimeMatrix
 from runtime.soak_runner import SoakRunner
 from runtime.state_refresh import StateRefresh
+from runtime.openclaw_tool_broker import (
+    OpenClawToolBroker,
+    project_current_hook_enforcement,
+)
 from runtime.tool_governance_runtime import ToolGovernanceRuntime
 from tool_proxy.safe_api import SafeAPI
 from tool_proxy.safe_browser import SafeBrowser
@@ -106,10 +110,21 @@ def _env_hosts(name: str) -> list[str] | None:
 
 state_store = WorldStateStore(exclusive_writer=True, writer_owner="veyra-api")
 tool_governance = ToolGovernanceRuntime(state_store)
+openclaw_tool_broker = OpenClawToolBroker(
+    state_store,
+    tool_governance,
+    sandbox_base=state_store.root / "runtime" / "openclaw_tool_sandboxes",
+)
 runtime_entity = RuntimeEntity(state_store=state_store)
 commitment_core = CommitmentCore(state_store)
 awareness_loop = AwarenessLoop(state_store=state_store, runtime_entity=runtime_entity, commitment_core=commitment_core)
 awareness_loop.verifier.tool_receipt_resolver = tool_governance.resolve_receipt
+awareness_loop.agent_registry.configure_openclaw_governance(
+    dispatch_preparer=openclaw_tool_broker.prepare_dispatch,
+    dispatch_canceller=openclaw_tool_broker.cancel_registered_run,
+    run_evidence_resolver=tool_governance.run_evidence,
+    status_resolver=openclaw_tool_broker.status,
+)
 commitment_core.memory_bridge = awareness_loop.memory_bridge
 commitment_push = CommitmentPushRuntime(
     state_store=state_store,
@@ -124,11 +139,25 @@ feishu_adapter = FeishuAdapter(intake_gateway, state_store=state_store)
 feishu_ws_runner = FeishuWsRunner(state_store=state_store, adapter=feishu_adapter)
 console_dir = Path("ui/console")
 review_queue = ReviewQueue(state_store)
-rollback_manager = RollbackManager(state_store)
+local_tool_sandbox = (
+    state_store.root / "runtime" / "local_tool_sandbox"
+).absolute()
+local_tool_sandbox.mkdir(parents=True, exist_ok=True, mode=0o700)
+rollback_manager = RollbackManager(
+    state_store,
+    snapshot_root=state_store.root / "runtime" / "rollback_snapshots",
+    sandbox_root=local_tool_sandbox,
+)
 action_journal = ActionJournal(state_store)
 replay_engine = Replay(state_store)
-safe_shell = SafeShell(state_store=state_store)
-safe_file = SafeFile(state_store=state_store)
+safe_shell = SafeShell(
+    state_store=state_store,
+    sandbox_root=local_tool_sandbox,
+)
+safe_file = SafeFile(
+    state_store=state_store,
+    sandbox_root=local_tool_sandbox,
+)
 safe_browser = SafeBrowser(state_store=state_store)
 safe_api = SafeAPI(state_store=state_store)
 action_proposal_tool_trace = ToolTrace(state_store)
@@ -161,6 +190,7 @@ action_executor = ActionExecutor(
     safe_browser=safe_browser,
     safe_api=safe_api,
     rollback_manager=rollback_manager,
+    review_authorizer=review_queue.authorize_execution,
 )
 foresight_engine = ForesightEngine(reasoning=awareness_loop.core_reasoning)
 # The autonomous loop is intentionally deterministic/read-only by default.
@@ -482,12 +512,35 @@ async def console():
 
 
 def _tool_proxy_status() -> dict[str, Any]:
-    return {
-        "status": "success",
-        "shell": {"tool": "safe_shell", "configured": True, "mode": "subprocess"},
-        "file": {"tool": "safe_file", "configured": True, "mode": "local_filesystem"},
+    hook_snapshot = openclaw_tool_broker.status()
+    try:
+        openclaw_status = awareness_loop.agent_registry.get(
+            "openclaw"
+        ).connection_status(force_refresh=True)
+    except Exception as exc:
+        openclaw_status = {
+            "connected": False,
+            "status": "unavailable",
+            "reason": str(exc)[:600],
+        }
+    hook_status = project_current_hook_enforcement(
+        hook_snapshot,
+        openclaw_status,
+    )
+    local_statuses = {
+        "shell": safe_shell.status(),
+        "file": safe_file.status(),
+        "rollback": rollback_manager.status(),
         "browser": safe_browser.status(),
         "api": safe_api.status(),
+    }
+    return {
+        "status": hook_status.get("status", "validation_pending"),
+        "scope": hook_status.get("scope"),
+        "tool_proxy_enforced": hook_status.get("tool_proxy_enforced") is True,
+        "hook_enforcement": hook_status,
+        **local_statuses,
+        "legacy_side_effect_ingress": "deny_only",
         "environment_overrides": _tool_proxy_env_overrides,
     }
 
@@ -605,7 +658,17 @@ app.include_router(
         metrics=routing_metrics,
     )
 )
-app.include_router(build_tool_governance_router(tool_governance))
+app.include_router(
+    build_tool_governance_router(
+        tool_governance,
+        openclaw_tool_broker,
+        plugin_status_resolver=lambda: (
+            awareness_loop.agent_registry.get(
+                "openclaw"
+            ).connection_status(force_refresh=True)
+        ),
+    )
+)
 app.include_router(
     build_agent_memory_router(
         _DynamicDeps(
@@ -799,24 +862,15 @@ async def tool_proxy_config(request: ToolProxyConfigRequest):
 
 @app.post("/tool-proxy/shell")
 async def tool_proxy_shell(request: ShellRequest):
-    result = safe_shell.run(request.command)
-    if result.get("status") == "needs_confirmation":
-        command_text = " ".join(request.command)
-        review = review_queue.create(
-            event_id=f"tool_{utc_now_iso()}",
-            task_text=f"Confirm shell command: {command_text}",
-            risk_level="R4",
-            foresight=foresight_engine.predict_text_action(command_text, RiskLevel.R4),
-            guardian_decision={"decision": "ask_user", "risk_level": "R4", "reason": result.get("review", {}).get("reason", "requires confirmation")},
-            proposal={
-                "agent": "tool_proxy",
-                "action": {"type": "shell_command", "command": request.command},
-                "risk_guess": "R4",
-                "reversible": "partial",
-            },
-        )
-        return {"status": "needs_confirmation", "review": review}
-    return result
+    return {
+        "status": "blocked",
+        "reason": (
+            "Legacy shell ingress is deny-only. Use a registered OpenClaw "
+            "veyra_shell_probe call or an explicit canonical review."
+        ),
+        "execution_authority_enabled": False,
+        "command": request.command,
+    }
 
 
 @app.post("/tool-proxy/file/read")
@@ -826,17 +880,41 @@ async def tool_proxy_file_read(request: FileReadRequest):
 
 @app.post("/tool-proxy/file/write")
 async def tool_proxy_file_write(request: FileWriteRequest):
-    return safe_file.write_text(request.path, request.content, request.reason)
+    return {
+        "status": "blocked",
+        "reason": (
+            "Legacy file-write ingress is deny-only. Use the registered "
+            "veyra_file_write tool so preflight, execution and effect evidence "
+            "share one exact invocation."
+        ),
+        "execution_authority_enabled": False,
+        "path": request.path,
+    }
 
 
 @app.post("/tool-proxy/browser/open")
 async def tool_proxy_browser_open(request: BrowserOpenRequest):
-    return safe_browser.open(request.url, approved_by=request.approved_by)
+    return {
+        "status": "needs_action_proposal",
+        "reason": (
+            "Caller-supplied approved_by is diagnostic only. Browser execution "
+            "requires a canonical review-backed executor path."
+        ),
+        "execution_authority_enabled": False,
+        "url": request.url,
+    }
 
 
 @app.post("/tool-proxy/api/request")
 async def tool_proxy_api_request(request: APIProxyRequest):
-    return safe_api.request(request.payload, approved_by=request.approved_by)
+    return {
+        "status": "needs_action_proposal",
+        "reason": (
+            "Caller-supplied approved_by is diagnostic only. API execution "
+            "requires a canonical review-backed executor path."
+        ),
+        "execution_authority_enabled": False,
+    }
 
 
 @app.post("/rollback/snapshot")
@@ -960,12 +1038,15 @@ async def action_proposal(request: ActionProposalRequest):
             "tool_trace": tool_trace,
             "verification": verification,
         }
-    execution = action_executor.execute_review(
-        {
-            "review_id": request.proposal_id or "direct_action",
-            "proposal": request.model_dump(),
-        }
-    )
+    execution = {
+        "status": "needs_governed_execution",
+        "reason": (
+            "R0-R2 proposals do not mint execution authority. Use a registered "
+            "Veyra-backed OpenClaw tool; unsupported external actions remain "
+            "non-executable in Phase 3."
+        ),
+        "execution_authority_enabled": False,
+    }
     tool_trace = (
         execution.get("tool_trace")
         if isinstance(execution.get("tool_trace"), dict)
@@ -1194,8 +1275,12 @@ def _action_trace_target(action: dict[str, Any]) -> Any:
 def _mvp_validation_snapshot(agent_status_data: dict[str, Any]) -> dict[str, Any]:
     capabilities = agent_status_data.get("capabilities") if isinstance(agent_status_data.get("capabilities"), dict) else {}
     features = capabilities.get("features") if isinstance(capabilities.get("features"), dict) else {}
-    proxy_validation = features.get("tool_proxy_validation") if isinstance(features.get("tool_proxy_validation"), dict) else {}
-    proxy_enforced = features.get("tool_proxy_enforced") is True and proxy_validation.get("status") == "validated"
+    proxy_validation = openclaw_tool_broker.status()
+    proxy_enforced = (
+        features.get("tool_proxy_enforced") is True
+        and proxy_validation.get("tool_proxy_enforced") is True
+        and proxy_validation.get("status") == "validated"
+    )
 
     memory_status = awareness_loop.memory_bridge.provider_status()
     memory_validations = memory_status.get("validation") if isinstance(memory_status.get("validation"), dict) else {}

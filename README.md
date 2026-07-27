@@ -6,7 +6,7 @@ Veyra v0.1 is an awareness-first Agent governance runtime for local personal pro
 
 Veyra is local-first: configuration, runtime state, and audit data stay on your machine under `.env`, `state/`, and `agency/`. When you enable a model, OpenClaw, Feishu, or another integration, Veyra sends the data required to serve that request to the configured provider. It is not a SaaS service and does not require Veyra cloud tenancy, accounts, or billing.
 
-Veyra is now in Runtime Stabilization and local release hardening. The code-level awareness/governance loop is implemented, while external capabilities report `not_configured`, `validation_pending`, `validated`, `degraded`, or `stale` from observed evidence. The next work should prioritize fresh-clone and signed-package acceptance, real Feishu/OpenClaw soak testing, native Memory validation, and an OpenClaw pre-tool hook that makes Tool Proxy enforcement non-bypassable.
+Veyra is now in Runtime Stabilization and local release hardening. The code-level awareness/governance loop is implemented, while external capabilities report `not_configured`, `validation_pending`, `validated`, `degraded`, or `stale` from observed evidence. Phase 3 now includes a live-validated, scoped OpenClaw pre-tool bridge for explicitly registered Veyra governed sessions. Broader native-tool coverage, cross-process recovery, real-workspace execution, production soak testing, native Memory validation, and fresh-clone/signed-package acceptance remain pending.
 
 ## Desktop Local Window
 
@@ -440,7 +440,7 @@ The Core model is inside Veyra Core, not inside the selected Agent Runtime. It i
 
 The same capability can also be attached while configuring a selected runtime with `POST /agents/{name}/config` by setting `use_model_for_core`, `model_base_url`, `model_api_key_env`, and `model`. Top-level `/core/model/config` takes precedence when explicitly enabled.
 
-Agent tool governance is part of the task contract. Veyra adds `policy_patch.tool_proxy_contract` to every Agent task packet. R3-R4 tool actions must go through `/actions/proposals` and return approval evidence; R5 actions are blocked. The Verifier rejects or downgrades Agent success claims when high-risk `tool_calls` lack ActionProposal, review, policy, or Tool Proxy trace evidence. Until OpenClaw exposes a validated pre-tool/tool-event hook, `/agent/status` must report external Agent Tool Proxy enforcement as `validation_pending`, not as enforced.
+Agent tool governance is part of the task contract. Veyra adds `policy_patch.tool_proxy_contract` to every Agent task packet. R3-R4 tool actions must go through `/actions/proposals` and return approval evidence; R5 actions are blocked. The Verifier rejects or downgrades Agent success claims when high-risk `tool_calls` lack ActionProposal, review, policy, or Tool Proxy trace evidence. `/agent/status` may report `tool_proxy_enforced=true` only when the broker canary matches the current explicit implementation identity and a fresh Gateway snapshot confirms that the governance plugin is active with the expected protocol and revision. This is limited to `veyra_governed_openclaw_sessions`; unregistered sessions, cross-process recovery, and real-workspace execution are not covered.
 
 Runtime observability now records each message route into `runtime_trace.jsonl` with redacted source identifiers, latency, final route, model/probe/agent usage, context size, drift warnings, memory policy, failure reason, and OpenClaw involvement. The telemetry APIs are backend-first so the console can consume them later without another route redesign.
 
@@ -450,10 +450,10 @@ MemoryBridge supports `local`, `selected`, explicit runtime names such as `openc
 
 OpenClaw uses the same WebSocket Gateway protocol as the local OpenClaw Control UI. Veyra converts `http://127.0.0.1:18789` to `ws://127.0.0.1:18789`, sends `connect`, checks `health` / `status`, and submits Agent work with `chat.send`. If OpenClaw is reachable but requires device pairing or a gateway token, `/agent/status` reports that explicitly instead of treating the control UI HTML as a working Agent API.
 
-For OpenClaw deployments with Control UI auth enabled, set `OPENCLAW_GATEWAY_TOKEN` to the dashboard token. If that environment variable is not set, Veyra can read the local dashboard token from `~/.openclaw/openclaw.json` at runtime; set `VEYRA_OPENCLAW_USE_LOCAL_CONFIG=0` to disable that fallback. Veyra stores its generated OpenClaw device identity in `state/openclaw_device.json` and ignores that file in git because it contains local signing material.
+For OpenClaw deployments with Control UI auth enabled, set `OPENCLAW_GATEWAY_TOKEN` to the dashboard token. If that environment variable is not set, Veyra can read the local dashboard token from `~/.openclaw/openclaw.json` at runtime; set `VEYRA_OPENCLAW_USE_LOCAL_CONFIG=0` to disable that fallback. Veyra stores its generated OpenClaw device identity in `state/local/openclaw_device.json` and ignores that file in git because it contains local signing material. The adapter writes this credential atomically with file mode `0600`; its standard `state/local` parent is restricted to `0700`, and an existing legacy file is tightened before it is read.
 OpenClaw status and execution artifacts are redacted and summarized before being exposed through Veyra state endpoints, so gateway tokens, device tokens, signatures, private keys, host paths, and full runtime snapshots are not copied into `/agent/status` or audit logs.
 
-Agent runtime version changes are handled at the adapter boundary. VeyraCore depends on the `AgentAdapter` contract, while `OpenClawAdapter` negotiates the gateway protocol, checks advertised methods, and soft-fails optional methods such as `tools.catalog` and `skills.status`. If OpenClaw raises its gateway protocol, set `OPENCLAW_PROTOCOL_MIN` / `OPENCLAW_PROTOCOL_MAX` before changing core code, then verify with `GET /agent/status` and `python3 scripts/mvp_self_test.py`.
+Agent runtime version changes are handled at the adapter boundary. VeyraCore depends on the `AgentAdapter` contract, while `OpenClawAdapter` negotiates the gateway protocol, checks advertised methods, and soft-fails optional methods such as `tools.catalog` and `skills.status`. If OpenClaw raises its gateway protocol, set `OPENCLAW_PROTOCOL_MIN` / `OPENCLAW_PROTOCOL_MAX` before changing core code, then verify with `GET /agent/status` and `python3 scripts/mvp_self_test.py`. After an OpenClaw host/plugin version, provider/model/auth configuration, or governance revision change, rerun the real Phase 3 live canary; status checks and offline self-tests alone do not renew enforcement validation.
 
 Hermes and Custom HTTP adapters expect these runtime endpoints by default:
 
@@ -485,7 +485,7 @@ Veyra reports implementation and validation separately. A module can be `impleme
 
 - `implemented`: code path exists and is covered by local checks.
 - `configured`: an external runtime or executor has a concrete endpoint/configuration.
-- `validated`: Veyra connected to the real external surface and received a successful capability/status result.
+- `validated`: the real external surface passed the check specific to the claim; capability or status success alone does not validate tool enforcement.
 - `validation_pending`: code and configuration exist, but the real external service did not yet pass live validation.
 
 This keeps the API honest: Veyra does not fake a connected Agent runtime or production-ready deployment when the local environment has not provided one.
