@@ -118,6 +118,70 @@ def _memory_provider_for_callback(task_context: dict[str, Any], execution: Execu
     return "selected" if provider in {"", "external", "unknown"} else provider
 
 
+def _is_case_context(
+    task_context: dict[str, Any], context_found: bool
+) -> bool:
+    return bool(
+        context_found
+        and str(task_context.get("case_id") or "").strip()
+    )
+
+
+def _adapter_for_context(loop: Any, task_context: dict[str, Any]) -> Any:
+    target = str(
+        task_context.get("target_agent")
+        or task_context.get("executor")
+        or ""
+    ).strip()
+    if not target:
+        return loop.agent_registry.selected()
+    names = {str(item) for item in loop.agent_registry.names()}
+    if target not in names:
+        raise HTTPException(
+            status_code=409,
+            detail=f"registered Agent runtime is unavailable: {target}",
+        )
+    return loop.agent_registry.get(target)
+
+
+def _accept_case_execution(
+    loop: Any,
+    *,
+    execution: ExecutionResult,
+    task_context: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return loop.bounded_negotiation.accept_registered_execution(
+            execution=execution,
+            task_context=task_context,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Durable Case callback rejected: {str(exc)[:500]}",
+        ) from exc
+
+
+def _fetch_registered_case_execution(
+    loop: Any,
+    *,
+    task_context: dict[str, Any],
+) -> ExecutionResult:
+    try:
+        execution = loop.bounded_negotiation.fetch_registered_execution(
+            task_context=task_context,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Durable Case run could not be observed exactly: "
+                f"{str(exc)[:500]}"
+            ),
+        ) from exc
+    return execution
+
+
 def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
     router = APIRouter()
 
@@ -125,9 +189,36 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
     async def agent_task_status(task_id: str) -> dict[str, Any]:
         loop = deps["awareness_loop"]
         state_store = deps["state_store"]
-        loop.agent_adapter = loop.agent_registry.selected()
-        execution = loop.agent_adapter.fetch_task_status(task_id)
-        verified = loop.verifier.verify_execution_result(execution)
+        task_context, context_found = _task_context_for_callback(
+            loop, task_id
+        )
+        adapter = _adapter_for_context(loop, task_context)
+        runtime_task_id = str(
+            task_context.get("runtime_task_id") or task_id
+        )
+        case_bound = _is_case_context(task_context, context_found)
+        execution = (
+            _fetch_registered_case_execution(
+                loop,
+                task_context=task_context,
+            )
+            if case_bound
+            else adapter.fetch_task_status(runtime_task_id)
+        )
+        negotiation = (
+            _accept_case_execution(
+                loop,
+                execution=execution,
+                task_context=task_context,
+            )
+            if case_bound
+            else None
+        )
+        verified = (
+            negotiation["verification"]
+            if isinstance(negotiation, dict)
+            else loop.verifier.verify_execution_result(execution)
+        )
         trace = loop.execution_trace.record(
             {
                 "event_id": f"poll_{task_id}",
@@ -135,35 +226,144 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
                 "task_id": execution.task_id,
                 "executor": execution.executor,
                 "status": verified["status"],
-                "execution_result": execution.to_dict(),
+                "execution_result": (
+                    loop.bounded_negotiation.public_execution_summary(
+                        execution
+                    )
+                    if case_bound
+                    else execution.to_dict()
+                ),
                 "verification": verified,
             }
         )
         state_store.patch_json("task_state.json", {"current_task": {"task_id": task_id, "route": "agent", "status": verified["status"]}})
         loop.task_tracker.apply_result(execution=execution, verification=verified, event_id=f"poll_{task_id}")
-        return {"execution_result": execution.to_dict(), "verification": verified, "execution_trace": trace}
+        return {
+            "execution_result": (
+                loop.bounded_negotiation.public_execution_summary(
+                    execution
+                )
+                if case_bound
+                else execution.to_dict()
+            ),
+            "verification": verified,
+            "execution_trace": (
+                loop.bounded_negotiation.public_trace_summary(trace)
+                if case_bound
+                else trace
+            ),
+            "durable_case": (
+                negotiation.get("case")
+                if isinstance(negotiation, dict)
+                else None
+            ),
+            "agent_dialogue": (
+                negotiation.get("dialogue_message")
+                if isinstance(negotiation, dict)
+                else None
+            ),
+        }
 
     @router.post("/agent/tasks/refresh")
     async def agent_tasks_refresh() -> dict[str, Any]:
         loop = deps["awareness_loop"]
-        loop.agent_adapter = loop.agent_registry.selected()
-        return loop.task_tracker.refresh_pending(loop.agent_adapter, loop.verifier)
+        selected_adapter = loop.agent_registry.selected()
+        case_recovery = await run_in_threadpool(
+            loop.bounded_negotiation.recover_pending,
+            limit=20,
+            reason="agent_tasks_refresh",
+        )
+        legacy = await run_in_threadpool(
+            loop.task_tracker.refresh_pending,
+            selected_adapter,
+            loop.verifier,
+        )
+        return {
+            "status": (
+                "degraded"
+                if case_recovery.get("status") == "degraded"
+                else legacy.get("status", "success")
+            ),
+            "durable_cases": case_recovery,
+            "legacy_tasks": {
+                "status": legacy.get("status", "success"),
+                "pruned_count": int(
+                    legacy.get("pruned_count") or 0
+                ),
+                "refreshed_count": len(
+                    legacy.get("refreshed", [])
+                    if isinstance(legacy.get("refreshed"), list)
+                    else []
+                ),
+                "remaining_count": int(
+                    legacy.get("remaining_count") or 0
+                ),
+            },
+        }
 
     @router.post("/agent/results")
     async def agent_result_callback(request: AgentResultRequest) -> dict[str, Any]:
         loop = deps["awareness_loop"]
         task_context, context_found = _task_context_for_callback(loop, request.task_id)
-        execution = ExecutionResult(
-            task_id=request.task_id,
-            executor=request.executor,
-            status=request.status,
-            result=request.result,
-            logs=request.logs,
-            changed_files=request.changed_files,
-            tool_calls=request.tool_calls,
-            raw=request.raw,
+        case_bound = _is_case_context(task_context, context_found)
+        if case_bound:
+            registered_run_id = str(
+                task_context.get("runtime_task_id") or ""
+            ).strip()
+            if (
+                registered_run_id
+                and request.task_id != registered_run_id
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Durable Case callback task_id does not match "
+                        "the registered runtime_task_id"
+                    ),
+                )
+            expected_executor = str(
+                task_context.get("target_agent") or ""
+            ).strip()
+            if request.executor != expected_executor:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Durable Case callback executor does not match "
+                        "the registered target_agent"
+                    ),
+                )
+            # A callback is only a wake-up hint. Its status, dialogue, raw
+            # evidence and cleanup claims are untrusted; re-fetch the exact
+            # persisted run through its dispatch-time adapter binding.
+            execution = _fetch_registered_case_execution(
+                loop,
+                task_context=task_context,
+            )
+        else:
+            execution = ExecutionResult(
+                task_id=request.task_id,
+                executor=request.executor,
+                status=request.status,
+                result=request.result,
+                logs=request.logs,
+                changed_files=request.changed_files,
+                tool_calls=request.tool_calls,
+                raw=request.raw,
+            )
+        negotiation = (
+            _accept_case_execution(
+                loop,
+                execution=execution,
+                task_context=task_context,
+            )
+            if case_bound
+            else None
         )
-        verified = loop.verifier.verify_execution_result(execution)
+        verified = (
+            negotiation["verification"]
+            if isinstance(negotiation, dict)
+            else loop.verifier.verify_execution_result(execution)
+        )
         trace = loop.execution_trace.record(
             {
                 "event_id": f"callback_{execution.task_id}",
@@ -171,8 +371,19 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
                 "task_id": execution.task_id,
                 "executor": execution.executor,
                 "status": verified["status"],
-                "execution_result": execution.to_dict(),
+                "execution_result": (
+                    loop.bounded_negotiation.public_execution_summary(
+                        execution
+                    )
+                    if case_bound
+                    else execution.to_dict()
+                ),
                 "verification": verified,
+                "durable_case": (
+                    negotiation.get("case")
+                    if isinstance(negotiation, dict)
+                    else None
+                ),
                 "callback_context": {
                     "context_found": context_found,
                     "session_id": task_context.get("session_id"),
@@ -186,7 +397,18 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
         task_update = loop.task_tracker.apply_result(execution=execution, verification=verified, event_id=f"callback_{execution.task_id}")
         provider = _memory_provider_for_callback(task_context, execution)
         memory_runtime = getattr(loop, "memory_policy_runtime", None)
-        if memory_runtime is None or not hasattr(memory_runtime, "apply_agent_result"):
+        if case_bound:
+            memory_policy_execution = {
+                "status": "skipped",
+                "policy": str(
+                    task_context.get("memory_policy") or "forget"
+                ),
+                "reason": (
+                    "Durable Case dialogue is a proposal and cannot authorize "
+                    "Agent-result memory"
+                ),
+            }
+        elif memory_runtime is None or not hasattr(memory_runtime, "apply_agent_result"):
             memory_policy_execution = {
                 "status": "skipped",
                 "policy": str(task_context.get("memory_policy") or "forget"),
@@ -207,20 +429,58 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
         )
         return {
             "status": verified["status"],
-            "execution_result": execution.to_dict(),
+            "execution_result": (
+                loop.bounded_negotiation.public_execution_summary(
+                    execution
+                )
+                if case_bound
+                else execution.to_dict()
+            ),
             "verification": verified,
-            "execution_trace": trace,
-            "task_update": task_update,
+            "execution_trace": (
+                loop.bounded_negotiation.public_trace_summary(trace)
+                if case_bound
+                else trace
+            ),
+            "task_update": (
+                {
+                    "matched": bool(task_update.get("matched")),
+                    "status": task_update.get("status"),
+                    "pending_count": int(
+                        task_update.get("pending_count") or 0
+                    ),
+                }
+                if case_bound
+                else task_update
+            ),
+            "durable_case": (
+                negotiation.get("case")
+                if isinstance(negotiation, dict)
+                else None
+            ),
+            "agent_dialogue": (
+                negotiation.get("dialogue_message")
+                if isinstance(negotiation, dict)
+                else None
+            ),
             "memory_write": memory_write,
             "memory_policy_execution": memory_policy_execution,
             "callback_context": {
                 "context_found": context_found,
-                "session_id": task_context.get("session_id"),
-                "correlation_id": task_context.get("correlation_id")
-                or task_context.get("event_id")
-                or task_context.get("task_packet_id"),
                 "memory_policy": task_context.get("memory_policy") or "forget",
                 "provider": provider,
+                **(
+                    {}
+                    if case_bound
+                    else {
+                        "session_id": task_context.get("session_id"),
+                        "correlation_id": (
+                            task_context.get("correlation_id")
+                            or task_context.get("event_id")
+                            or task_context.get("task_packet_id")
+                        ),
+                    }
+                ),
             },
         }
 
@@ -228,17 +488,91 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
     async def agent_task_stop(task_id: str) -> dict[str, Any]:
         loop = deps["awareness_loop"]
         state_store = deps["state_store"]
-        loop.agent_adapter = loop.agent_registry.selected()
-        stopped = loop.agent_adapter.stop_task(task_id)
-        state_store.append_jsonl("action_record.jsonl", {"route": "agent_stop", "status": "stopped" if stopped else "not_stopped", "artifacts": {"task_id": task_id}})
-        return {"task_id": task_id, "stopped": stopped}
+        task_context, context_found = _task_context_for_callback(
+            loop, task_id
+        )
+        if _is_case_context(task_context, context_found):
+            case = await run_in_threadpool(
+                loop.durable_case_store.get_case,
+                case_id=str(task_context["case_id"]),
+                user_id=str(task_context["user_id"]),
+                workspace_id=str(task_context["case_workspace_id"]),
+            )
+            if str(case.get("status") or "") == "CANCELLED":
+                result = {
+                    "status": "cancelled",
+                    "case": loop.bounded_negotiation.public_case_summary(
+                        case
+                    ),
+                    "cancellation": {"receipt_replayed": True},
+                }
+            else:
+                result = await run_in_threadpool(
+                    loop.bounded_negotiation.cancel_case,
+                    case_id=str(task_context["case_id"]),
+                    user_id=str(task_context["user_id"]),
+                    workspace_id=str(
+                        task_context["case_workspace_id"]
+                    ),
+                    expected_revision=int(case["revision"]),
+                    operation_id=(
+                        f"agent_stop:{case['case_id']}:"
+                        f"{case['revision']}:{task_id}"
+                    ),
+                    reason="explicit_agent_task_stop",
+                )
+            stopped = result.get("status") == "cancelled"
+        else:
+            adapter = _adapter_for_context(
+                loop, task_context
+            )
+            cancellation = await run_in_threadpool(
+                adapter.cancel_task_authority,
+                task_id,
+                reason="explicit_agent_task_stop",
+            )
+            result = {
+                "status": cancellation.get("status"),
+                "cancellation": (
+                    loop.bounded_negotiation._public_cancellation(
+                        cancellation
+                    )
+                ),
+            }
+            stopped = cancellation.get("status") == "cancelled"
+        state_store.append_jsonl(
+            "action_record.jsonl",
+            {
+                "route": "agent_stop",
+                "status": "stopped" if stopped else "not_stopped",
+                "artifacts": {
+                    "task_id": task_id,
+                    "case_id": task_context.get("case_id"),
+                },
+            },
+        )
+        response = {
+            "stopped": stopped,
+            "result": result,
+        }
+        if _is_case_context(task_context, context_found):
+            case_summary = (
+                result.get("case")
+                if isinstance(result.get("case"), dict)
+                else {}
+            )
+            response["case_id"] = case_summary.get("case_id")
+            response["case_revision"] = case_summary.get("revision")
+        else:
+            response["task_id"] = task_id
+        return response
 
     @router.get("/agent/status")
     async def agent_status() -> dict[str, Any]:
         loop = deps["awareness_loop"]
         state_store = deps["state_store"]
-        loop.agent_adapter = loop.agent_registry.selected()
-        status = loop.agent_adapter.connection_status()
+        adapter = loop.agent_registry.selected()
+        status = adapter.connection_status()
         state_store.patch_json("executor_state.json", {"selected_agent": loop.agent_registry.selected_name(), **status})
         return status
 
@@ -283,7 +617,6 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         runtime_entity.set_selected_agent(request.name)
-        loop.agent_adapter = loop.agent_registry.selected()
         return status
 
     @router.post("/agents/{name}/config")
@@ -293,8 +626,6 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
         if payload.get("model_decision_mode") and payload["model_decision_mode"] not in {"auto", "always"}:
             raise HTTPException(status_code=422, detail="model_decision_mode must be 'auto' or 'always'")
         status = loop.agent_registry.upsert(name, payload)
-        if status.get("selected_agent") == name:
-            loop.agent_adapter = loop.agent_registry.selected()
         return status
 
     @router.get("/memory/summary")

@@ -36,6 +36,7 @@ from rollback_audit.tool_trace import ToolTrace
 from rollback_audit.replay import Replay
 from rollback_audit.replay_runtime import ReplayRuntime
 from routers.agent_memory import build_agent_memory_router
+from routers.cases import build_cases_router
 from routers.commitments import build_commitments_router
 from routers.debug_audit import build_debug_audit_router
 from routers.local_setup import build_local_setup_router
@@ -315,6 +316,7 @@ active_loop = ActiveRuntimeLoop(
     project_guardian_producers=project_guardian_producers.run_once,
     project_guardian=project_guardian.run_once,
     project_guardian_attention=project_guardian_attention.run_once,
+    case_recovery=awareness_loop.bounded_negotiation.recover_pending,
 )
 runtime_cron = Cron(state_store=state_store, active_loop=active_loop, commitment_push=commitment_push)
 agent_orchestrator = AgentOrchestrator(
@@ -678,6 +680,20 @@ app.include_router(
                 "runtime_entity": lambda: runtime_entity,
                 "runtime_matrix": lambda: runtime_matrix,
                 "agent_orchestrator": lambda: agent_orchestrator,
+            }
+        )
+    )
+)
+app.include_router(
+    build_cases_router(
+        _DynamicDeps(
+            {
+                "durable_case_store": (
+                    lambda: awareness_loop.durable_case_store
+                ),
+                "bounded_negotiation": (
+                    lambda: awareness_loop.bounded_negotiation
+                ),
             }
         )
     )

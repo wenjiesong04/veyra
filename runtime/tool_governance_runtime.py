@@ -110,6 +110,20 @@ class ToolGovernanceRuntime:
                         "cancelled governed sessions cannot be reactivated"
                     )
                 return
+            for digest, entry in sessions.items():
+                if not isinstance(entry, dict):
+                    raise ToolGovernanceStorageError(
+                        "governed session ledger contains a malformed entry"
+                    )
+                stored = self._load_model(
+                    GovernedSessionBinding,
+                    entry.get("binding"),
+                    label="governed session",
+                )
+                if stored.run_id == binding.run_id:
+                    raise ToolGovernanceConflict(
+                        "run_id is already bound to another governed session"
+                    )
             sessions[binding.binding_digest] = {
                 "binding": payload,
                 "status": "active",
@@ -1044,6 +1058,80 @@ class ToolGovernanceRuntime:
             {"grant_id": grant_id, "reason": str(reason or "revoked")[:600]},
         )
         return dict(selected)
+
+    def cancel_run_sessions(
+        self,
+        run_id: str,
+        *,
+        reason: str = "session_cancelled",
+    ) -> dict[str, Any]:
+        """Close every governance session for an exact run identity.
+
+        This is used to reconcile a crash after session registration but
+        before the OpenClaw hook dispatch ledger is committed. Broker prepare
+        and cancellation serialize the scan with dispatch creation.
+        """
+
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id or "\x00" in normalized_run_id:
+            raise ValueError("run_id must be a normalized identifier")
+        document = self.state_store.read_json(STATE_FILE)
+        self._validate_document(document)
+        binding_digests: list[str] = []
+        for binding_digest, entry in self._mapping(
+            document, "sessions"
+        ).items():
+            if not isinstance(entry, dict):
+                raise ToolGovernanceStorageError(
+                    "governed session ledger contains a malformed entry"
+                )
+            binding = self._load_model(
+                GovernedSessionBinding,
+                entry.get("binding"),
+                label="governed session",
+            )
+            if binding.run_id == normalized_run_id:
+                binding_digests.append(str(binding_digest))
+        if not binding_digests:
+            return {
+                "status": "absent",
+                "authority_revoked": True,
+                "revoked_grants": 0,
+                "executing_reservations": [],
+                "cancelled_reservations": [],
+                "matched_session_count": 0,
+            }
+
+        results = [
+            self.cancel_session(binding_digest, reason=reason)
+            for binding_digest in sorted(binding_digests)
+        ]
+        executing = sorted(
+            {
+                str(item)
+                for result in results
+                for item in result.get("executing_reservations", [])
+            }
+        )
+        cancelled = sorted(
+            {
+                str(item)
+                for result in results
+                for item in result.get("cancelled_reservations", [])
+            }
+        )
+        status = "too_late" if executing else "cancelled"
+        return {
+            "status": status,
+            "authority_revoked": not executing,
+            "revoked_grants": sum(
+                int(result.get("revoked_grants") or 0)
+                for result in results
+            ),
+            "executing_reservations": executing,
+            "cancelled_reservations": cancelled,
+            "matched_session_count": len(results),
+        }
 
     def cancel_session(
         self,

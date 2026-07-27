@@ -25,28 +25,58 @@ class TaskPacketBuilder:
         memory_policy: str = "forget",
         agent_execution_session_id: str | None = None,
         agent_session_policy: str = "ephemeral_per_task",
+        task_id: str | None = None,
+        case_id: str | None = None,
+        step_id: str | None = None,
+        runtime_run_id: str | None = None,
+        dialogue_message: dict[str, object] | None = None,
     ) -> VeyraTaskPacket:
-        task_id = f"task_{uuid4().hex[:12]}"
+        resolved_task_id = (
+            str(task_id or "").strip() or f"task_{uuid4().hex[:12]}"
+        )
+        resolved_case_id = (
+            str(case_id or "").strip() or event.event_id
+        )
+        resolved_step_id = (
+            str(step_id or "").strip() or resolved_task_id
+        )
         patched_policy = dict(policy_patch)
-        patched_policy["tool_proxy_contract"] = agent_tool_proxy_contract(task_id)
+        patched_policy["tool_proxy_contract"] = agent_tool_proxy_contract(
+            resolved_task_id
+        )
         risk_level = str(patched_policy.get("risk_level") or "R0")
-        execution_session = str(agent_execution_session_id or "").strip() or default_agent_execution_session_id(task_id)
-        return VeyraTaskPacket(
-            task_id=task_id,
-            target_agent=target_agent,
-            session_id=event.source.session_id,
-            user_message=str(event.payload.get("text", "")),
-            user_goal=str(context_patch.get("user_goal") or event.payload.get("text", "")),
-            required_capabilities=list(dict.fromkeys(required_capabilities or [])),
-            context_patch=context_patch,
-            persona_patch=persona_patch,
-            policy_patch=patched_policy,
-            verification_policy=self._verification_policy(risk_level, required_capabilities or [], context_patch),
-            rollback_requirement=self._rollback_requirement(risk_level, patched_policy),
-            memory_policy=memory_policy,
-            agent_execution_session_id=execution_session,
-            agent_session_policy=agent_session_policy,
-            governance_context={
+        execution_session = (
+            str(agent_execution_session_id or "").strip()
+            or default_agent_execution_session_id(resolved_task_id)
+        )
+        packet_fields: dict[str, Any] = {
+            "task_id": resolved_task_id,
+            "target_agent": target_agent,
+            "session_id": event.source.session_id,
+            "user_message": str(event.payload.get("text", "")),
+            "user_goal": str(
+                context_patch.get("user_goal")
+                or event.payload.get("text", "")
+            ),
+            "required_capabilities": list(
+                dict.fromkeys(required_capabilities or [])
+            ),
+            "context_patch": context_patch,
+            "persona_patch": persona_patch,
+            "policy_patch": patched_policy,
+            "verification_policy": self._verification_policy(
+                risk_level,
+                required_capabilities or [],
+                context_patch,
+            ),
+            "rollback_requirement": self._rollback_requirement(
+                risk_level,
+                patched_policy,
+            ),
+            "memory_policy": memory_policy,
+            "agent_execution_session_id": execution_session,
+            "agent_session_policy": agent_session_policy,
+            "governance_context": {
                 "user_id": event.source.user_id,
                 "workspace_id": str(
                     self.state_store.read_json("local_world.json").get(
@@ -55,10 +85,29 @@ class TaskPacketBuilder:
                     or ""
                 ),
                 "channel_id": event.source.channel,
-                "case_id": event.event_id,
-                "step_id": task_id,
+                "case_id": resolved_case_id,
+                "step_id": resolved_step_id,
             },
+        }
+        # Phase 4 adds a private, preallocated runtime identity and a public
+        # bounded-dialogue envelope. Keep this builder compatible while those
+        # packet fields are rolled out alongside it.
+        dataclass_fields = getattr(
+            VeyraTaskPacket,
+            "__dataclass_fields__",
+            {},
         )
+        if "runtime_run_id" in dataclass_fields:
+            packet_fields["runtime_run_id"] = str(
+                runtime_run_id or ""
+            ).strip()
+        if "dialogue_message" in dataclass_fields:
+            packet_fields["dialogue_message"] = (
+                dict(dialogue_message)
+                if isinstance(dialogue_message, dict)
+                else None
+            )
+        return VeyraTaskPacket(**packet_fields)
 
     def _verification_policy(self, risk_level: str, capabilities: list[str], context_patch: dict[str, Any]) -> dict[str, Any]:
         risk = self._risk(risk_level)

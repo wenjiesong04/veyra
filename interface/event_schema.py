@@ -213,6 +213,13 @@ class VeyraTaskPacket:
     # the Veyra-side dialogue/user session and must NOT be used as the agent runtime key.
     agent_execution_session_id: str = ""
     agent_session_policy: str = "ephemeral_per_task"
+    # Optional provider-neutral Phase 4 envelope. It is public to the selected
+    # Agent and must already be bound to this packet by the Durable Case runtime.
+    dialogue_message: dict[str, Any] | None = None
+    # The runtime run identifier is server-owned coordination state. Unlike the
+    # dialogue envelope it must never be serialized into an Agent prompt or a
+    # public LoopResult.
+    runtime_run_id: str = ""
     # Server-derived identity used only to register a governed Agent dispatch.
     # It is deliberately excluded from to_dict(): neither the Agent prompt nor
     # the public LoopResult may receive this private registration context.
@@ -221,4 +228,7 @@ class VeyraTaskPacket:
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data.pop("governance_context", None)
+        data.pop("runtime_run_id", None)
+        if data.get("dialogue_message") is None:
+            data.pop("dialogue_message", None)
         return data

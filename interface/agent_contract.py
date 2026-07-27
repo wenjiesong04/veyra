@@ -4,6 +4,12 @@ import json
 from typing import Any
 
 from interface.agent_compatibility import compatibility_policy_summary, evaluate_agent_compatibility
+from interface.agent_dialogue_contract import (
+    DialogueType,
+    dialogue_contract_summary,
+    parse_dialogue_message,
+    validate_dialogue_message,
+)
 
 
 AGENT_CONTRACT_VERSION = "veyra.agent_adapter.v2"
@@ -31,6 +37,7 @@ def contract_summary() -> dict[str, Any]:
                 "rollback_requirement",
                 "memory_policy",
             ],
+            "optional": ["dialogue_message"],
             "transport": "structured_json_with_rendered_prompt_fallback",
         },
         "execution_result": {
@@ -49,6 +56,7 @@ def contract_summary() -> dict[str, Any]:
             "required": ["runtime", "status", "connected", "tools", "skills", "requires_tool_proxy", "compatibility"],
         },
         "compatibility": compatibility_policy_summary(),
+        "dialogue": dialogue_contract_summary(),
     }
 
 
@@ -66,12 +74,23 @@ def validate_task_packet_payload(payload: dict[str, Any]) -> list[str]:
     for key in ["verification_policy", "rollback_requirement"]:
         if key in payload and not isinstance(payload[key], dict):
             errors.append(f"task_packet.{key} must be an object")
+    if payload.get("dialogue_message") is not None:
+        if not isinstance(payload["dialogue_message"], dict):
+            errors.append("task_packet.dialogue_message must be an object")
+        else:
+            errors.extend(
+                f"task_packet.dialogue_message {error}"
+                for error in validate_dialogue_message(
+                    payload["dialogue_message"],
+                    expected_sender="veyra",
+                    allowed_types={DialogueType.TASK_REQUEST},
+                )
+            )
     return errors
 
 
 def render_prompt_payload(payload: dict[str, Any]) -> str:
-    return "\n".join(
-        [
+    sections = [
             f"Veyra Agent Contract: {AGENT_CONTRACT_VERSION}",
             "You are an Agent Runtime operating under Veyra governance.",
             "You are not the final authority. Veyra owns policy, memory, confirmation, verification, and delivery.",
@@ -118,8 +137,100 @@ def render_prompt_payload(payload: dict[str, Any]) -> str:
             "Rollback Requirement:",
             json.dumps(payload.get("rollback_requirement", {}), ensure_ascii=False, indent=2, sort_keys=True),
             f"Memory Policy: {payload.get('memory_policy', 'forget')}",
-        ]
-    )
+    ]
+    dialogue = payload.get("dialogue_message")
+    if dialogue is not None:
+        task_request = parse_dialogue_message(
+            dialogue,
+            expected_sender="veyra",
+            allowed_types={DialogueType.TASK_REQUEST},
+        )
+        request_payload = task_request.model_dump(mode="json")
+        reply_envelope = {
+            "contract_version": request_payload["contract_version"],
+            "message_id": "msg_agent_unique_id",
+            "message_type": "EVIDENCE_REQUEST",
+            "case_id": request_payload["case_id"],
+            "case_revision": request_payload["case_revision"],
+            "turn_index": request_payload["turn_index"],
+            "task_packet_id": request_payload["task_packet_id"],
+            "operation_id": request_payload["operation_id"],
+            "scope_digest": request_payload["scope_digest"],
+            "sender": "agent",
+            "in_reply_to": request_payload["message_id"],
+            "payload": {},
+        }
+        reply_payload_shapes = {
+            "EVIDENCE_REQUEST": {
+                "requested_evidence": [
+                    {
+                        "question": "bounded question",
+                        "reason": "why this evidence is needed",
+                        "claim_ref": "optional_claim_ref_or_null",
+                        "freshness_required": True,
+                    }
+                ],
+                "requested_capabilities": [],
+            },
+            "CHALLENGE": {
+                "challenged_claim_refs": ["claim_ref"],
+                "reason": "bounded reason",
+                "alternative": "bounded alternative",
+                "evidence_refs": [],
+                "requested_capabilities": [],
+            },
+            "OPTION_SET": {
+                "options": [
+                    {
+                        "option_id": "option_1",
+                        "summary": "bounded summary",
+                        "assumptions": [],
+                        "expected_outcome": "bounded outcome",
+                        "costs": [],
+                        "risks": [],
+                        "evidence_refs": [],
+                        "required_capabilities": [],
+                    },
+                    {
+                        "option_id": "option_2",
+                        "summary": "bounded summary",
+                        "assumptions": [],
+                        "expected_outcome": "bounded outcome",
+                        "costs": [],
+                        "risks": [],
+                        "evidence_refs": [],
+                        "required_capabilities": [],
+                    },
+                ],
+                "recommended_option_id": None,
+            },
+        }
+        sections.extend(
+            [
+                "Bounded Agent Dialogue:",
+                "This task participates in veyra.agent_dialogue.v1. Return the normal structured response with exactly one dialogue_message envelope.",
+                "Choose exactly one of EVIDENCE_REQUEST, CHALLENGE, or OPTION_SET. Do not invent other message types.",
+                "Echo case_id, case_revision, task_packet_id, operation_id, scope_digest, and in_reply_to exactly. A capability field is only a request; it is not permission.",
+                "Your message is a proposal. It cannot establish facts, authorization, execution success, or verification.",
+                "Task Request:",
+                json.dumps(request_payload, ensure_ascii=False, indent=2, sort_keys=True),
+                "Dialogue Reply Envelope (replace message_type and payload together):",
+                json.dumps(
+                    {"dialogue_message": reply_envelope},
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                "Allowed Strict Payload Shapes (choose exactly one; do not add fields):",
+                json.dumps(
+                    reply_payload_shapes,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+            ]
+        )
+    return "\n".join(sections)
 
 
 def normalize_capabilities(
@@ -139,8 +250,15 @@ def normalize_capabilities(
         "memory_patch": True,
         "task_status": True,
         "stop_task": True,
+        "bounded_agent_dialogue": bool(
+            isinstance(data.get("features"), dict)
+            and data["features"].get("bounded_agent_dialogue")
+        ),
         **(data.get("features") if isinstance(data.get("features"), dict) else {}),
     }
+    features["bounded_agent_dialogue"] = (
+        features.get("bounded_agent_dialogue") is True
+    )
     compatibility = evaluate_agent_compatibility(
         data,
         runtime=str(data.get("runtime") or runtime),

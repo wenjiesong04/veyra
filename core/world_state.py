@@ -47,6 +47,7 @@ JSONL_FILES = [
     "context_drift_log.jsonl",
     "openclaw_workspace_memory_fallback.jsonl",
     "situation_trace.jsonl",
+    "durable_case_trace.jsonl",
 ]
 
 STATE_FILE_LAYOUT: dict[str, str] = {
@@ -80,6 +81,7 @@ STATE_FILE_LAYOUT: dict[str, str] = {
     "openclaw_tool_hook_state.json": f"{STATE_RUNTIME}/openclaw_tool_hook_state.json",
     "event_inbox.json": f"{STATE_RUNTIME}/event_inbox.json",
     "situation_state.json": f"{STATE_RUNTIME}/situation_state.json",
+    "durable_case_state.json": f"{STATE_RUNTIME}/durable_case_state.json",
     "project_guardian_state.json": f"{STATE_RUNTIME}/project_guardian_state.json",
     "project_guardian_signal_state.json": f"{STATE_RUNTIME}/project_guardian_signal_state.json",
     "project_guardian_producer_state.json": f"{STATE_RUNTIME}/project_guardian_producer_state.json",
@@ -127,6 +129,7 @@ STATE_METADATA: dict[str, dict[str, Any]] = {
     "openclaw_tool_hook_state.json": {"source": "openclaw_tool_broker", "ttl_seconds": 0, "confidence": 1.0},
     "event_inbox.json": {"source": "event_inbox", "ttl_seconds": 0, "confidence": 1.0},
     "situation_state.json": {"source": "situation_evaluator", "ttl_seconds": 86400, "confidence": 0.78},
+    "durable_case_state.json": {"source": "durable_case_store", "ttl_seconds": 0, "confidence": 1.0},
     "project_guardian_state.json": {"source": "project_guardian", "ttl_seconds": 0, "confidence": 0.82},
     "project_guardian_signal_state.json": {"source": "project_guardian_signal_ledger", "ttl_seconds": 0, "confidence": 0.9},
     "project_guardian_producer_state.json": {"source": "project_guardian_producers", "ttl_seconds": 0, "confidence": 0.95},
@@ -145,6 +148,7 @@ DURABLE_STATE_FILES = CONFIG_STATE_FILES | {
     "tool_governance_state.json",
     "openclaw_tool_hook_state.json",
     "event_inbox.json",
+    "durable_case_state.json",
     "project_guardian_state.json",
     "project_guardian_signal_state.json",
     "project_guardian_producer_state.json",
@@ -548,6 +552,15 @@ class WorldStateStore:
                 "schema_version": "veyra.situation_state.v1",
                 "situations": [],
                 "count": 0,
+                "updated_at": None,
+            },
+            "durable_case_state.json": {
+                "schema_version": "veyra.durable_case_state.v1",
+                "cases": {},
+                "event_index": {},
+                "trace_outbox": [],
+                "trace_sequence": 0,
+                "trace_outbox_count": 0,
                 "updated_at": None,
             },
             "project_guardian_state.json": {
@@ -1027,6 +1040,7 @@ class WorldStateStore:
             "state_change_proposals": self.read_json("state_change_proposals.json"),
             "event_inbox": self.read_json("event_inbox.json"),
             "situation_state": self.read_json("situation_state.json"),
+            "durable_case_state": self.read_json("durable_case_state.json"),
             "project_guardian_state": self.read_json("project_guardian_state.json"),
             "project_guardian_signal_state": self.read_json("project_guardian_signal_state.json"),
             "feishu_ws_state": self.read_json("feishu_ws_state.json"),

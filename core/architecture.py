@@ -82,6 +82,7 @@ CORE_MODULES: list[dict[str, str]] = [
     {"id": "project_guardian_attention", "path": "runtime/project_guardian_attention_runtime.py", "status": "phase2_shadow"},
     {"id": "belief_uncertainty_core", "path": "awareness/belief_core.py", "status": "p8_deep_ttl"},
     {"id": "world_state", "path": "core/world_state.py", "status": "mvp_foundation"},
+    {"id": "durable_case", "path": "runtime/durable_case_store.py", "status": "phase4_analysis_only"},
     {"id": "core_model_client", "path": "core/model_client.py", "status": "p6_model_assisted"},
     {"id": "core_reasoning", "path": "core/reasoning_core.py", "status": "p6_model_assisted"},
     {"id": "understanding_core", "path": "core/understanding_core.py", "status": "p10_understanding_first"},
@@ -166,6 +167,20 @@ STATE_DEFINITIONS: list[dict[str, Any]] = [
         "owner": "AwarenessLoop",
         "purpose": "Current task, route, status, and recent task history.",
         "freshness": "event_scoped",
+    },
+    {
+        "id": "durable_case_state",
+        "file": "state/runtime/durable_case_state.json",
+        "owner": "Runtime.DurableCaseStore",
+        "purpose": "Scoped, revisioned, replay-safe Agent case lifecycle, checkpoints, bounded dialogue records, and pending trace delivery.",
+        "freshness": "revision_backed",
+    },
+    {
+        "id": "durable_case_trace",
+        "file": "state/logs/durable_case_trace.jsonl",
+        "owner": "Runtime.DurableCaseStore",
+        "purpose": "Append-only lifecycle evidence recovered from the Durable Case trace outbox.",
+        "freshness": "append_only_audit",
     },
     {
         "id": "attention_state",

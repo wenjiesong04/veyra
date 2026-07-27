@@ -67,6 +67,17 @@ class AgentAdapter(ABC):
             raw={"configured": False},
         )
 
+    def fetch_bound_task_status(
+        self,
+        task_id: str,
+        *,
+        identity: dict[str, Any],
+    ) -> ExecutionResult:
+        """Recover a task using caller-held non-secret durable identity."""
+
+        del identity
+        return self.fetch_task_status(task_id)
+
     def poll_task(self, task_id: str, timeout_seconds: float = 0.0, interval_seconds: float = 1.0) -> ExecutionResult:
         if timeout_seconds <= 0:
             return self.fetch_task_status(task_id)
@@ -84,8 +95,28 @@ class AgentAdapter(ABC):
         payload = normalize_execution_payload(raw_result, default_task_id="unknown", default_executor="unknown", default_status="unknown")
         return ExecutionResult(**payload)
 
+    def cancel_task_authority(
+        self,
+        task_id: str,
+        *,
+        reason: str = "user_requested_stop",
+        identity: dict[str, Any] | None = None,
+        abort_agent: bool = True,
+    ) -> dict[str, Any]:
+        del identity, abort_agent
+        return {
+            "status": "unsupported",
+            "task_id": str(task_id or "").strip(),
+            "reason": str(reason or "user_requested_stop")[:600],
+            "authority_revoked": False,
+            "agent_abort_confirmed": False,
+        }
+
     def stop_task(self, task_id: str) -> bool:
-        return False
+        return (
+            self.cancel_task_authority(task_id).get("status")
+            == "cancelled"
+        )
 
     def connection_status(self) -> dict[str, Any]:
         status = normalize_capabilities({"status": "adapter_unconfigured"}, runtime="unknown")

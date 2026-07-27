@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -187,6 +188,8 @@ class OpenClawToolBroker:
     ) -> None:
         self.state_store = state_store
         self.governance = governance
+        self._dispatch_prepare_lock = threading.Lock()
+        self._dispatch_tokens: dict[str, str] = {}
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.dispatch_ttl = dispatch_ttl
         if not timedelta(seconds=30) <= dispatch_ttl <= timedelta(hours=1):
@@ -211,6 +214,20 @@ class OpenClawToolBroker:
         self._validate_state()
 
     def prepare_dispatch(
+        self,
+        task_packet: VeyraTaskPacket,
+        *,
+        run_id: str,
+        session_key: str,
+    ) -> HookDispatchRegistration:
+        with self._dispatch_prepare_lock:
+            return self._prepare_dispatch_locked(
+                task_packet,
+                run_id=run_id,
+                session_key=session_key,
+            )
+
+    def _prepare_dispatch_locked(
         self,
         task_packet: VeyraTaskPacket,
         *,
@@ -260,11 +277,56 @@ class OpenClawToolBroker:
             step_id=step_id,
             run_id=run,
         )
+        document = self.state_store.read_json(HOOK_STATE_FILE)
+        self._validate_document(document)
+        existing = self._mapping(document, "dispatches").get(run)
+        if isinstance(existing, dict):
+            if (
+                existing.get("binding")
+                != binding.model_dump(mode="json")
+                or existing.get("session_key") != session
+            ):
+                raise OpenClawHookConflict(
+                    "run_id is already registered to another dispatch"
+                )
+            if existing.get("status") != "active":
+                raise OpenClawHookConflict(
+                    "run_id belongs to a non-active governed dispatch"
+                )
+            dispatch_token = self._dispatch_tokens.get(run, "")
+            if (
+                not dispatch_token
+                or secret_sha256(dispatch_token)
+                != existing.get("dispatch_token_digest")
+            ):
+                raise OpenClawHookConflict(
+                    "active dispatch token is unavailable after restart; "
+                    "recover or cancel the existing run instead of resubmitting"
+                )
+            expires_at = datetime.fromisoformat(
+                str(existing["expires_at"]).replace("Z", "+00:00")
+            )
+            return HookDispatchRegistration(
+                run_id=run,
+                session_key=session,
+                dispatch_token=dispatch_token,
+                expires_at=expires_at,
+                binding_digest=binding.binding_digest,
+                sandbox_root=str(existing["sandbox_root"]),
+                allowed_tools=tuple(
+                    str(item)
+                    for item in existing.get("allowed_tools", [])
+                ),
+            )
         sandbox_root = (
             self.sandbox_base
             / f"{canonical_sha256({'run_id': run, 'binding': binding.binding_digest})[:32]}"
         )
-        sandbox_root.mkdir(mode=0o700)
+        sandbox_root.mkdir(mode=0o700, exist_ok=True)
+        if sandbox_root.is_symlink() or not sandbox_root.is_dir():
+            raise OpenClawHookConflict(
+                "dispatch sandbox must be a real directory"
+            )
         scope = ExecutionScope.create(sandbox_root)
         dispatch_token = secrets.token_urlsafe(32)
         token_digest = secret_sha256(dispatch_token)
@@ -284,7 +346,10 @@ class OpenClawToolBroker:
             "cancelled_at": None,
         }
 
-        self.governance.register_session(binding)
+        try:
+            self.governance.register_session(binding)
+        except ToolGovernanceConflict as exc:
+            raise OpenClawHookConflict(str(exc)) from exc
 
         def register(document: dict[str, Any]) -> None:
             self._validate_document(document)
@@ -304,6 +369,7 @@ class OpenClawToolBroker:
             self._increment(document, "dispatch_registered")
 
         self.state_store.mutate_json(HOOK_STATE_FILE, register)
+        self._dispatch_tokens[run] = dispatch_token
         self._audit(
             "hook_dispatch_registered",
             {
@@ -350,12 +416,66 @@ class OpenClawToolBroker:
     ) -> dict[str, Any]:
         """Trusted in-process cancellation without retaining a raw bearer."""
 
+        with self._dispatch_prepare_lock:
+            return self._cancel_registered_run_locked(
+                run_id,
+                reason=reason,
+            )
+
+    def _cancel_registered_run_locked(
+        self,
+        run_id: str,
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
         run = self._identifier(run_id, "run_id")
         document = self.state_store.read_json(HOOK_STATE_FILE)
         self._validate_document(document)
         dispatch = self._mapping(document, "dispatches").get(run)
         if not isinstance(dispatch, dict):
-            raise OpenClawHookDenied("governed dispatch not found")
+            governance_result = self.governance.cancel_run_sessions(
+                run,
+                reason=reason,
+            )
+            executing = list(
+                governance_result.get("executing_reservations") or []
+            )
+            if (
+                governance_result.get("status") == "too_late"
+                or executing
+            ):
+                return {
+                    "status": "too_late",
+                    "run_id": run,
+                    "reason": (
+                        "governance authority crossed the irreversible "
+                        "execution boundary before dispatch reconciliation"
+                    ),
+                    "authority_revoked": False,
+                    "revoked_grants": governance_result.get(
+                        "revoked_grants", 0
+                    ),
+                    "cancelled_reservations": governance_result.get(
+                        "cancelled_reservations", []
+                    ),
+                    "executing_reservations": executing,
+                }
+            return {
+                "status": "absent",
+                "run_id": run,
+                "reason": (
+                    "validated broker ledger contains no dispatch and any "
+                    "matching partial governance session is closed"
+                ),
+                "authority_revoked": True,
+                "revoked_grants": governance_result.get(
+                    "revoked_grants", 0
+                ),
+                "cancelled_reservations": governance_result.get(
+                    "cancelled_reservations", []
+                ),
+                "executing_reservations": [],
+            }
         return self._cancel_registered_dispatch(
             run_id=run,
             dispatch=dict(dispatch),
@@ -429,9 +549,13 @@ class OpenClawToolBroker:
                     token_index.pop(token_digest, None)
 
         self.state_store.mutate_json(HOOK_STATE_FILE, cancel)
+        self._dispatch_tokens.pop(run_id, None)
         return {
             "status": cancellation_status,
             "run_id": run_id,
+            # Non-secret durable identity required to close the matching
+            # OpenClaw plugin session after an adapter restart.
+            "session_key": str(dispatch.get("session_key") or ""),
             "binding_digest": binding.binding_digest,
             "revoked_grants": governance_result.get("revoked_grants", 0),
             "executing_reservations": governance_result.get(

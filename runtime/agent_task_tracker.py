@@ -48,6 +48,14 @@ class AgentTaskTracker:
         verification_policy: dict[str, Any] | None = None,
         rollback_requirement: dict[str, Any] | None = None,
         user_goal: str | None = None,
+        case_id: str | None = None,
+        case_workspace_id: str | None = None,
+        case_step_id: str | None = None,
+        case_operation_id: str | None = None,
+        case_revision: int | None = None,
+        dialogue_message_id: str | None = None,
+        target_agent: str | None = None,
+        force_pending: bool = False,
     ) -> dict[str, Any] | None:
         task_context = self._task_context(
             execution=execution,
@@ -65,8 +73,18 @@ class AgentTaskTracker:
             verification_policy=verification_policy,
             rollback_requirement=rollback_requirement,
             user_goal=user_goal,
+            case_id=case_id,
+            case_workspace_id=case_workspace_id,
+            case_step_id=case_step_id,
+            case_operation_id=case_operation_id,
+            case_revision=case_revision,
+            dialogue_message_id=dialogue_message_id,
+            target_agent=target_agent,
         )
-        if execution.status not in NON_TERMINAL_STATUSES:
+        if (
+            execution.status not in NON_TERMINAL_STATUSES
+            and not force_pending
+        ):
             terminal_context = {
                 **task_context,
                 "final_status": execution.status,
@@ -131,6 +149,64 @@ class AgentTaskTracker:
                 return dict(context)
         return None
 
+    def retire_case_tasks(
+        self,
+        *,
+        case_id: str,
+        case_status: str,
+    ) -> dict[str, Any]:
+        """Remove pending Agent polls after a Case reaches a terminal fence."""
+
+        retired: list[str] = []
+
+        def retire(task_state: dict[str, Any]) -> dict[str, Any]:
+            pending = (
+                task_state.get("pending_agent_tasks")
+                if isinstance(
+                    task_state.get("pending_agent_tasks"), list
+                )
+                else []
+            )
+            kept: list[Any] = []
+            contexts = (
+                dict(task_state.get("agent_task_contexts") or {})
+                if isinstance(
+                    task_state.get("agent_task_contexts"), dict
+                )
+                else {}
+            )
+            for item in pending:
+                if not isinstance(item, dict):
+                    kept.append(item)
+                    continue
+                context = self._context_from_item(item)
+                if str(context.get("case_id") or "") != case_id:
+                    kept.append(item)
+                    continue
+                task_id = str(item.get("task_id") or "")
+                if task_id:
+                    retired.append(task_id)
+                    contexts[task_id] = {
+                        **context,
+                        "final_status": (
+                            f"durable_case_{case_status.lower()}"
+                        ),
+                        "verification_status": "case_lifecycle_terminal",
+                        "updated_at": utc_now_iso(),
+                    }
+            task_state["pending_agent_tasks"] = kept
+            task_state["agent_task_contexts"] = contexts
+            return task_state
+
+        self.state_store.mutate_json("task_state.json", retire)
+        return {
+            "status": "success",
+            "case_id": case_id,
+            "case_status": case_status,
+            "retired_task_ids": retired,
+            "retired_count": len(retired),
+        }
+
     def apply_result(
         self,
         *,
@@ -193,7 +269,7 @@ class AgentTaskTracker:
                 archived = contexts.get(execution.task_id)
                 if isinstance(archived, dict) and self._is_authoritative(archived):
                     resolved_context = self._merge_context(incoming_context, archived)
-            if execution.status in {"success", "failed", "error", "blocked"}:
+            if execution.status not in NON_TERMINAL_STATUSES:
                 pending = [
                     item
                     for item in pending
@@ -210,10 +286,8 @@ class AgentTaskTracker:
                 }
                 self._store_context(task_state, execution.task_id, resolved_context)
             task_state["current_task"] = {
-                "task_id": execution.task_id,
                 "route": route,
                 "status": verification.get("status"),
-                "task_context": resolved_context,
             }
             return task_state
 
@@ -221,9 +295,15 @@ class AgentTaskTracker:
         if resolved_context and self._is_authoritative(resolved_context):
             self._run_recovery_hook(execution, verification, resolved_context)
         return {
-            "pending_agent_tasks": task_state.get("pending_agent_tasks", []),
             "matched": matched,
-            "task_context": resolved_context,
+            "status": execution.status,
+            "pending_count": len(
+                task_state.get("pending_agent_tasks", [])
+                if isinstance(
+                    task_state.get("pending_agent_tasks"), list
+                )
+                else []
+            ),
         }
 
     def refresh_pending(self, adapter: AgentAdapter, verifier: Any, limit: int = 20) -> dict[str, Any]:
@@ -231,6 +311,11 @@ class AgentTaskTracker:
         pending = self.state_store.read_json("task_state.json").get("pending_agent_tasks", [])
         refreshed: list[dict[str, Any]] = []
         for item in list(pending)[:limit]:
+            task_context = self._context_from_item(item)
+            if task_context.get("case_id"):
+                # Durable Case recovery owns its exact adapter, dialogue
+                # verifier, cancellation fence, and lifecycle transition.
+                continue
             task_id = str(item.get("task_id") or "")
             if not task_id:
                 continue
@@ -248,12 +333,23 @@ class AgentTaskTracker:
                 }
             )
             self.apply_result(execution=execution, verification=verification, event_id=str(item.get("event_id") or ""), route=str(item.get("route") or "agent"))
-            refreshed.append({"execution_result": execution.to_dict(), "verification": verification, "execution_trace": trace})
+            refreshed.append(
+                {
+                    "status": execution.status,
+                    "verification_status": verification.get("status"),
+                    "trace_id": trace.get("trace_id"),
+                }
+            )
+        remaining = self.state_store.read_json("task_state.json").get(
+            "pending_agent_tasks", []
+        )
         return {
             "status": "success",
-            "pruned": prune_report.get("pruned", []),
+            "pruned_count": len(prune_report.get("pruned", [])),
             "refreshed": refreshed,
-            "remaining": self.state_store.read_json("task_state.json").get("pending_agent_tasks", []),
+            "remaining_count": len(
+                remaining if isinstance(remaining, list) else []
+            ),
         }
 
     def prune_stale_pending(
@@ -273,6 +369,10 @@ class AgentTaskTracker:
         pruned: list[dict[str, Any]] = []
         now = datetime.now(timezone.utc)
         for item in pending:
+            task_context = self._context_from_item(item)
+            if task_context.get("case_id"):
+                kept.append(item)
+                continue
             task_id = str(item.get("task_id") or "")
             if not task_id:
                 continue
@@ -527,6 +627,13 @@ class AgentTaskTracker:
         verification_policy: dict[str, Any] | None = None,
         rollback_requirement: dict[str, Any] | None = None,
         user_goal: str | None = None,
+        case_id: str | None = None,
+        case_workspace_id: str | None = None,
+        case_step_id: str | None = None,
+        case_operation_id: str | None = None,
+        case_revision: int | None = None,
+        dialogue_message_id: str | None = None,
+        target_agent: str | None = None,
     ) -> dict[str, Any]:
         raw = execution.raw if isinstance(execution.raw, dict) else {}
         embedded = raw.get("task_context") if isinstance(raw.get("task_context"), dict) else {}
@@ -553,6 +660,24 @@ class AgentTaskTracker:
                 rollback_requirement if rollback_requirement is not None else embedded.get("rollback_requirement")
             ),
             "user_goal": self._safe_user_goal(user_goal or embedded.get("user_goal")),
+            "case_id": case_id or embedded.get("case_id"),
+            "case_workspace_id": (
+                case_workspace_id
+                or embedded.get("case_workspace_id")
+            ),
+            "case_step_id": case_step_id or embedded.get("case_step_id"),
+            "case_operation_id": (
+                case_operation_id or embedded.get("case_operation_id")
+            ),
+            "case_revision": (
+                case_revision
+                if case_revision is not None
+                else embedded.get("case_revision")
+            ),
+            "dialogue_message_id": (
+                dialogue_message_id or embedded.get("dialogue_message_id")
+            ),
+            "target_agent": target_agent or embedded.get("target_agent"),
             "registered_at": embedded.get("registered_at") or utc_now_iso(),
             "updated_at": utc_now_iso(),
         }
@@ -583,6 +708,13 @@ class AgentTaskTracker:
                 "registered_at",
                 "authority",
                 "user_goal",
+                "case_id",
+                "case_workspace_id",
+                "case_step_id",
+                "case_operation_id",
+                "case_revision",
+                "dialogue_message_id",
+                "target_agent",
             )
             if item.get(key) is not None
         }
@@ -608,6 +740,13 @@ class AgentTaskTracker:
                 "verification_policy",
                 "rollback_requirement",
                 "user_goal",
+                "case_id",
+                "case_workspace_id",
+                "case_step_id",
+                "case_operation_id",
+                "case_revision",
+                "dialogue_message_id",
+                "target_agent",
             )
             if key in context
         }
@@ -629,6 +768,8 @@ class AgentTaskTracker:
             str(context.get("runtime_task_id") or ""),
             str(context.get("task_packet_id") or ""),
             str(context.get("correlation_id") or ""),
+            str(context.get("case_id") or ""),
+            str(context.get("dialogue_message_id") or ""),
         }
 
     @staticmethod

@@ -32,6 +32,7 @@ class ActiveRuntimeLoop:
         project_guardian_producers: Callable[..., Any] | None = None,
         project_guardian: Callable[..., Any] | None = None,
         project_guardian_attention: Callable[..., Any] | None = None,
+        case_recovery: Callable[..., Any] | None = None,
     ) -> None:
         self.state_store = state_store
         self.runtime_entity = runtime_entity
@@ -46,6 +47,7 @@ class ActiveRuntimeLoop:
         self.project_guardian_producers = project_guardian_producers
         self.project_guardian = project_guardian
         self.project_guardian_attention = project_guardian_attention
+        self.case_recovery = case_recovery
         self.task_tracker = task_tracker
         self.adapter_resolver = adapter_resolver
         self.verifier = verifier
@@ -116,6 +118,7 @@ class ActiveRuntimeLoop:
                 "project_guardian_attention",
                 lambda: self._project_guardian_attention_tick(),
             ),
+            self._step("durable_cases", lambda: self._durable_case_tick()),
             self._step("pending_tasks", lambda: self.task_tracker.refresh_pending(self.adapter_resolver(), self.verifier, limit=20)),
             self._step("stale_state", lambda: self.state_refresh.refresh_stale(limit=20)),
             self._step("proactive", lambda: self.proactive_checks.run_read_only(timeout_seconds=12)),
@@ -240,6 +243,11 @@ class ActiveRuntimeLoop:
         if self.project_guardian_attention is None:
             return {"status": "not_configured"}
         return self.project_guardian_attention(reason="active_loop")
+
+    def _durable_case_tick(self) -> dict[str, Any]:
+        if self.case_recovery is None:
+            return {"status": "not_configured"}
+        return self.case_recovery(limit=20, reason="active_loop")
 
     def _run_replay_runtime(self) -> dict[str, Any]:
         if self.replay_runtime is None:

@@ -151,7 +151,13 @@ class OpenClawAdapter(AgentAdapter):
             or self.session_key
         )
         task_context = self._task_context_for_packet(task_packet, session_key)
-        run_id = f"veyra-{uuid4().hex}"
+        # Durable Case allocates this identity before dispatch so a crash
+        # between registration and submission can be resumed or cancelled
+        # exactly. Legacy callers still receive an adapter-generated run id.
+        run_id = (
+            str(getattr(task_packet, "runtime_run_id", "") or "").strip()
+            or f"veyra-{uuid4().hex}"
+        )
         governance_registration: dict[str, Any] | None = None
         if self._governance_dispatch_preparer is not None:
             try:
@@ -335,6 +341,9 @@ class OpenClawAdapter(AgentAdapter):
                 changed_files=execution.changed_files,
                 tool_calls=execution.tool_calls,
                 governance_identity=governance_identity,
+                exact_run_observed=self._execution_observed_exact_run(
+                    execution
+                ),
             )
             return execution
         if final.get("state") == "error":
@@ -360,6 +369,9 @@ class OpenClawAdapter(AgentAdapter):
                 changed_files=execution.changed_files,
                 tool_calls=execution.tool_calls,
                 governance_identity=governance_identity,
+                exact_run_observed=self._execution_observed_exact_run(
+                    execution
+                ),
             )
             return execution
         self._remember_chat_run(
@@ -389,6 +401,7 @@ class OpenClawAdapter(AgentAdapter):
                     "tools": [],
                     "skills": [],
                     "requires_tool_proxy": True,
+                    "features": self._phase4_capability_features(),
                 },
                 runtime="openclaw",
                 base_url=None,
@@ -409,6 +422,7 @@ class OpenClawAdapter(AgentAdapter):
                     "connected": False,
                     "error": exc.message,
                     "details": self._redact_payload(exc.details),
+                    "features": self._phase4_capability_features(),
                 },
                 runtime="openclaw",
                 base_url=self.gateway_url,
@@ -420,6 +434,18 @@ class OpenClawAdapter(AgentAdapter):
         with self._capabilities_cache_lock:
             self._capabilities_cache = {}
             self._capabilities_cache_at = 0.0
+
+    @staticmethod
+    def _phase4_capability_features() -> dict[str, Any]:
+        return {
+            "agent_dialogue_v1": True,
+            # Compatibility alias exposed by the shared capability normalizer.
+            "bounded_agent_dialogue": True,
+            "caller_supplied_run_id": True,
+            "idempotent_submit": True,
+            "exact_stop": True,
+            "enforced_execution_profile": "phase3_sandbox_proposal",
+        }
 
     def fetch_memory_summary(self, session_id: str) -> dict[str, Any]:
         if not self.gateway_url:
@@ -636,6 +662,66 @@ class OpenClawAdapter(AgentAdapter):
             return cached
         return self._resolve_chat_run(task_id, wait_timeout_ms=self._status_wait_ms())
 
+    def fetch_bound_task_status(
+        self,
+        task_id: str,
+        *,
+        identity: dict[str, Any],
+    ) -> ExecutionResult:
+        run_id = str(identity.get("run_id") or task_id).strip()
+        if run_id != str(task_id or "").strip():
+            return ExecutionResult(
+                task_id=str(task_id or "").strip(),
+                executor="openclaw",
+                status="blocked",
+                result="Durable recovery run identity does not match.",
+                raw={"identity_mismatch": True},
+            )
+        session_key = str(identity.get("session_key") or "").strip()
+        if session_key:
+            canonical_session = self._canonical_session_key(session_key)
+            recovered_identity = {
+                key: str(identity.get(key) or "").strip()
+                for key in ("run_id", "binding_digest")
+                if str(identity.get(key) or "").strip()
+            }
+            recovered_identity["session_key"] = canonical_session
+            with self._run_cache_lock:
+                current = (
+                    dict(self._run_cache.get(run_id) or {})
+                    if isinstance(self._run_cache.get(run_id), dict)
+                    else {}
+                )
+                task_context = (
+                    dict(current.get("task_context") or {})
+                    if isinstance(current.get("task_context"), dict)
+                    else {}
+                )
+                governance_identity = (
+                    dict(current.get("governance_identity") or {})
+                    if isinstance(
+                        current.get("governance_identity"), dict
+                    )
+                    else {}
+                )
+                self._run_cache[run_id] = {
+                    **current,
+                    "run_id": run_id,
+                    "status": current.get("status") or "submitted",
+                    "result": current.get("result") or "",
+                    "task_context": {
+                        **task_context,
+                        "agent_execution_session_id": canonical_session,
+                        "session_key": canonical_session,
+                    },
+                    "governance_identity": {
+                        **governance_identity,
+                        **recovered_identity,
+                    },
+                    "updated_at": time.time(),
+                }
+        return self.fetch_task_status(run_id)
+
     def poll_task(self, task_id: str, timeout_seconds: float = 0.0, interval_seconds: float = 1.0) -> ExecutionResult:
         if timeout_seconds <= 0:
             return self.fetch_task_status(task_id)
@@ -677,46 +763,128 @@ class OpenClawAdapter(AgentAdapter):
         )
         return execution
 
-    def stop_task(self, task_id: str) -> bool:
+    def cancel_task_authority(
+        self,
+        task_id: str,
+        *,
+        reason: str = "user_requested_stop",
+        identity: dict[str, Any] | None = None,
+        abort_agent: bool = True,
+    ) -> dict[str, Any]:
+        normalized_task_id = str(task_id or "").strip()
         if self._governance_dispatch_canceller is None:
             if not self.gateway_url:
-                return False
+                return {
+                    "status": "cancellation_unconfirmed",
+                    "run_id": normalized_task_id,
+                    "reason": "OpenClaw gateway is not configured",
+                    "authority_revoked": False,
+                    "plugin_authority_closed": False,
+                    "agent_abort_confirmed": False,
+                }
             with self._run_cache_lock:
                 cached = copy.deepcopy(
-                    self._run_cache.get(str(task_id or "").strip()) or {}
+                    self._run_cache.get(normalized_task_id) or {}
                 )
             task_context = (
                 cached.get("task_context")
                 if isinstance(cached.get("task_context"), dict)
                 else {}
             )
+            cached_identity = (
+                cached.get("governance_identity")
+                if isinstance(cached.get("governance_identity"), dict)
+                else {}
+            )
+            exact_identity = self._normalized_governance_identity(
+                {
+                    **cached_identity,
+                    **(identity if isinstance(identity, dict) else {}),
+                },
+                run_id=normalized_task_id,
+                fallback_session_key=str(
+                    task_context.get("agent_execution_session_id")
+                    or task_context.get("session_key")
+                    or ""
+                ),
+            )
             session_key = str(
-                task_context.get("agent_execution_session_id")
-                or task_context.get("session_key")
-                or ""
+                exact_identity.get("session_key") or ""
             ).strip()
             if not session_key:
-                return False
+                return {
+                    "status": "cancellation_unconfirmed",
+                    "run_id": normalized_task_id,
+                    "reason": "exact OpenClaw session identity is unavailable",
+                    "authority_revoked": False,
+                    "plugin_authority_closed": False,
+                    "agent_abort_confirmed": False,
+                    "identity": exact_identity,
+                }
+            if not abort_agent:
+                return {
+                    "status": "cancellation_unconfirmed",
+                    "run_id": normalized_task_id,
+                    "reason": str(reason or "user_requested_stop")[:600],
+                    "authority_revoked": False,
+                    "plugin_authority_closed": False,
+                    "agent_abort_confirmed": False,
+                    "identity": exact_identity,
+                }
+            canonical_session = self._canonical_session_key(session_key)
             try:
                 response = self._gateway_request(
                     "chat.abort",
                     {
-                        "sessionKey": self._canonical_session_key(
-                            session_key
-                        ),
+                        "sessionKey": canonical_session,
                         "agentId": self.agent_id,
-                        "runId": task_id,
+                        "runId": normalized_task_id,
                     },
                 )
-            except (OpenClawGatewayError, ValueError):
-                return False
-            return self._confirmed_chat_abort(response)
-        cleanup = self._cancel_run_authority(
-            task_id,
-            reason="user_requested_stop",
-            abort_chat=True,
+            except (OpenClawGatewayError, ValueError) as exc:
+                return {
+                    "status": "cancellation_unconfirmed",
+                    "run_id": normalized_task_id,
+                    "reason": str(exc)[:600],
+                    "authority_revoked": False,
+                    "plugin_authority_closed": False,
+                    "agent_abort_confirmed": False,
+                    "identity": exact_identity,
+                }
+            confirmed = self._confirmed_chat_abort(
+                response,
+                run_id=normalized_task_id,
+                session_key=canonical_session,
+            )
+            return {
+                "status": (
+                    "cancelled"
+                    if confirmed
+                    else "cancellation_unconfirmed"
+                ),
+                "run_id": normalized_task_id,
+                "reason": str(reason or "user_requested_stop")[:600],
+                "authority_revoked": False,
+                "plugin_authority_closed": True,
+                "agent_abort_confirmed": confirmed,
+                "agent_abort": {
+                    "status": "aborted" if confirmed else "unconfirmed",
+                    "response": self._redact_payload(response),
+                },
+                "identity": exact_identity,
+            }
+        return self._cancel_run_authority(
+            normalized_task_id,
+            reason=reason,
+            identity=identity,
+            abort_chat=abort_agent,
         )
-        return cleanup.get("status") == "cancelled"
+
+    def stop_task(self, task_id: str) -> bool:
+        return (
+            self.cancel_task_authority(task_id).get("status")
+            == "cancelled"
+        )
 
     def connection_status(self, *, force_refresh: bool = False) -> dict[str, Any]:
         try:
@@ -729,6 +897,7 @@ class OpenClawAdapter(AgentAdapter):
                     "connected": False,
                     "error": str(exc),
                     "protocol": "openclaw_gateway_ws",
+                    "features": self._phase4_capability_features(),
                 },
                 runtime="openclaw",
                 base_url=self.gateway_url,
@@ -743,6 +912,11 @@ class OpenClawAdapter(AgentAdapter):
             "base_url": self.gateway_url,
             "protocol": "openclaw_gateway_ws",
             "contract_version": AGENT_CONTRACT_VERSION,
+            "features": (
+                dict(capabilities.get("features"))
+                if isinstance(capabilities.get("features"), dict)
+                else self._phase4_capability_features()
+            ),
             "auth_diagnostics": self._auth_diagnostics(),
             "validation": {
                 "implemented": True,
@@ -929,6 +1103,7 @@ class OpenClawAdapter(AgentAdapter):
             "compatibility": compatibility,
             "auth": self._auth_summary(hello),
             "features": {
+                **self._phase4_capability_features(),
                 "structured_task_packet": True,
                 "rendered_prompt_fallback": True,
                 "memory_summary": bool(optional_methods.get("memory.summary")),
@@ -1119,6 +1294,9 @@ class OpenClawAdapter(AgentAdapter):
                     ),
                     changed_files=execution.changed_files,
                     tool_calls=execution.tool_calls,
+                    exact_run_observed=self._execution_observed_exact_run(
+                        execution
+                    ),
                 )
                 return execution
             return execution
@@ -1147,6 +1325,9 @@ class OpenClawAdapter(AgentAdapter):
                 ),
                 changed_files=execution.changed_files,
                 tool_calls=execution.tool_calls,
+                exact_run_observed=self._execution_observed_exact_run(
+                    execution
+                ),
             )
             return execution
 
@@ -1405,6 +1586,7 @@ class OpenClawAdapter(AgentAdapter):
         changed_files: list[str] | None = None,
         tool_calls: list[str] | None = None,
         governance_identity: dict[str, str] | None = None,
+        exact_run_observed: bool | None = None,
     ) -> None:
         with self._run_cache_lock:
             current = self._run_cache.get(run_id) if isinstance(self._run_cache.get(run_id), dict) else {}
@@ -1423,8 +1605,48 @@ class OpenClawAdapter(AgentAdapter):
                     if governance_identity
                     else current.get("governance_identity") or {}
                 ),
+                # A cache key is only Veyra's lookup hint; it is never proof
+                # that OpenClaw reported the same run. Preserve exact
+                # provenance only after a strict provider observation.
+                "exact_run_observed": bool(
+                    current.get("exact_run_observed") is True
+                    or exact_run_observed is True
+                ),
                 "updated_at": time.time(),
             }
+
+    @staticmethod
+    def _execution_observed_exact_run(
+        execution: ExecutionResult,
+    ) -> bool:
+        raw = execution.raw if isinstance(execution.raw, dict) else {}
+        if raw.get("exact_run_observed") is True:
+            return True
+        for key in ("agent_wait", "final_event", "task"):
+            payload = raw.get(key)
+            if not isinstance(payload, dict):
+                continue
+            observed = str(
+                payload.get("runId")
+                or payload.get("run_id")
+                or payload.get("taskId")
+                or payload.get("task_id")
+                or payload.get("id")
+                or ""
+            ).strip()
+            if observed != execution.task_id:
+                continue
+            if payload.get("providerStarted") is False:
+                return False
+            if (
+                str(payload.get("status") or "").strip().lower()
+                == "timeout"
+                and str(payload.get("timeoutPhase") or "").strip().lower()
+                == "queue"
+            ):
+                return False
+            return True
+        return False
 
     def _execution_raw_for_run(
         self,
@@ -1521,7 +1743,7 @@ class OpenClawAdapter(AgentAdapter):
             if isinstance(prior.get("broker"), dict)
             else {}
         )
-        if prior_broker.get("status") == "cancelled":
+        if prior_broker.get("status") in {"cancelled", "absent"}:
             broker = copy.deepcopy(prior_broker)
         elif self._governance_dispatch_canceller is None:
             broker = {
@@ -1545,16 +1767,31 @@ class OpenClawAdapter(AgentAdapter):
                 }
 
         broker_digest = str(broker.get("binding_digest") or "").strip()
+        broker_session_key = str(
+            broker.get("session_key") or ""
+        ).strip()
         identity_digest = str(
             governance_identity.get("binding_digest") or ""
         ).strip()
+        identity_session_key = str(
+            governance_identity.get("session_key") or ""
+        ).strip()
         identity_conflict = bool(
-            broker_digest
-            and identity_digest
-            and broker_digest != identity_digest
+            (
+                broker_digest
+                and identity_digest
+                and broker_digest != identity_digest
+            )
+            or (
+                broker_session_key
+                and identity_session_key
+                and broker_session_key != identity_session_key
+            )
         )
         if broker_digest and not identity_digest:
             governance_identity["binding_digest"] = broker_digest
+        if broker_session_key and not identity_session_key:
+            governance_identity["session_key"] = broker_session_key
 
         prior_plugin = (
             prior.get("plugin")
@@ -1568,6 +1805,14 @@ class OpenClawAdapter(AgentAdapter):
             and prior.get("identity") == governance_identity
         ):
             plugin = copy.deepcopy(prior_plugin)
+        elif broker.get("status") == "absent":
+            plugin = {
+                "status": "absent",
+                "reason": (
+                    "validated Veyra broker ledger proves no governed "
+                    "dispatch was registered"
+                ),
+            }
         elif identity_conflict:
             plugin = {
                 "status": "identity_mismatch",
@@ -1604,6 +1849,14 @@ class OpenClawAdapter(AgentAdapter):
             )
         elif prior_abort.get("status") == "aborted":
             agent_abort = copy.deepcopy(prior_abort)
+        elif identity_conflict:
+            agent_abort = {
+                "status": "identity_mismatch",
+                "reason": (
+                    "broker identity does not match the requested OpenClaw "
+                    "session identity"
+                ),
+            }
         elif not self.gateway_url:
             agent_abort = {
                 "status": "not_configured",
@@ -1633,7 +1886,13 @@ class OpenClawAdapter(AgentAdapter):
                         "runId": normalized_run_id,
                     },
                 )
-                if self._confirmed_chat_abort(response):
+                if self._confirmed_chat_abort(
+                    response,
+                    run_id=normalized_run_id,
+                    session_key=str(
+                        governance_identity.get("session_key") or ""
+                    ),
+                ):
                     agent_abort = {
                         "status": "aborted",
                         "response": self._redact_payload(response),
@@ -1652,7 +1911,10 @@ class OpenClawAdapter(AgentAdapter):
                     "reason": str(exc)[:600],
                 }
 
-        authority_revoked = broker.get("status") == "cancelled"
+        authority_revoked = broker.get("status") in {
+            "cancelled",
+            "absent",
+        }
         plugin_authority_closed = (
             plugin.get("status") in plugin_closed_statuses
         )
@@ -1760,8 +2022,28 @@ class OpenClawAdapter(AgentAdapter):
         }
 
     @staticmethod
-    def _confirmed_chat_abort(response: Any) -> bool:
+    def _confirmed_chat_abort(
+        response: Any,
+        *,
+        run_id: str = "",
+        session_key: str = "",
+    ) -> bool:
         if not isinstance(response, dict):
+            return False
+        response_run_id = str(
+            response.get("runId") or response.get("run_id") or ""
+        ).strip()
+        response_session_key = str(
+            response.get("sessionKey")
+            or response.get("session_key")
+            or ""
+        ).strip()
+        if response_run_id and response_run_id != str(run_id or "").strip():
+            return False
+        if (
+            response_session_key
+            and response_session_key != str(session_key or "").strip()
+        ):
             return False
         if response.get("aborted") is False or response.get("ok") is False:
             return False
@@ -1793,10 +2075,26 @@ class OpenClawAdapter(AgentAdapter):
             or response.get("bindingDigest")
             or ""
         ).strip()
+        session_key = str(
+            response.get("session_key")
+            or response.get("sessionKey")
+            or ""
+        ).strip()
         if response_run_id != run_id:
             return {
                 "status": "identity_mismatch",
                 "reason": "Veyra dispatch cancellation belongs to another run",
+            }
+        status = str(response.get("status") or "").strip().lower()
+        if status == "absent":
+            return {
+                "status": "absent",
+                "reason": str(
+                    response.get("reason")
+                    or "validated broker ledger contains no dispatch"
+                )[:600],
+                "executing_reservations": [],
+                "cancelled_reservations": [],
             }
         if (
             len(digest) != 64
@@ -1806,7 +2104,6 @@ class OpenClawAdapter(AgentAdapter):
                 "status": "identity_mismatch",
                 "reason": "Veyra dispatch cancellation has no exact binding",
             }
-        status = str(response.get("status") or "").strip().lower()
         if status not in {"cancelled", "too_late"}:
             return {
                 "status": status or "failed",
@@ -1815,10 +2112,12 @@ class OpenClawAdapter(AgentAdapter):
                     or "Veyra did not confirm authority revocation"
                 )[:600],
                 "binding_digest": digest,
+                "session_key": session_key,
             }
         return {
             "status": status,
             "binding_digest": digest,
+            "session_key": session_key,
             "revoked_grants": response.get("revoked_grants", 0),
             "executing_reservations": OpenClawAdapter._string_items(
                 response.get("executing_reservations")
@@ -2109,7 +2408,13 @@ class OpenClawAdapter(AgentAdapter):
         public_cached.pop("governance_identity", None)
         execution_raw = self._execution_raw_for_run(
             task_id,
-            {"cached_run": public_cached, "poll_method": "run_cache"},
+            {
+                "cached_run": public_cached,
+                "poll_method": "run_cache",
+                "exact_run_observed": (
+                    cached.get("exact_run_observed") is True
+                ),
+            },
             result_text=str(cached.get("result") or ""),
         )
         return self._project_terminal_execution(
@@ -2543,6 +2848,9 @@ class OpenClawAdapter(AgentAdapter):
 
     def _unconfigured_result(self, task_packet: VeyraTaskPacket) -> ExecutionResult:
         prompt = self.render_prompt(task_packet)
+        runtime_run_id = str(
+            getattr(task_packet, "runtime_run_id", "") or ""
+        ).strip()
         session_key = self._canonical_session_key(
             str(
                 getattr(task_packet, "agent_execution_session_id", "")
@@ -2551,7 +2859,7 @@ class OpenClawAdapter(AgentAdapter):
             or self.session_key
         )
         return ExecutionResult(
-            task_id=task_packet.task_id,
+            task_id=runtime_run_id or task_packet.task_id,
             executor="openclaw",
             status="adapter_unconfigured",
             result="OpenClaw adapter is not connected. Configure OPENCLAW_GATEWAY_URL or OPENCLAW_BASE_URL before submitting real tasks.",
@@ -2567,6 +2875,9 @@ class OpenClawAdapter(AgentAdapter):
         return {
             "task_packet_id": task_packet.task_id,
             "correlation_id": task_packet.task_id,
+            "runtime_run_id": str(
+                getattr(task_packet, "runtime_run_id", "") or ""
+            ).strip(),
             "session_id": task_packet.session_id,
             "agent_execution_session_id": session_key,
             "agent_session_policy": task_packet.agent_session_policy,
@@ -2582,22 +2893,36 @@ class OpenClawAdapter(AgentAdapter):
         raw = str(text or "").strip()
         if not raw:
             return {}
-        candidates = [raw]
-        fenced = re.fullmatch(r"```(?:json)?\s*(\{.*\})\s*```", raw, flags=re.IGNORECASE | re.DOTALL)
-        if fenced:
-            candidates.insert(0, fenced.group(1))
-        first = raw.find("{")
-        last = raw.rfind("}")
-        if first >= 0 and last > first:
-            candidates.append(raw[first : last + 1])
-        for candidate in candidates:
+        decoder = json.JSONDecoder()
+        objects: list[dict[str, Any]] = []
+        cursor = 0
+        # OpenClaw providers may place the normal response and the strict
+        # dialogue envelope in adjacent JSON code blocks. Decode complete
+        # top-level objects structurally instead of treating the first/last
+        # braces as one document.
+        while cursor < len(raw) and len(objects) < 8:
+            start = raw.find("{", cursor)
+            if start < 0:
+                break
             try:
-                parsed = json.loads(candidate)
-            except (TypeError, ValueError):
+                parsed, end = decoder.raw_decode(raw, start)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                cursor = start + 1
                 continue
             if isinstance(parsed, dict):
-                return parsed
-        return {}
+                objects.append(parsed)
+            cursor = max(end, start + 1)
+        if not objects:
+            return {}
+        merged: dict[str, Any] = {}
+        for parsed in objects:
+            overlap = set(merged).intersection(parsed)
+            if overlap:
+                # Multiple top-level objects must be an unambiguous partition
+                # of one response. Conflicting/duplicated fields fail closed.
+                return {}
+            merged.update(parsed)
+        return merged
 
     @staticmethod
     def _string_items(value: Any) -> list[str]:

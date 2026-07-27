@@ -71,6 +71,11 @@ from probes.weather_probe import WeatherProbe
 from probes.web_probe import WebProbe
 from rollback_audit.execution_trace import ExecutionTrace
 from runtime.agent_task_tracker import AgentTaskTracker
+from runtime.bounded_agent_negotiation import (
+    BoundedNegotiationError,
+    BoundedNegotiationRuntime,
+)
+from runtime.durable_case_store import DurableCaseStore
 from runtime.event_awareness_runtime import ShadowAwarenessRuntime
 from runtime.routing_trace import RuntimeTraceRecorder
 from skills.skill_loader import SkillLoader
@@ -122,6 +127,16 @@ class AwarenessLoop:
         )
         self.execution_trace = ExecutionTrace(state_store)
         self.task_tracker = AgentTaskTracker(state_store, self.execution_trace)
+        self.durable_case_store = DurableCaseStore(state_store)
+        self.bounded_negotiation = BoundedNegotiationRuntime(
+            state_store=state_store,
+            case_store=self.durable_case_store,
+            task_packet_builder=self.task_packet_builder,
+            verifier=self.verifier,
+            response_synthesizer=self.response_synthesizer,
+            registry=self.agent_registry,
+            task_tracker=self.task_tracker,
+        )
         self.memory_policy_runtime = MemoryPolicyRuntime(state_store, lambda patch: self.memory_bridge.write_patch(patch))
         self.state_proposals = StateChangeProposalStore(state_store)
         self.controller = VeyraController(self.capabilities)
@@ -507,8 +522,15 @@ class AwarenessLoop:
                 },
             )
         elif decision.route == Route.AGENT:
-            self.agent_adapter = self.agent_registry.selected()
-            selected_agent = decision.target_agent or self.agent_registry.selected_name()
+            configured_agent = self.agent_registry.selected_name()
+            # Model output may recommend a target runtime, but it cannot
+            # change the configured provider or choose where user context is
+            # sent. Provider selection remains an operator-controlled setting.
+            selected_agent = configured_agent
+            # Keep the dispatch-time adapter local for the whole event. HTTP
+            # polling/status traffic may resolve another historical provider
+            # concurrently and must never redirect this user's context.
+            selected_adapter = self.agent_registry.selected()
             memory_summary = self.memory_bridge.read_summary(event.source.session_id, attention_focus)
             context_patch = self.context_builder.build(text, attention_focus, decision=decision.to_dict(), foresight=foresight, event=event)
             context_patch["memory_summary"] = memory_summary
@@ -558,89 +580,379 @@ class AwarenessLoop:
                 dialogue_session_id=event.source.session_id,
                 text=text,
             )
-            packet = self.task_packet_builder.build(
-                event=event,
-                target_agent=selected_agent,
-                persona_patch=persona_patch,
-                policy_patch=self.guardian.policy_patch(decision.risk_level),
-                context_patch=context_patch,
-                required_capabilities=decision.required_capabilities,
-                memory_policy=decision.memory_policy,
-                agent_execution_session_id=session_plan.get("reuse_session_id"),
-                agent_session_policy=str(session_plan.get("policy") or "ephemeral_per_task"),
+            phase4_enabled = self.bounded_negotiation.supports_adapter(
+                selected_adapter
             )
-            self.agent_session_router.record(
-                dialogue_session_id=event.source.session_id,
-                agent_execution_session_id=packet.agent_execution_session_id,
-                task_id=packet.task_id,
-                user_goal=packet.user_goal,
-            )
-            execution = self.agent_adapter.send_task(packet)
-            execution = self._poll_if_needed(execution)
-            verified = self.verifier.verify_execution_result(execution)
-            interpreted = self.result_interpreter.interpret_execution(execution, verified)
-            synthesized_response = self.response_synthesizer.agent_response(interpreted, verified)
-            self._schedule_agent_follow_up(event=event, decision=decision, execution=execution)
-            artifacts = {
-                "task_packet": packet.to_dict(),
-                "execution_result": asdict(execution),
-                "interpreted_result": interpreted,
-                "verification": verified,
-                "pending_task": None,
-                "decision": decision.to_dict(),
-                "controller": controller_plan.to_dict(),
-                "guardian": guardian_decision,
-                "persona": persona_patch,
-                "agent_session": {
-                    "agent_execution_session_id": packet.agent_execution_session_id,
-                    "agent_session_policy": packet.agent_session_policy,
-                    "dialogue_session_id": event.source.session_id,
-                    **session_plan.get("trace", {}),
-                },
-                "context_scope": scoped.get("scope"),
-            }
-            artifacts["execution_trace"] = self.execution_trace.record(
-                {
-                    "event_id": event.event_id,
-                    "route": decision.route.value,
-                    "task_id": execution.task_id,
-                    "executor": execution.executor,
-                    "status": verified["status"],
+            prepared: dict[str, Any] | None = None
+            if phase4_enabled:
+                prepared = self.bounded_negotiation.prepare(
+                    event=event,
+                    selected_agent=selected_agent,
+                    persona_patch=persona_patch,
+                    policy_patch=self.guardian.policy_patch(
+                        decision.risk_level
+                    ),
+                    context_patch=context_patch,
+                    required_capabilities=decision.required_capabilities,
+                    memory_policy=decision.memory_policy,
+                    agent_execution_session_id=str(
+                        session_plan.get("reuse_session_id") or ""
+                    ),
+                    agent_session_policy=str(
+                        session_plan.get("policy")
+                        or "ephemeral_per_task"
+                    ),
+                )
+                packet = prepared.get("packet")
+            else:
+                packet = self.task_packet_builder.build(
+                    event=event,
+                    target_agent=selected_agent,
+                    persona_patch=persona_patch,
+                    policy_patch=self.guardian.policy_patch(
+                        decision.risk_level
+                    ),
+                    context_patch=context_patch,
+                    required_capabilities=decision.required_capabilities,
+                    memory_policy=decision.memory_policy,
+                    agent_execution_session_id=session_plan.get(
+                        "reuse_session_id"
+                    ),
+                    agent_session_policy=str(
+                        session_plan.get("policy")
+                        or "ephemeral_per_task"
+                    ),
+                )
+            if packet is None:
+                replayed_case = (
+                    prepared.get("case")
+                    if isinstance(prepared, dict)
+                    and isinstance(prepared.get("case"), dict)
+                    else {}
+                )
+                replayed_case = (
+                    self.bounded_negotiation.public_case_summary(
+                        replayed_case
+                    )
+                    if replayed_case
+                    else {}
+                )
+                result = LoopResult(
+                    event_id=event.event_id,
+                    route=decision.route,
+                    status="partially_success",
+                    response=(
+                        "该事件已绑定到现有 Durable Case；我没有重复下发 "
+                        "Agent 或产生新的副作用。"
+                    ),
+                    risk_level=decision.risk_level,
+                    artifacts={
+                        "durable_case": replayed_case,
+                        "phase4": {
+                            "enabled": True,
+                            "operation_replayed": True,
+                            "execution_profile": (
+                                self.bounded_negotiation.EXECUTION_PROFILE
+                            ),
+                        },
+                        "decision": decision.to_dict(),
+                        "controller": controller_plan.to_dict(),
+                        "guardian": guardian_decision,
+                        "persona": persona_patch,
+                        "context_scope": scoped.get("scope"),
+                    },
+                )
+            else:
+                self.agent_session_router.record(
+                    dialogue_session_id=event.source.session_id,
+                    agent_execution_session_id=(
+                        packet.agent_execution_session_id
+                    ),
+                    task_id=packet.task_id,
+                    user_goal=packet.user_goal,
+                )
+                execution = selected_adapter.send_task(packet)
+                execution = self._poll_if_needed(
+                    execution,
+                    adapter=selected_adapter,
+                )
+                phase4_supervision_required = False
+                if phase4_enabled and prepared is not None:
+                    try:
+                        negotiation = (
+                            self.bounded_negotiation.accept_execution(
+                                prepared=prepared,
+                                execution=execution,
+                            )
+                        )
+                    except BoundedNegotiationError as exc:
+                        binding = (
+                            prepared.get("binding")
+                            if isinstance(
+                                prepared.get("binding"), dict
+                            )
+                            else {}
+                        )
+                        current_case = self.durable_case_store.get_case(
+                            case_id=str(binding["case_id"]),
+                            user_id=str(binding["user_id"]),
+                            workspace_id=str(binding["workspace_id"]),
+                        )
+                        phase4_supervision_required = True
+                        execution = ExecutionResult(
+                            task_id=str(binding["runtime_run_id"]),
+                            executor=str(binding["target_agent"]),
+                            status="submitted",
+                            result=(
+                                "Agent result awaits exact governance "
+                                "reconciliation."
+                            ),
+                            raw={
+                                "phase4_supervision_required": True,
+                                "acceptance_error_type": type(exc).__name__,
+                            },
+                        )
+                        verified = {
+                            "status": "needs_more_probe",
+                            "verdict": (
+                                "agent_result_requires_governance_reconciliation"
+                            ),
+                            "confidence": 0.4,
+                            "evidence": {
+                                "proposal_is_evidence": False,
+                                "proposal_is_authority": False,
+                                "terminal_authority_closed": False,
+                            },
+                            "next_action": (
+                                "reconcile_exact_bound_agent_run"
+                            ),
+                            "needs_rollback": False,
+                            "needs_memory_patch": False,
+                        }
+                        negotiation = {
+                            "case": (
+                                self.bounded_negotiation
+                                .public_case_summary(current_case)
+                            ),
+                            "dialogue_message": None,
+                            "verification": verified,
+                        }
+                        synthesized_response = (
+                            "Agent 终态尚未完成治理闭合；Durable Case 保持"
+                            "可评估并由恢复循环继续监督，没有重复下发。"
+                        )
+                        interpreted = (
+                            self.result_interpreter.interpret_execution(
+                                execution, verified
+                            )
+                        )
+                    else:
+                        verified = negotiation["verification"]
+                        synthesized_response = negotiation["response"]
+                        interpreted = (
+                            self.result_interpreter.interpret_execution(
+                                execution, verified
+                            )
+                        )
+                else:
+                    negotiation = None
+                    verified = self.verifier.verify_execution_result(
+                        execution
+                    )
+                    interpreted = (
+                        self.result_interpreter.interpret_execution(
+                            execution, verified
+                        )
+                    )
+                    synthesized_response = (
+                        self.response_synthesizer.agent_response(
+                            interpreted, verified
+                        )
+                    )
+                    self._schedule_agent_follow_up(
+                        event=event,
+                        decision=decision,
+                        execution=execution,
+                    )
+                phase4_task_packet = (
+                    {
+                        "target_agent": packet.target_agent,
+                        "required_capabilities": list(
+                            packet.required_capabilities
+                        ),
+                        "memory_policy": packet.memory_policy,
+                        "verification_policy": dict(
+                            packet.verification_policy
+                        ),
+                        "rollback_requirement": dict(
+                            packet.rollback_requirement
+                        ),
+                        "agent_session_policy": (
+                            packet.agent_session_policy
+                        ),
+                        "dialogue_contract": (
+                            str(
+                                (
+                                    packet.dialogue_message
+                                    if isinstance(
+                                        packet.dialogue_message, dict
+                                    )
+                                    else {}
+                                ).get("contract_version")
+                                or ""
+                            )
+                        ),
+                    }
+                    if phase4_enabled
+                    else packet.to_dict()
+                )
+                phase4_interpreted = (
+                    {
+                        "status": interpreted.get("status"),
+                        "executor": interpreted.get("executor"),
+                        "verification_status": verified.get("status"),
+                        "verification_verdict": verified.get("verdict"),
+                        "next_action": verified.get("next_action"),
+                    }
+                    if phase4_enabled
+                    else interpreted
+                )
+                artifacts = {
+                    "task_packet": phase4_task_packet,
+                    "execution_result": (
+                        self.bounded_negotiation.public_execution_summary(
+                            execution
+                        )
+                        if phase4_enabled
+                        else asdict(execution)
+                    ),
+                    "interpreted_result": phase4_interpreted,
+                    "verification": verified,
+                    "pending_task": None,
                     "decision": decision.to_dict(),
                     "controller": controller_plan.to_dict(),
                     "guardian": guardian_decision,
                     "persona": persona_patch,
-                    "execution_result": asdict(execution),
-                    "interpreted_result": interpreted,
-                    "verification": verified,
+                    "agent_session": {
+                        "agent_session_policy": (
+                            packet.agent_session_policy
+                        ),
+                        **(
+                            {"isolated": True}
+                            if phase4_enabled
+                            else {
+                                "agent_execution_session_id": (
+                                    packet.agent_execution_session_id
+                                ),
+                                "dialogue_session_id": (
+                                    event.source.session_id
+                                ),
+                                **session_plan.get("trace", {}),
+                            }
+                        ),
+                    },
+                    "context_scope": scoped.get("scope"),
+                    "phase4": {
+                        "enabled": phase4_enabled,
+                        "execution_profile": (
+                            self.bounded_negotiation.EXECUTION_PROFILE
+                            if phase4_enabled
+                            else None
+                        ),
+                    },
                 }
-            )
-            pending_task = self.task_tracker.register(
-                event_id=event.event_id,
-                route=decision.route.value,
-                execution=execution,
-                verification=verified,
-                session_id=event.source.session_id,
-                channel=event.source.channel,
-                user_id=event.source.user_id,
-                correlation_id=event.event_id,
-                task_packet_id=packet.task_id,
-                agent_execution_session_id=packet.agent_execution_session_id,
-                agent_session_policy=packet.agent_session_policy,
-                memory_policy=packet.memory_policy,
-                verification_policy=packet.verification_policy,
-                rollback_requirement=packet.rollback_requirement,
-                user_goal=packet.user_goal,
-            )
-            artifacts["pending_task"] = pending_task
-            result = LoopResult(
-                event_id=event.event_id,
-                route=decision.route,
-                status=verified["status"],
-                response=synthesized_response,
-                risk_level=decision.risk_level,
-                artifacts=artifacts,
-            )
+                if negotiation is not None:
+                    artifacts["durable_case"] = negotiation.get("case")
+                    artifacts["agent_dialogue"] = negotiation.get(
+                        "dialogue_message"
+                    )
+                execution_trace = self.execution_trace.record(
+                    {
+                        "event_id": event.event_id,
+                        "route": decision.route.value,
+                        "task_id": execution.task_id,
+                        "executor": execution.executor,
+                        "status": verified["status"],
+                        "decision": decision.to_dict(),
+                        "controller": controller_plan.to_dict(),
+                        "guardian": guardian_decision,
+                        "persona": persona_patch,
+                        "execution_result": (
+                            self.bounded_negotiation
+                            .public_execution_summary(execution)
+                            if phase4_enabled
+                            else asdict(execution)
+                        ),
+                        "interpreted_result": phase4_interpreted,
+                        "verification": verified,
+                        "durable_case": (
+                            negotiation.get("case")
+                            if negotiation is not None
+                            else None
+                        ),
+                    }
+                )
+                artifacts["execution_trace"] = (
+                    self.bounded_negotiation.public_trace_summary(
+                        execution_trace
+                    )
+                    if phase4_enabled
+                    else execution_trace
+                )
+                binding = (
+                    prepared.get("binding")
+                    if phase4_enabled
+                    and isinstance(prepared, dict)
+                    and isinstance(prepared.get("binding"), dict)
+                    else {}
+                )
+                pending_task = self.task_tracker.register(
+                    event_id=event.event_id,
+                    route=decision.route.value,
+                    execution=execution,
+                    verification=verified,
+                    session_id=event.source.session_id,
+                    channel=event.source.channel,
+                    user_id=event.source.user_id,
+                    correlation_id=event.event_id,
+                    task_packet_id=packet.task_id,
+                    agent_execution_session_id=(
+                        packet.agent_execution_session_id
+                    ),
+                    agent_session_policy=packet.agent_session_policy,
+                    memory_policy=packet.memory_policy,
+                    verification_policy=packet.verification_policy,
+                    rollback_requirement=packet.rollback_requirement,
+                    user_goal=packet.user_goal,
+                    case_id=binding.get("case_id"),
+                    case_workspace_id=binding.get("workspace_id"),
+                    case_step_id=binding.get("step_id"),
+                    case_operation_id=binding.get("operation_id"),
+                    case_revision=binding.get("case_revision"),
+                    dialogue_message_id=binding.get("message_id"),
+                    target_agent=selected_agent,
+                    force_pending=phase4_supervision_required,
+                )
+                artifacts["pending_task"] = (
+                    {
+                        "registered": pending_task is not None,
+                        "status": execution.status,
+                        "verification_status": verified.get("status"),
+                        "next_action": verified.get("next_action"),
+                        "case_id": binding.get("case_id"),
+                        "case_revision": binding.get("case_revision"),
+                    }
+                    if phase4_enabled
+                    else pending_task
+                )
+                result = LoopResult(
+                    event_id=event.event_id,
+                    route=decision.route,
+                    status=verified["status"],
+                    response=synthesized_response,
+                    risk_level=decision.risk_level,
+                    artifacts=artifacts,
+                )
         elif decision.route == Route.NATIVE_TOOL:
             result = LoopResult(
                 event_id=event.event_id,
@@ -3343,8 +3655,14 @@ class AwarenessLoop:
             "action_record.jsonl",
             {"event_id": event.event_id, "route": result.route.value, "status": result.status, "artifacts": result.artifacts},
         )
-        self.agent_adapter = self.agent_registry.selected()
-        self.state_store.patch_json("executor_state.json", {"selected_agent": self.agent_registry.selected_name(), **self.agent_adapter.connection_status()})
+        status_adapter = self.agent_registry.selected()
+        self.state_store.patch_json(
+            "executor_state.json",
+            {
+                "selected_agent": self.agent_registry.selected_name(),
+                **status_adapter.connection_status(),
+            },
+        )
         self.runtime_entity.set_idle()
 
     def _sync_user_awareness_from_text(self, event: VeyraEvent, result: LoopResult) -> dict[str, Any] | None:
@@ -3603,12 +3921,17 @@ class AwarenessLoop:
                 output.append(value)
         return output
 
-    def _poll_if_needed(self, execution: ExecutionResult) -> ExecutionResult:
+    def _poll_if_needed(
+        self,
+        execution: ExecutionResult,
+        *,
+        adapter: AgentAdapter,
+    ) -> ExecutionResult:
         if execution.status not in NON_TERMINAL_STATUSES:
             return execution
         timeout_seconds, interval_seconds = self._agent_poll_windows()
         try:
-            polled = self.agent_adapter.poll_task(
+            polled = adapter.poll_task(
                 execution.task_id,
                 timeout_seconds=timeout_seconds,
                 interval_seconds=interval_seconds,

@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from core.definitions import RiskLevel
 from interface.agent_adapter import ExecutionResult
+from interface.agent_dialogue_contract import DialogueContractError, extract_agent_dialogue
 from tool_proxy.agent_tool_contract import AgentToolCompliance, ToolReceiptResolver
 from tool_proxy.governance_contract import VerifiedToolEffect, canonical_json
 
@@ -52,6 +53,79 @@ class Verifier:
             "confidence": float(probe_result.get("confidence", 0.8 if success else 0.35)),
             "evidence": evidence,
             "next_action": "update_world_state" if success else "retry_or_escalate_probe",
+        }
+
+    def verify_agent_dialogue(
+        self,
+        agent_response: Any,
+        *,
+        expected_case_id: str,
+        expected_case_revision: int,
+        expected_turn_index: int,
+        expected_in_reply_to: str,
+        expected_task_packet_id: str,
+        expected_operation_id: str,
+        expected_scope_digest: str,
+    ) -> dict[str, Any]:
+        """Validate a proposal envelope without promoting it to evidence."""
+
+        try:
+            message = extract_agent_dialogue(
+                agent_response,
+                expected_case_id=expected_case_id,
+                expected_case_revision=expected_case_revision,
+                expected_turn_index=expected_turn_index,
+                expected_in_reply_to=expected_in_reply_to,
+                expected_task_packet_id=expected_task_packet_id,
+                expected_operation_id=expected_operation_id,
+                expected_scope_digest=expected_scope_digest,
+            )
+        except DialogueContractError as exc:
+            return {
+                # A malformed proposal proves only that this Agent reply
+                # cannot be accepted. It is not durable execution evidence
+                # that the user's underlying Situation failed.
+                "status": "needs_more_probe",
+                "verdict": "agent_dialogue_contract_invalid",
+                "confidence": 0.9,
+                "evidence": {
+                    "contract_errors": list(exc.errors),
+                    "proposal_is_evidence": False,
+                    "proposal_is_authority": False,
+                },
+                "next_action": "reject_dialogue_and_keep_case_evaluable",
+                "needs_rollback": False,
+                "needs_memory_patch": False,
+            }
+        if message is None:
+            return {
+                "status": "needs_more_probe",
+                "verdict": "agent_dialogue_message_missing",
+                "confidence": 0.9,
+                "evidence": {
+                    "proposal_is_evidence": False,
+                    "proposal_is_authority": False,
+                },
+                "next_action": "request_exact_dialogue_envelope",
+                "needs_rollback": False,
+                "needs_memory_patch": False,
+            }
+        return {
+            "status": "partially_success",
+            "verdict": "agent_dialogue_proposal_requires_case_evaluation",
+            "confidence": 0.8,
+            "evidence": {
+                "message_id": message["message_id"],
+                "message_type": message["message_type"],
+                "case_id": message["case_id"],
+                "case_revision": message["case_revision"],
+                "proposal_is_evidence": False,
+                "proposal_is_authority": False,
+                "proposal_is_verified_outcome": False,
+            },
+            "next_action": "evaluate_proposal_in_durable_case",
+            "needs_rollback": False,
+            "needs_memory_patch": False,
         }
 
     def verify_execution_result(self, execution_result: ExecutionResult) -> dict[str, Any]:
@@ -170,6 +244,16 @@ class Verifier:
                 "risk_level": tool_proxy_compliance.get("max_risk"),
             }
 
+        if status == "success" and structured_evidence["dialogue_proposal_only"]:
+            return {
+                "status": "partially_success",
+                "verdict": "agent_dialogue_proposal_requires_case_evaluation",
+                "confidence": 0.62,
+                "evidence": evidence,
+                "next_action": "evaluate_proposal_in_durable_case",
+                "needs_rollback": False,
+                "needs_memory_patch": False,
+            }
         if status == "success" and structured_evidence["sufficient"]:
             verified = {
                 "status": "verified_success",
@@ -311,7 +395,19 @@ class Verifier:
         agent_response = raw.get("agent_response")
         if isinstance(agent_response, dict):
             if self._is_evidence_container(agent_response.get("evidence_used")):
-                outcome_sources.append("raw.agent_response.evidence_used")
+                reported_sources.append("raw.agent_response.evidence_used")
+                if self._is_outcome_evidence_container(
+                    agent_response.get("evidence_used")
+                ):
+                    reported_outcome_sources.append(
+                        "raw.agent_response.evidence_used"
+                    )
+        dialogue_proposal_only = bool(
+            isinstance(agent_response, dict)
+            and isinstance(agent_response.get("dialogue_message"), dict)
+        )
+        if dialogue_proposal_only:
+            reported_sources.append("raw.agent_response.dialogue_message")
 
         raw_change_evidence = any(
             self._is_evidence_container(raw.get(key))
@@ -415,11 +511,11 @@ class Verifier:
             and (
                 agent_response.get("answer_or_plan")
                 or self._is_evidence_container(agent_response.get("proposed_actions"))
+                or dialogue_proposal_only
             )
             and not execution_result.tool_calls
             and not execution_result.changed_files
             and not unique_outcome_sources
-            and not unique_reported_sources
         )
         return {
             "sufficient": sufficient,
@@ -441,6 +537,7 @@ class Verifier:
             "authoritative_receipt_count": len(authoritative_receipts),
             "independent_outcome_observed": independent_outcome_observed,
             "agent_plan_only": agent_plan_only,
+            "dialogue_proposal_only": dialogue_proposal_only,
             "result_text_only": bool(execution_result.result.strip())
             and not unique_outcome_sources
             and not unique_reported_sources,

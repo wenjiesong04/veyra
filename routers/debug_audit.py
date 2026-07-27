@@ -808,15 +808,58 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
 
 def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
     public = redact_sensitive(payload)
-    # Event, situation, and Guardian signal projections are tenant-scoped.
+    # Event, situation, Durable Case, and Guardian projections are
+    # tenant-scoped. The Durable Case document also carries private Agent run
+    # bindings, so it must only be exposed through the owner-scoped /cases
+    # projections.
     # The generic state endpoint has no authenticated tenant identity, so it
     # must not expose any of these collections.
     public.pop("event_inbox", None)
     public.pop("situation_state", None)
+    public.pop("durable_case_state", None)
     public.pop("project_guardian_state", None)
     public.pop("project_guardian_signal_state", None)
     public.pop("project_guardian_producer_state", None)
     public.pop("project_guardian_attention_state", None)
+    private_task_state = (
+        payload.get("task_state")
+        if isinstance(payload.get("task_state"), dict)
+        else {}
+    )
+    pending_tasks = (
+        private_task_state.get("pending_agent_tasks")
+        if isinstance(
+            private_task_state.get("pending_agent_tasks"), list
+        )
+        else []
+    )
+    archived_contexts = (
+        private_task_state.get("agent_task_contexts")
+        if isinstance(
+            private_task_state.get("agent_task_contexts"), dict
+        )
+        else {}
+    )
+    current_task = (
+        private_task_state.get("current_task")
+        if isinstance(private_task_state.get("current_task"), dict)
+        else {}
+    )
+    # The task ledger now carries private Agent run/session and Case bindings.
+    # `/state` has no tenant identity, so expose health-like aggregates only.
+    public["task_state"] = {
+        "pending_agent_task_count": len(pending_tasks),
+        "archived_agent_task_context_count": len(archived_contexts),
+        "current_task": (
+            {
+                key: current_task.get(key)
+                for key in ("route", "status")
+                if key in current_task
+            }
+            if current_task
+            else None
+        ),
+    }
     agent_config = public.get("agent_config") if isinstance(public.get("agent_config"), dict) else {}
     if isinstance(agent_config, dict):
         core_model = agent_config.get("core_model") if isinstance(agent_config.get("core_model"), dict) else {}
