@@ -181,14 +181,26 @@ def main() -> int:
             "reason": "Agent requests read file through Tool Proxy.",
         }
     )
-    expect(read_file.get("status") == "ok", "file read allowed", read_file)
+    expect(
+        read_file.get("status") == "needs_governed_execution"
+        and read_file.get("execution_result", {}).get(
+            "execution_authority_enabled"
+        )
+        is False,
+        "legacy file read cannot mint execution authority",
+        read_file,
+    )
     expect(read_file.get("tool_trace", {}).get("trace_id"), "file read tool trace", read_file)
     expect(
         read_file.get("verification", {}).get("status") == "needs_more_probe"
         and read_file.get("verification", {}).get("verdict")
-        == "tool_proxy_trace_missing",
-        "legacy file read trace is not upgraded without an authoritative Grant receipt",
+        == "execution_status_unknown",
+        "denied legacy file read is not upgraded to verified execution",
         read_file,
+    )
+    expect(
+        scratch.read_text(encoding="utf-8") == "before\n",
+        "denied legacy file read has no side effect",
     )
 
     write_file = proposal(
@@ -201,15 +213,30 @@ def main() -> int:
             "reason": "Agent requests scoped file write through Tool Proxy.",
         }
     )
-    expect(write_file.get("status") == "ok", "file write allowed with policy", write_file)
-    expect(write_file.get("execution_result", {}).get("snapshot", {}).get("snapshot_id"), "file write snapshot", write_file)
-    expect(write_file.get("tool_trace", {}).get("snapshot_id"), "file write trace snapshot", write_file)
+    expect(
+        write_file.get("status") == "needs_governed_execution"
+        and write_file.get("execution_result", {}).get(
+            "execution_authority_enabled"
+        )
+        is False,
+        "legacy file write cannot mint execution authority",
+        write_file,
+    )
+    expect(
+        not write_file.get("tool_trace", {}).get("snapshot_id"),
+        "denied legacy file write creates no rollback snapshot",
+        write_file,
+    )
     expect(
         write_file.get("verification", {}).get("status") == "needs_more_probe"
         and write_file.get("verification", {}).get("verdict")
-        == "tool_proxy_trace_missing",
-        "legacy file write trace is not upgraded without an authoritative Grant receipt",
+        == "execution_status_unknown",
+        "denied legacy file write is not upgraded to verified execution",
         write_file,
+    )
+    expect(
+        scratch.read_text(encoding="utf-8") == "before\n",
+        "denied legacy file write changes no file",
     )
 
     rm_rf = proposal(
@@ -300,8 +327,13 @@ def main() -> int:
     expect(kill_process.get("risk_level") == "R4", "process kill risk raised to R4", kill_process)
 
     direct_launchctl = post_json("/tool-proxy/shell", {"command": ["launchctl", "kickstart", "-k", "gui/501/ai.veyra.api"]})
-    expect(direct_launchctl.get("status") == "needs_confirmation", "direct ToolProxy launchctl requires human review", direct_launchctl)
-    expect(direct_launchctl.get("review", {}).get("review_id"), "direct ToolProxy launchctl review created", direct_launchctl)
+    expect(
+        direct_launchctl.get("status") == "blocked"
+        and direct_launchctl.get("execution_authority_enabled") is False
+        and not direct_launchctl.get("review"),
+        "legacy direct shell ingress is deny-only",
+        direct_launchctl,
+    )
 
     natural_restart_text = "帮我重启 Veyra 服务。"
     resolved_restart = semantic_understanding(
@@ -451,14 +483,43 @@ def main() -> int:
 
     tool_logs = get_json("/logs/tools")
     traces = [item for item in tool_logs.get("items", []) if item.get("trace_id")]
-    expect(len(traces) >= 12, "all scenarios emitted tool traces", traces)
+    expected_trace_ids = {
+        "guard_read_file",
+        "guard_write_file",
+        "guard_rm_rf",
+        "guard_env_read",
+        "guard_restart",
+        "guard_launchctl_restart",
+        "guard_systemctl_restart",
+        "guard_kill_process",
+        "guard_force_push",
+        "guard_db_delete",
+        "guard_db_drop",
+    }
+    observed_trace_ids = {
+        str(item.get("trace_id") or "")
+        for item in traces
+    }
+    expect(
+        expected_trace_ids <= observed_trace_ids,
+        "all action proposals emitted tool traces",
+        traces,
+    )
     audit = get_json("/audit/journal?limit=200")
     proposals = [
         item
         for item in audit.get("items", [])
         if str(item.get("event_id") or "").startswith("guard_") or str(item.get("trace_id") or "").startswith("guard_")
     ]
-    expect(len(proposals) >= 12, "all scenarios entered audit", proposals)
+    observed_audit_ids = {
+        str(item.get("event_id") or item.get("trace_id") or "")
+        for item in proposals
+    }
+    expect(
+        expected_trace_ids <= observed_audit_ids,
+        "all action proposals entered audit",
+        proposals,
+    )
 
     print("Tool Proxy guard smoke passed.")
     return 0

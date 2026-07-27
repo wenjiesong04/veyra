@@ -41,10 +41,6 @@ class DownAdapter:
         return {"connected": False, "status": "unavailable"}
 
 
-def review_for(proposal: dict) -> dict:
-    return {"review_id": "rev_test", "status": "pending", "proposal": proposal}
-
-
 def main() -> None:
     with TemporaryDirectory(prefix="veyra-review-exec-") as tmp:
         store = WorldStateStore(Path(tmp) / "state")
@@ -53,40 +49,92 @@ def main() -> None:
         ]})
 
         pc_connected = ProactiveChecks(store, agency_root=str(Path(tmp) / "a1"), model_assist_enabled=False, agent_adapter_resolver=lambda: ConnectedAdapter())
-        executor = ActionExecutor(state_store=store, proactive_executor=pc_connected.execute_approved_proposal)
+        review_queue = ReviewQueue(store)
+        executor = ActionExecutor(
+            state_store=store,
+            proactive_executor=pc_connected.execute_approved_proposal,
+            review_authorizer=review_queue.authorize_execution,
+        )
+
+        def execute_proposal(
+            selected_executor: ActionExecutor,
+            proposal: dict,
+            label: str,
+        ) -> dict:
+            review = review_queue.create(
+                event_id=f"exec-{label}",
+                task_text=label,
+                risk_level="R2",
+                foresight={},
+                guardian_decision={"decision": "allow", "risk_level": "R2"},
+                proposal=proposal,
+            )
+            approved, claim_token = review_queue.approve_and_claim(
+                review["review_id"],
+                "smoke approval",
+            )
+            expect(bool(claim_token), f"{label} obtains execution claim", approved)
+            return selected_executor.execute_review(
+                approved,
+                claim_token=claim_token,
+            )
 
         # Before: proposal types with top-level "type" used to fall to not_supported.
         # Now: approving an R2 proactive_remediation review actually runs the diagnostic.
-        remediation_review = review_for({
+        remediation_proposal = {
             "type": "proactive_remediation",
             "gap_id": "agent_task_drift",
             "suggested_action": "review_agent_task_drift",
             "action_text": "review drifting agent tasks",
-        })
-        result = executor.execute_review(remediation_review)
+        }
+        result = execute_proposal(
+            executor,
+            remediation_proposal,
+            "proactive-remediation",
+        )
         expect(result.get("status") == "diagnosed", "approved remediation executes (not not_supported)", result)
         expect(result.get("operation") == "proactive_remediation", "operation tagged", result)
         expect(any(t.get("task_id") == "t1" for t in (result.get("drifting_tasks") or [])), "remediation surfaced the drifting task", result)
 
         # agent_restart with a reachable adapter recovers via reversible reconnect.
         store.write_json("executor_state.json", {"status": "unavailable", "connected": False})
-        restart_review = review_for({"type": "agent_restart", "target": "selected_agent"})
-        recovered = executor.execute_review(restart_review)
+        recovered = execute_proposal(
+            executor,
+            {"type": "agent_restart", "target": "selected_agent"},
+            "agent-restart-connected",
+        )
         expect(recovered.get("status") == "recovered" and recovered.get("method") == "reconnect", "agent_restart recovers via reconnect", recovered)
         expect(store.read_json("executor_state.json").get("connected") is True, "executor marked connected after recovery", store.read_json("executor_state.json"))
 
         # agent_restart with an unreachable adapter and no configured command is a safe no-op.
         pc_down = ProactiveChecks(store, agency_root=str(Path(tmp) / "a2"), model_assist_enabled=False, agent_adapter_resolver=lambda: DownAdapter())
-        executor_down = ActionExecutor(state_store=store, proactive_executor=pc_down.execute_approved_proposal)
-        noop = executor_down.execute_review(review_for({"type": "agent_restart", "target": "selected_agent"}))
+        executor_down = ActionExecutor(
+            state_store=store,
+            proactive_executor=pc_down.execute_approved_proposal,
+            review_authorizer=review_queue.authorize_execution,
+        )
+        noop = execute_proposal(
+            executor_down,
+            {"type": "agent_restart", "target": "selected_agent"},
+            "agent-restart-down",
+        )
         expect(noop.get("status") == "approved_no_op", "no restart command -> safe no-op, never auto-restarts", noop)
 
         # Unwired executor degrades honestly instead of pretending success.
-        bare = ActionExecutor(state_store=store)
-        bare_result = bare.execute_review(review_for({"type": "proactive_remediation", "suggested_action": "review_resource_pressure"}))
+        bare = ActionExecutor(
+            state_store=store,
+            review_authorizer=review_queue.authorize_execution,
+        )
+        bare_result = execute_proposal(
+            bare,
+            {
+                "type": "proactive_remediation",
+                "suggested_action": "review_resource_pressure",
+            },
+            "unwired-remediation",
+        )
         expect(bare_result.get("status") == "not_supported", "unwired executor reports not_supported honestly", bare_result)
 
-        review_queue = ReviewQueue(store)
         status_cases = [
             ("approved-noop", {"status": "approved_noop"}, "governance_only", False),
             ("approved-no-op", noop, "governance_only", False),
@@ -168,6 +216,10 @@ def main() -> None:
                 bool(claim_token),
                 f"{label} obtains one execution claim",
                 review,
+            )
+            review_queue.authorize_execution(
+                review["review_id"],
+                claim_token,
             )
             review_queue.update_execution(
                 review["review_id"],

@@ -19,6 +19,7 @@ class ReplayRuntime:
 
     CANDIDATE_STATUSES = {"needs_rollback", "verified_failed", "execution_failed", "failed", "error", "timeout"}
     PROCESSING_LEASE_SECONDS = 300
+    AUTO_EXECUTION_SUPPORTED = False
 
     def __init__(
         self,
@@ -95,7 +96,14 @@ class ReplayRuntime:
                     "jobs": jobs[-500:],
                 }
             )
-            state.setdefault("config", {"auto_execute_enabled": False, "allow_r4_restore": False})
+            config = (
+                state.get("config")
+                if isinstance(state.get("config"), dict)
+                else {}
+            )
+            config["auto_execute_enabled"] = False
+            config["allow_r4_restore"] = False
+            state["config"] = config
 
         self.state_store.mutate_json("replay_runtime_state.json", merge_candidates)
         self.state_store.append_jsonl("action_record.jsonl", {"route": "replay_runtime_scan", "status": "success", "artifacts": {"created": len(created), "candidate_count": len(candidates)}})
@@ -103,21 +111,33 @@ class ReplayRuntime:
 
     def configure(self, *, auto_execute_enabled: bool | None = None, allow_r4_restore: bool | None = None) -> dict[str, Any]:
         configured: dict[str, Any] = {}
+        enable_requested = bool(auto_execute_enabled or allow_r4_restore)
 
         def configure_runtime(state: dict[str, Any]) -> None:
             nonlocal configured
             config = state.setdefault("config", {})
             if not isinstance(config, dict):
                 state["config"] = config = {}
-            if auto_execute_enabled is not None:
-                config["auto_execute_enabled"] = bool(auto_execute_enabled)
-            if allow_r4_restore is not None:
-                config["allow_r4_restore"] = bool(allow_r4_restore)
+            # Phase 3 keeps rollback execution behind an explicit, one-time
+            # ReviewQueue claim. Runtime/API configuration cannot mint that
+            # authority or turn R4 compensation into an unattended action.
+            config["auto_execute_enabled"] = False
+            config["allow_r4_restore"] = False
             state["updated_at"] = utc_now_iso()
             configured = dict(config)
 
         self.state_store.mutate_json("replay_runtime_state.json", configure_runtime)
-        return {"status": "success", "config": configured, "runtime": self.status()}
+        return {
+            "status": "blocked" if enable_requested else "success",
+            "reason": (
+                "Replay auto-execution is deny-only; approve the generated "
+                "R4 review explicitly."
+                if enable_requested
+                else "Replay remains review-only."
+            ),
+            "config": configured,
+            "runtime": self.status(),
+        }
 
     def run_pending(
         self,
@@ -129,23 +149,15 @@ class ReplayRuntime:
     ) -> dict[str, Any]:
         claim_token = f"claim_{uuid4().hex}"
         claimed: list[dict[str, Any]] = []
-        effective_auto_execute = False
+        auto_execute_requested = bool(auto_execute or allow_r4_restore)
 
         def claim_jobs(state: dict[str, Any]) -> None:
-            nonlocal effective_auto_execute
             config = state.get("config") if isinstance(state.get("config"), dict) else {}
-            effective_auto_execute = bool(
-                auto_execute
-                and config.get("auto_execute_enabled")
-                and allow_r4_restore
-                and config.get("allow_r4_restore")
-            )
+            config["auto_execute_enabled"] = False
+            config["allow_r4_restore"] = False
+            state["config"] = config
             jobs = state.get("jobs") if isinstance(state.get("jobs"), list) else []
-            runnable_statuses = (
-                {"pending", "plan_ready", "needs_confirmation"}
-                if effective_auto_execute
-                else {"pending", "plan_ready"}
-            )
+            runnable_statuses = {"pending", "plan_ready"}
             for job in jobs:
                 if len(claimed) >= max(0, int(limit)):
                     break
@@ -191,32 +203,26 @@ class ReplayRuntime:
                     "plan": redact_sensitive(proposal.get("plan", {}), max_string=2200),
                 }
                 if proposal.get("proposal_status") == "ready" and (
-                    auto_create_reviews or effective_auto_execute
+                    auto_create_reviews or auto_execute_requested
                 ):
                     review = self._review_for_job(job, proposal)
-                    if effective_auto_execute:
-                        execution = self._auto_execute_review(
-                            review,
-                            allow_r4_restore=allow_r4_restore,
-                        )
-                        update.update(
-                            {
-                                "status": "auto_executed"
-                                if execution.get("status") in {"restored", "success", "ok"}
-                                else "auto_execution_failed",
-                                "review_id": review.get("review_id"),
-                                "review": execution.get("review", review),
-                                "execution_result": execution.get("execution_result", execution),
-                            }
-                        )
-                    else:
-                        update.update(
-                            {
-                                "status": "needs_confirmation",
-                                "review_id": review.get("review_id"),
-                                "review": review,
-                            }
-                        )
+                    update.update(
+                        {
+                            "status": "needs_confirmation",
+                            "review_id": review.get("review_id"),
+                            "review": review,
+                            **(
+                                {
+                                    "reason": (
+                                        "Replay auto-execution request was "
+                                        "downgraded to explicit review."
+                                    )
+                                }
+                                if auto_execute_requested
+                                else {}
+                            ),
+                        }
+                    )
                 elif proposal.get("proposal_status") != "ready":
                     update.update(
                         {
@@ -244,11 +250,28 @@ class ReplayRuntime:
                 "artifacts": {
                     "processed": len(processed),
                     "auto_create_reviews": auto_create_reviews,
-                    "auto_execute": effective_auto_execute,
+                    "auto_execute_requested": auto_execute_requested,
+                    "auto_execute": False,
                 },
             },
         )
-        return {"status": "success", "processed_count": len(processed), "processed": processed, "runtime": self.status()}
+        return {
+            "status": (
+                "needs_review"
+                if auto_execute_requested
+                else "success"
+            ),
+            "reason": (
+                "Replay auto-execution is disabled; ready compensation was "
+                "left behind an explicit review."
+                if auto_execute_requested
+                else "Replay plans were processed without execution authority."
+            ),
+            "execution_authority_enabled": False,
+            "processed_count": len(processed),
+            "processed": processed,
+            "runtime": self.status(),
+        }
 
     def _finalize_claim(
         self,
@@ -330,55 +353,16 @@ class ReplayRuntime:
         return self._create_review(payload)
 
     def _auto_execute_review(self, review: dict[str, Any], *, allow_r4_restore: bool) -> dict[str, Any]:
-        proposal = review.get("proposal") if isinstance(review.get("proposal"), dict) else {}
-        action = proposal.get("action") if isinstance(proposal.get("action"), dict) else {}
-        if action.get("type") != "rollback_restore":
-            return {"status": "blocked", "reason": "Replay auto-execute only supports snapshot rollback_restore proposals.", "review": review}
-        if review.get("risk_level") == RiskLevel.R4.value and not allow_r4_restore:
-            return {"status": "needs_confirmation", "reason": "R4 restore auto-execute is not allowed by request/config.", "review": review}
-        if self.action_executor is None:
-            return {"status": "needs_confirmation", "reason": "ActionExecutor is not attached to ReplayRuntime.", "review": review}
-        approved, claim_token = self.review_queue.approve_and_claim(
-            str(review.get("review_id")),
-            "auto-approved by ReplayRuntime explicit policy",
-        )
-        if claim_token is None:
-            existing_result = (
-                approved.get("execution_result")
-                if isinstance(approved.get("execution_result"), dict)
-                else None
-            )
-            if existing_result is not None:
-                return {
-                    "status": existing_result.get("status", "observed"),
-                    "review": approved,
-                    "execution_result": existing_result,
-                    "replayed": True,
-                }
-            return {
-                "status": "indeterminate",
-                "reason": (
-                    "Review execution was already claimed; automatic replay is "
-                    "forbidden until the prior attempt is reconciled."
-                ),
-                "review": approved,
-            }
-        execution_result = self.action_executor.execute_review(approved)
-        updated_review = self.review_queue.update_execution(
-            str(review.get("review_id")),
-            execution_result,
-            claim_token=claim_token,
-        )
-        self.state_store.append_jsonl(
-            "action_record.jsonl",
-            {
-                "event_id": review.get("event_id"),
-                "route": "replay_runtime_auto_execute",
-                "status": execution_result.get("status"),
-                "artifacts": {"review_id": review.get("review_id"), "execution_result": execution_result},
-            },
-        )
-        return {"status": execution_result.get("status"), "review": updated_review, "execution_result": execution_result}
+        return {
+            "status": "needs_confirmation",
+            "reason": (
+                "ReplayRuntime cannot approve or execute rollback reviews. "
+                "A user must approve the canonical review through the one-time "
+                "execution-claim path."
+            ),
+            "execution_authority_enabled": False,
+            "review": review,
+        }
 
     def _is_candidate(self, item: dict[str, Any]) -> bool:
         status = str(item.get("status") or "")
@@ -396,5 +380,17 @@ class ReplayRuntime:
 
     def _read_state(self) -> dict[str, Any]:
         state = self.state_store.read_json("replay_runtime_state.json") or {"status": "idle", "jobs": [], "last_scan_at": None}
-        state.setdefault("config", {"auto_execute_enabled": False, "allow_r4_restore": False})
+        config = state.get("config") if isinstance(state.get("config"), dict) else {}
+        stale_authority_flags = bool(
+            config.get("auto_execute_enabled")
+            or config.get("allow_r4_restore")
+        )
+        state["config"] = {
+            **config,
+            "auto_execute_enabled": False,
+            "allow_r4_restore": False,
+        }
+        state["execution_authority_enabled"] = False
+        if stale_authority_flags:
+            state["stale_authority_flags_ignored"] = True
         return state

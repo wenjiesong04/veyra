@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import secrets
@@ -330,6 +331,111 @@ class ReviewQueue:
             )
         return selected, claim_token if claimed else None
 
+    def authorize_execution(
+        self,
+        review_id: str,
+        claim_token: str,
+    ) -> dict[str, Any]:
+        """Consume a review claim at the executor boundary.
+
+        The review supplied by an HTTP caller or another runtime component is
+        never an authority object.  This method reloads the canonical queue
+        entry, validates the one-time bearer claim and proposal digest, then
+        atomically moves the claim to ``executing``.  A crash after this point
+        remains indeterminate and cannot be replayed automatically.
+        """
+
+        normalized_review_id = str(review_id or "")
+        normalized_token = str(claim_token or "")
+        if (
+            not normalized_review_id
+            or normalized_review_id != normalized_review_id.strip()
+        ):
+            raise PermissionError("review_id is required for execution")
+        if (
+            not normalized_token
+            or normalized_token != normalized_token.strip()
+            or len(normalized_token) > 512
+        ):
+            raise PermissionError(
+                f"Execution claim token required for review: {normalized_review_id}"
+            )
+
+        selected: dict[str, Any] | None = None
+
+        def authorize(state: dict[str, Any]) -> None:
+            nonlocal selected
+            items = state.setdefault("items", [])
+            if not isinstance(items, list):
+                state["items"] = items = []
+            for item in items:
+                if (
+                    not isinstance(item, dict)
+                    or item.get("review_id") != normalized_review_id
+                ):
+                    continue
+                if item.get("status") != "approved":
+                    raise PermissionError(
+                        "Only an approved canonical review can authorize "
+                        f"execution: {normalized_review_id}"
+                    )
+                if isinstance(item.get("execution_result"), dict):
+                    raise PermissionError(
+                        f"Review execution is already observed: {normalized_review_id}"
+                    )
+                claim = item.get("execution_claim")
+                if not isinstance(claim, dict):
+                    raise PermissionError(
+                        f"Execution claim is missing for review: {normalized_review_id}"
+                    )
+                expected_token_digest = str(claim.get("token_digest") or "")
+                if not expected_token_digest or not secrets.compare_digest(
+                    expected_token_digest,
+                    _claim_token_digest(normalized_token),
+                ):
+                    raise PermissionError(
+                        "Execution claim token does not match review: "
+                        f"{normalized_review_id}"
+                    )
+                proposal_digest = _canonical_digest(item.get("proposal"))
+                if not secrets.compare_digest(
+                    str(claim.get("proposal_digest") or ""),
+                    proposal_digest,
+                ):
+                    raise ValueError(
+                        "Review proposal changed after execution claim: "
+                        f"{normalized_review_id}"
+                    )
+                if claim.get("state") != "indeterminate":
+                    raise PermissionError(
+                        "Execution claim is not available for one-time use: "
+                        f"{normalized_review_id}"
+                    )
+                claim["state"] = "executing"
+                claim["authorized_at"] = utc_now_iso()
+                selected = copy.deepcopy(item)
+                return
+            raise KeyError(f"Review not found: {normalized_review_id}")
+
+        self.state_store.mutate_json("review_queue.json", authorize)
+        if selected is None:
+            raise KeyError(f"Review not found: {normalized_review_id}")
+        self.state_store.append_jsonl(
+            "action_record.jsonl",
+            {
+                "event_id": selected.get("event_id"),
+                "route": "human_review_execution",
+                "status": "execution_authorized",
+                "artifacts": {
+                    "review_id": normalized_review_id,
+                    "proposal_digest": (
+                        selected.get("execution_claim") or {}
+                    ).get("proposal_digest"),
+                },
+            },
+        )
+        return selected
+
     def mark_resolved(self, review_id: str, reason: str = "") -> dict[str, Any]:
         return self._set_terminal_status(review_id, "resolved", reason or "marked resolved by runtime hygiene")
 
@@ -382,6 +488,10 @@ class ReviewQueue:
             for item in items:
                 if not isinstance(item, dict) or item.get("review_id") != review_id:
                     continue
+                if item.get("status") != "approved":
+                    raise PermissionError(
+                        f"Only an approved review can record execution: {review_id}"
+                    )
                 claim = item.get("execution_claim")
                 if not isinstance(claim, dict) or not claim_token:
                     raise PermissionError(
@@ -405,6 +515,11 @@ class ReviewQueue:
                     )
                 existing_result = item.get("execution_result")
                 if isinstance(existing_result, dict):
+                    if claim.get("state") != "observed":
+                        raise ValueError(
+                            "Review has an execution result without an observed "
+                            f"claim: {review_id}"
+                        )
                     if _canonical_digest(existing_result) != (
                         incoming_result_digest
                     ):
@@ -413,6 +528,11 @@ class ReviewQueue:
                         )
                     selected = dict(item)
                     return
+                if claim.get("state") != "executing":
+                    raise PermissionError(
+                        "Execution result can only follow executor-boundary "
+                        f"authorization: {review_id}"
+                    )
                 item["execution_result"] = execution_result
                 claim["state"] = "observed"
                 claim["observed_at"] = utc_now_iso()

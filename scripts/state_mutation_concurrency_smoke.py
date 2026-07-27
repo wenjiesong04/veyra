@@ -96,11 +96,18 @@ def main() -> int:
         assert all(item.get("status") == "approved" for item in decided)
         assert len(review_queue.list(status="approved")) == 36
 
-        source = root / "source.txt"
+        sandbox = root / "sandbox"
+        sandbox.mkdir()
+        source = sandbox / "source.txt"
         source.write_text("snapshot payload\n", encoding="utf-8")
-        rollback = RollbackManager(store, snapshot_root=str(root / "snapshots"))
+        rollback = RollbackManager(
+            store,
+            snapshot_root=root / "snapshots",
+            sandbox_root=sandbox,
+        )
         with ThreadPoolExecutor(max_workers=12) as pool:
             snapshots = list(pool.map(lambda _: rollback.snapshot_file(str(source), "concurrency smoke"), range(30)))
+        assert all(item.get("status") == "created" for item in snapshots)
         stored_snapshots = store.read_json("rollback_state.json").get("snapshots", [])
         assert len(stored_snapshots) == 30, f"snapshot append lost updates: {len(stored_snapshots)}"
         assert len({item["snapshot_id"] for item in snapshots}) == 30

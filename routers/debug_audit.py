@@ -263,6 +263,7 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
             execution = await run_in_threadpool(
                 deps["action_executor"].execute_review,
                 review,
+                claim_token=claim_token,
             )
             return deps["review_queue"].update_execution(
                 review_id,
@@ -389,15 +390,23 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     @router.post("/audit/replay/runtime/execute")
     async def audit_replay_runtime_execute(request: ReplayRuntimeRequest | None = None) -> dict[str, Any]:
         payload = request or ReplayRuntimeRequest(auto_execute=True, allow_r4_restore=True)
-        deps["replay_runtime"].configure(auto_execute_enabled=True, allow_r4_restore=payload.allow_r4_restore)
         scan = deps["replay_runtime"].scan(limit=payload.limit)
         run = deps["replay_runtime"].run_pending(
             auto_create_reviews=True,
             auto_execute=True,
-            allow_r4_restore=payload.allow_r4_restore,
+            allow_r4_restore=True,
             limit=min(payload.limit, 50),
         )
-        return {"status": "success", "scan": scan, "run": run}
+        return {
+            "status": "needs_review",
+            "reason": (
+                "Replay execution endpoint is deny-only; compensation remains "
+                "behind an explicit canonical review."
+            ),
+            "execution_authority_enabled": False,
+            "scan": scan,
+            "run": run,
+        }
 
     @router.post("/proactive/check")
     async def proactive_check() -> dict[str, Any]:

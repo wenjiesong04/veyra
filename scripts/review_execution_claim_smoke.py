@@ -104,6 +104,7 @@ def main() -> None:
             _, token = outcome
             if token is None:
                 return
+            queue.authorize_execution(review_id, token)
             with effect_lock:
                 effect_count += 1
 
@@ -161,12 +162,21 @@ def main() -> None:
                 self.calls = 0
                 self.lock = Lock()
 
-            def execute_review(self, claimed_review: dict) -> dict:
+            def execute_review(
+                self,
+                claimed_review: dict,
+                *,
+                claim_token: str,
+            ) -> dict:
+                canonical = queue.authorize_execution(
+                    str(claimed_review["review_id"]),
+                    claim_token,
+                )
                 with self.lock:
                     self.calls += 1
                 return {
                     "status": "success",
-                    "review_id": claimed_review.get("review_id"),
+                    "review_id": canonical.get("review_id"),
                 }
 
         counting_executor = CountingExecutor()
@@ -286,10 +296,9 @@ def main() -> None:
 
         store.mutate_json("review_queue.json", tamper_proposal)
         try:
-            queue.update_execution(
+            queue.authorize_execution(
                 tampered_id,
-                {"status": "success"},
-                claim_token=tampered_token,
+                tampered_token,
             )
         except ValueError:
             pass
