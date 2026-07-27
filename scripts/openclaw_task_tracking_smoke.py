@@ -22,6 +22,29 @@ def expect(condition: bool, label: str, detail: Any = None) -> None:
 def main() -> None:
     adapter = OpenClawAdapter(base_url="ws://127.0.0.1:18789")
     history_sessions: list[str] = []
+    split_response = adapter._structured_agent_response(
+        """```json
+{"agent_understanding":"bounded analysis","confidence":0.8}
+```
+```json
+{"dialogue_message":{"message_type":"EVIDENCE_REQUEST"}}
+```"""
+    )
+    expect(
+        split_response.get("agent_understanding") == "bounded analysis"
+        and split_response.get("dialogue_message")
+        == {"message_type": "EVIDENCE_REQUEST"},
+        "adjacent structured JSON blocks compose without prose inference",
+        split_response,
+    )
+    ambiguous_response = adapter._structured_agent_response(
+        '{"confidence":0.8}\n{"confidence":0.2}'
+    )
+    expect(
+        ambiguous_response == {},
+        "overlapping structured JSON blocks fail closed",
+        ambiguous_response,
+    )
 
     def gateway_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == "agent.wait":

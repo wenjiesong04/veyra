@@ -80,7 +80,17 @@ def check_tool_proxy_and_verifier() -> None:
             },
         )
     )
-    expect(structured["status"] == "verified_success", "structured outcome evidence can be verified", structured)
+    expect(
+        structured["status"] == "partially_success"
+        and structured["evidence"]["structured_evidence"]["sources"] == []
+        and "raw.agent_response.evidence_used"
+        in structured["evidence"]["structured_evidence"][
+            "reported_sources"
+        ]
+        and structured["needs_memory_patch"] is False,
+        "Agent-reported evidence remains presentable but cannot verify an outcome",
+        structured,
+    )
 
     plan_only = verifier.verify_execution_result(
         ExecutionResult(
@@ -251,10 +261,47 @@ def check_task_context_transaction() -> None:
             event_id="event_1",
         )
         expect(update["matched"] is True, "terminal result matches pending task", update)
-        expect(update["task_context"].get("memory_policy") == "long_term", "terminal update returns original task context", update)
-        expect(not update["pending_agent_tasks"], "terminal result removes pending task", update)
+        expect(
+            update["pending_count"] == 0,
+            "terminal result removes pending task without returning private context",
+            update,
+        )
         archived = tracker.get_context("run_1") or {}
         expect(archived.get("final_status") == "success", "terminal task context remains durably resolvable", archived)
+
+        tracker.register(
+            event_id="event_adapter_down",
+            route="agent",
+            execution=ExecutionResult(
+                task_id="run_adapter_down",
+                executor="openclaw",
+                status="submitted",
+                result="queued",
+            ),
+            verification={
+                "status": "partially_success",
+                "next_action": "poll_runtime_or_probe_result",
+            },
+            user_id="user_1",
+        )
+        adapter_down_update = tracker.apply_result(
+            execution=ExecutionResult(
+                task_id="run_adapter_down",
+                executor="openclaw",
+                status="adapter_unconfigured",
+                result="adapter unavailable",
+            ),
+            verification={
+                "status": "needs_more_probe",
+                "next_action": "reconfigure_agent",
+            },
+            event_id="event_adapter_down",
+        )
+        expect(
+            adapter_down_update["pending_count"] == 0,
+            "all contract-terminal statuses retire pending task supervision",
+            adapter_down_update,
+        )
 
         immediate_failure = ExecutionResult(
             task_id="run_immediate_failure",

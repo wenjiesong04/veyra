@@ -27,7 +27,9 @@ from core.definitions import RiskLevel  # noqa: E402
 from core.runtime_entity import RuntimeEntity  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
 from interface.agent_adapter import AgentAdapter, ExecutionResult  # noqa: E402
+from interface.intake_gateway import IntakeGateway  # noqa: E402
 from interface.event_schema import Decision, EventSource, EventType, Route, VeyraEvent, VeyraTaskPacket  # noqa: E402
+from runtime.bounded_agent_negotiation import BoundedNegotiationError  # noqa: E402
 
 
 def expect(condition: bool, label: str, detail: Any = None) -> None:
@@ -199,8 +201,190 @@ def run() -> None:
             other.agent_execution_session_id,
         )
 
+        target_loop, target_fake = build_loop(
+            tmp / "untrusted-target-agent"
+        )
+
+        def model_selected_other_provider(
+            text: str,
+            attention_focus: list[str],
+            event: VeyraEvent | None = None,
+            **_kwargs: Any,
+        ) -> Decision:
+            del text, attention_focus, event
+            return Decision(
+                route=Route.AGENT,
+                risk_level=RiskLevel.R0,
+                reason="model supplied an untrusted provider name",
+                target_agent="other-provider",
+                intent="information",
+                needs_agent=True,
+                required_capabilities=["openclaw.web_search"],
+            )
+
+        def reject_unconfigured_provider(name: str) -> AgentAdapter:
+            raise AssertionError(
+                f"model-selected provider must not be resolved: {name}"
+            )
+
+        target_loop.decision_core.decide = (  # type: ignore[assignment]
+            model_selected_other_provider
+        )
+        target_loop.agent_registry.get = (  # type: ignore[assignment]
+            reject_unconfigured_provider
+        )
+        rogue_adapter = FakeOpenClawAdapter()
+        original_context_build = target_loop.context_builder.build
+
+        def interleaved_context_build(*args: Any, **kwargs: Any) -> dict[str, object]:
+            # Simulate a concurrent status/old-Case request changing the
+            # historical compatibility field during context construction.
+            target_loop.agent_adapter = rogue_adapter
+            return original_context_build(*args, **kwargs)
+
+        target_loop.context_builder.build = interleaved_context_build  # type: ignore[assignment]
+        target_loop.handle_event(
+            make_event(
+                "为 Veyra 实现一个跨模块恢复算法并给出补丁",
+                session_id="provider-selection",
+                idx=400,
+            )
+        )
+        expect(
+            len(target_fake.sent) == 1
+            and target_fake.sent[0].target_agent == "openclaw"
+            and rogue_adapter.sent == [],
+            "model and concurrent shared-state changes cannot override configured provider",
+            [
+                packet.target_agent
+                for packet in target_fake.sent
+            ]
+            + [f"rogue_sent={len(rogue_adapter.sent)}"],
+        )
+
+    _check_phase4_intake_supervision()
     _check_openclaw_adapter_uses_packet_session_key()
     print("\nALL agent session isolation checks passed.")
+
+
+def _check_phase4_intake_supervision() -> None:
+    class ClosureUnconfirmedAdapter(FakeOpenClawAdapter):
+        FEATURES = {
+            "agent_dialogue_v1": True,
+            "caller_supplied_run_id": True,
+            "idempotent_submit": True,
+            "exact_stop": True,
+            "tool_proxy_enforced": True,
+            "enforced_execution_profile": "phase3_sandbox_proposal",
+        }
+
+        def connection_status(self) -> dict[str, Any]:
+            return {"connected": True, "features": dict(self.FEATURES)}
+
+        def send_task(
+            self, task_packet: VeyraTaskPacket
+        ) -> ExecutionResult:
+            self.sent.append(task_packet)
+            return ExecutionResult(
+                task_id=str(task_packet.runtime_run_id),
+                executor="openclaw",
+                status="success",
+                result="terminal reply whose authority is not yet closed",
+                raw={"exact_run_observed": True},
+            )
+
+    with tempfile.TemporaryDirectory(
+        prefix="veyra-phase4-intake-supervision-"
+    ) as raw_tmp:
+        loop, _legacy = build_loop(Path(raw_tmp))
+        loop.state_store.patch_json(
+            "local_world.json",
+            {"current_project": "workspace-intake-supervision"},
+        )
+        adapter = ClosureUnconfirmedAdapter()
+        loop.agent_registry.selected = lambda: adapter  # type: ignore[assignment]
+        loop.agent_registry.selected_name = lambda: "openclaw"  # type: ignore[assignment]
+
+        def unconfirmed_acceptance(**_kwargs: Any) -> dict[str, Any]:
+            raise BoundedNegotiationError(
+                "terminal Agent authority closure is unconfirmed"
+            )
+
+        loop.bounded_negotiation.accept_execution = unconfirmed_acceptance  # type: ignore[assignment]
+        gateway = IntakeGateway(
+            loop,
+            state_store=loop.state_store,
+        )
+        request = {
+            "text": "请通过 Agent 分析一次恢复策略并给出两个只读方案",
+            "channel": "api",
+            "user_id": "user-intake-supervision",
+            "session_id": "session-intake-supervision",
+            "message_id": "message-intake-supervision",
+        }
+        first = gateway.receive_message(**request)
+        replay = gateway.receive_message(**request)
+        pending = loop.state_store.read_json(
+            "task_state.json"
+        ).get("pending_agent_tasks", [])
+        cases = loop.durable_case_store.list_cases(
+            user_id="user-intake-supervision",
+            workspace_id="workspace-intake-supervision",
+        )
+        private_run_id = str(
+            (
+                pending[0].get("task_context", {})
+                if pending and isinstance(pending[0], dict)
+                else {}
+            ).get("runtime_task_id")
+            or ""
+        )
+        public_text = __import__("json").dumps(
+            first,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        expect(
+            first["loop_result"]["status"] == "needs_more_probe"
+            and replay["status"] == "duplicate"
+            and replay["previous"]["event_id"]
+            == first["event"]["event_id"]
+            and len(adapter.sent) == 1
+            and len(cases) == 1
+            and len(pending) == 1,
+            "unconfirmed terminal closure keeps one Case supervised and preserves intake dedupe",
+            {
+                "first": first,
+                "replay": replay,
+                "case_count": len(cases),
+                "pending_count": len(pending),
+                "sent_count": len(adapter.sent),
+            },
+        )
+        expect(
+            bool(private_run_id)
+            and private_run_id not in public_text
+            and "agent_execution_session_id" not in public_text
+            and "runtime_task_id" not in public_text,
+            "Phase 4 supervised degradation keeps provider binding private",
+            first["loop_result"],
+        )
+        expect(
+            all(
+                private_key not in public_text
+                for private_key in (
+                    '"binding_digest"',
+                    '"operation_id"',
+                    '"raw"',
+                    '"scope_digest"',
+                    '"session_key"',
+                    '"task_context"',
+                    '"task_packet_id"',
+                )
+            ),
+            "Phase 4 LoopResult uses a deliberate public artifact projection",
+            first["loop_result"],
+        )
 
 
 def _check_openclaw_adapter_uses_packet_session_key() -> None:
@@ -232,6 +416,22 @@ def _check_openclaw_adapter_uses_packet_session_key() -> None:
         captured,
     )
     expect(captured.get("session_key") != "main", "OpenClaw send does not fall back to fixed main key", captured)
+
+    # A cache lookup is not provider evidence. In particular, a terminal
+    # result with no matching runId must remain non-exact on every replay.
+    adapter._remember_chat_run(  # type: ignore[attr-defined]
+        "run-unobserved",
+        final_event={},
+        status="success",
+        result="unbound terminal result",
+    )
+    cached = adapter._cached_execution("run-unobserved")  # type: ignore[attr-defined]
+    expect(
+        cached is not None
+        and cached.raw.get("exact_run_observed") is False,
+        "terminal run cache preserves non-exact observation provenance",
+        cached.to_dict() if cached is not None else None,
+    )
 
 
 if __name__ == "__main__":

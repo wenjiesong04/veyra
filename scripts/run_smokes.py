@@ -51,6 +51,12 @@ GATE_SMOKES = [
     "state_refresh_fairness_smoke.py",
     "openclaw_capability_identity_smoke.py",
     "agent_governance_transaction_smoke.py",
+    "agent_session_isolation_smoke.py",
+    "agent_dialogue_contract_smoke.py",
+    "durable_case_smoke.py",
+    "bounded_agent_negotiation_smoke.py",
+    "durable_case_http_contract_smoke.py",
+    "phase4_agent_callback_smoke.py",
     "memory_integrity_smoke.py",
     "state_mutation_concurrency_smoke.py",
 ]

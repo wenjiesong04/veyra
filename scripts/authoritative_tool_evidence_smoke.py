@@ -124,8 +124,17 @@ def main() -> int:
         semantic_answer,
     )
     expect(
-        semantic_answer["status"] == "verified_success"
+        semantic_answer["status"] == "partially_success"
         and "claim_scope" not in semantic_answer
+        and semantic_answer["evidence"]["structured_evidence"][
+            "sources"
+        ]
+        == []
+        and "raw.agent_response.evidence_used"
+        in semantic_answer["evidence"]["structured_evidence"][
+            "reported_sources"
+        ]
+        and semantic_answer["needs_memory_patch"] is False
         and semantic_interpreted["summary"]
         == "The bounded probe found a healthy service."
         and MemoryPolicyRuntime._trusted_execution_summary(
@@ -133,7 +142,7 @@ def main() -> int:
             semantic_answer,
         )
         == "The bounded probe found a healthy service.",
-        "non-tool semantic answer evidence remains compatible",
+        "non-tool semantic answer stays display-compatible without becoming evidence",
         {
             "verdict": semantic_answer,
             "interpreted": semantic_interpreted,

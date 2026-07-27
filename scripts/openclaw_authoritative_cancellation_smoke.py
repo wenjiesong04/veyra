@@ -479,6 +479,46 @@ def check_terminal_cleanup_after_projection() -> None:
     )
 
 
+def check_absent_prepared_dispatch_closure() -> None:
+    run_id = "run-prepared-before-broker"
+    session_key = "agent-exec:run-prepared-before-broker"
+    adapter = OpenClawAdapter(
+        base_url="ws://127.0.0.1:18789",
+        governance_dispatch_canceller=(
+            lambda observed_run_id, **_kwargs: {
+                "status": "absent",
+                "run_id": observed_run_id,
+                "reason": (
+                    "validated broker ledger contains no governed dispatch"
+                ),
+                "authority_revoked": True,
+                "executing_reservations": [],
+                "cancelled_reservations": [],
+            }
+        ),
+    )
+    cleanup = adapter.cancel_task_authority(
+        run_id,
+        reason="prepared dispatch was never registered",
+        identity={
+            "run_id": run_id,
+            "session_key": session_key,
+            "binding_digest": "",
+        },
+        abort_agent=False,
+    )
+    expect(
+        cleanup["status"] == "cancelled"
+        and cleanup["authority_revoked"] is True
+        and cleanup["plugin_authority_closed"] is True
+        and cleanup["agent_abort_confirmed"] is True
+        and cleanup["broker"]["status"] == "absent"
+        and cleanup["plugin"]["status"] == "absent",
+        "healthy absent broker ledger closes prepared-before-dispatch authority",
+        cleanup,
+    )
+
+
 def check_submission_failure_cleanup() -> None:
     calls: list[tuple[str, Any]] = []
     captured: dict[str, str] = {}
@@ -613,6 +653,7 @@ def main() -> int:
     check_legacy_abort_truth()
     check_failure_and_too_late_truth()
     check_terminal_cleanup_after_projection()
+    check_absent_prepared_dispatch_closure()
     check_submission_failure_cleanup()
     check_registry_wiring()
     print("openclaw_authoritative_cancellation_smoke: ok")

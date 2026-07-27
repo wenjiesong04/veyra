@@ -23,6 +23,7 @@ from runtime.openclaw_tool_broker import (
     HOOK_STATE_FILE,
     HOOK_PLUGIN_IMPLEMENTATION_REVISION,
     HOOK_PLUGIN_PROTOCOL,
+    OpenClawHookConflict,
     OpenClawHookDenied,
     OpenClawToolBroker,
     project_current_hook_enforcement,
@@ -75,6 +76,118 @@ def main() -> None:
             run_id="veyra-run-canary",
             session_key="agent-exec:task_canary",
         )
+        replayed_registration = broker.prepare_dispatch(
+            packet("task_canary"),
+            run_id="veyra-run-canary",
+            session_key="agent-exec:task_canary",
+        )
+        hook_state = store.read_json("openclaw_tool_hook_state.json")
+        expect(
+            replayed_registration == registration
+            and hook_state.get("metrics", {}).get(
+                "dispatch_registered"
+            )
+            == 1
+            and registration.dispatch_token
+            not in json.dumps(hook_state, sort_keys=True),
+            "same-process governed dispatch retry is idempotent without persisting bearer",
+            {
+                "first": registration,
+                "replayed": replayed_registration,
+                "metrics": hook_state.get("metrics"),
+            },
+        )
+        absent = broker.cancel_registered_run(
+            "veyra-run-never-registered",
+            reason="prepared_before_broker_registration",
+        )
+        expect(
+            absent["status"] == "absent"
+            and absent["authority_revoked"] is True
+            and absent["executing_reservations"] == [],
+            "validated broker ledger proves an unregistered run had no authority",
+            absent,
+        )
+
+        partial_run = "veyra-run-partial-registration"
+        original_mutate_json = store.mutate_json
+        fail_hook_commit = {"armed": True}
+
+        def crash_after_governance_registration(
+            name: str,
+            mutator: object,
+        ) -> dict[str, object]:
+            if name == HOOK_STATE_FILE and fail_hook_commit["armed"]:
+                fail_hook_commit["armed"] = False
+                raise RuntimeError(
+                    "simulated crash before hook dispatch commit"
+                )
+            return original_mutate_json(name, mutator)  # type: ignore[arg-type,return-value]
+
+        store.mutate_json = crash_after_governance_registration  # type: ignore[method-assign]
+        try:
+            broker.prepare_dispatch(
+                packet("task_partial"),
+                run_id=partial_run,
+                session_key="agent-exec:task_partial",
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(
+                "fault injection did not interrupt hook dispatch commit"
+            )
+        finally:
+            store.mutate_json = original_mutate_json  # type: ignore[method-assign]
+
+        partial_before = [
+            entry
+            for entry in store.read_json(
+                "tool_governance_state.json"
+            ).get("sessions", {}).values()
+            if isinstance(entry, dict)
+            and isinstance(entry.get("binding"), dict)
+            and entry["binding"].get("run_id") == partial_run
+            and entry.get("status") == "active"
+        ]
+        partial_cancel = broker.cancel_registered_run(
+            partial_run,
+            reason="reconcile_partial_registration",
+        )
+        partial_after = [
+            entry
+            for entry in store.read_json(
+                "tool_governance_state.json"
+            ).get("sessions", {}).values()
+            if isinstance(entry, dict)
+            and isinstance(entry.get("binding"), dict)
+            and entry["binding"].get("run_id") == partial_run
+            and entry.get("status") == "active"
+        ]
+        expect(
+            len(partial_before) == 1
+            and partial_cancel["status"] == "absent"
+            and partial_cancel["authority_revoked"] is True
+            and partial_after == [],
+            "absent hook dispatch cancellation closes partial governance session",
+            {
+                "before": partial_before,
+                "cancellation": partial_cancel,
+                "after": partial_after,
+            },
+        )
+        try:
+            broker.prepare_dispatch(
+                packet("task_partial"),
+                run_id=partial_run,
+                session_key="agent-exec:task_partial",
+            )
+        except OpenClawHookConflict:
+            pass
+        else:
+            raise AssertionError(
+                "cancelled partial governance authority was reactivated"
+            )
 
         allowed = broker.preflight(
             run_id=registration.run_id,
