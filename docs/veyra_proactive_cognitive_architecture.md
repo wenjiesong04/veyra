@@ -2,7 +2,7 @@
 
 > 状态：目标架构与实施蓝图
 >
-> 设计核验基线：2026-07-26，架构审计起点 `f166b8551aa8`；第一阶段关闭于 `c2d3954`
+> 设计核验基线：2026-07-28；以当前代码、Git、自动化 gate 和重启后的真实运行证据为准
 >
 > 适用范围：Veyra 本地控制面、选定 Agent Runtime、主动感知、长期任务、治理执行与学习闭环
 >
@@ -57,7 +57,7 @@ Veyra 更新世界状态、承诺、经验和下一次主动行为
 - 已增加故障注入、伪造 trace、跨用户、后台 tick、组合崩溃恢复、并发 claim、专属 trace retention，以及全部 9 个公开 Route 的完整输出、状态和风险等价 smoke；最终本机 30 次/路由/模式样本中 `record_only` 相对 `disabled` 的 p50 增量为 1.240–1.956 ms、p95 增量为 1.853–2.730 ms，完整 `shadow` 的 p50 增量为 19.127–25.701 ms、p95 增量为 31.809–39.803 ms。该 wall-clock benchmark 可复跑但只作诊断，不作为 CI 硬阈值；
 - 当前生产接线只自动把 user-message intake 发布到 EventInbox；其余扩展事件类型已有 envelope、admission 和测试契约，但仍需要各 component/task/commitment 的真实 producer 显式调用 `publish_event()`，不能宣传为已接通的事件源。
 
-这意味着 Phase 1 已完成“事件先可靠进入、关系可以在后台投影、失败可恢复且可审计、事实不能由模型或 artifact 自我认证”的有界基础切片。它**尚未**实现无限历史、长期 dedupe tombstone、多事件 Situation 聚合、主动决策、Attention 调度、Durable Case、Veyra-Agent 多轮协商、真实 pre-tool enforcement 或自动自愈；这些能力必须按后续阶段和非弱化门槛逐步启用。
+这意味着 Phase 1 已完成“事件先可靠进入、关系可以在后台投影、失败可恢复且可审计、事实不能由模型或 artifact 自我认证”的有界基础切片。就 Phase 1 本身而言，它没有实现无限历史、长期 dedupe tombstone、多事件 Situation 聚合、主动决策、Attention 调度、Durable Case、Veyra-Agent 协商、真实 pre-tool enforcement 或自动自愈；后续已经落地的 Phase 2–4 范围必须按本节各自的验证状态解释，不能倒推为 Phase 1 当时已有。
 
 ### 1.2 当前已经落地的 Phase 2 read-only/shadow 技术闭环
 
@@ -88,6 +88,20 @@ Veyra 更新世界状态、承诺、经验和下一次主动行为
 当前自动化覆盖 3 种双信号正组合、跨 session 聚合、Goal/用户/scope/time/revision 错误关联、producer/evidence/privacy/authority 字段伪造、同秒 clear、过期 tombstone、Inbox 淘汰、frontier crash repair、revision/closure/reopen、乱序 replay、跨实例 kill switch、epoch fence、重启去重、后台故障隔离和零业务副作用；Git 专项覆盖 worktree/origin/ref/SHA、index/filter/replace/config 竞态与 point-in-time 合同；CI 专项覆盖 provider binding、failure/pending-rerun/success、completion time、policy digest、repo/ref/SHA/workflow/app/job/attempt/分页/transport 错配、最终 run re-list 竞态、精确 github.com origin、畸形 provider、disabled 零请求、容量生命周期和真实 `git_dirty + ci_failed` shadow candidate；intent 专项覆盖无隐式推断、declare/withdraw、CAS、幂等/冲突、双提交修复和 reserved ingress；Attention 专项覆盖确定性 score、unknown context、阈值、suppression precedence、显式同用户分组、dismiss/restart、语义损坏 policy fail-closed、私有状态与全部 authority lock；HTTP 专项覆盖 strict schema 和 event-loop 非阻塞。全部 9 个 Route 在 Guardian/producer/intent/Attention 的 disabled、record-only、shadow 和故障情形下仍逐字段比较完整公开输出、状态和风险。16 组 canonical fixture 得到 precision/recall 1.0、错误关联 0、evidence contract 1.0；这是**规则级 fixture 证据，不是真实项目 replay 或人工建议 usefulness 证据**。标签盲、score 前 evaluator 重算、同次 bytes hash/parse、duplicate-key 拒绝、decision-semantic 去重、工件哈希与 evaluator ruleset 绑定、精确 TP/FP/FN 与双人评价门槛已经写入 [Project Guardian Held-out Replay 评估协议](./project_guardian_evaluation_protocol.md)，但当前没有合格真实数据集，结果必须保持 `not_ready`。
 
 因此，Phase 2 的 **read-only/shadow 技术实现已完成**；formal promotion evidence 仍为 `validation_pending/not_ready`。在真实 held-out corpus、独立来源台账、冻结 labels、双人人工 usefulness 评测和最终推送 SHA 的 fresh live CI 证明完成前，不能进入 `advise_only`，不能发送通知，也不能获得执行权。
+
+### 1.3 当前已经落地的 Phase 4 Durable Case 与有界 Agent 协商
+
+当前版本已经把一次明确的 Agent 委托接入一个**分析/提案限定**的 Durable Case，并完成当前 Kimi + OpenClaw 配置下的真实运行验证：
+
+- `core/durable_case.py` 冻结了严格、不可隐式类型转换的 Case/checkpoint/dialogue 模型；Case identity 精确绑定 user、workspace 和 source event，Phase 4 状态机只包含 `OBSERVING / QUALIFIED / DELIBERATING / AWAITING_EVIDENCE / PROPOSED / PAUSED / CANCELLING / CANCELLED / FAILED / INDETERMINATE / CLOSED`，刻意没有 `AUTHORIZED` 或 `EXECUTING`；
+- `runtime/durable_case_store.py` 提供 revision CAS、operation-id 幂等与语义冲突检测、checkpoint/dialogue 原子提交、两阶段 cancel、trace outbox、终态保留和持久 round-robin recovery cursor；恢复预算耗尽不会长期饿死排在后面的 Case；
+- `interface/agent_dialogue_contract.py` 和 `runtime/bounded_agent_negotiation.py` 当前只接受 `TASK_REQUEST / EVIDENCE_REQUEST / CHALLENGE / OPTION_SET`。reply 必须精确回显 Case revision、turn、parent、task、operation 和 scope 绑定；extra field、类型 coercion、自由文本推断或错绑一律不推进 Case。Agent 自报证据只算 reported proposal，最多得到 `partially_success`，不能成为事实、授权、执行或 verified outcome；
+- TASK_REQUEST 会在 dispatch 前持久化；OpenClaw 使用 caller-supplied run identity 和同进程 bearer，callback 只作为 wake-up hint，Veyra 必须按持久绑定重新取得 exact run 观察。终态消息只有在 broker authority、插件 session 和必要的 Agent abort 状态全部闭合后才可推进；治理闭合不确定时 Case 保持可继续评估且 intake dedupe 不释放；
+- `routers/cases.py` 提供 owner-scoped list/detail 和 strict command API；pause/close 不能跨过仍存活的 Agent authority，cancel/reconcile 使用 revision 和 operation ID。公开响应、callback、refresh、stop、LoopResult 与 `/state` 均使用专门投影，不暴露 provider run/session/binding/token、raw provider payload、全局 pending context 或其他用户任务；
+- Agent adapter 合同保持 provider-neutral。当前真实验证使用 Kimi/Moonshot 配置的 OpenClaw：一个明确实现请求进入 `route=agent`，Kimi 返回严格 `EVIDENCE_REQUEST`，Case 到达 `AWAITING_EVIDENCE`，checkpoint 的 effect state 保持 `not_started`，治理 session 归零；同一 `message_id` 重放只返回 duplicate，工作区 Git diff 不变。Kimi 将普通结构化回答与 dialogue envelope 放在相邻 JSON block 时，adapter 只按有界 JSON 结构组合互不重叠的顶层字段；字段重叠或结构歧义仍 fail closed；
+- 进程重启后的恢复、错绑 callback、terminal cache provenance、取消竞态、prepared-before-broker crash、同进程重复 submit、跨 provider 并发隔离、公开隐私边界、Phase 1 三个不变量与全部 9 Route 非弱化均进入 gate。
+
+这不是通用工作流引擎或无限多轮 Agent 会话。当前每个 Case 只有一次 bounded Agent reply 预算；`AWAITING_EVIDENCE / PROPOSED / PAUSED` 之后的 evidence supply、plan selection、授权、执行和验证循环尚未开放。状态继续使用现有有界 JSON 原子存储，没有 SQLite 迁移，也没有引入 HMAC 归档、密钥轮换、旧索引迁移或压缩预算。其他模型/provider 需要分别完成 capability、严格输出质量和 live compatibility 验证，不能由 Kimi 的成功自动继承。
 
 ## 2. “像贾维斯”在本项目中的可实现含义
 
@@ -161,12 +175,12 @@ Guardian、授权系统、Tool Proxy、Verifier、审计、密钥管理、签名
 - `PARTIAL`：只覆盖目标的一部分，不能按完整能力宣传；
 - `TARGET`：设计目标，尚未实现。
 
-特别是 `Durable Case`、覆盖任意工具/环境的完整 `CapabilityGrant`、全局 100% pre-tool enforcement、多事件 Situation Engine、Foresight v2 和自治自愈目前仍是 `TARGET`，不是当前安全不变量。Phase 3 已从 contract-only ledger 推进到一个**经真实 Kimi/OpenClaw governed run 验证的窄范围执行切片**：只有预注册的 Veyra → OpenClaw governed session、三个固定自定义工具和 Veyra 管理的逐 run sandbox 可以进入 server-side broker。本次实现/运行快照在 `scope=veyra_governed_openclaw_sessions` 下取得 `canary.status=validated`，且 fresh plugin-active/revision 检查使公开组合状态为 `tool_proxy_enforced=true`；`pre_tool_coverage=1.0` 只表示当前 broker state 累计记录的 execution starts 全都有 reservation，不是本次 run 或当前 implementation revision 专属分母，也不是所有 OpenClaw tool call 的全局覆盖率。它不能等同于任意 OpenClaw session、原生工具、真实 workspace 或生产环境已经获得受治理执行权。
+Phase 4 已实现分析/提案限定的 `Durable Case` 子集；带 plan selection、授权、执行、验证、补偿和长期 wakeup 的完整 Case 仍是 `TARGET`。覆盖任意工具/环境的完整 `CapabilityGrant`、全局 100% pre-tool enforcement、多事件 Situation Engine、Foresight v2 和自治自愈同样不是当前安全不变量。Phase 3 已从 contract-only ledger 推进到一个**经真实 Kimi/OpenClaw governed run 验证的窄范围执行切片**：只有预注册的 Veyra → OpenClaw governed session、三个固定自定义工具和 Veyra 管理的逐 run sandbox 可以进入 server-side broker。本次实现/运行快照在 `scope=veyra_governed_openclaw_sessions` 下取得 `canary.status=validated`，且 fresh plugin-active/revision 检查使公开组合状态为 `tool_proxy_enforced=true`；`pre_tool_coverage=1.0` 只表示当前 broker state 累计记录的 execution starts 全都有 reservation，不是本次 run 或当前 implementation revision 专属分母，也不是所有 OpenClaw tool call 的全局覆盖率。它不能等同于任意 OpenClaw session、原生工具、真实 workspace 或生产环境已经获得受治理执行权。
 
 | 能力 | 当前代码 | 已有价值 | 主要差距 |
 |---|---|---|---|
 | 事件入口 | `interface/event_schema.py`、`event_normalizer.py`、`intake_gateway.py`、`runtime/event_inbox.py` | `PARTIAL`：已有扩展事件类型、correlation、causation、evidence、dedupe 和有界持久 admission | 仍缺显式 schema version、可靠性、敏感级别，以及可承担长期 replay/dedupe 权威的事件存储 |
-| 持续循环 | `runtime/active_loop.py`、`cron.py`、`proactive_checks.py` | 能定时心跳、刷新状态、检查 Agent、运行 commitment | 主要是固定周期轮询；没有事件优先级、背压、durable wakeup 和完整 Case 恢复 |
+| 持续循环 | `runtime/active_loop.py`、`cron.py`、`proactive_checks.py` | 能定时心跳、刷新状态、检查 Agent、运行 commitment；Phase 4 已接入有界 Case round-robin recovery | 主要仍是固定周期轮询；没有通用事件优先级、长期 durable wakeup 或完整工作流恢复 |
 | 世界状态 | `core/world_state.py` | 有原子写、writer lease、JSON/JSONL、TTL 健康 | 多个文件是状态快照，关系和来源链难查询；不同领域的权威边界仍需统一 |
 | Observation/Belief | `core/perception_layer.py`、`awareness/claim_schema.py`、`belief_core.py` | 区分 source、confidence、TTL、fresh/stale/conflict | Evidence 仍嵌在 Claim 中；没有可追溯证据图、实体关系、有效时间和假设层 |
 | Attention | `awareness/attention_core.py`、`awareness/project_guardian_attention.py`、`runtime/project_guardian_attention_runtime.py` | `PARTIAL`：Project Guardian 已有确定性 score、显式 Goal/policy 绑定、pause/quiet hours/dismiss precedence、反事实 disposition 和同用户显式分组 | 仍只覆盖 Project Guardian；不调用真实 Probe/Agent，不发送通知，不消费预算或启动 cooldown，也不是通用 Attention/Situation Engine |
@@ -174,8 +188,8 @@ Guardian、授权系统、Tool Proxy、Verifier、审计、密钥管理、签名
 | Agency | `core/agency_core.py` | 能从状态差距生成 bounded intention | A3 是固定默认值，代码明确说明 A0–A5 选择尚未实现 |
 | 理解和决策 | `understanding_core.py`、`cognition_pipeline.py`、`decision_core.py` | 模型优先理解、证据路由和多种执行路径已存在 | 普通请求会出现重复认知；部分后续策略仍依赖开放词表；长期情境与一次性 turn 没有统一 |
 | Foresight | `core/foresight_engine.py` | 已能提出副作用、前置条件和更安全替代 | 当前主要是重启/删除等规则加模型建议，不是可校准的效果预测和模拟 |
-| Agent 委托 | `task_packet_builder.py`、`delegation_policy.py`、`openclaw_adapter.py` | `VERIFIED / SCOPED`：当前 Kimi/Moonshot 配置已通过 OpenClaw 完成真实 governed Agent run，并走通 governed-session 预注册与权威结果投影；按 run/session/binding 的 exact cancellation 由定向自动化验证 | 主要仍是 Veyra 单向发包；尚无类型化质疑、证据请求、方案协商和逐步授权，其他模型/provider 仍需独立兼容与 live 验证 |
-| 持久任务 | `runtime/agent_task_tracker.py`、`core/state_proposal.py` | 已有任务上下文、digest、revision、过期、幂等和 indeterminate 处理 | 还没有承载整个情境生命周期的 Durable Case 状态机 |
+| Agent 委托 | `task_packet_builder.py`、`delegation_policy.py`、`openclaw_adapter.py`、`interface/agent_dialogue_contract.py` | `VERIFIED / SCOPED`：当前 Kimi/Moonshot 配置已通过 OpenClaw 完成真实 governed Agent run；Phase 4 已真实接受严格 `EVIDENCE_REQUEST`，并走通 exact observation、撤权闭合和公开投影 | 当前只是一轮 `TASK_REQUEST → EVIDENCE_REQUEST/CHALLENGE/OPTION_SET`；evidence supply、plan selection、逐步授权和其他模型/provider live 验证仍未完成 |
+| 持久任务 | `core/durable_case.py`、`runtime/durable_case_store.py`、`runtime/bounded_agent_negotiation.py`、`runtime/agent_task_tracker.py` | `VERIFIED / SCOPED`：已有 owner scope、revision CAS、幂等 operation、checkpoint/dialogue、取消、trace outbox、round-robin crash recovery 和 HTTP 生命周期投影 | 仅承载 foreground Agent 分析 Case；尚未把 Goal、Commitment、Situation、授权执行和长期 wakeup 统一成完整事务 |
 | 执行治理 | `guardian/`、`tool_proxy/`、`execution/`、`runtime/openclaw_tool_broker.py`、`apps/openclaw/veyra-governance/` | `VERIFIED / SCOPED`：已有严格 Grant/receipt/effect 合同、server-side broker、OpenClaw pre/execute/observe bridge；真实 canary 直接覆盖授权 Veyra write、同 run native write block 和 traversal block | 当前只覆盖注册的 Veyra session 和逐 run sandbox；live run 没有逐项覆盖所有原生/自定义工具，不能声称所有 OpenClaw/Agent tool call 必经 Veyra |
 | 验证/恢复 | `core/verifier.py`、`rollback_audit/` | 有结构化验证、权威 receipt/effect 投影、精确 snapshot/trace/restore；canonical review 文件写入执行前必须先生成同 scope snapshot；scoped live hook write/effect canary 已通过 | 更广工具的独立 effect verifier 和通用 rollback 仍未实现；本次 canary 不是未来版本永久有效证明 |
 | 学习/自改进 | `runtime/self_improvement.py`、`memory_bridge/` | 能记录能力缺口，默认不自行改源码是正确边界 | 没有统一的 outcome learning、预测校准、策略候选晋级和安全扩展生命周期 |
@@ -624,6 +638,8 @@ Agent 接入必须保持**模型和供应商中立**。Veyra 面向的是版本�
 | `PAUSE/CANCEL` | Veyra → Agent | 用户或策略触发停止 |
 | `FINAL_SYNTHESIS` | Agent → Veyra | 结果解释，不是完成证明 |
 
+上表是完整目标协议。Phase 4 当前只实现并验证 `TASK_REQUEST / EVIDENCE_REQUEST / CHALLENGE / OPTION_SET`；其中只有 `TASK_REQUEST` 由 Veyra 发出，Agent 只能返回其余三种中的一种。`CONTEXT_PATCH`、plan selection、capability negotiation、step result、replan 和 final synthesis 尚未接入 Case 状态机，不能仅因类型出现在设计表中就视为可用。
+
 ### 12.3 协商循环
 
 ```mermaid
@@ -650,6 +666,8 @@ stateDiagram-v2
     Cancelled --> [*]
     Indeterminate --> [*]
 ```
+
+上图同样表示完整目标循环。当前可运行闭环止于 `AWAITING_EVIDENCE / PROPOSED / PAUSED`，或在撤权确认后进入 `CANCELLED`；它不会从 proposal 自动进入 `AUTHORIZED / EXECUTING / VERIFYING`。Malformed、错绑或自由文本 reply 会在 authority 已关闭后进入 `PAUSED`，闭合证据不完整则保持 `DELIBERATING` 并由恢复循环继续监督。
 
 Agent 可以说“Veyra 当前前提不成立”，Veyra不能因为自己主导就忽略。它应检查 Challenge 的证据，必要时 Probe 或询问用户。Veyra 主导的是流程和权限，不是把自己的初次判断当成真理。
 
@@ -794,6 +812,8 @@ Anthropic 的工程建议强调，从简单可组合模式开始，为 Agent 提
 
 ### 15.2 Case 结构
 
+下面是完整目标结构；当前 Phase 4 持久化的是其最小严格子集：scope/source event/user goal/status/priority/revision、checkpoint、dialogue、operation replay、pause/cancel 和 trace outbox。当前没有 autonomy profile、decision versions、grants、通用 step DAG 或执行预算。
+
 ```json
 {
   "case_id": "case_...",
@@ -825,6 +845,8 @@ Anthropic 的工程建议强调，从简单可组合模式开始，为 Agent 提
 ```
 
 ### 15.3 Case 状态机
+
+下面是完整目标状态机。当前实现的 analysis-only 子集以 `core/durable_case.py::ALLOWED_CASE_TRANSITIONS` 为准，明确删除授权和执行状态。
 
 ```mermaid
 stateDiagram-v2
@@ -873,7 +895,7 @@ stateDiagram-v2
   - Effect ledger 记录是否已开始、已观察、未知；
   - 无法确认时进入 `INDETERMINATE`，不盲目重试。
 
-Temporal 的 durable execution 是此处的成熟工程参考：通过持久事件历史在进程和基础设施故障后恢复工作流。Veyra 当前有界候选层不宣称具备这项能力；只有 Durable Case 用例被证明后，才以 SQLite 或同类持久执行机制实现所需子集，不需要立即引入整个框架。[Temporal documentation](https://docs.temporal.io/)
+Temporal 的 durable execution 是此处的成熟工程参考：通过持久事件历史在进程和基础设施故障后恢复工作流。[Temporal documentation](https://docs.temporal.io/) Veyra Phase 4 已在现有 `WorldStateStore` 上实现一次 Agent 协商所需的有界恢复语义，包括 pre-dispatch checkpoint、CAS、operation replay、trace outbox、两阶段取消和公平恢复游标；它不宣称具备 Temporal 等价的基础设施级 durable execution、无限历史、通用 DAG 或外部副作用 exactly-once。当前证据没有证明需要数据库迁移，因此继续使用有界 JSON 状态，后续只有在真实 Case 规模和查询/恢复需求出现后才重新评估 SQLite。
 
 ## 16. Governed Execution：把治理放到真实动作前
 
@@ -1316,12 +1338,17 @@ External event + local dependency Claim + Commitment
 | `core/verifier.py` | 使用 authoritative tool ledger 与独立 verifier |
 | `runtime/self_improvement.py` | 扩展为候选学习/扩展生命周期 |
 
-### 23.2 建议新增
+### 23.2 已新增与后续建议
 
 ```text
+core/durable_case.py                         # Phase 4 已实现
+interface/agent_dialogue_contract.py         # Phase 4 已实现
+runtime/durable_case_store.py                # Phase 4 已实现
+runtime/bounded_agent_negotiation.py         # Phase 4 已实现
+routers/cases.py                             # Phase 4 已实现
+
 runtime/event_fabric.py
 runtime/runtime_db.py
-runtime/durable_case.py
 runtime/case_orchestrator.py
 runtime/wakeup_scheduler.py
 
@@ -1345,7 +1372,7 @@ runtime/playbook_registry.py
 apps/openclaw/veyra-governance/
 ```
 
-新增目录不代表一次全部实现。必须按垂直闭环逐步落地。
+列入该图不代表一次全部实现；未标注“Phase 4 已实现”的项目仍是建议名称或目标职责，必须按垂直闭环逐步落地。尤其不要为了名称对齐而把当前有界 JSON Case 迁移到数据库或重写 `AwarenessLoop`。
 
 ### 23.3 逐步拆分超大中心文件
 
@@ -1447,20 +1474,24 @@ apps/openclaw/veyra-governance/
 - 实际通知、预算消费、cooldown lifecycle 和 usefulness learning；
 - `advise_only`，必须等 §24.2 的真实 held-out 与人工门槛完成后再评估。
 
-### 24.4 之后才实现 Durable Case
+### 24.4 当前已完成的 analysis-only Durable Case
 
 ```text
-OBSERVING → QUALIFIED → DELIBERATING → PROPOSED
-→ AUTHORIZED/AWAITING_AUTHORIZATION
-→ EXECUTING_STEP → VERIFYING
-→ SUCCEEDED/FAILED/INDETERMINATE/PAUSED
+OBSERVING → QUALIFIED → DELIBERATING
+                         ├→ AWAITING_EVIDENCE
+                         ├→ PROPOSED
+                         └→ PAUSED
+QUALIFIED/DELIBERATING/AWAITING_EVIDENCE/PROPOSED/PAUSED
+                         → CANCELLING → CANCELLED
+除 CANCELLING 外的非终态可按严格边界进入 FAILED / INDETERMINATE / CLOSED；
+CANCELLING 只能进入 CANCELLED / FAILED / INDETERMINATE
 ```
 
-先不实现通用 DAG；Case step 使用顺序列表、revision CAS、幂等 operation ID 和可恢复 transition。只有这一步的事件量、恢复和长期 dedupe 需求被真实用例证明后，才决定是否迁移 SQLite。
+当前不实现通用 DAG；Case 使用有界 checkpoint/dialogue 列表、revision CAS、幂等 operation ID、trace outbox 和可恢复 transition。dispatch 前先持久化 identity，恢复时按持久 round-robin cursor 公平扫描；terminal reply 必须先确认 exact observation 和三层 authority closure。只有真实事件量、查询、恢复和长期 dedupe 需求证明现有 JSON 边界不足后，才重新评估 SQLite。
 
-### 24.5 Agent 协商晚于只读 Guardian 验证
+### 24.5 当前已完成的第一轮有界 Agent 协商
 
-第一版只支持 `TASK_REQUEST / EVIDENCE_REQUEST / CHALLENGE / OPTION_SET`。普通 direct/probe 不进入协商；Agent 只做只读分析或 sandbox proposal。
+第一版只支持 `TASK_REQUEST / EVIDENCE_REQUEST / CHALLENGE / OPTION_SET`，并且每个 Case 只有一次 Agent reply 预算。普通 direct/probe 不进入协商；Agent 只做只读分析或 sandbox proposal。当前 Kimi/OpenClaw live case 已接受 `EVIDENCE_REQUEST` 并停在 `AWAITING_EVIDENCE`，但 Veyra 尚未自动补证据、选择方案或发起第二轮，因此不能称为通用多轮协商。
 
 Phase 1–2 的新链继续严格 `record_only / shadow / read-only`，不能借 Phase 3 获得执行权。Phase 3 只允许 canary 所需的逐 run 隔离 sandbox 和当前三个固定 Veyra executor；真实 workspace、外部系统或生产环境副作用必须重新具备 target-specific Grant、auth-derived user scope、独立 verifier、必要的 snapshot/compensation 和该 scope 自己的 fresh canary 后另行晋级。broker 的 reservation coverage 不能当成全局 hook coverage，也不能因为已有 Review、插件或 `execution_authority_enabled` 字段就提前开启。
 
@@ -1531,10 +1562,12 @@ Phase 1–2 的新链继续严格 `record_only / shadow / read-only`，不能借
 
 ### Phase 4：Durable Case + 有界 Agent 协商
 
-- Case transition、checkpoint、幂等 operation 和 cancel/revoke；
-- `TASK_REQUEST / EVIDENCE_REQUEST / CHALLENGE / OPTION_SET`；
-- 普通 direct/probe 保持原链；
-- Agent 只读或 sandbox，副作用仍受 Phase 3 权威边界控制。
+- `IMPLEMENTED / ANALYSIS ONLY`：严格 Durable Case schema、owner scope、deterministic admission、revision CAS、operation replay/conflict、checkpoint/dialogue、pause/resume/close、两阶段 cancel/revoke、trace outbox 和持久 round-robin recovery cursor 已经接入；
+- `IMPLEMENTED / BOUNDED DIALOGUE`：`TASK_REQUEST / EVIDENCE_REQUEST / CHALLENGE / OPTION_SET` 采用 exact parent/revision/turn/task/operation/scope 绑定；自由文本、coercion、extra field、错绑和歧义 JSON fail closed。Agent proposal 不建立事实、权限、执行或验证；
+- `IMPLEMENTED / EXACT RUNTIME BINDING`：Case identity 在 dispatch 前持久化，caller-supplied run、idempotent submit、callback-as-hint、exact refetch、terminal provenance 和 broker/plugin/Agent authority closure 已接入；process restart、partial registration、重复 submit、迟到 callback 和 provider 并发隔离均有回归；
+- `IMPLEMENTED / PUBLIC BOUNDARY`：Case API、LoopResult、callback、poll、refresh、stop 和 `/state` 不公开 provider run/session/binding/token/raw 或全局 pending context；普通 direct/probe 及 Phase 1 全部 9 Route 的公开 response/status/risk 保持原链；
+- `VALIDATED / CURRENT KIMI + OPENCLAW`：重启后的真实实现请求进入 Agent 路由并得到严格 `EVIDENCE_REQUEST`，Case 到达 `AWAITING_EVIDENCE`、effect state 为 `not_started`、authority session 归零、重复 intake 去重且 Git diff 不变；另一个 Kimi 双 JSON-block 输出暴露并验证了结构解析/撤权 canonical identity 的真实问题，修复后进入 gate；
+- `REMAINING`：evidence/context patch 回合、plan selection、第二轮及更多轮协商、授权/执行/验证状态、通用 DAG、长期 wakeup、数据库迁移和其他模型/provider live validation 尚未实现。Agent 仍只读或 sandbox proposal，副作用继续受 Phase 3 权威边界控制。
 
 ### Phase 5：有界自治、Self-Heal、Foresight 与学习校准
 
@@ -1653,7 +1686,7 @@ disabled
 
 这个方向真正有价值的地方，不是让 Veyra “表现得更像人”，而是让系统拥有普通响应式 Agent 缺少的连续性：
 
-- 重要事件会被资格判断后进入可恢复的 Situation/Case，而不是只存在于一次对话；当前有界候选层尚不承诺永久保留；
+- 重要事件可以在资格判断后进入可恢复的 Situation 投影或 analysis-only Durable Case，而不是只存在于一次对话；当前 Case 仍是有界 JSON 状态，不承诺永久历史、通用工作流或执行自治；
 - 世界状态有来源、新鲜度、冲突和证据链；
 - 当前关注与用户长期目标相关；
 - Veyra 能主动发现机会和问题；
