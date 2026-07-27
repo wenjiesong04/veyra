@@ -18,6 +18,7 @@ from tool_proxy.governance_contract import (
     PreflightDecision,
     ToolInvocation,
     ToolObservation,
+    VerifiedToolEffect,
     RiskLevelValue,
     canonical_sha256,
     secret_sha256,
@@ -592,6 +593,433 @@ class ToolGovernanceRuntime:
             )
         return receipt
 
+    def bind_scoped_execution_token(
+        self,
+        *,
+        reservation_id: str,
+        reservation_token: str,
+        execution_token_digest: str,
+        executor: str,
+    ) -> None:
+        """Bind a second one-use token to an already reserved exact invocation.
+
+        The contract-only decision remains deny-only.  A separately scoped
+        executor can use this binding as its final server-side fence without
+        persisting either bearer token.
+        """
+
+        supplied_reservation_digest = secret_sha256(reservation_token)
+        now = self._now()
+        if len(execution_token_digest) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in execution_token_digest
+        ):
+            raise ValueError("execution_token_digest must be a SHA-256 digest")
+        normalized_executor = str(executor or "").strip()
+        if not normalized_executor or "\x00" in normalized_executor:
+            raise ValueError("executor must be a normalized identifier")
+
+        def bind(document: dict[str, Any]) -> None:
+            self._validate_document(document)
+            call = self._mapping(document, "calls").get(reservation_id)
+            if not isinstance(call, dict):
+                raise ToolGovernanceConflict("reservation not found")
+            stored_digest = str(call.get("reservation_token_digest") or "")
+            if not secrets.compare_digest(
+                stored_digest,
+                supplied_reservation_digest,
+            ):
+                raise ToolGovernanceConflict("reservation token is invalid")
+            receipt = self._load_model(
+                AuthoritativeToolReceipt,
+                call.get("receipt"),
+                label="tool receipt",
+            )
+            if receipt.ledger_state != "authorized_not_observed":
+                raise ToolGovernanceConflict(
+                    "reservation is not awaiting scoped execution"
+                )
+            grant_entry = self._mapping(document, "grants").get(
+                receipt.grant_id
+            )
+            if not isinstance(grant_entry, dict):
+                raise ToolGovernanceStorageError(
+                    "receipt points to a missing capability grant"
+                )
+            grant = self._load_model(
+                CapabilityGrant,
+                grant_entry.get("grant"),
+                label="capability grant",
+            )
+            if (
+                grant.invocation_digest != receipt.invocation_digest
+                or grant_entry.get("status") not in {"active", "consumed"}
+                or now < grant.not_before
+                or now >= grant.expires_at
+            ):
+                raise ToolGovernanceConflict(
+                    "capability grant is no longer active for scoped execution"
+                )
+            session = self._mapping(document, "sessions").get(
+                grant.binding.binding_digest
+            )
+            if not isinstance(session, dict) or session.get("status") != "active":
+                raise ToolGovernanceConflict(
+                    "governed session was cancelled before executor binding"
+                )
+            stored_binding = self._load_model(
+                GovernedSessionBinding,
+                session.get("binding"),
+                label="governed session",
+            )
+            if stored_binding != grant.binding:
+                raise ToolGovernanceConflict(
+                    "governed session binding changed before executor binding"
+                )
+            existing = call.get("scoped_execution")
+            if isinstance(existing, dict):
+                if (
+                    existing.get("execution_token_digest")
+                    != execution_token_digest
+                    or existing.get("executor") != normalized_executor
+                ):
+                    raise ToolGovernanceConflict(
+                        "reservation is already bound to another scoped executor"
+                    )
+                return
+            call["scoped_execution"] = {
+                "execution_token_digest": execution_token_digest,
+                "executor": normalized_executor,
+                "state": "reserved",
+                "bound_at": self._now().isoformat(),
+                "claimed_at": None,
+                "completed_at": None,
+            }
+
+        self.state_store.mutate_json(STATE_FILE, bind)
+
+    def claim_scoped_execution(
+        self,
+        *,
+        reservation_id: str,
+        reservation_token: str,
+        execution_token: str,
+        invocation_digest: str,
+        executor: str,
+    ) -> AuthoritativeToolReceipt:
+        """Atomically cross the irreversible start boundary for one executor.
+
+        Expiry, session cancellation, grant revocation, token replay and exact
+        invocation scope are checked again at execution time.  A won claim is
+        never automatically retried after a crash.
+        """
+
+        now = self._now()
+        supplied_reservation_digest = secret_sha256(reservation_token)
+        supplied_execution_digest = secret_sha256(execution_token)
+        selected: dict[str, AuthoritativeToolReceipt] = {}
+
+        def claim(document: dict[str, Any]) -> None:
+            self._validate_document(document)
+            calls = self._mapping(document, "calls")
+            call = calls.get(reservation_id)
+            if not isinstance(call, dict):
+                raise ToolGovernanceConflict("reservation not found")
+            if not secrets.compare_digest(
+                str(call.get("reservation_token_digest") or ""),
+                supplied_reservation_digest,
+            ):
+                raise ToolGovernanceConflict("reservation token is invalid")
+            receipt = self._load_model(
+                AuthoritativeToolReceipt,
+                call.get("receipt"),
+                label="tool receipt",
+            )
+            if receipt.invocation_digest != invocation_digest:
+                raise ToolGovernanceConflict(
+                    "execution invocation does not match reservation"
+                )
+            if receipt.ledger_state != "authorized_not_observed":
+                raise ToolGovernanceConflict(
+                    "reservation is not awaiting execution"
+                )
+
+            scoped = call.get("scoped_execution")
+            if not isinstance(scoped, dict):
+                raise ToolGovernanceConflict(
+                    "reservation has no scoped execution binding"
+                )
+            if scoped.get("executor") != executor:
+                raise ToolGovernanceConflict("scoped executor identity mismatch")
+            if not secrets.compare_digest(
+                str(scoped.get("execution_token_digest") or ""),
+                supplied_execution_digest,
+            ):
+                raise ToolGovernanceConflict("execution token is invalid")
+            if scoped.get("state") != "reserved":
+                raise ToolGovernanceConflict(
+                    "scoped execution token was already claimed"
+                )
+
+            grants = self._mapping(document, "grants")
+            grant_entry = grants.get(receipt.grant_id)
+            if not isinstance(grant_entry, dict):
+                raise ToolGovernanceStorageError(
+                    "receipt points to a missing capability grant"
+                )
+            grant = self._load_model(
+                CapabilityGrant,
+                grant_entry.get("grant"),
+                label="capability grant",
+            )
+            if grant.invocation_digest != invocation_digest:
+                raise ToolGovernanceConflict(
+                    "capability grant invocation changed after reservation"
+                )
+            if now < grant.not_before or now >= grant.expires_at:
+                if now >= grant.expires_at:
+                    grant_entry["status"] = "expired"
+                    grant_entry["expired_at"] = now.isoformat()
+                raise ToolGovernanceConflict(
+                    "capability grant is not valid at execution time"
+                )
+            if grant_entry.get("status") == "revoked":
+                raise ToolGovernanceConflict(
+                    "capability grant was revoked before execution"
+                )
+            if grant_entry.get("status") not in {"consumed", "active"}:
+                raise ToolGovernanceConflict(
+                    "capability grant is not executable"
+                )
+
+            sessions = self._mapping(document, "sessions")
+            session = sessions.get(grant.binding.binding_digest)
+            if not isinstance(session, dict) or session.get("status") != "active":
+                raise ToolGovernanceConflict(
+                    "governed session was cancelled before execution"
+                )
+            stored_binding = self._load_model(
+                GovernedSessionBinding,
+                session.get("binding"),
+                label="governed session",
+            )
+            if stored_binding != grant.binding:
+                raise ToolGovernanceConflict(
+                    "governed session binding changed after reservation"
+                )
+
+            scoped["state"] = "executing"
+            scoped["claimed_at"] = now.isoformat()
+            selected["receipt"] = receipt
+
+        self.state_store.mutate_json(STATE_FILE, claim)
+        receipt = selected.get("receipt")
+        if receipt is None:
+            raise ToolGovernanceStorageError(
+                "scoped execution claim did not produce a receipt"
+            )
+        self._audit(
+            "scoped_execution_claimed",
+            {
+                "reservation_id": reservation_id,
+                "run_id": receipt.run_id,
+                "tool_call_id": receipt.tool_call_id,
+                "invocation_digest": receipt.invocation_digest,
+                "executor": executor,
+            },
+        )
+        return receipt
+
+    def complete_scoped_execution(
+        self,
+        *,
+        reservation_id: str,
+        reservation_token: str,
+        state: str,
+    ) -> None:
+        if state not in {"observed_success", "observed_failure", "indeterminate"}:
+            raise ValueError("invalid scoped execution completion state")
+        supplied_digest = secret_sha256(reservation_token)
+
+        def complete(document: dict[str, Any]) -> None:
+            self._validate_document(document)
+            call = self._mapping(document, "calls").get(reservation_id)
+            if not isinstance(call, dict):
+                raise ToolGovernanceConflict("reservation not found")
+            if not secrets.compare_digest(
+                str(call.get("reservation_token_digest") or ""),
+                supplied_digest,
+            ):
+                raise ToolGovernanceConflict("reservation token is invalid")
+            scoped = call.get("scoped_execution")
+            if not isinstance(scoped, dict):
+                raise ToolGovernanceConflict(
+                    "reservation has no scoped execution binding"
+                )
+            if scoped.get("state") == state:
+                return
+            if scoped.get("state") != "executing":
+                raise ToolGovernanceConflict(
+                    "scoped execution was not claimed"
+                )
+            scoped["state"] = state
+            completed_at = self._now()
+            scoped["completed_at"] = completed_at.isoformat()
+
+            receipt = self._load_model(
+                AuthoritativeToolReceipt,
+                call.get("receipt"),
+                label="tool receipt",
+            )
+            grant_entry = self._mapping(document, "grants").get(
+                receipt.grant_id
+            )
+            if not isinstance(grant_entry, dict):
+                raise ToolGovernanceStorageError(
+                    "receipt points to a missing capability grant"
+                )
+            grant = self._load_model(
+                CapabilityGrant,
+                grant_entry.get("grant"),
+                label="capability grant",
+            )
+            session = self._mapping(document, "sessions").get(
+                grant.binding.binding_digest
+            )
+            if (
+                not isinstance(session, dict)
+                or session.get("status") != "cancellation_requested"
+            ):
+                return
+            matching_grant_ids: set[str] = set()
+            for grant_id, candidate in self._mapping(
+                document,
+                "grants",
+            ).items():
+                if not isinstance(candidate, dict):
+                    raise ToolGovernanceStorageError(
+                        "grant ledger contains a malformed entry"
+                    )
+                candidate_grant = self._load_model(
+                    CapabilityGrant,
+                    candidate.get("grant"),
+                    label="capability grant",
+                )
+                if (
+                    candidate_grant.binding.binding_digest
+                    == grant.binding.binding_digest
+                ):
+                    matching_grant_ids.add(str(grant_id))
+            still_executing = False
+            for candidate_call in self._mapping(
+                document,
+                "calls",
+            ).values():
+                if not isinstance(candidate_call, dict):
+                    raise ToolGovernanceStorageError(
+                        "tool call ledger contains a malformed entry"
+                    )
+                candidate_receipt = self._load_model(
+                    AuthoritativeToolReceipt,
+                    candidate_call.get("receipt"),
+                    label="tool receipt",
+                )
+                candidate_scoped = candidate_call.get("scoped_execution")
+                if (
+                    candidate_receipt.grant_id in matching_grant_ids
+                    and isinstance(candidate_scoped, dict)
+                    and candidate_scoped.get("state") == "executing"
+                ):
+                    still_executing = True
+                    break
+            if not still_executing:
+                session["status"] = "cancelled"
+                session["cancelled_at"] = completed_at.isoformat()
+
+        self.state_store.mutate_json(STATE_FILE, complete)
+
+    def record_verified_effect(
+        self,
+        effect: VerifiedToolEffect,
+    ) -> VerifiedToolEffect:
+        """Attach one independently verified projection to its observed receipt."""
+
+        def attach(document: dict[str, Any]) -> None:
+            self._validate_document(document)
+            call_index = self._mapping(document, "run_call_index")
+            reservation_id = call_index.get(
+                self._call_key(effect.run_id, effect.tool_call_id)
+            )
+            call = (
+                self._mapping(document, "calls").get(reservation_id)
+                if isinstance(reservation_id, str)
+                else None
+            )
+            if not isinstance(call, dict):
+                raise ToolGovernanceConflict(
+                    "verified effect has no authoritative receipt"
+                )
+            receipt = self._load_model(
+                AuthoritativeToolReceipt,
+                call.get("receipt"),
+                label="tool receipt",
+            )
+            expected = (
+                receipt.receipt_id,
+                receipt.run_id,
+                receipt.tool_call_id,
+                receipt.tool_name,
+                receipt.invocation_digest,
+                receipt.result_digest,
+                receipt.targets_digest,
+            )
+            observed = (
+                effect.receipt_id,
+                effect.run_id,
+                effect.tool_call_id,
+                effect.tool_name,
+                effect.invocation_digest,
+                effect.result_digest,
+                effect.targets_digest,
+            )
+            if expected != observed:
+                raise ToolGovernanceConflict(
+                    "verified effect does not match its authoritative receipt"
+                )
+            if (
+                receipt.ledger_state != "observed_success"
+                or receipt.observed_at is None
+                or effect.observed_at < receipt.observed_at
+            ):
+                raise ToolGovernanceConflict(
+                    "only a successful observed receipt can receive effect evidence"
+                )
+            existing = call.get("effect_evidence")
+            if isinstance(existing, dict):
+                stored = self._load_model(
+                    VerifiedToolEffect,
+                    existing,
+                    label="verified tool effect",
+                )
+                if stored != effect:
+                    raise ToolGovernanceConflict(
+                        "a different verified effect is already attached"
+                    )
+                return
+            call["effect_evidence"] = effect.model_dump(mode="json")
+
+        self.state_store.mutate_json(STATE_FILE, attach)
+        self._audit(
+            "verified_effect_recorded",
+            {
+                "receipt_id": effect.receipt_id,
+                "run_id": effect.run_id,
+                "tool_call_id": effect.tool_call_id,
+                "evidence_digest": effect.evidence_digest,
+            },
+        )
+        return effect
+
     def revoke_grant(self, grant_id: str, *, reason: str) -> dict[str, Any]:
         now = self._now()
         selected: dict[str, Any] = {}
@@ -632,13 +1060,13 @@ class ToolGovernanceRuntime:
             session = sessions.get(binding_digest)
             if not isinstance(session, dict):
                 raise KeyError(f"Governed session not found: {binding_digest}")
-            session["status"] = "cancelled"
-            session["cancelled_at"] = now.isoformat()
-            session["cancellation_reason"] = str(reason or "session_cancelled")[
-                :600
-            ]
-            revoked = 0
-            for entry in self._mapping(document, "grants").values():
+            bounded_reason = str(reason or "session_cancelled")[:600]
+
+            matching_grants: dict[str, dict[str, Any]] = {}
+            for grant_id, entry in self._mapping(
+                document,
+                "grants",
+            ).items():
                 if not isinstance(entry, dict):
                     raise ToolGovernanceStorageError(
                         "grant ledger contains a malformed entry"
@@ -648,22 +1076,103 @@ class ToolGovernanceRuntime:
                     entry.get("grant"),
                     label="capability grant",
                 )
+                if grant.binding.binding_digest == binding_digest:
+                    matching_grants[str(grant_id)] = entry
+
+            executing_reservations: list[str] = []
+            cancelled_reservations: list[str] = []
+            executing_grants: set[str] = set()
+            terminal_grants: set[str] = set()
+            for reservation_id, call in self._mapping(
+                document,
+                "calls",
+            ).items():
+                if not isinstance(call, dict):
+                    raise ToolGovernanceStorageError(
+                        "tool call ledger contains a malformed entry"
+                    )
+                receipt = self._load_model(
+                    AuthoritativeToolReceipt,
+                    call.get("receipt"),
+                    label="tool receipt",
+                )
+                if receipt.grant_id not in matching_grants:
+                    continue
+                scoped = call.get("scoped_execution")
+                scoped_state = (
+                    str(scoped.get("state") or "")
+                    if isinstance(scoped, dict)
+                    else ""
+                )
+                if scoped_state == "executing":
+                    executing_reservations.append(str(reservation_id))
+                    executing_grants.add(receipt.grant_id)
+                elif scoped_state == "reserved":
+                    scoped["state"] = "cancelled_before_start"
+                    scoped["completed_at"] = now.isoformat()
+                    cancelled_reservations.append(str(reservation_id))
+                elif scoped_state in {
+                    "observed_success",
+                    "observed_failure",
+                    "indeterminate",
+                }:
+                    terminal_grants.add(receipt.grant_id)
+
+            cancellation_status = (
+                "too_late" if executing_reservations else "cancelled"
+            )
+            if executing_reservations:
+                session["status"] = "cancellation_requested"
+                session["cancellation_requested_at"] = now.isoformat()
+            else:
+                session["status"] = "cancelled"
+                session["cancelled_at"] = now.isoformat()
+            session["cancellation_reason"] = bounded_reason
+
+            revoked = 0
+            for grant_id, entry in matching_grants.items():
                 if (
-                    grant.binding.binding_digest == binding_digest
-                    and entry.get("status") == "active"
+                    entry.get("status") in {"active", "consumed"}
+                    and grant_id not in executing_grants
+                    and grant_id not in terminal_grants
                 ):
                     entry["status"] = "revoked"
                     entry["revoked_at"] = now.isoformat()
                     entry["revocation_reason"] = "governed_session_cancelled"
                     revoked += 1
-            result.update({"session": dict(session), "revoked_grants": revoked})
+            result.update(
+                {
+                    "status": cancellation_status,
+                    "session": dict(session),
+                    "revoked_grants": revoked,
+                    "executing_reservations": sorted(
+                        executing_reservations
+                    ),
+                    "cancelled_reservations": sorted(
+                        cancelled_reservations
+                    ),
+                }
+            )
 
         self.state_store.mutate_json(STATE_FILE, cancel)
         self._audit(
-            "session_cancelled",
+            (
+                "session_cancellation_too_late"
+                if result.get("status") == "too_late"
+                else "session_cancelled"
+            ),
             {
                 "binding_digest": binding_digest,
+                "status": result.get("status"),
                 "revoked_grants": result.get("revoked_grants", 0),
+                "executing_reservations": result.get(
+                    "executing_reservations",
+                    [],
+                ),
+                "cancelled_reservations": result.get(
+                    "cancelled_reservations",
+                    [],
+                ),
             },
         )
         return result
@@ -693,7 +1202,87 @@ class ToolGovernanceRuntime:
         )
         if receipt.ledger_state not in {"observed_success", "observed_failure"}:
             return None
-        return receipt.model_dump(mode="json")
+        payload = receipt.model_dump(mode="json")
+        raw_effect = call.get("effect_evidence")
+        if isinstance(raw_effect, dict):
+            effect = self._load_model(
+                VerifiedToolEffect,
+                raw_effect,
+                label="verified tool effect",
+            )
+            payload["effect_evidence"] = effect.model_dump(mode="json")
+        return payload
+
+    def run_evidence(self, run_id: str) -> dict[str, Any]:
+        """Build the exact caller projection for one governed Agent run."""
+
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            raise ValueError("run_id is required")
+        document = self.state_store.read_json(STATE_FILE)
+        self._validate_document(document)
+        observed: list[tuple[AuthoritativeToolReceipt, VerifiedToolEffect | None]] = []
+        for raw_call in self._mapping(document, "calls").values():
+            if not isinstance(raw_call, dict):
+                raise ToolGovernanceStorageError(
+                    "tool call ledger contains a malformed entry"
+                )
+            receipt = self._load_model(
+                AuthoritativeToolReceipt,
+                raw_call.get("receipt"),
+                label="tool receipt",
+            )
+            if (
+                receipt.run_id != normalized_run_id
+                or receipt.ledger_state
+                not in {"observed_success", "observed_failure"}
+            ):
+                continue
+            raw_effect = raw_call.get("effect_evidence")
+            effect = (
+                self._load_model(
+                    VerifiedToolEffect,
+                    raw_effect,
+                    label="verified tool effect",
+                )
+                if isinstance(raw_effect, dict)
+                else None
+            )
+            observed.append((receipt, effect))
+        observed.sort(
+            key=lambda item: (
+                item[0].reserved_at,
+                item[0].tool_call_id,
+            )
+        )
+        tool_calls: list[str] = []
+        receipt_refs: list[dict[str, Any]] = []
+        changed_files: list[str] = []
+        seen_files: set[str] = set()
+        for index, (receipt, effect) in enumerate(observed):
+            tool_calls.append(receipt.tool_name)
+            receipt_refs.append(
+                {
+                    "run_id": receipt.run_id,
+                    "tool_call_id": receipt.tool_call_id,
+                    "invocation_digest": receipt.invocation_digest,
+                    "reported_call_index": index,
+                }
+            )
+            if effect is None:
+                continue
+            for path in effect.changed_files:
+                if path not in seen_files:
+                    seen_files.add(path)
+                    changed_files.append(path)
+        return {
+            "run_id": normalized_run_id,
+            "tool_calls": tool_calls,
+            "tool_receipt_refs": receipt_refs,
+            "changed_files": changed_files,
+            "observed_call_count": len(observed),
+            "effect_count": sum(1 for _receipt, effect in observed if effect),
+        }
 
     def status(self) -> dict[str, Any]:
         try:

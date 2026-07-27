@@ -225,7 +225,12 @@ def _check_openclaw_adapter_uses_packet_session_key() -> None:
         agent_execution_session_id="agent-exec:task_xyz",
     )
     adapter.send_task(packet)
-    expect(captured.get("session_key") == "agent-exec:task_xyz", "OpenClaw send uses per-task sessionKey", captured)
+    expect(
+        captured.get("session_key")
+        == "agent:main:agent-exec:task_xyz",
+        "OpenClaw send uses the canonical per-task sessionKey",
+        captured,
+    )
     expect(captured.get("session_key") != "main", "OpenClaw send does not fall back to fixed main key", captured)
 
 

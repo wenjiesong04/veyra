@@ -46,6 +46,18 @@ class TaskPacketBuilder:
             memory_policy=memory_policy,
             agent_execution_session_id=execution_session,
             agent_session_policy=agent_session_policy,
+            governance_context={
+                "user_id": event.source.user_id,
+                "workspace_id": str(
+                    self.state_store.read_json("local_world.json").get(
+                        "current_project"
+                    )
+                    or ""
+                ),
+                "channel_id": event.source.channel,
+                "case_id": event.event_id,
+                "step_id": task_id,
+            },
         )
 
     def _verification_policy(self, risk_level: str, capabilities: list[str], context_patch: dict[str, Any]) -> dict[str, Any]:

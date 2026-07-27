@@ -4,6 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from interface.agent_adapter import ExecutionResult
 from interface.agent_contract import contract_summary
@@ -263,7 +264,8 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
 
     @router.post("/agents/invoke")
     async def agents_invoke(request: AgentInvokeRequest) -> dict[str, Any]:
-        return deps["agent_orchestrator"].invoke(
+        return await run_in_threadpool(
+            deps["agent_orchestrator"].invoke,
             text=request.text,
             agents=request.agents,
             mode=request.mode,

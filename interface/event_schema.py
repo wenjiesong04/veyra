@@ -213,6 +213,12 @@ class VeyraTaskPacket:
     # the Veyra-side dialogue/user session and must NOT be used as the agent runtime key.
     agent_execution_session_id: str = ""
     agent_session_policy: str = "ephemeral_per_task"
+    # Server-derived identity used only to register a governed Agent dispatch.
+    # It is deliberately excluded from to_dict(): neither the Agent prompt nor
+    # the public LoopResult may receive this private registration context.
+    governance_context: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data.pop("governance_context", None)
+        return data

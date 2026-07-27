@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Callable
 
 from core.world_state import WorldStateStore
 from interface.agent_adapter import AgentAdapter
@@ -16,6 +16,10 @@ class AgentRegistry:
     def __init__(self, state_store: WorldStateStore) -> None:
         self.state_store = state_store
         self._adapters: dict[str, AgentAdapter] = {}
+        self._openclaw_governance_preparer: Callable[..., Any] | None = None
+        self._openclaw_governance_canceller: Callable[..., Any] | None = None
+        self._openclaw_governance_evidence: Callable[..., Any] | None = None
+        self._openclaw_governance_status: Callable[..., Any] | None = None
         self._ensure_config()
         self.refresh()
 
@@ -80,7 +84,23 @@ class AgentRegistry:
     def get(self, name: str) -> AgentAdapter:
         if name not in self._adapters:
             self.refresh()
-        return self._adapters.get(name) or OpenClawAdapter()
+        return self._adapters.get(name) or self._build_openclaw_adapter({})
+
+    def configure_openclaw_governance(
+        self,
+        *,
+        dispatch_preparer: Callable[..., Any],
+        dispatch_canceller: Callable[..., Any],
+        run_evidence_resolver: Callable[..., Any],
+        status_resolver: Callable[..., Any],
+    ) -> None:
+        """Apply the same trusted callbacks to current and future adapters."""
+
+        self._openclaw_governance_preparer = dispatch_preparer
+        self._openclaw_governance_canceller = dispatch_canceller
+        self._openclaw_governance_evidence = run_evidence_resolver
+        self._openclaw_governance_status = status_resolver
+        self.refresh()
 
     def list_status(self) -> dict[str, Any]:
         selected = self.selected_name()
@@ -126,19 +146,37 @@ class AgentRegistry:
             "stop_path_template": config.get("stop_path_template") or "/tasks/{task_id}/stop",
         }
         if kind == "openclaw":
-            return OpenClawAdapter(
-                base_url=base_url,
-                api_key=api_key,
-                timeout=timeout,
-                protocol_min=self._optional_int(config.get("protocol_min")),
-                protocol_max=self._optional_int(config.get("protocol_max")),
-                **paths,
+            return self._build_openclaw_adapter(
+                {
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "timeout": timeout,
+                    "protocol_min": self._optional_int(
+                        config.get("protocol_min")
+                    ),
+                    "protocol_max": self._optional_int(
+                        config.get("protocol_max")
+                    ),
+                    **paths,
+                }
             )
         if kind == "hermes":
             return HermesAdapter(base_url=base_url, api_key=api_key, timeout=timeout, **paths)
         if kind == "custom":
             return CustomAgentAdapter(base_url=base_url, api_key=api_key, timeout=timeout, **paths)
         return CustomAgentAdapter(base_url=base_url, api_key=api_key, timeout=timeout, **paths)
+
+    def _build_openclaw_adapter(
+        self,
+        config: dict[str, Any],
+    ) -> OpenClawAdapter:
+        return OpenClawAdapter(
+            governance_dispatch_preparer=self._openclaw_governance_preparer,
+            governance_dispatch_canceller=self._openclaw_governance_canceller,
+            governance_run_evidence_resolver=self._openclaw_governance_evidence,
+            governance_status_resolver=self._openclaw_governance_status,
+            **config,
+        )
 
     @staticmethod
     def _optional_int(value: Any) -> int | None:

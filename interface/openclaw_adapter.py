@@ -10,7 +10,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse, urlunparse
 from uuid import uuid4
 
@@ -25,7 +25,13 @@ except ImportError:  # pragma: no cover - optional runtime dependency
     serialization = None  # type: ignore[assignment]
 
 from interface.agent_adapter import AgentAdapter, ExecutionResult
-from interface.agent_contract import AGENT_CONTRACT_VERSION, normalize_capabilities, validate_task_packet_payload
+from interface.agent_contract import (
+    AGENT_CONTRACT_VERSION,
+    TERMINAL_STATUSES,
+    normalize_capabilities,
+    normalize_execution_payload,
+    validate_task_packet_payload,
+)
 from interface.event_schema import VeyraTaskPacket
 
 
@@ -33,6 +39,10 @@ DEFAULT_OPENCLAW_PROTOCOL_MIN = 3
 DEFAULT_OPENCLAW_PROTOCOL_MAX = 4
 OPENCLAW_REQUIRED_METHODS = ("chat.send",)
 OPENCLAW_OPTIONAL_METHODS = ("health", "status", "tools.catalog", "skills.status", "agent.wait", "chat.history", "memory.summary", "memory.patch")
+OPENCLAW_GOVERNANCE_PROTOCOL = "veyra.openclaw.governance.v1"
+OPENCLAW_GOVERNANCE_IMPLEMENTATION_REVISION = (
+    "veyra.openclaw.governance.phase3.v2"
+)
 
 
 class OpenClawGatewayError(RuntimeError):
@@ -69,6 +79,11 @@ class OpenClawAdapter(AgentAdapter):
         protocol_min: int | None = None,
         protocol_max: int | None = None,
         task_wait_timeout: float | None = None,
+        agent_id: str | None = None,
+        governance_dispatch_preparer: Callable[..., Any] | None = None,
+        governance_dispatch_canceller: Callable[..., Any] | None = None,
+        governance_run_evidence_resolver: Callable[..., Any] | None = None,
+        governance_status_resolver: Callable[..., Any] | None = None,
         **_: Any,
     ) -> None:
         raw_url = base_url or os.getenv("OPENCLAW_GATEWAY_URL") or os.getenv("OPENCLAW_BASE_URL", "")
@@ -79,6 +94,9 @@ class OpenClawAdapter(AgentAdapter):
         self.timeout = timeout
         self.connect_timeout = min(max(timeout, 1.0), 5.0)
         self.session_key = os.getenv("OPENCLAW_SESSION_KEY", "main")
+        self.agent_id = self._openclaw_agent_id(
+            agent_id or os.getenv("OPENCLAW_AGENT_ID", "main")
+        )
         configured_wait = task_wait_timeout
         if configured_wait is None:
             configured_wait = self._float_env("OPENCLAW_TASK_WAIT_TIMEOUT", 75.0)
@@ -97,10 +115,17 @@ class OpenClawAdapter(AgentAdapter):
         self.protocol_max = max(self.protocol_min, configured_max)
         self._run_cache: dict[str, dict[str, Any]] = {}
         self._run_cache_lock = threading.Lock()
+        self._governance_cleanup_lock = threading.Lock()
         self._capabilities_cache: dict[str, Any] = {}
         self._capabilities_cache_at = 0.0
         self._capabilities_cache_ttl = max(0.0, min(self._float_env("OPENCLAW_CAPABILITIES_CACHE_TTL", 5.0), 30.0))
         self._capabilities_cache_lock = threading.Lock()
+        self._governance_dispatch_preparer = governance_dispatch_preparer
+        self._governance_dispatch_canceller = governance_dispatch_canceller
+        self._governance_run_evidence_resolver = (
+            governance_run_evidence_resolver
+        )
+        self._governance_status_resolver = governance_status_resolver
 
     def send_task(self, task_packet: VeyraTaskPacket) -> ExecutionResult:
         validation_errors = validate_task_packet_payload(task_packet.to_dict())
@@ -118,13 +143,148 @@ class OpenClawAdapter(AgentAdapter):
         # Isolate each task in its own agent conversation window. The Veyra dialogue/user
         # session id (e.g. feishu:ou_xxx:oc_xxx) must never be the OpenClaw sessionKey, and
         # the fixed "main" key must not be shared across independent tasks.
-        session_key = str(getattr(task_packet, "agent_execution_session_id", "") or "").strip() or self.session_key
+        session_key = self._canonical_session_key(
+            str(
+                getattr(task_packet, "agent_execution_session_id", "")
+                or ""
+            ).strip()
+            or self.session_key
+        )
         task_context = self._task_context_for_packet(task_packet, session_key)
-        try:
-            raw = self._send_chat(prompt, session_key=session_key)
-        except OpenClawGatewayError as exc:
+        run_id = f"veyra-{uuid4().hex}"
+        governance_registration: dict[str, Any] | None = None
+        if self._governance_dispatch_preparer is not None:
+            try:
+                prepared = self._governance_dispatch_preparer(
+                    task_packet,
+                    run_id=run_id,
+                    session_key=session_key,
+                )
+                if hasattr(prepared, "plugin_payload"):
+                    governance_registration = prepared.plugin_payload()
+                elif isinstance(prepared, dict):
+                    governance_registration = dict(prepared)
+                else:
+                    raise TypeError(
+                        "governance dispatch preparer returned an invalid registration"
+                    )
+            except Exception as exc:
+                self._remember_chat_run(
+                    run_id,
+                    status="blocked",
+                    result="Governed OpenClaw registration failed.",
+                    task_context=task_context,
+                )
+                cleanup = self._cancel_run_authority(
+                    run_id,
+                    reason="dispatch_registration_failed",
+                    abort_chat=True,
+                )
+                return ExecutionResult(
+                    task_id=run_id,
+                    executor="openclaw",
+                    status="blocked",
+                    result=(
+                        "OpenClaw dispatch was blocked because Veyra could not "
+                        "establish a governed session."
+                    ),
+                    logs=prompt,
+                    raw=self._redact_payload(
+                        {
+                            "task_context": task_context,
+                            "governance": {
+                                "status": "registration_failed",
+                                "reason": str(exc)[:600],
+                            },
+                            "governance_cleanup": cleanup,
+                        }
+                    ),
+                )
+        governance_identity = self._normalized_governance_identity(
+            governance_registration,
+            run_id=run_id,
+            fallback_session_key=session_key,
+        )
+        if (
+            governance_registration is not None
+            and not self._complete_governance_identity(governance_identity)
+        ):
+            self._remember_chat_run(
+                run_id,
+                status="blocked",
+                result="Governed OpenClaw registration identity was invalid.",
+                task_context=task_context,
+                governance_identity=governance_identity,
+            )
+            cleanup = self._cancel_run_authority(
+                run_id,
+                reason="dispatch_identity_invalid",
+                identity=governance_identity,
+                abort_chat=True,
+            )
             return ExecutionResult(
-                task_id=task_packet.task_id,
+                task_id=run_id,
+                executor="openclaw",
+                status="blocked",
+                result=(
+                    "OpenClaw dispatch was blocked because its governed "
+                    "run identity was incomplete or inconsistent."
+                ),
+                logs=prompt,
+                raw=self._redact_payload(
+                    {
+                        "task_context": task_context,
+                        "governance": {
+                            "status": "registration_identity_invalid",
+                        },
+                        "governance_cleanup": cleanup,
+                    }
+                ),
+            )
+        try:
+            if governance_registration is None:
+                raw = self._send_chat(
+                    prompt,
+                    session_key=session_key,
+                )
+            else:
+                raw = self._send_chat(
+                    prompt,
+                    session_key=session_key,
+                    idempotency_key=run_id,
+                    governance_registration=governance_registration,
+                )
+        except OpenClawGatewayError as exc:
+            if governance_registration is None:
+                return ExecutionResult(
+                    task_id=task_packet.task_id,
+                    executor="openclaw",
+                    status=exc.status,
+                    result=f"OpenClaw gateway request failed: {exc.message}",
+                    logs=prompt,
+                    raw=self._redact_payload(
+                        {
+                            "task_context": task_context,
+                            "gateway_url": self.gateway_url,
+                            "error": exc.details,
+                        }
+                    ),
+                )
+            self._remember_chat_run(
+                run_id,
+                status=exc.status,
+                result=f"OpenClaw gateway request failed: {exc.message}",
+                task_context=task_context,
+                governance_identity=governance_identity,
+            )
+            cleanup = self._cancel_run_authority(
+                run_id,
+                reason="gateway_submission_failed",
+                identity=governance_identity,
+                abort_chat=True,
+            )
+            return ExecutionResult(
+                task_id=run_id,
                 executor="openclaw",
                 status=exc.status,
                 result=f"OpenClaw gateway request failed: {exc.message}",
@@ -134,27 +294,36 @@ class OpenClawAdapter(AgentAdapter):
                         "task_context": task_context,
                         "gateway_url": self.gateway_url,
                         "error": exc.details,
+                        "governance_cleanup": cleanup,
                     }
                 ),
             )
         final = raw.get("final_event") or {}
         text = self._message_text(final.get("message"))
-        run_id = str(raw.get("run_id") or raw.get("chat_send", {}).get("runId") or task_packet.task_id)
+        run_id = str(raw.get("run_id") or raw.get("chat_send", {}).get("runId") or run_id)
         execution_raw = {**raw, "task_context": task_context}
         agent_response = self._structured_agent_response(text)
         if agent_response:
             execution_raw["agent_response"] = agent_response
-        changed_files = self._string_items(agent_response.get("changed_files")) if agent_response else []
-        tool_calls = self._string_items(agent_response.get("tool_calls")) if agent_response else []
+        self._remember_chat_run(
+            run_id,
+            final_event=final,
+            status="running",
+            result=f"Task submitted to OpenClaw. run_id={run_id}",
+            task_context=task_context,
+            agent_response=agent_response,
+            governance_identity=governance_identity,
+        )
         if final.get("state") == "final":
-            execution = ExecutionResult(
-                task_id=run_id,
-                executor="openclaw",
-                status="success",
-                result=text or "OpenClaw finished with no text.",
-                changed_files=changed_files,
-                tool_calls=tool_calls,
-                raw=self._redact_payload(execution_raw),
+            execution = self._project_terminal_execution(
+                ExecutionResult(
+                    task_id=run_id,
+                    executor="openclaw",
+                    status="success",
+                    result=text or "OpenClaw finished with no text.",
+                    raw=execution_raw,
+                ),
+                projection_source="chat.send.final",
             )
             self._remember_chat_run(
                 run_id,
@@ -163,17 +332,24 @@ class OpenClawAdapter(AgentAdapter):
                 result=text,
                 task_context=task_context,
                 agent_response=agent_response,
-                changed_files=changed_files,
-                tool_calls=tool_calls,
+                changed_files=execution.changed_files,
+                tool_calls=execution.tool_calls,
+                governance_identity=governance_identity,
             )
             return execution
         if final.get("state") == "error":
-            execution = ExecutionResult(
-                task_id=run_id,
-                executor="openclaw",
-                status="error",
-                result=str(final.get("errorMessage") or "OpenClaw task failed."),
-                raw=self._redact_payload(execution_raw),
+            execution = self._project_terminal_execution(
+                ExecutionResult(
+                    task_id=run_id,
+                    executor="openclaw",
+                    status="error",
+                    result=str(
+                        final.get("errorMessage")
+                        or "OpenClaw task failed."
+                    ),
+                    raw=execution_raw,
+                ),
+                projection_source="chat.send.error",
             )
             self._remember_chat_run(
                 run_id,
@@ -181,6 +357,9 @@ class OpenClawAdapter(AgentAdapter):
                 status="error",
                 result=execution.result,
                 task_context=task_context,
+                changed_files=execution.changed_files,
+                tool_calls=execution.tool_calls,
+                governance_identity=governance_identity,
             )
             return execution
         self._remember_chat_run(
@@ -189,6 +368,7 @@ class OpenClawAdapter(AgentAdapter):
             status="submitted",
             result=f"Task submitted to OpenClaw. run_id={run_id}",
             task_context=task_context,
+            governance_identity=governance_identity,
         )
         return ExecutionResult(
             task_id=run_id,
@@ -465,14 +645,78 @@ class OpenClawAdapter(AgentAdapter):
         wait_ms = int(max(1.0, min(float(timeout_seconds), 300.0)) * 1000)
         return self._resolve_chat_run(task_id, wait_timeout_ms=wait_ms)
 
+    def receive_result(self, raw_result: dict[str, Any]) -> ExecutionResult:
+        """Normalize external results without trusting Agent-reported effects."""
+
+        payload = normalize_execution_payload(
+            raw_result,
+            default_task_id="unknown",
+            default_executor="openclaw",
+            default_status="submitted",
+        )
+        execution = ExecutionResult(**payload)
+        if execution.status in TERMINAL_STATUSES:
+            return self._project_terminal_execution(
+                execution,
+                projection_source="receive_result",
+            )
+        # A non-terminal Agent payload cannot establish that any effect occurred.
+        execution.changed_files = []
+        execution.tool_calls = []
+        execution.raw = self._redact_payload(
+            {
+                **execution.raw,
+                "governed_tool_evidence": {
+                    "status": "pending_terminal_projection",
+                    "authority_source": "veyra_private_tool_ledger",
+                    "observed_call_count": 0,
+                    "effect_count": 0,
+                },
+                "tool_receipt_refs": [],
+            }
+        )
+        return execution
+
     def stop_task(self, task_id: str) -> bool:
-        if not self.gateway_url:
-            return False
-        try:
-            self._gateway_request("chat.abort", {"runId": task_id})
-            return True
-        except OpenClawGatewayError:
-            return False
+        if self._governance_dispatch_canceller is None:
+            if not self.gateway_url:
+                return False
+            with self._run_cache_lock:
+                cached = copy.deepcopy(
+                    self._run_cache.get(str(task_id or "").strip()) or {}
+                )
+            task_context = (
+                cached.get("task_context")
+                if isinstance(cached.get("task_context"), dict)
+                else {}
+            )
+            session_key = str(
+                task_context.get("agent_execution_session_id")
+                or task_context.get("session_key")
+                or ""
+            ).strip()
+            if not session_key:
+                return False
+            try:
+                response = self._gateway_request(
+                    "chat.abort",
+                    {
+                        "sessionKey": self._canonical_session_key(
+                            session_key
+                        ),
+                        "agentId": self.agent_id,
+                        "runId": task_id,
+                    },
+                )
+            except (OpenClawGatewayError, ValueError):
+                return False
+            return self._confirmed_chat_abort(response)
+        cleanup = self._cancel_run_authority(
+            task_id,
+            reason="user_requested_stop",
+            abort_chat=True,
+        )
+        return cleanup.get("status") == "cancelled"
 
     def connection_status(self, *, force_refresh: bool = False) -> dict[str, Any]:
         try:
@@ -526,29 +770,76 @@ class OpenClawAdapter(AgentAdapter):
             self._capabilities_cache = copy.deepcopy(capabilities)
             self._capabilities_cache_at = time.monotonic()
 
-    def _send_chat(self, message: str, *, session_key: str | None = None) -> dict[str, Any]:
+    def _send_chat(
+        self,
+        message: str,
+        *,
+        session_key: str | None = None,
+        idempotency_key: str | None = None,
+        governance_registration: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         events: list[dict[str, Any]] = []
         active_session_key = str(session_key or "").strip() or self.session_key
         with self._open_socket() as ws:
             hello = self._connect(ws, events)
-            idempotency_key = f"veyra-{uuid4().hex}"
+            active_run_id = (
+                str(idempotency_key or "").strip()
+                or f"veyra-{uuid4().hex}"
+            )
+            governance_status: dict[str, Any] | None = None
+            if governance_registration is not None:
+                governance_status = self._request_on_socket(
+                    ws,
+                    "veyra.governance.registerSession",
+                    governance_registration,
+                    events,
+                )
+                if governance_status.get("status") not in {
+                    "registered",
+                    "active",
+                    "ok",
+                    "success",
+                }:
+                    raise OpenClawGatewayError(
+                        "blocked",
+                        "OpenClaw governance plugin rejected the dispatch",
+                        self._redact_payload(governance_status),
+                    )
             chat_send = self._request_on_socket(
                 ws,
                 "chat.send",
                 {
                     "sessionKey": active_session_key,
+                    "agentId": self.agent_id,
                     "message": message,
-                    "idempotencyKey": idempotency_key,
+                    "idempotencyKey": active_run_id,
                 },
                 events,
             )
-            run_id = str(chat_send.get("runId") or idempotency_key)
+            run_id = str(chat_send.get("runId") or active_run_id)
+            if run_id != active_run_id:
+                raise OpenClawGatewayError(
+                    "blocked",
+                    "OpenClaw runId did not preserve the governed idempotency key",
+                    {
+                        "expected_run_id": active_run_id,
+                        "observed_run_id": run_id,
+                    },
+                )
             final_event = self._wait_for_chat_final(ws, run_id, events)
         return self._redact_payload(
             {
                 "hello": self._hello_summary(hello),
                 "chat_send": chat_send,
                 "run_id": run_id,
+                "governance_registration": (
+                    {
+                        "status": governance_status.get("status"),
+                        "runId": run_id,
+                    }
+                    if isinstance(governance_status, dict)
+                    else None
+                ),
                 "final_event": final_event,
                 "events": events[-20:],
             }
@@ -562,6 +853,68 @@ class OpenClawAdapter(AgentAdapter):
             status = self._compat_request(ws, hello, "status", {}, events)
             tools = self._compat_request(ws, hello, "tools.catalog", {}, events)
             skills = self._compat_request(ws, hello, "skills.status", {}, events)
+            try:
+                governance_plugin = self._request_on_socket(
+                    ws,
+                    "veyra.governance.status",
+                    {},
+                    events,
+                )
+            except Exception as exc:
+                governance_plugin = {
+                    "status": "unavailable",
+                    "reason": (
+                        exc.message
+                        if isinstance(exc, OpenClawGatewayError)
+                        else str(exc)[:600]
+                    ),
+                }
+        try:
+            governance_runtime = (
+                self._governance_status_resolver()
+                if self._governance_status_resolver is not None
+                else {
+                    "status": "not_configured",
+                    "tool_proxy_enforced": False,
+                }
+            )
+        except Exception as exc:
+            governance_runtime = {
+                "status": "degraded",
+                "tool_proxy_enforced": False,
+                "reason": str(exc)[:600],
+            }
+        plugin_active = governance_plugin.get("status") in {
+            "active",
+            "ok",
+            "success",
+            "validated",
+        }
+        runtime_implementation = (
+            governance_runtime.get("implementation")
+            if isinstance(
+                governance_runtime.get("implementation"),
+                dict,
+            )
+            else {}
+        )
+        governance_identity_match = bool(
+            governance_plugin.get("protocol_version")
+            == OPENCLAW_GOVERNANCE_PROTOCOL
+            and governance_plugin.get("implementation_revision")
+            == OPENCLAW_GOVERNANCE_IMPLEMENTATION_REVISION
+            and runtime_implementation.get("plugin_protocol")
+            == OPENCLAW_GOVERNANCE_PROTOCOL
+            and runtime_implementation.get(
+                "plugin_implementation_revision"
+            )
+            == OPENCLAW_GOVERNANCE_IMPLEMENTATION_REVISION
+        )
+        scoped_enforcement = bool(
+            plugin_active
+            and governance_identity_match
+            and governance_runtime.get("canary_validated") is True
+        )
         compatibility = self._compatibility_summary(hello)
         compatible = all(compatibility["required_methods"].values())
         optional_methods = compatibility.get("optional_methods") if isinstance(compatibility.get("optional_methods"), dict) else {}
@@ -583,12 +936,22 @@ class OpenClawAdapter(AgentAdapter):
                 "task_status": True,
                 "task_poll": "agent.wait+chat.history",
                 "stop_task": True,
-                # Veyra advertises the Tool Proxy contract in every task packet, but
-                # OpenClaw does not currently provide a proven pre-tool enforcement hook.
-                "tool_proxy_enforced": False,
+                "tool_proxy_enforced": scoped_enforcement,
                 "tool_proxy_contract_advertised": True,
-                "tool_proxy_enforcement_status": "validation_pending",
+                "tool_proxy_enforcement_status": (
+                    "validated"
+                    if scoped_enforcement
+                    else "validation_pending"
+                ),
+                "tool_proxy_enforcement_scope": (
+                    "veyra_governed_openclaw_sessions"
+                ),
+                "tool_proxy_identity_match": (
+                    governance_identity_match
+                ),
             },
+            "governance_plugin": self._redact_payload(governance_plugin),
+            "governance_runtime": self._redact_payload(governance_runtime),
             "health": self._health_summary(health),
             "gateway_status": self._status_summary(status),
             "tools": self._tools_summary(tools),
@@ -832,18 +1195,22 @@ class OpenClawAdapter(AgentAdapter):
             )
         if normalized == "error":
             error_text = str(wait_payload.get("error") or wait_payload.get("stopReason") or "OpenClaw task failed.")
-            return ExecutionResult(
-                task_id=task_id,
-                executor="openclaw",
-                status="error",
-                result=error_text,
-                raw=self._redact_payload(
-                    self._execution_raw_for_run(
+            return self._project_terminal_execution(
+                ExecutionResult(
+                    task_id=task_id,
+                    executor="openclaw",
+                    status="error",
+                    result=error_text,
+                    raw=self._execution_raw_for_run(
                         task_id,
-                        {"agent_wait": wait_payload, "poll_method": "agent.wait"},
+                        {
+                            "agent_wait": wait_payload,
+                            "poll_method": "agent.wait",
+                        },
                         result_text=error_text,
-                    )
+                    ),
                 ),
+                projection_source="agent.wait.error",
             )
 
         result_text = self._result_text_for_run(task_id, wait_payload)
@@ -852,15 +1219,15 @@ class OpenClawAdapter(AgentAdapter):
             {"agent_wait": wait_payload, "poll_method": "agent.wait"},
             result_text=result_text,
         )
-        agent_response = execution_raw.get("agent_response") if isinstance(execution_raw.get("agent_response"), dict) else {}
-        return ExecutionResult(
-            task_id=task_id,
-            executor="openclaw",
-            status="success",
-            result=result_text or "OpenClaw finished with no text.",
-            changed_files=self._string_items(agent_response.get("changed_files")),
-            tool_calls=self._string_items(agent_response.get("tool_calls")),
-            raw=self._redact_payload(execution_raw),
+        return self._project_terminal_execution(
+            ExecutionResult(
+                task_id=task_id,
+                executor="openclaw",
+                status="success",
+                result=result_text or "OpenClaw finished with no text.",
+                raw=execution_raw,
+            ),
+            projection_source="agent.wait.final",
         )
 
     def _execution_from_chat_event(self, task_id: str, final_event: dict[str, Any]) -> ExecutionResult:
@@ -871,22 +1238,28 @@ class OpenClawAdapter(AgentAdapter):
             result_text=text,
         )
         if final_event.get("state") == "error":
-            return ExecutionResult(
+            return self._project_terminal_execution(
+                ExecutionResult(
+                    task_id=task_id,
+                    executor="openclaw",
+                    status="error",
+                    result=str(
+                        final_event.get("errorMessage")
+                        or "OpenClaw task failed."
+                    ),
+                    raw=execution_raw,
+                ),
+                projection_source="chat.events.error",
+            )
+        return self._project_terminal_execution(
+            ExecutionResult(
                 task_id=task_id,
                 executor="openclaw",
-                status="error",
-                result=str(final_event.get("errorMessage") or "OpenClaw task failed."),
-                raw=self._redact_payload(execution_raw),
-            )
-        agent_response = execution_raw.get("agent_response") if isinstance(execution_raw.get("agent_response"), dict) else {}
-        return ExecutionResult(
-            task_id=task_id,
-            executor="openclaw",
-            status="success",
-            result=text or "OpenClaw finished with no text.",
-            changed_files=self._string_items(agent_response.get("changed_files")),
-            tool_calls=self._string_items(agent_response.get("tool_calls")),
-            raw=self._redact_payload(execution_raw),
+                status="success",
+                result=text or "OpenClaw finished with no text.",
+                raw=execution_raw,
+            ),
+            projection_source="chat.events.final",
         )
 
     def _listen_for_chat_run(self, run_id: str, timeout_seconds: float) -> dict[str, Any]:
@@ -913,9 +1286,19 @@ class OpenClawAdapter(AgentAdapter):
             )
         known_task = self._find_task(status, task_id)
         if known_task:
-            state = str(known_task.get("state") or known_task.get("status") or "running")
-            normalized = "success" if state in {"final", "done", "completed"} else "error" if state in {"error", "failed"} else "running"
-            return ExecutionResult(
+            state = str(
+                known_task.get("state")
+                or known_task.get("status")
+                or "running"
+            ).strip().lower()
+            normalized = (
+                "success"
+                if state in {"final", "done", "completed", "success", "ok"}
+                else "error"
+                if state in {"error", "failed", "aborted"}
+                else "running"
+            )
+            execution = ExecutionResult(
                 task_id=task_id,
                 executor="openclaw",
                 status=normalized,
@@ -928,6 +1311,12 @@ class OpenClawAdapter(AgentAdapter):
                     )
                 ),
             )
+            if normalized in TERMINAL_STATUSES:
+                return self._project_terminal_execution(
+                    execution,
+                    projection_source="status.snapshot",
+                )
+            return execution
         tasks = status.get("tasks") if isinstance(status.get("tasks"), dict) else {}
         active = tasks.get("active")
         if isinstance(active, int) and active > 0:
@@ -1015,6 +1404,7 @@ class OpenClawAdapter(AgentAdapter):
         agent_response: dict[str, Any] | None = None,
         changed_files: list[str] | None = None,
         tool_calls: list[str] | None = None,
+        governance_identity: dict[str, str] | None = None,
     ) -> None:
         with self._run_cache_lock:
             current = self._run_cache.get(run_id) if isinstance(self._run_cache.get(run_id), dict) else {}
@@ -1028,6 +1418,11 @@ class OpenClawAdapter(AgentAdapter):
                 "agent_response": agent_response or current.get("agent_response") or {},
                 "changed_files": changed_files if changed_files is not None else current.get("changed_files") or [],
                 "tool_calls": tool_calls if tool_calls is not None else current.get("tool_calls") or [],
+                "governance_identity": (
+                    governance_identity
+                    if governance_identity
+                    else current.get("governance_identity") or {}
+                ),
                 "updated_at": time.time(),
             }
 
@@ -1051,6 +1446,656 @@ class OpenClawAdapter(AgentAdapter):
             raw["agent_response"] = agent_response
         return raw
 
+    def _cancel_run_authority(
+        self,
+        run_id: str,
+        *,
+        reason: str,
+        identity: dict[str, Any] | None = None,
+        abort_chat: bool,
+    ) -> dict[str, Any]:
+        """Close Veyra authority before cancelling plugin and Agent state."""
+
+        with self._governance_cleanup_lock:
+            return self._cancel_run_authority_locked(
+                run_id,
+                reason=reason,
+                identity=identity,
+                abort_chat=abort_chat,
+            )
+
+    def _cancel_run_authority_locked(
+        self,
+        run_id: str,
+        *,
+        reason: str,
+        identity: dict[str, Any] | None,
+        abort_chat: bool,
+    ) -> dict[str, Any]:
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            return {
+                "status": "cancellation_unconfirmed",
+                "run_id": "",
+                "reason": "run id is required for authoritative cancellation",
+                "authority_revoked": False,
+                "plugin_authority_closed": False,
+                "agent_abort_confirmed": False,
+            }
+
+        with self._run_cache_lock:
+            cached = copy.deepcopy(
+                self._run_cache.get(normalized_run_id) or {}
+            )
+        task_context = (
+            cached.get("task_context")
+            if isinstance(cached.get("task_context"), dict)
+            else {}
+        )
+        cached_identity = (
+            cached.get("governance_identity")
+            if isinstance(cached.get("governance_identity"), dict)
+            else {}
+        )
+        merged_identity = {
+            **cached_identity,
+            **(identity if isinstance(identity, dict) else {}),
+        }
+        governance_identity = self._normalized_governance_identity(
+            merged_identity,
+            run_id=normalized_run_id,
+            fallback_session_key=str(
+                task_context.get("agent_execution_session_id")
+                or task_context.get("session_key")
+                or ""
+            ),
+        )
+        prior = (
+            cached.get("governance_cleanup")
+            if isinstance(cached.get("governance_cleanup"), dict)
+            else {}
+        )
+
+        prior_broker = (
+            prior.get("broker")
+            if isinstance(prior.get("broker"), dict)
+            else {}
+        )
+        if prior_broker.get("status") == "cancelled":
+            broker = copy.deepcopy(prior_broker)
+        elif self._governance_dispatch_canceller is None:
+            broker = {
+                "status": "not_configured",
+                "reason": "trusted Veyra dispatch canceller is not configured",
+            }
+        else:
+            try:
+                response = self._governance_dispatch_canceller(
+                    normalized_run_id,
+                    reason=reason,
+                )
+                broker = self._normalized_broker_cancellation(
+                    response,
+                    run_id=normalized_run_id,
+                )
+            except Exception as exc:
+                broker = {
+                    "status": "failed",
+                    "reason": str(exc)[:600],
+                }
+
+        broker_digest = str(broker.get("binding_digest") or "").strip()
+        identity_digest = str(
+            governance_identity.get("binding_digest") or ""
+        ).strip()
+        identity_conflict = bool(
+            broker_digest
+            and identity_digest
+            and broker_digest != identity_digest
+        )
+        if broker_digest and not identity_digest:
+            governance_identity["binding_digest"] = broker_digest
+
+        prior_plugin = (
+            prior.get("plugin")
+            if isinstance(prior.get("plugin"), dict)
+            else {}
+        )
+        plugin_closed_statuses = {"cancelled", "absent"}
+        if (
+            prior_plugin.get("status") in plugin_closed_statuses
+            and self._complete_governance_identity(governance_identity)
+            and prior.get("identity") == governance_identity
+        ):
+            plugin = copy.deepcopy(prior_plugin)
+        elif identity_conflict:
+            plugin = {
+                "status": "identity_mismatch",
+                "reason": (
+                    "broker binding digest does not match the registered "
+                    "OpenClaw session identity"
+                ),
+            }
+        elif not self._complete_governance_identity(governance_identity):
+            plugin = {
+                "status": "identity_unavailable",
+                "reason": (
+                    "exact sessionKey, runId and bindingDigest are required"
+                ),
+            }
+        elif not self.gateway_url:
+            plugin = {
+                "status": "not_configured",
+                "reason": "OpenClaw gateway is not configured",
+            }
+        else:
+            plugin = self._cancel_plugin_session(governance_identity)
+
+        prior_abort = (
+            prior.get("agent_abort")
+            if isinstance(prior.get("agent_abort"), dict)
+            else {}
+        )
+        if not abort_chat:
+            agent_abort = (
+                copy.deepcopy(prior_abort)
+                if prior_abort.get("status") == "aborted"
+                else {"status": "not_requested"}
+            )
+        elif prior_abort.get("status") == "aborted":
+            agent_abort = copy.deepcopy(prior_abort)
+        elif not self.gateway_url:
+            agent_abort = {
+                "status": "not_configured",
+                "reason": "OpenClaw gateway is not configured",
+            }
+        elif not str(
+            governance_identity.get("session_key") or ""
+        ).strip():
+            agent_abort = {
+                "status": "identity_unavailable",
+                "reason": (
+                    "OpenClaw chat.abort requires the exact session key"
+                ),
+            }
+        else:
+            try:
+                response = self._gateway_request(
+                    "chat.abort",
+                    {
+                        "sessionKey": self._canonical_session_key(
+                            str(
+                                governance_identity.get("session_key")
+                                or ""
+                            )
+                        ),
+                        "agentId": self.agent_id,
+                        "runId": normalized_run_id,
+                    },
+                )
+                if self._confirmed_chat_abort(response):
+                    agent_abort = {
+                        "status": "aborted",
+                        "response": self._redact_payload(response),
+                    }
+                else:
+                    agent_abort = {
+                        "status": "unconfirmed",
+                        "reason": (
+                            "OpenClaw did not confirm that the run was aborted"
+                        ),
+                        "response": self._redact_payload(response),
+                    }
+            except Exception as exc:
+                agent_abort = {
+                    "status": "failed",
+                    "reason": str(exc)[:600],
+                }
+
+        authority_revoked = broker.get("status") == "cancelled"
+        plugin_authority_closed = (
+            plugin.get("status") in plugin_closed_statuses
+        )
+        agent_abort_confirmed = (
+            not abort_chat or agent_abort.get("status") == "aborted"
+        )
+        if (
+            authority_revoked
+            and plugin_authority_closed
+            and agent_abort_confirmed
+        ):
+            status = "cancelled"
+        elif broker.get("status") == "too_late":
+            status = "too_late"
+        else:
+            status = "cancellation_unconfirmed"
+        cleanup = {
+            "status": status,
+            "run_id": normalized_run_id,
+            "reason": str(reason or "dispatch_cancelled")[:600],
+            "authority_revoked": authority_revoked,
+            "plugin_authority_closed": plugin_authority_closed,
+            "agent_abort_confirmed": agent_abort_confirmed,
+            "broker": broker,
+            "plugin": plugin,
+            "agent_abort": agent_abort,
+            "identity": governance_identity,
+        }
+        with self._run_cache_lock:
+            current = (
+                self._run_cache.get(normalized_run_id)
+                if isinstance(
+                    self._run_cache.get(normalized_run_id),
+                    dict,
+                )
+                else {}
+            )
+            self._run_cache[normalized_run_id] = {
+                **current,
+                "run_id": normalized_run_id,
+                "governance_identity": (
+                    governance_identity
+                    if governance_identity
+                    else current.get("governance_identity") or {}
+                ),
+                "governance_cleanup": copy.deepcopy(cleanup),
+                "updated_at": time.time(),
+            }
+        return self._redact_payload(cleanup)
+
+    def _cancel_plugin_session(
+        self,
+        identity: dict[str, str],
+    ) -> dict[str, Any]:
+        try:
+            response = self._gateway_request(
+                "veyra.governance.cancelSession",
+                {
+                    "sessionKey": identity["session_key"],
+                    "runId": identity["run_id"],
+                    "bindingDigest": identity["binding_digest"],
+                },
+            )
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "reason": str(exc)[:600],
+            }
+        if not isinstance(response, dict):
+            return {
+                "status": "failed",
+                "reason": "OpenClaw cancellation returned a non-object",
+            }
+        response_run_id = str(
+            response.get("runId") or response.get("run_id") or ""
+        ).strip()
+        response_session_key = str(
+            response.get("sessionKey")
+            or response.get("session_key")
+            or ""
+        ).strip()
+        if (
+            response_run_id != identity["run_id"]
+            or response_session_key != identity["session_key"]
+        ):
+            return {
+                "status": "identity_mismatch",
+                "reason": (
+                    "OpenClaw cancellation response did not preserve the "
+                    "exact run and session identity"
+                ),
+            }
+        cancelled = response.get("cancelled")
+        idempotent = response.get("idempotent") is True
+        if cancelled is True:
+            status = "cancelled"
+        elif cancelled is False and idempotent:
+            status = "absent"
+        else:
+            status = "unconfirmed"
+        return {
+            "status": status,
+            "idempotent": idempotent,
+            "response": self._redact_payload(response),
+        }
+
+    @staticmethod
+    def _confirmed_chat_abort(response: Any) -> bool:
+        if not isinstance(response, dict):
+            return False
+        if response.get("aborted") is False or response.get("ok") is False:
+            return False
+        if response.get("aborted") is True or response.get("ok") is True:
+            return True
+        return str(response.get("status") or "").strip().lower() in {
+            "aborted",
+            "cancelled",
+            "ok",
+            "success",
+        }
+
+    @staticmethod
+    def _normalized_broker_cancellation(
+        response: Any,
+        *,
+        run_id: str,
+    ) -> dict[str, Any]:
+        if not isinstance(response, dict):
+            return {
+                "status": "failed",
+                "reason": "Veyra dispatch cancellation returned a non-object",
+            }
+        response_run_id = str(
+            response.get("run_id") or response.get("runId") or ""
+        ).strip()
+        digest = str(
+            response.get("binding_digest")
+            or response.get("bindingDigest")
+            or ""
+        ).strip()
+        if response_run_id != run_id:
+            return {
+                "status": "identity_mismatch",
+                "reason": "Veyra dispatch cancellation belongs to another run",
+            }
+        if (
+            len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            return {
+                "status": "identity_mismatch",
+                "reason": "Veyra dispatch cancellation has no exact binding",
+            }
+        status = str(response.get("status") or "").strip().lower()
+        if status not in {"cancelled", "too_late"}:
+            return {
+                "status": status or "failed",
+                "reason": str(
+                    response.get("reason")
+                    or "Veyra did not confirm authority revocation"
+                )[:600],
+                "binding_digest": digest,
+            }
+        return {
+            "status": status,
+            "binding_digest": digest,
+            "revoked_grants": response.get("revoked_grants", 0),
+            "executing_reservations": OpenClawAdapter._string_items(
+                response.get("executing_reservations")
+            ),
+            "cancelled_reservations": OpenClawAdapter._string_items(
+                response.get("cancelled_reservations")
+            ),
+        }
+
+    @staticmethod
+    def _normalized_governance_identity(
+        value: Any,
+        *,
+        run_id: str,
+        fallback_session_key: str = "",
+    ) -> dict[str, str]:
+        normalized_run_id = str(run_id or "").strip()
+        source = value if isinstance(value, dict) else {}
+        reported_run_id = str(
+            source.get("runId") or source.get("run_id") or ""
+        ).strip()
+        reported_session_key = str(
+            source.get("sessionKey") or source.get("session_key") or ""
+        ).strip()
+        if source and (not reported_run_id or not reported_session_key):
+            return {}
+        if reported_run_id and reported_run_id != normalized_run_id:
+            return {}
+        session_key = str(
+            reported_session_key
+            or fallback_session_key
+            or ""
+        ).strip()
+        digest = str(
+            source.get("bindingDigest")
+            or source.get("binding_digest")
+            or ""
+        ).strip()
+        if digest and (
+            len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            digest = ""
+        return {
+            "run_id": normalized_run_id,
+            "session_key": session_key,
+            "binding_digest": digest,
+        }
+
+    @staticmethod
+    def _complete_governance_identity(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        run_id = str(value.get("run_id") or "").strip()
+        session_key = str(value.get("session_key") or "").strip()
+        digest = str(value.get("binding_digest") or "").strip()
+        return bool(
+            run_id
+            and session_key
+            and len(digest) == 64
+            and all(
+                character in "0123456789abcdef"
+                for character in digest
+            )
+        )
+
+    def _project_terminal_execution(
+        self,
+        execution: ExecutionResult,
+        *,
+        projection_source: str,
+    ) -> ExecutionResult:
+        """Replace Agent-reported effects with Veyra's run ledger projection."""
+
+        projection = self._authoritative_run_projection(execution.task_id)
+        raw = (
+            copy.deepcopy(execution.raw)
+            if isinstance(execution.raw, dict)
+            else {}
+        )
+        agent_response = (
+            raw.get("agent_response")
+            if isinstance(raw.get("agent_response"), dict)
+            else {}
+        )
+        reported_tool_calls = self._string_items(
+            agent_response.get("tool_calls")
+        ) or self._string_items(execution.tool_calls)
+        reported_changed_files = self._string_items(
+            agent_response.get("changed_files")
+        ) or self._string_items(execution.changed_files)
+        raw["agent_reported_tool_evidence"] = {
+            "status": "diagnostic_only",
+            "authoritative": False,
+            "tool_call_count": len(reported_tool_calls),
+            "changed_file_count": len(reported_changed_files),
+        }
+        raw["governed_tool_evidence"] = {
+            "status": projection["status"],
+            "authority_source": "veyra_private_tool_ledger",
+            "projection_source": projection_source,
+            "observed_call_count": projection["observed_call_count"],
+            "effect_count": projection["effect_count"],
+            **(
+                {"reason": projection["reason"]}
+                if projection.get("reason")
+                else {}
+            ),
+        }
+        raw["tool_receipt_refs"] = projection["tool_receipt_refs"]
+        raw["governance_cleanup"] = self._cancel_run_authority(
+            execution.task_id,
+            reason=f"terminal_projection:{projection_source}",
+            abort_chat=False,
+        )
+        return ExecutionResult(
+            task_id=execution.task_id,
+            executor=execution.executor,
+            status=execution.status,
+            result=execution.result,
+            logs=execution.logs,
+            changed_files=projection["changed_files"],
+            tool_calls=projection["tool_calls"],
+            raw=self._redact_payload(raw),
+        )
+
+    def _authoritative_run_projection(
+        self,
+        run_id: str,
+    ) -> dict[str, Any]:
+        normalized_run_id = str(run_id or "").strip()
+
+        def empty(status: str, reason: str) -> dict[str, Any]:
+            return {
+                "status": status,
+                "reason": reason[:600],
+                "tool_calls": [],
+                "changed_files": [],
+                "tool_receipt_refs": [],
+                "observed_call_count": 0,
+                "effect_count": 0,
+            }
+
+        if not normalized_run_id:
+            return empty(
+                "resolution_failed",
+                "OpenClaw terminal result has no normalized run id.",
+            )
+        if self._governance_run_evidence_resolver is None:
+            return empty(
+                "not_configured",
+                "Veyra authoritative run evidence resolver is not configured.",
+            )
+        try:
+            evidence = self._governance_run_evidence_resolver(
+                normalized_run_id
+            )
+        except Exception as exc:
+            return empty("resolution_failed", str(exc))
+        if not isinstance(evidence, dict):
+            return empty(
+                "resolution_failed",
+                "Veyra run evidence resolver returned a non-object.",
+            )
+        evidence_status = str(evidence.get("status") or "").strip().lower()
+        if evidence_status in {
+            "blocked",
+            "degraded",
+            "error",
+            "failed",
+            "not_available",
+            "not_configured",
+            "resolution_failed",
+            "unavailable",
+        }:
+            return empty(
+                "resolution_failed",
+                str(
+                    evidence.get("reason")
+                    or evidence.get("error")
+                    or f"Veyra run evidence resolver reported {evidence_status}."
+                ),
+            )
+        if str(evidence.get("run_id") or "").strip() != normalized_run_id:
+            return empty(
+                "resolution_failed",
+                "Veyra run evidence projection belongs to another run.",
+            )
+
+        tool_calls = self._string_items(evidence.get("tool_calls"))
+        changed_files = self._string_items(evidence.get("changed_files"))
+        refs = self._validated_tool_receipt_refs(
+            normalized_run_id,
+            evidence.get("tool_receipt_refs"),
+        )
+        if refs is None or len(tool_calls) != len(refs):
+            return empty(
+                "resolution_failed",
+                "Veyra run evidence projection has malformed receipt bindings.",
+            )
+        raw_observed_count = evidence.get(
+            "observed_call_count",
+            len(refs),
+        )
+        raw_effect_count = evidence.get("effect_count", 0)
+        if isinstance(raw_observed_count, bool) or isinstance(
+            raw_effect_count,
+            bool,
+        ):
+            return empty(
+                "resolution_failed",
+                "Veyra run evidence projection has invalid counters.",
+            )
+        try:
+            observed_call_count = int(raw_observed_count)
+            effect_count = int(raw_effect_count)
+        except (TypeError, ValueError):
+            return empty(
+                "resolution_failed",
+                "Veyra run evidence projection has invalid counters.",
+            )
+        if (
+            observed_call_count != len(refs)
+            or effect_count < 0
+            or effect_count > observed_call_count
+        ):
+            return empty(
+                "resolution_failed",
+                "Veyra run evidence projection counters do not match receipts.",
+            )
+        return {
+            "status": "resolved",
+            "reason": "",
+            "tool_calls": tool_calls,
+            "changed_files": changed_files,
+            "tool_receipt_refs": refs,
+            "observed_call_count": observed_call_count,
+            "effect_count": effect_count,
+        }
+
+    @staticmethod
+    def _validated_tool_receipt_refs(
+        run_id: str,
+        value: Any,
+    ) -> list[dict[str, Any]] | None:
+        if not isinstance(value, (list, tuple)):
+            return None
+        refs: list[dict[str, Any]] = []
+        for expected_index, item in enumerate(value):
+            if not isinstance(item, dict):
+                return None
+            call_id = str(item.get("tool_call_id") or "").strip()
+            digest = str(item.get("invocation_digest") or "").strip()
+            reported_index = item.get("reported_call_index")
+            if (
+                str(item.get("run_id") or "").strip() != run_id
+                or not call_id
+                or len(digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in digest
+                )
+                or isinstance(reported_index, bool)
+                or not isinstance(reported_index, int)
+                or reported_index != expected_index
+            ):
+                return None
+            refs.append(
+                {
+                    "run_id": run_id,
+                    "tool_call_id": call_id,
+                    "invocation_digest": digest,
+                    "reported_call_index": reported_index,
+                }
+            )
+        return refs
+
     def _cached_execution(self, task_id: str) -> ExecutionResult | None:
         with self._run_cache_lock:
             cached = self._run_cache.get(task_id)
@@ -1060,19 +2105,26 @@ class OpenClawAdapter(AgentAdapter):
         if status not in {"success", "error"}:
             return None
         final_event = cached.get("final_event") if isinstance(cached.get("final_event"), dict) else {}
+        public_cached = copy.deepcopy(cached)
+        public_cached.pop("governance_identity", None)
         execution_raw = self._execution_raw_for_run(
             task_id,
-            {"cached_run": cached, "poll_method": "run_cache"},
+            {"cached_run": public_cached, "poll_method": "run_cache"},
             result_text=str(cached.get("result") or ""),
         )
-        return ExecutionResult(
-            task_id=task_id,
-            executor="openclaw",
-            status=status,
-            result=str(cached.get("result") or self._message_text(final_event.get("message")) or ""),
-            changed_files=self._string_items(cached.get("changed_files")),
-            tool_calls=self._string_items(cached.get("tool_calls")),
-            raw=self._redact_payload(execution_raw),
+        return self._project_terminal_execution(
+            ExecutionResult(
+                task_id=task_id,
+                executor="openclaw",
+                status=status,
+                result=str(
+                    cached.get("result")
+                    or self._message_text(final_event.get("message"))
+                    or ""
+                ),
+                raw=execution_raw,
+            ),
+            projection_source="run_cache",
         )
 
     def _status_wait_ms(self) -> int:
@@ -1174,7 +2226,6 @@ class OpenClawAdapter(AgentAdapter):
             return None
         # This file contains local signing material and must remain gitignored.
         # Only short summaries of device-auth state may leave the adapter boundary.
-        self.device_store.parent.mkdir(parents=True, exist_ok=True)
         store = self._read_device_store()
         if not store:
             seed = os.urandom(32)
@@ -1261,16 +2312,52 @@ class OpenClawAdapter(AgentAdapter):
             self._write_device_store(store)
 
     def _read_device_store(self) -> dict[str, Any]:
+        try:
+            self._prepare_device_store_parent()
+        except OSError:
+            return {}
         if not self.device_store.exists():
             return {}
+        if self.device_store.is_symlink():
+            return {}
         try:
+            os.chmod(self.device_store, 0o600)
             data = json.loads(self.device_store.read_text(encoding="utf-8") or "{}")
         except (OSError, json.JSONDecodeError):
             return {}
         return data if isinstance(data, dict) and data.get("version") == 1 else {}
 
     def _write_device_store(self, store: dict[str, Any]) -> None:
-        self.device_store.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._prepare_device_store_parent()
+        payload = json.dumps(store, ensure_ascii=False, indent=2)
+        temporary = self.device_store.parent / f".{self.device_store.name}.{uuid4().hex}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                descriptor = -1
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.device_store)
+            os.chmod(self.device_store, 0o600)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _prepare_device_store_parent(self) -> None:
+        parent = self.device_store.parent
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Veyra's standard credential location is a dedicated local-state
+        # directory. Do not chmod arbitrary custom parent directories.
+        if self.device_store.name == "openclaw_device.json" and parent.name == "local":
+            os.chmod(parent, 0o700)
 
     def _hello_summary(self, hello: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -1439,6 +2526,10 @@ class OpenClawAdapter(AgentAdapter):
             "secret",
             "signature",
             "token",
+            "capabilitytoken",
+            "dispatchtoken",
+            "executiontoken",
+            "reservationtoken",
         }
         if isinstance(value, dict):
             redacted: dict[str, Any] = {}
@@ -1452,7 +2543,13 @@ class OpenClawAdapter(AgentAdapter):
 
     def _unconfigured_result(self, task_packet: VeyraTaskPacket) -> ExecutionResult:
         prompt = self.render_prompt(task_packet)
-        session_key = str(getattr(task_packet, "agent_execution_session_id", "") or "").strip() or self.session_key
+        session_key = self._canonical_session_key(
+            str(
+                getattr(task_packet, "agent_execution_session_id", "")
+                or ""
+            ).strip()
+            or self.session_key
+        )
         return ExecutionResult(
             task_id=task_packet.task_id,
             executor="openclaw",
@@ -1528,6 +2625,36 @@ class OpenClawAdapter(AgentAdapter):
             text,
         )
         return text[:500]
+
+    @staticmethod
+    def _openclaw_agent_id(value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", normalized):
+            raise ValueError("OpenClaw agent_id is invalid")
+        return normalized
+
+    def _canonical_session_key(self, value: str) -> str:
+        session_key = str(value or "").strip()
+        if (
+            not session_key
+            or "\x00" in session_key
+            or len(session_key.encode("utf-8")) > 512
+        ):
+            raise ValueError("OpenClaw session key is invalid")
+        if session_key in {"global", "unknown"}:
+            return session_key
+        if session_key.startswith("agent:"):
+            parts = session_key.split(":", 2)
+            if (
+                len(parts) != 3
+                or parts[1] != self.agent_id
+                or not parts[2]
+            ):
+                raise ValueError(
+                    "OpenClaw session key does not match configured agent_id"
+                )
+            return session_key
+        return f"agent:{self.agent_id}:{session_key}"
 
     @staticmethod
     def _gateway_url(raw_url: str) -> str:
