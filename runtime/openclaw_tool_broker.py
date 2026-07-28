@@ -16,6 +16,10 @@ from runtime.tool_governance_runtime import (
     ToolGovernanceRuntime,
     ToolGovernanceStorageError,
 )
+from runtime.authority_fence import (
+    agent_transport_authority_fence,
+    agent_transport_call_inflight,
+)
 from tool_proxy.execution_scope import ExecutionScope, ExecutionScopeError
 from tool_proxy.governance_contract import (
     GovernedSessionBinding,
@@ -220,12 +224,17 @@ class OpenClawToolBroker:
         run_id: str,
         session_key: str,
     ) -> HookDispatchRegistration:
-        with self._dispatch_prepare_lock:
-            return self._prepare_dispatch_locked(
-                task_packet,
-                run_id=run_id,
-                session_key=session_key,
-            )
+        with agent_transport_authority_fence(self.state_store):
+            if agent_transport_call_inflight(self.state_store):
+                raise OpenClawHookConflict(
+                    "agent transport maintenance is still in flight"
+                )
+            with self._dispatch_prepare_lock:
+                return self._prepare_dispatch_locked(
+                    task_packet,
+                    run_id=run_id,
+                    session_key=session_key,
+                )
 
     def _prepare_dispatch_locked(
         self,

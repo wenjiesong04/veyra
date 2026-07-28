@@ -80,6 +80,9 @@ CORE_MODULES: list[dict[str, str]] = [
     {"id": "runtime_cron", "path": "runtime/cron.py", "status": "p9_runtime_scheduler"},
     {"id": "attention_core", "path": "awareness/attention_core.py", "status": "mvp_foundation"},
     {"id": "project_guardian_attention", "path": "runtime/project_guardian_attention_runtime.py", "status": "phase2_shadow"},
+    {"id": "autonomy_policy", "path": "core/autonomy_policy.py", "status": "phase5_domain_scoped"},
+    {"id": "agent_transport_authority_fence", "path": "runtime/authority_fence.py", "status": "phase5_scoped_canary"},
+    {"id": "self_heal_playbook", "path": "runtime/self_heal_playbook.py", "status": "phase5_shadow"},
     {"id": "belief_uncertainty_core", "path": "awareness/belief_core.py", "status": "p8_deep_ttl"},
     {"id": "world_state", "path": "core/world_state.py", "status": "mvp_foundation"},
     {"id": "durable_case", "path": "runtime/durable_case_store.py", "status": "phase4_analysis_only"},
@@ -194,6 +197,13 @@ STATE_DEFINITIONS: list[dict[str, Any]] = [
         "file": "state/runtime/project_guardian_attention_state.json",
         "owner": "ProjectGuardianAttentionRuntime",
         "purpose": "Bound Attention policies, counterfactual assessments, dismissals, and grouped shadow situations.",
+        "freshness": "revision_backed",
+    },
+    {
+        "id": "self_heal_state",
+        "file": "state/runtime/self_heal_state.json",
+        "owner": "Runtime.OpenClawReconnectPlaybook",
+        "purpose": "Versioned target binding, failure confirmations, attempt claims, cooldown, circuit breaker, and review linkage for bounded runtime recovery.",
         "freshness": "revision_backed",
     },
     {

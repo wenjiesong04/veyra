@@ -8,6 +8,7 @@ from interface.agent_adapter import AgentAdapter
 from interface.custom_agent_adapter import CustomAgentAdapter
 from interface.hermes_adapter import HermesAdapter
 from interface.openclaw_adapter import OpenClawAdapter
+from runtime.authority_fence import agent_transport_authority_fence
 
 
 class AgentRegistry:
@@ -38,6 +39,7 @@ class AgentRegistry:
                         "base_url": os.getenv("OPENCLAW_BASE_URL", ""),
                         "api_key_env": "OPENCLAW_GATEWAY_TOKEN",
                         "enabled": True,
+                        "self_heal_identity_epoch": 0,
                     },
                     "hermes": {
                         "kind": "hermes",
@@ -121,13 +123,27 @@ class AgentRegistry:
     def upsert(self, name: str, patch: dict[str, Any]) -> dict[str, Any]:
         if name not in {"openclaw", "hermes", "custom"} and not patch.get("kind"):
             patch["kind"] = "custom"
-        config = self.config()
-        agents = config.setdefault("agents", {})
-        current = agents.get(name, {}) if isinstance(agents.get(name), dict) else {}
-        current.update({key: value for key, value in patch.items() if value is not None})
-        agents[name] = current
-        self.state_store.write_json("agent_config.json", config)
-        self.refresh()
+        # The durable config and its in-memory adapter are one authority
+        # binding. Self-heal must never observe the new config with the old
+        # adapter in the small write-to-refresh window.
+        with agent_transport_authority_fence(self.state_store):
+            config = self.config()
+            agents = config.setdefault("agents", {})
+            current = (
+                agents.get(name, {})
+                if isinstance(agents.get(name), dict)
+                else {}
+            )
+            current.update(
+                {
+                    key: value
+                    for key, value in patch.items()
+                    if value is not None
+                }
+            )
+            agents[name] = current
+            self.state_store.write_json("agent_config.json", config)
+            self.refresh()
         return self.list_status()
 
     def _build_adapter(self, name: str, config: dict[str, Any]) -> AgentAdapter | None:

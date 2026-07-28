@@ -86,6 +86,7 @@ STATE_FILE_LAYOUT: dict[str, str] = {
     "project_guardian_signal_state.json": f"{STATE_RUNTIME}/project_guardian_signal_state.json",
     "project_guardian_producer_state.json": f"{STATE_RUNTIME}/project_guardian_producer_state.json",
     "project_guardian_attention_state.json": f"{STATE_RUNTIME}/project_guardian_attention_state.json",
+    "self_heal_state.json": f"{STATE_RUNTIME}/self_heal_state.json",
     "rollback_state.json": f"{STATE_RUNTIME}/rollback_state.json",
     "replay_runtime_state.json": f"{STATE_RUNTIME}/replay_runtime_state.json",
     "ops_soak_state.json": f"{STATE_RUNTIME}/ops_soak_state.json",
@@ -134,6 +135,7 @@ STATE_METADATA: dict[str, dict[str, Any]] = {
     "project_guardian_signal_state.json": {"source": "project_guardian_signal_ledger", "ttl_seconds": 0, "confidence": 0.9},
     "project_guardian_producer_state.json": {"source": "project_guardian_producers", "ttl_seconds": 0, "confidence": 0.95},
     "project_guardian_attention_state.json": {"source": "project_guardian_attention", "ttl_seconds": 0, "confidence": 0.82},
+    "self_heal_state.json": {"source": "self_heal_playbook", "ttl_seconds": 0, "confidence": 1.0},
     "feishu_ws_state.json": {"source": "feishu_ws_runner", "ttl_seconds": 600, "confidence": 0.65},
     "ops_runtime_matrix.json": {"source": "runtime_matrix", "ttl_seconds": 1800, "confidence": 0.74},
     "ops_config.json": {"source": "ops_config", "ttl_seconds": 0, "confidence": 0.8},
@@ -153,11 +155,18 @@ DURABLE_STATE_FILES = CONFIG_STATE_FILES | {
     "project_guardian_signal_state.json",
     "project_guardian_producer_state.json",
     "project_guardian_attention_state.json",
+    "self_heal_state.json",
 }
 
 _ROOT_LOCKS_GUARD = threading.Lock()
 _ROOT_MUTATION_LOCKS: dict[str, threading.RLock] = {}
+_ROOT_AUTHORITY_LOCKS: dict[tuple[str, str], threading.RLock] = {}
+_ROOT_AUTHORITY_CALLS_INFLIGHT: set[tuple[str, str]] = set()
 _WRITER_LEASES: dict[str, dict[str, Any]] = {}
+_AUTHORITY_GUARDED_CONFIG = {
+    "agent_config.json": "agent_transport",
+    "ops_config.json": "agent_transport",
+}
 
 
 class StateWriterConflictError(RuntimeError):
@@ -301,6 +310,49 @@ class WorldStateStore:
             self._ensure_writer_lease()
             yield
 
+    @contextmanager
+    def authority_transaction(self, domain: str) -> Iterator[None]:
+        normalized = str(domain or "").strip()
+        if not normalized:
+            raise ValueError("authority domain is required")
+        key = (self._root_key, normalized)
+        with _ROOT_LOCKS_GUARD:
+            fence = _ROOT_AUTHORITY_LOCKS.setdefault(
+                key,
+                threading.RLock(),
+            )
+        with fence:
+            yield
+
+    def mark_authority_call_inflight(self, domain: str) -> bool:
+        key = (self._root_key, str(domain or "").strip())
+        if not key[1]:
+            return False
+        with _ROOT_LOCKS_GUARD:
+            if key in _ROOT_AUTHORITY_CALLS_INFLIGHT:
+                return False
+            _ROOT_AUTHORITY_CALLS_INFLIGHT.add(key)
+            return True
+
+    def clear_authority_call_inflight(self, domain: str) -> None:
+        key = (self._root_key, str(domain or "").strip())
+        with _ROOT_LOCKS_GUARD:
+            _ROOT_AUTHORITY_CALLS_INFLIGHT.discard(key)
+
+    def authority_call_inflight(self, domain: str) -> bool:
+        key = (self._root_key, str(domain or "").strip())
+        with _ROOT_LOCKS_GUARD:
+            return key in _ROOT_AUTHORITY_CALLS_INFLIGHT
+
+    @contextmanager
+    def _config_authority_transaction(self, name: str) -> Iterator[None]:
+        domain = _AUTHORITY_GUARDED_CONFIG.get(name)
+        if domain is None:
+            yield
+            return
+        with self.authority_transaction(domain):
+            yield
+
     def _selected_root(self, root: str | Path) -> str | Path:
         if str(root) != "state":
             return root
@@ -379,7 +431,11 @@ class WorldStateStore:
                     "average_source_trust": 0.0,
                 },
             },
-            "task_state.json": {"current_task": None, "history": []},
+            "task_state.json": {
+                "current_task": None,
+                "history": [],
+                "pending_agent_tasks": [],
+            },
             "attention_state.json": {"focus": [], "ignored_noise": []},
             "persona_state.json": {"active_modes": ["Minimalist"], "last_binding": None, "history": [], "updated_at": None},
             "channel_state.json": {
@@ -452,7 +508,13 @@ class WorldStateStore:
                     "max_tokens": 1600,
                 },
                 "agents": {
-                    "openclaw": {"kind": "openclaw", "base_url": "", "api_key_env": "OPENCLAW_GATEWAY_TOKEN", "enabled": True},
+                    "openclaw": {
+                        "kind": "openclaw",
+                        "base_url": "",
+                        "api_key_env": "OPENCLAW_GATEWAY_TOKEN",
+                        "enabled": True,
+                        "self_heal_identity_epoch": 0,
+                    },
                     "hermes": {"kind": "hermes", "base_url": "", "api_key_env": "HERMES_API_KEY", "enabled": True},
                     "custom": {"kind": "custom", "base_url": "", "api_key_env": "CUSTOM_AGENT_API_KEY", "enabled": True},
                 },
@@ -600,6 +662,11 @@ class WorldStateStore:
                 "last_run": None,
                 "updated_at": None,
             },
+            "self_heal_state.json": {
+                "schema_version": "veyra.self_heal_state.v1",
+                "playbooks": {},
+                "updated_at": None,
+            },
             "feishu_ws_state.json": {"status": "stopped", "last_event_at": None},
             "ops_runtime_matrix.json": {"status": "not_run", "runtimes": []},
             "ops_config.json": {
@@ -631,6 +698,18 @@ class WorldStateStore:
                     "mode": "disabled",
                     "mode_epoch": 0,
                     "allowed_modes": ["disabled", "record_only", "shadow"],
+                },
+                "self_heal": {
+                    "openclaw_reconnect": {
+                        "mode": "shadow",
+                        "mode_epoch": 0,
+                        "allowed_modes": [
+                            "disabled",
+                            "record_only",
+                            "shadow",
+                            "scoped_canary",
+                        ],
+                    },
                 },
             },
             "setup_wizard.json": {"completed": False},
@@ -788,10 +867,11 @@ class WorldStateStore:
         return merged
 
     def write_json(self, name: str, payload: dict[str, Any]) -> None:
-        with self.writer_transaction():
-            previous = self.read_json(name)
-            prepared = self._prepare_json_write(name, payload, previous)
-            self._write_json_atomic(self.path_for(name), prepared)
+        with self._config_authority_transaction(name):
+            with self.writer_transaction():
+                previous = self.read_json(name)
+                prepared = self._prepare_json_write(name, payload, previous)
+                self._write_json_atomic(self.path_for(name), prepared)
 
     def mutate_json(
         self,
@@ -799,18 +879,29 @@ class WorldStateStore:
         mutator: Callable[[dict[str, Any]], dict[str, Any] | None],
     ) -> dict[str, Any]:
         """Atomically read, mutate and replace one JSON state document."""
-        with self.writer_transaction():
-            previous = self.read_json(name)
-            working = copy.deepcopy(previous)
-            mutated = mutator(working)
-            payload = working if mutated is None else mutated
-            if not isinstance(payload, dict):
-                raise TypeError(f"mutator for {name} must return a dict or None")
-            if self._mutation_business_payload(name, payload) == self._mutation_business_payload(name, previous):
-                return copy.deepcopy(previous)
-            prepared = self._prepare_json_write(name, payload, previous, allow_stale_revision=True)
-            self._write_json_atomic(self.path_for(name), prepared)
-            return copy.deepcopy(prepared)
+        with self._config_authority_transaction(name):
+            with self.writer_transaction():
+                previous = self.read_json(name)
+                working = copy.deepcopy(previous)
+                mutated = mutator(working)
+                payload = working if mutated is None else mutated
+                if not isinstance(payload, dict):
+                    raise TypeError(
+                        f"mutator for {name} must return a dict or None"
+                    )
+                if self._mutation_business_payload(
+                    name,
+                    payload,
+                ) == self._mutation_business_payload(name, previous):
+                    return copy.deepcopy(previous)
+                prepared = self._prepare_json_write(
+                    name,
+                    payload,
+                    previous,
+                    allow_stale_revision=True,
+                )
+                self._write_json_atomic(self.path_for(name), prepared)
+                return copy.deepcopy(prepared)
 
     def patch_json(self, name: str, patch: dict[str, Any]) -> dict[str, Any]:
         return self.mutate_json(name, lambda current: {**current, **patch})
@@ -1043,6 +1134,7 @@ class WorldStateStore:
             "durable_case_state": self.read_json("durable_case_state.json"),
             "project_guardian_state": self.read_json("project_guardian_state.json"),
             "project_guardian_signal_state": self.read_json("project_guardian_signal_state.json"),
+            "self_heal_state": self.read_json("self_heal_state.json"),
             "feishu_ws_state": self.read_json("feishu_ws_state.json"),
             "ops_config": self.read_json("ops_config.json"),
         }

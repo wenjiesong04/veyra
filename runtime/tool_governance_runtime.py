@@ -11,6 +11,10 @@ from pydantic import BaseModel
 
 from core.action_risk import RISK_ORDER
 from core.world_state import WorldStateStore
+from runtime.authority_fence import (
+    agent_transport_authority_fence,
+    agent_transport_call_inflight,
+)
 from tool_proxy.governance_contract import (
     AuthoritativeToolReceipt,
     CapabilityGrant,
@@ -131,14 +135,19 @@ class ToolGovernanceRuntime:
                 "cancelled_at": None,
             }
 
-        self.state_store.mutate_json(STATE_FILE, register)
-        self._audit(
-            "session_registered",
-            {
-                "binding_digest": binding.binding_digest,
-                "run_id": binding.run_id,
-            },
-        )
+        with agent_transport_authority_fence(self.state_store):
+            if agent_transport_call_inflight(self.state_store):
+                raise ToolGovernanceConflict(
+                    "agent transport maintenance is still in flight"
+                )
+            self.state_store.mutate_json(STATE_FILE, register)
+            self._audit(
+                "session_registered",
+                {
+                    "binding_digest": binding.binding_digest,
+                    "run_id": binding.run_id,
+                },
+            )
         return binding
 
     def issue_grant(

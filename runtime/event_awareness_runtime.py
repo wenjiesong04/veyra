@@ -69,37 +69,36 @@ class ShadowAwarenessRuntime:
         if selected not in self.MODES:
             raise ValueError(f"mode must be one of {sorted(self.MODES)}")
         result: dict[str, Any] = {}
-        with self.state_store.writer_transaction():
-            def update(config: dict[str, Any]) -> None:
-                current = (
-                    config.get("event_awareness")
-                    if isinstance(config.get("event_awareness"), dict)
-                    else {}
-                )
-                previous = str(
-                    current.get("mode") or self.mode or "record_only"
-                ).strip().lower()
-                if previous not in self.MODES:
-                    previous = "record_only"
-                previous_epoch = self._nonnegative_int(
-                    current.get("mode_epoch")
-                )
-                next_epoch = previous_epoch + int(previous != selected)
-                config["event_awareness"] = {
-                    **copy.deepcopy(current),
-                    "mode": selected,
-                    "mode_epoch": next_epoch,
-                    "allowed_modes": sorted(self.MODES),
-                }
-                self.mode = selected
-                self.mode_epoch = next_epoch
-                result.update(
-                    previous_mode=previous,
-                    mode=selected,
-                    mode_epoch=next_epoch,
-                )
+        def update(config: dict[str, Any]) -> None:
+            current = (
+                config.get("event_awareness")
+                if isinstance(config.get("event_awareness"), dict)
+                else {}
+            )
+            previous = str(
+                current.get("mode") or self.mode or "record_only"
+            ).strip().lower()
+            if previous not in self.MODES:
+                previous = "record_only"
+            previous_epoch = self._nonnegative_int(
+                current.get("mode_epoch")
+            )
+            next_epoch = previous_epoch + int(previous != selected)
+            config["event_awareness"] = {
+                **copy.deepcopy(current),
+                "mode": selected,
+                "mode_epoch": next_epoch,
+                "allowed_modes": sorted(self.MODES),
+            }
+            self.mode = selected
+            self.mode_epoch = next_epoch
+            result.update(
+                previous_mode=previous,
+                mode=selected,
+                mode_epoch=next_epoch,
+            )
 
-            self.state_store.mutate_json("ops_config.json", update)
+        self.state_store.mutate_json("ops_config.json", update)
         self.state_store.append_jsonl(
             "action_record.jsonl",
             {
