@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Proves the broadened discovery surface and Agent self-heal.
+"""Proves broadened discovery and the legacy self-heal entry is constrained.
 
 Discovery: resource pressure (CPU/memory/disk), log anomalies, and Agent task drift
-become state gaps. Self-heal: a reversible reconnect runs automatically, while an
-irreversible restart is only ever escalated to a review (R4), and only when active
-commitments depend on the agent.
+become state gaps. The former private reconnect helper now delegates to the single
+Phase 5 controller and stays shadow-only by default.
 """
 from __future__ import annotations
 
@@ -32,13 +31,65 @@ def by_id(gaps: list[dict]) -> dict[str, dict]:
 
 
 class ConnectedAdapter:
-    def connection_status(self) -> dict:
-        return {"connected": True, "status": "available"}
+    gateway_url = "ws://127.0.0.1:18789"
+
+    def connection_status(self, *, force_refresh: bool = False) -> dict:
+        capabilities = {
+            "contract_version": "veyra.agent_adapter.v2",
+            "runtime": "openclaw",
+            "status": "available",
+            "connected": True,
+            "protocol": "openclaw_gateway_ws",
+            "compatibility": {
+                "status": "compatible",
+                "required_methods": {
+                    "chat.send": True,
+                    "health": True,
+                    "status": True,
+                },
+            },
+            "features": {
+                "agent_dialogue_v1": True,
+                "bounded_agent_dialogue": True,
+                "caller_supplied_run_id": True,
+                "idempotent_submit": True,
+                "exact_stop": True,
+                "enforced_execution_profile": "phase3_sandbox_proposal",
+                "tool_proxy_enforced": True,
+            },
+            "raw": {
+                "health": {"ok": True},
+                "server": {
+                    "method_count": 8,
+                    "protocol": "openclaw_gateway_ws",
+                    "version": "phase5-fixture",
+                },
+                "gateway_status": {"tasks": {"active": 0}},
+                "tools": {"items": []},
+                "skills": {"items": []},
+            },
+        }
+        return {
+            "connected": True,
+            "status": "available",
+            "capabilities": capabilities,
+        }
 
 
 class DownAdapter:
-    def connection_status(self) -> dict:
-        return {"connected": False, "status": "unavailable"}
+    gateway_url = "ws://127.0.0.1:18789"
+
+    def connection_status(self, *, force_refresh: bool = False) -> dict:
+        return {
+            "connected": False,
+            "status": "unavailable",
+            "capabilities": {
+                "runtime": "openclaw",
+                "status": "unavailable",
+                "connected": False,
+                "compatibility": {"status": "unavailable"},
+            },
+        }
 
 
 def main() -> None:
@@ -67,33 +118,48 @@ def main() -> None:
         expect(drift is not None and drift["risk_level"] == "R2", "agent task drift discovered (R2)", drift)
         expect(set(drift.get("affected_tasks") or []) == {"t1", "t2"}, "drift lists both failed and stalled tasks", drift)
 
-        # --- Self-heal: reversible reconnect runs automatically ---
+        # --- Legacy helper: only a fresh healthy observation, never a claimed repair. ---
         store.write_json("executor_state.json", {"status": "unavailable", "connected": False})
         pc_ok = ProactiveChecks(store, agency_root=str(Path(tmp) / "agency"), model_assist_enabled=False, agent_adapter_resolver=lambda: ConnectedAdapter())
+        pc_ok.self_heal.probe_runner = lambda port: {
+            "source": "openclaw_probe",
+            "target": "openclaw_runtime",
+            "status": "listening",
+            "details": {"port": port},
+            "validation": {"source": "real_probe", "observed": True},
+        }
         result = pc_ok._self_heal_agent({"gap_id": "selected_agent_unavailable", "target": "selected_agent"})
-        expect(result.get("self_heal") == "reconnected", "reversible reconnect runs automatically", result)
-        expect(store.read_json("executor_state.json").get("connected") is True, "executor state reflects reconnect", store.read_json("executor_state.json"))
+        self_heal = result.get("self_heal") or {}
+        expect(self_heal.get("status") == "shadow_healthy", "legacy entry delegates to fresh shadow observation", result)
+        expect(self_heal.get("attempt_count") == 0, "healthy observation consumes no repair attempt", self_heal)
+        expect(
+            store.read_json("executor_state.json").get("connected") is False,
+            "shadow health does not rewrite authoritative executor state",
+            store.read_json("executor_state.json"),
+        )
 
-        # --- Self-heal: restart is only escalated to review, and only when it matters ---
+        # --- Default shadow: failure is observed, with no attempt or restart review. ---
         pc_down_idle = ProactiveChecks(store, agency_root=str(Path(tmp) / "agency2"), model_assist_enabled=False, agent_adapter_resolver=lambda: DownAdapter())
+        pc_down_idle.self_heal.probe_runner = lambda port: {
+            "source": "openclaw_probe",
+            "target": "openclaw_runtime",
+            "status": "closed",
+            "details": {"port": port},
+            "validation": {"source": "real_probe", "observed": True},
+        }
         idle = pc_down_idle._self_heal_agent({"gap_id": "selected_agent_unavailable", "target": "selected_agent"})
-        expect(idle.get("self_heal") == "reconnect_failed", "no restart review when no commitments depend on agent", idle)
-        expect(not idle.get("review_id"), "idle reconnect failure creates no review", idle)
+        idle_self_heal = idle.get("self_heal") or {}
+        expect(idle_self_heal.get("status") == "shadow_qualified", "default shadow records failure without acting", idle)
+        expect(idle_self_heal.get("attempt_count") == 0, "shadow failure consumes no attempt", idle)
 
         store.write_json("user_commitments.json", {"commitments": [{"commitment_id": "c1", "kind": "weather_daily", "status": "active"}]})
         pc_down = ProactiveChecks(store, agency_root=str(Path(tmp) / "agency3"), model_assist_enabled=False, agent_adapter_resolver=lambda: DownAdapter())
-        escalated = pc_down._self_heal_agent({"gap_id": "selected_agent_unavailable", "target": "selected_agent"})
-        expect(escalated.get("self_heal") == "reconnect_failed_escalated_to_review", "restart escalates to review when commitments depend on agent", escalated)
-        expect(bool(escalated.get("review_id")), "restart escalation creates a review", escalated)
+        pc_down.self_heal.probe_runner = pc_down_idle.self_heal.probe_runner
+        observed = pc_down._self_heal_agent({"gap_id": "selected_agent_unavailable", "target": "selected_agent"})
+        expect((observed.get("self_heal") or {}).get("attempt_count") == 0, "commitments cannot bypass shadow mode", observed)
         items = store.read_json("review_queue.json").get("items", [])
-        restart = [i for i in items if isinstance(i, dict) and (i.get("proposal") or {}).get("type") == "agent_restart"]
-        expect(len(restart) == 1 and restart[0].get("risk_level") == "R4", "restart review is R4 and irreversible", restart)
-
-        # Dedup: a second self-heal does not pile up duplicate restart reviews.
-        pc_down._self_heal_agent({"gap_id": "selected_agent_unavailable", "target": "selected_agent"})
-        items2 = store.read_json("review_queue.json").get("items", [])
-        restart2 = [i for i in items2 if isinstance(i, dict) and (i.get("proposal") or {}).get("type") == "agent_restart"]
-        expect(len(restart2) == 1, "duplicate restart reviews are suppressed", restart2)
+        restart = [i for i in items if isinstance(i, dict) and "restart" in str((i.get("proposal") or {}).get("type") or "")]
+        expect(not restart, "shadow mode never creates restart reviews", restart)
 
     print("proactive_extended_smoke: ok")
 

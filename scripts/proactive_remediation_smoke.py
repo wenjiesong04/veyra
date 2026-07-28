@@ -20,8 +20,59 @@ from runtime.proactive_checks import ProactiveChecks  # noqa: E402
 
 
 class FakeAdapter:
-    def fetch_capabilities(self) -> dict:
-        return {"runtime": "openclaw", "status": "available", "connected": True, "tools": ["web_search"]}
+    gateway_url = "ws://127.0.0.1:18789"
+
+    @staticmethod
+    def capabilities() -> dict:
+        return {
+            "contract_version": "veyra.agent_adapter.v2",
+            "runtime": "openclaw",
+            "status": "available",
+            "connected": True,
+            "protocol": "openclaw_gateway_ws",
+            "compatibility": {
+                "status": "compatible",
+                "required_methods": {
+                    "chat.send": True,
+                    "health": True,
+                    "status": True,
+                },
+            },
+            "features": {
+                "agent_dialogue_v1": True,
+                "bounded_agent_dialogue": True,
+                "caller_supplied_run_id": True,
+                "idempotent_submit": True,
+                "exact_stop": True,
+                "enforced_execution_profile": "phase3_sandbox_proposal",
+                "tool_proxy_enforced": True,
+            },
+            "raw": {
+                "health": {"ok": True},
+                "server": {
+                    "method_count": 8,
+                    "protocol": "openclaw_gateway_ws",
+                    "version": "phase5-fixture",
+                },
+                "gateway_status": {"tasks": {"active": 0}},
+                "tools": {"items": [{"id": "web_search"}]},
+                "skills": {"items": []},
+            },
+        }
+
+    def connection_status(self, *, force_refresh: bool = False) -> dict:
+        caps = self.capabilities()
+        return {
+            "connected": True,
+            "status": "available",
+            "capabilities": caps,
+        }
+
+    def fetch_capabilities(self, *, force_refresh: bool = False) -> dict:
+        return self.capabilities()
+
+    def invalidate_capabilities_cache(self) -> None:
+        return None
 
 
 def expect(condition: bool, label: str, detail: object = None) -> None:
@@ -41,6 +92,13 @@ def main() -> None:
             model_assist_enabled=False,
             agent_adapter_resolver=lambda: FakeAdapter(),
         )
+        pc.self_heal.probe_runner = lambda port: {
+            "source": "openclaw_probe",
+            "target": "openclaw_runtime",
+            "status": "listening",
+            "details": {"port": port},
+            "validation": {"source": "real_probe", "observed": True},
+        }
 
         r1 = {
             "intention_id": "int_r1",
@@ -72,10 +130,21 @@ def main() -> None:
         # R1: read-only remediation actually runs and refreshes the capability snapshot.
         reviewed1 = pc._review_intention(r1)
         expect(reviewed1.get("status") == "executed_read_only", "R1 capability gap is remediated in place", reviewed1)
-        expect((reviewed1.get("remediation") or {}).get("status") == "refreshed", "capability refresh used the agent adapter", reviewed1.get("remediation"))
+        remediation = reviewed1.get("remediation") or {}
+        expect(
+            remediation.get("status") == "observed"
+            and (remediation.get("self_heal") or {}).get("status")
+            == "shadow_healthy",
+            "default shadow records a fresh capability observation",
+            remediation,
+        )
         snapshot = store.read_json("executor_state.json").get("capability_snapshot", {})
-        expect(snapshot.get("freshness") == "fresh", "executor capability snapshot is now fresh", snapshot)
-        expect("web_search" in (snapshot.get("tools") or []), "refreshed snapshot carries adapter capabilities", snapshot)
+        expect(
+            snapshot.get("freshness") == "stale"
+            and "web_search" not in (snapshot.get("tools") or []),
+            "shadow observation does not rewrite the executor capability snapshot",
+            snapshot,
+        )
 
         # R2: becomes a one-click-approvable review proposal (never auto-executed).
         reviewed2 = pc._review_intention(r2)

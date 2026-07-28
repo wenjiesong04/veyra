@@ -57,6 +57,10 @@ GATE_SMOKES = [
     "bounded_agent_negotiation_smoke.py",
     "durable_case_http_contract_smoke.py",
     "phase4_agent_callback_smoke.py",
+    "autonomy_policy_smoke.py",
+    "openclaw_reconnect_playbook_smoke.py",
+    "openclaw_reconnect_http_contract_smoke.py",
+    "self_heal_route_non_regression_smoke.py",
     "memory_integrity_smoke.py",
     "state_mutation_concurrency_smoke.py",
 ]
