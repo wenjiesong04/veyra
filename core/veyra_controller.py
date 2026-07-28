@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -27,11 +28,35 @@ class ControllerPlan:
 class VeyraController:
     """Applies capability and governance routing before any tool or agent executes."""
 
-    def __init__(self, capability_registry: CapabilityRegistry) -> None:
+    def __init__(
+        self,
+        capability_registry: CapabilityRegistry,
+        *,
+        agent_runtime_refresher: Callable[[], None] | None = None,
+    ) -> None:
         self.capabilities = capability_registry
         self.delegation_policy = DelegationPolicy(capability_registry)
+        self._agent_runtime_refresher = agent_runtime_refresher
 
     def prepare(self, decision: Decision) -> tuple[Decision, ControllerPlan]:
+        agent_refresh_attempted = False
+        agent_refresh_failed = False
+
+        def refresh_agent_observation() -> None:
+            nonlocal agent_refresh_attempted, agent_refresh_failed
+            if (
+                agent_refresh_attempted
+                or self._agent_runtime_refresher is None
+            ):
+                return
+            agent_refresh_attempted = True
+            try:
+                self._agent_runtime_refresher()
+            except Exception:
+                # A failed observation must never authorize Agent execution
+                # from a previously cached snapshot.
+                agent_refresh_failed = True
+
         delegated, delegation_trace = self.delegation_policy.apply(decision)
         delegated, semantic_boundary_reason = self._enforce_semantic_boundary(delegated)
         if semantic_boundary_reason:
@@ -42,15 +67,42 @@ class VeyraController:
             }
         normalized = self._add_route_capability(delegated)
         required = list(dict.fromkeys(normalized.required_capabilities))
+        if (
+            self._agent_runtime_refresher is not None
+            and (
+                normalized.route == Route.AGENT
+                or normalized.needs_agent
+                or "selected_agent_runtime" in required
+            )
+        ):
+            refresh_agent_observation()
         missing = self.capabilities.missing(required)
+        if agent_refresh_failed and (
+            normalized.route == Route.AGENT
+            or normalized.needs_agent
+            or "selected_agent_runtime" in required
+        ):
+            missing = self._with_failed_agent_observation(missing)
         if normalized.route == Route.BLOCK:
             return normalized, ControllerPlan(Route.BLOCK, "ready", delegation_trace.get("reason", "guardian block route selected"), missing)
         unsupported_probe = self._unsupported_probe(normalized)
         if unsupported_probe:
+            if self._agent_fallback_refresh_allowed(normalized):
+                refresh_agent_observation()
             fallback_required = self._probe_fallback_capabilities(normalized, unsupported_probe)
-            agent_capabilities = self._available_agent_capabilities_for_missing(
-                replace(normalized, required_capabilities=fallback_required),
-                [{"capability": capability} for capability in fallback_required],
+            agent_capabilities = (
+                []
+                if agent_refresh_failed
+                else self._available_agent_capabilities_for_missing(
+                    replace(
+                        normalized,
+                        required_capabilities=fallback_required,
+                    ),
+                    [
+                        {"capability": capability}
+                        for capability in fallback_required
+                    ],
+                )
             )
             if agent_capabilities:
                 adjusted = replace(
@@ -84,8 +136,19 @@ class VeyraController:
                 constraints=list(dict.fromkeys(normalized.constraints + ["do not execute unsupported probe"])),
             )
             return adjusted, ControllerPlan(Route.ASK_USER, "missing_probe", adjusted.reason, [{"capability": unsupported_probe, "reason": "unsupported_native_probe"}])
+        if missing and self._agent_fallback_refresh_allowed(normalized):
+            refresh_agent_observation()
+            if agent_refresh_failed:
+                missing = self._with_failed_agent_observation(missing)
+            else:
+                # ASK_USER capability gaps may have been classified from an
+                # expired provider snapshot. Recompute after the one bounded
+                # refresh before deciding whether an Agent fallback exists.
+                missing = self.capabilities.missing(required)
         if missing:
             agent_capabilities = self._available_agent_capabilities_for_missing(normalized, missing)
+            if agent_refresh_failed:
+                agent_capabilities = []
             if agent_capabilities:
                 adjusted = replace(
                     normalized,
@@ -108,7 +171,10 @@ class VeyraController:
                     ),
                 )
                 return adjusted, ControllerPlan(Route.AGENT, "rerouted", adjusted.reason, missing)
-            if self._should_agent_fallback(normalized):
+            if (
+                not agent_refresh_failed
+                and self._should_agent_fallback(normalized)
+            ):
                 adjusted = replace(
                     normalized,
                     route=Route.AGENT,
@@ -165,6 +231,41 @@ class VeyraController:
             )
             return adjusted, ControllerPlan(Route.AGENT, "rerouted", "execution requires agent runtime", [])
         return normalized, ControllerPlan(normalized.route, "ready", str(delegation_trace.get("reason") or "route is executable"), [])
+
+    def _agent_fallback_refresh_allowed(self, decision: Decision) -> bool:
+        return bool(
+            decision.risk_level.value in {"R0", "R1"}
+            and self._semantic_effect_allowed(decision, "agent.execute")
+            and decision.route
+            in {
+                Route.DIRECT_ANSWER,
+                Route.PROBE,
+                Route.ASK_USER,
+                Route.AGENT,
+            }
+        )
+
+    @staticmethod
+    def _with_failed_agent_observation(
+        missing: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if any(
+            str(item.get("capability") or "")
+            == "selected_agent_runtime"
+            for item in missing
+        ):
+            return missing
+        return [
+            *missing,
+            {
+                "capability": "selected_agent_runtime",
+                "available": False,
+                "status": "observation_failed",
+                "reason": (
+                    "selected Agent Runtime freshness observation failed"
+                ),
+            },
+        ]
 
     def _available_agent_capabilities_for_missing(self, decision: Decision, missing: list[dict[str, Any]]) -> list[str]:
         if not self._semantic_effect_allowed(decision, "agent.execute"):

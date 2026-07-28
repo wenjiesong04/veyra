@@ -10,6 +10,7 @@ from typing import Any
 from core.model_client import redact_sensitive
 from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
+from interface.provider_certification import certify_agent_provider
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,46 +106,118 @@ AGENT_CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
 class CapabilityRegistry:
     """Compact capability inventory exposed to Core cognition and Controller gates."""
 
-    def __init__(self, state_store: WorldStateStore) -> None:
+    def __init__(
+        self,
+        state_store: WorldStateStore,
+        *,
+        now: datetime | None = None,
+    ) -> None:
         self.state_store = state_store
+        if now is not None and now.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+        self._fixed_now = now.astimezone(timezone.utc) if now is not None else None
 
     def snapshot(self) -> dict[str, Any]:
         config = self.state_store.read_json("agent_config.json")
         selected_agent = str(config.get("selected_agent") or "openclaw")
         agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
         selected_config = agents.get(selected_agent) if isinstance(agents.get(selected_agent), dict) else {}
-        agent_enabled = bool(selected_config.get("enabled", True))
+        agent_enabled = bool(selected_config and selected_config.get("enabled", True))
         agent_base_url = str(selected_config.get("base_url") or "")
+        executor_state = self.state_store.read_json("executor_state.json")
+        selected_certification = self._provider_certification(
+            selected_agent,
+            executor_state,
+            trusted_native_adapter=self._trusted_native_adapter(
+                selected_agent,
+                selected_config,
+            ),
+        )
+        selected_provider_available = self._provider_dispatch_available(
+            selected_agent,
+            selected_config,
+            selected_certification,
+            executor_state,
+        )
         now = utc_now_iso()
 
         capabilities = self._static_capabilities()
         capabilities.update(self._tool_proxy_capabilities(now))
         capabilities.update(self._mcp_capabilities(now))
-        agent_runtime_available = bool(agent_enabled and (agent_base_url or selected_agent in agents))
         capabilities["selected_agent_runtime"] = Capability(
             capability_id="selected_agent_runtime",
-            available=agent_runtime_available,
+            available=selected_provider_available,
             kind="agent_runtime",
             route="agent",
             executor=selected_agent,
             description="Governed handoff to the selected AgentAdapter runtime.",
-            status="configured" if agent_base_url else "interface_available",
-            reason="" if agent_base_url else "AgentAdapter exists, but the selected runtime endpoint may still be unconfigured.",
-            source="agent_config",
-            updated_at=now,
+            status=self._provider_status(
+                selected_certification,
+                enabled=agent_enabled,
+                dispatch_available=selected_provider_available,
+            ),
+            reason=self._provider_reason(
+                selected_agent,
+                selected_certification,
+                enabled=agent_enabled,
+                dispatch_available=selected_provider_available,
+            ),
+            source="executor_state.capabilities",
+            updated_at=str(
+                selected_certification.get("observed_at") or ""
+            ),
+            ttl_seconds=int(selected_certification.get("ttl_seconds") or 300),
             namespace="agent",
+        )
+        openclaw_config = (
+            agents.get("openclaw")
+            if isinstance(agents.get("openclaw"), dict)
+            else {}
+        )
+        openclaw_enabled = bool(
+            openclaw_config and openclaw_config.get("enabled", True)
+        )
+        openclaw_certification = (
+            selected_certification
+            if selected_agent == "openclaw"
+            else self._provider_certification(
+                "openclaw",
+                executor_state,
+                trusted_native_adapter=self._trusted_native_adapter(
+                    "openclaw",
+                    openclaw_config,
+                ),
+            )
+        )
+        openclaw_available = self._provider_dispatch_available(
+            "openclaw",
+            openclaw_config,
+            openclaw_certification,
+            executor_state,
         )
         capabilities["openclaw_runtime"] = Capability(
             capability_id="openclaw_runtime",
-            available=self._agent_available(agents, "openclaw") or bool(agents.get("openclaw")),
+            available=openclaw_available,
             kind="agent_runtime",
             route="agent",
             executor="openclaw",
             description="OpenClaw runtime execution through the AgentAdapter contract.",
-            status="configured" if self._agent_base_url(agents, "openclaw") else "not_configured",
-            reason="" if self._agent_base_url(agents, "openclaw") else "OpenClaw base_url is not configured.",
-            source="agent_config",
-            updated_at=now,
+            status=self._provider_status(
+                openclaw_certification,
+                enabled=openclaw_enabled,
+                dispatch_available=openclaw_available,
+            ),
+            reason=self._provider_reason(
+                "openclaw",
+                openclaw_certification,
+                enabled=openclaw_enabled,
+                dispatch_available=openclaw_available,
+            ),
+            source="executor_state.capabilities",
+            updated_at=str(
+                openclaw_certification.get("observed_at") or ""
+            ),
+            ttl_seconds=int(openclaw_certification.get("ttl_seconds") or 300),
             namespace="agent",
         )
         capabilities["web_search"] = Capability(
@@ -180,7 +253,13 @@ class CapabilityRegistry:
             reason="The channel must supply OCR, caption, or a vision adapter before Core can inspect image bytes.",
             updated_at=now,
         )
-        agent_capabilities = self._agent_capabilities(selected_agent, selected_config)
+        agent_capabilities = self._agent_capabilities(
+            selected_agent,
+            selected_config,
+            selected_certification,
+            executor_state,
+            provider_dispatch_available=selected_provider_available,
+        )
         capabilities.update(agent_capabilities)
         missing = self._missing_summary(capabilities, selected_agent)
 
@@ -229,9 +308,24 @@ class CapabilityRegistry:
                     "enabled": agent_enabled,
                     "base_url_configured": bool(agent_base_url),
                     "kind": selected_config.get("kind"),
-                    "capability_source": self._agent_capability_source(selected_config),
+                    "capability_source": (
+                        "executor_state.capabilities"
+                        if isinstance(executor_state.get("capabilities"), dict)
+                        and executor_state.get("capabilities")
+                        else self._agent_capability_source(selected_config)
+                    ),
+                    "provider_certified": (
+                        selected_certification.get("validated") is True
+                    ),
+                    "task_dispatch_available": (
+                        selected_provider_available
+                    ),
+                    "certification_status": selected_certification.get(
+                        "certification_status"
+                    ),
                 }
             ),
+            "provider_certification": selected_certification,
         }
 
     def is_available(self, capability_id: str) -> bool:
@@ -466,25 +560,61 @@ class CapabilityRegistry:
             ),
         }
 
-    def _agent_capabilities(self, selected_agent: str, selected_config: dict[str, Any]) -> dict[str, Capability]:
+    def _agent_capabilities(
+        self,
+        selected_agent: str,
+        selected_config: dict[str, Any],
+        provider_certification: dict[str, Any],
+        executor_state: dict[str, Any],
+        *,
+        provider_dispatch_available: bool,
+    ) -> dict[str, Capability]:
         output: dict[str, Capability] = {}
-        advertised = self._advertised_agent_capabilities(selected_agent, selected_config)
+        advertised = self._advertised_agent_capabilities(
+            selected_agent,
+            selected_config,
+            executor_state,
+        )
         runtime_configured = bool(selected_config.get("base_url")) or bool(selected_config)
+        provider_available = provider_dispatch_available
+        certification_status = str(
+            provider_certification.get("certification_status") or "unverified"
+        )
+        certification_reason = self._provider_reason(
+            selected_agent,
+            provider_certification,
+            enabled=bool(
+                selected_config and selected_config.get("enabled", True)
+            ),
+            dispatch_available=provider_dispatch_available,
+        )
         snapshot_status = advertised.get("_snapshot_status", "unknown")
-        snapshot_updated_at = str(advertised.get("_updated_at") or utc_now_iso())
+        snapshot_updated_at = str(advertised.get("_updated_at") or "")
         ttl_seconds = int(advertised.get("_ttl_seconds") or 300)
         for name in AGENT_CAPABILITY_NAMES:
             capability_id = f"{selected_agent}.{name}"
-            available = bool(advertised.get(name))
-            status = "available" if available else "unknown" if runtime_configured else "unavailable"
+            advertised_available = bool(advertised.get(name))
+            available = bool(provider_available and advertised_available)
+            status = (
+                "available"
+                if available
+                else certification_status
+                if not provider_available
+                else "unknown"
+                if runtime_configured
+                else "unavailable"
+            )
             reason = ""
-            if not available:
+            if not provider_available:
+                reason = certification_reason
+            elif not advertised_available:
                 reason = (
                     f"{selected_agent} has not advertised {name}; refresh selected runtime capabilities."
                     if runtime_configured
                     else f"{selected_agent} runtime is not configured."
                 )
-            if snapshot_status in {"stale", "expired"} and available:
+            if snapshot_status in {"stale", "expired"} and advertised_available:
+                available = False
                 status = snapshot_status
                 reason = f"{selected_agent} previously advertised {name}, but the capability snapshot is {snapshot_status}."
             output[capability_id] = Capability(
@@ -503,47 +633,81 @@ class CapabilityRegistry:
             )
         return output
 
-    def _advertised_agent_capabilities(self, selected_agent: str, selected_config: dict[str, Any]) -> dict[str, Any]:
-        values = set(self._collect_capability_tokens(selected_config.get("capabilities")))
-        values.update(self._collect_capability_tokens(selected_config.get("tools")))
-        features = selected_config.get("features") if isinstance(selected_config.get("features"), dict) else {}
-        values.update(name for name, enabled in features.items() if enabled)
-        snapshot = self._executor_capability_snapshot(selected_agent)
+    def _advertised_agent_capabilities(
+        self,
+        selected_agent: str,
+        selected_config: dict[str, Any],
+        executor_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        observed_values: set[str] = set()
+        snapshot = self._executor_capability_snapshot(
+            selected_agent,
+            executor_state,
+        )
         snapshot_capabilities = snapshot.get("capabilities") if isinstance(snapshot.get("capabilities"), dict) else {}
         snapshot_tools = snapshot.get("tools") if isinstance(snapshot.get("tools"), list) else []
         snapshot_features = snapshot.get("features") if isinstance(snapshot.get("features"), dict) else {}
-        values.update(self._collect_capability_tokens(snapshot_tools))
-        values.update(self._collect_capability_tokens(snapshot.get("raw")))
-        values.update(name for name, enabled in snapshot_features.items() if enabled)
+        observed_values.update(self._collect_capability_tokens(snapshot_tools))
+        observed_values.update(
+            self._collect_capability_tokens(snapshot.get("raw"))
+        )
+        observed_values.update(
+            name for name, enabled in snapshot_features.items() if enabled
+        )
         for item in snapshot_capabilities.values():
             if isinstance(item, dict):
-                values.update(self._collect_capability_tokens(item.get("tools")))
-                values.update(self._collect_capability_tokens(item.get("skills")))
-                values.update(self._collect_capability_tokens(item.get("raw")))
+                observed_values.update(
+                    self._collect_capability_tokens(item.get("tools"))
+                )
+                observed_values.update(
+                    self._collect_capability_tokens(item.get("skills"))
+                )
+                observed_values.update(
+                    self._collect_capability_tokens(item.get("raw"))
+                )
         output: dict[str, Any] = {
             "_source": snapshot.get("source") or self._agent_capability_source(selected_config),
-            "_updated_at": snapshot.get("updated_at") or selected_config.get("updated_at") or utc_now_iso(),
+            "_updated_at": (
+                snapshot.get("updated_at")
+                or selected_config.get("updated_at")
+                or ""
+            ),
             "_ttl_seconds": snapshot.get("ttl_seconds") or selected_config.get("capability_ttl_seconds") or 300,
             "_snapshot_status": snapshot.get("freshness") or self._freshness(str(snapshot.get("updated_at") or selected_config.get("updated_at") or ""), int(snapshot.get("ttl_seconds") or selected_config.get("capability_ttl_seconds") or 300)),
         }
-        normalized_values = {str(value).lower() for value in values}
+        normalized_values = {
+            str(value).lower() for value in observed_values
+        }
         for name, aliases in AGENT_CAPABILITY_ALIASES.items():
             output[name] = any(alias.lower() in normalized_values for alias in aliases)
         return output
 
-    def _executor_capability_snapshot(self, selected_agent: str) -> dict[str, Any]:
-        executor = self.state_store.read_json("executor_state.json")
-        snapshot = executor.get("capability_snapshot") if isinstance(executor.get("capability_snapshot"), dict) else {}
-        if not snapshot:
-            capabilities = executor.get("capabilities") if isinstance(executor.get("capabilities"), dict) else {}
-            if capabilities:
-                snapshot = {
-                    **capabilities,
-                    "runtime": capabilities.get("runtime") or selected_agent,
-                    "updated_at": capabilities.get("updated_at") or executor.get("updated_at"),
-                    "ttl_seconds": capabilities.get("ttl_seconds") or 300,
-                    "source": "executor_state.capabilities",
-                }
+    def _executor_capability_snapshot(
+        self,
+        selected_agent: str,
+        executor: dict[str, Any],
+    ) -> dict[str, Any]:
+        capabilities = (
+            executor.get("capabilities")
+            if isinstance(executor.get("capabilities"), dict)
+            else {}
+        )
+        if capabilities:
+            snapshot = {
+                **capabilities,
+                "runtime": capabilities.get("runtime") or selected_agent,
+                "updated_at": capabilities.get("updated_at"),
+                "ttl_seconds": capabilities.get("ttl_seconds")
+                or executor.get("ttl_seconds")
+                or 300,
+                "source": "executor_state.capabilities",
+            }
+        else:
+            snapshot = (
+                executor.get("capability_snapshot")
+                if isinstance(executor.get("capability_snapshot"), dict)
+                else {}
+            )
         if snapshot and str(snapshot.get("runtime") or snapshot.get("agent") or selected_agent) != selected_agent:
             return {}
         if not snapshot:
@@ -590,12 +754,198 @@ class CapabilityRegistry:
             return "unknown"
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
-        age = (datetime.now(timezone.utc) - parsed).total_seconds()
+        age = (self._now() - parsed).total_seconds()
         if age > ttl_seconds * 2:
             return "expired"
         if age > ttl_seconds:
             return "stale"
         return "fresh"
+
+    def _provider_certification(
+        self,
+        selected_agent: str,
+        executor_state: dict[str, Any],
+        *,
+        trusted_native_adapter: bool = False,
+    ) -> dict[str, Any]:
+        capabilities = (
+            executor_state.get("capabilities")
+            if isinstance(executor_state.get("capabilities"), dict)
+            else {}
+        )
+        ttl_seconds = self._provider_ttl(
+            executor_state.get("ttl_seconds")
+            or capabilities.get("ttl_seconds")
+            or 300
+        )
+        try:
+            certification = certify_agent_provider(
+                runtime=selected_agent,
+                capabilities=capabilities,
+                observed_at=capabilities.get("updated_at"),
+                now=self._now(),
+                ttl_seconds=ttl_seconds,
+                trusted_native_adapter=trusted_native_adapter,
+            )
+        except (TypeError, ValueError):
+            certification = {
+                "schema_version": "veyra.provider_certification.v1",
+                "runtime": selected_agent[:120],
+                "certification_status": "unverified",
+                "validated": False,
+                "observed_at": None,
+                "ttl_seconds": ttl_seconds,
+                "expires_at": None,
+                "freshness": {
+                    "status": "unknown",
+                    "age_seconds": None,
+                },
+                "evidence": {},
+                "issues": ["provider_certification_input_invalid"],
+                "read_only_dispatch_allowed": False,
+                "automatic_selection_allowed": False,
+                "provider_switch_allowed": False,
+                "side_effect_dispatch_allowed": False,
+                "policy_effect": "none",
+            }
+        executor_runtime = str(
+            executor_state.get("selected_agent") or ""
+        )
+        executor_status = str(executor_state.get("status") or "unknown")
+        executor_ready = bool(
+            executor_runtime == selected_agent
+            and executor_state.get("connected") is True
+            and executor_status in {"available", "ok", "success"}
+        )
+        if executor_ready:
+            return certification
+        issues = certification.get("issues")
+        selected_issues = (
+            [str(item) for item in issues]
+            if isinstance(issues, list)
+            else []
+        )
+        selected_issues.append(
+            "executor_runtime_identity_mismatch"
+            if executor_runtime != selected_agent
+            else "executor_not_currently_available"
+        )
+        return {
+            **certification,
+            "certification_status": (
+                "incompatible"
+                if executor_runtime
+                and executor_runtime != selected_agent
+                else "unverified"
+            ),
+            "validated": False,
+            "issues": sorted(set(selected_issues)),
+            "read_only_dispatch_allowed": False,
+            "automatic_selection_allowed": False,
+            "provider_switch_allowed": False,
+            "side_effect_dispatch_allowed": False,
+            "policy_effect": "none",
+        }
+
+    @staticmethod
+    def _trusted_native_adapter(
+        runtime: str,
+        config: dict[str, Any],
+    ) -> bool:
+        if runtime != "openclaw" or not isinstance(config, dict):
+            return False
+        return (
+            bool(config)
+            and config.get("enabled", True) is not False
+            and str(config.get("kind") or runtime).lower() == "openclaw"
+        )
+
+    def _provider_status(
+        self,
+        certification: dict[str, Any],
+        *,
+        enabled: bool,
+        dispatch_available: bool,
+    ) -> str:
+        if not enabled:
+            return "disabled"
+        if dispatch_available:
+            return "available"
+        if certification.get("validated") is True:
+            return "diagnostic_only"
+        return str(
+            certification.get("certification_status") or "unverified"
+        )
+
+    def _provider_reason(
+        self,
+        runtime: str,
+        certification: dict[str, Any],
+        *,
+        enabled: bool,
+        dispatch_available: bool = False,
+    ) -> str:
+        if not enabled:
+            return f"{runtime} runtime is disabled or absent from agent config."
+        if dispatch_available:
+            return ""
+        if certification.get("validated") is True:
+            return (
+                f"{runtime} is protocol-compatible for diagnostics, but "
+                "has no fresh locally enforced governed task-dispatch path."
+            )
+        issues = certification.get("issues")
+        details = (
+            ", ".join(str(item) for item in issues[:8])
+            if isinstance(issues, list)
+            else "provider_certification_missing"
+        )
+        return (
+            f"{runtime} has no fresh exact-compatible v2 provider "
+            f"certification: {details}."
+        )
+
+    def _provider_dispatch_available(
+        self,
+        runtime: str,
+        config: dict[str, Any],
+        certification: dict[str, Any],
+        executor_state: dict[str, Any],
+    ) -> bool:
+        if (
+            certification.get("validated") is not True
+            or not self._trusted_native_adapter(runtime, config)
+        ):
+            return False
+        capabilities = (
+            executor_state.get("capabilities")
+            if isinstance(executor_state.get("capabilities"), dict)
+            else {}
+        )
+        features = (
+            capabilities.get("features")
+            if isinstance(capabilities.get("features"), dict)
+            else {}
+        )
+        return bool(
+            features.get("tool_proxy_enforced") is True
+            and features.get("tool_proxy_identity_match") is True
+            and features.get("tool_proxy_enforcement_scope")
+            == "veyra_governed_openclaw_sessions"
+            and features.get("governance_callbacks_complete") is True
+        )
+
+    def _now(self) -> datetime:
+        return self._fixed_now or datetime.now(timezone.utc)
+
+    def _provider_ttl(self, value: Any) -> int:
+        if isinstance(value, bool):
+            return 300
+        try:
+            selected = int(value)
+        except (TypeError, ValueError):
+            return 300
+        return selected if 1 <= selected <= 86_400 else 300
 
     def _string_list(self, value: Any) -> list[str]:
         if isinstance(value, list):
@@ -652,11 +1002,3 @@ class CapabilityRegistry:
                 if nested_key in value:
                     tokens.update(self._collect_capability_tokens(value.get(nested_key)))
         return tokens
-
-    def _agent_available(self, agents: dict[str, Any], name: str) -> bool:
-        agent = agents.get(name) if isinstance(agents.get(name), dict) else {}
-        return bool(agent.get("enabled", True) and self._agent_base_url(agents, name))
-
-    def _agent_base_url(self, agents: dict[str, Any], name: str) -> str:
-        agent = agents.get(name) if isinstance(agents.get(name), dict) else {}
-        return str(agent.get("base_url") or "")

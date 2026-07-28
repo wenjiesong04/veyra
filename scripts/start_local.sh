@@ -39,6 +39,12 @@ if [ -f .env ]; then
   PORT="${VEYRA_PORT:-$PORT}"
 fi
 
+# Keep the policy declaration and the uvicorn listener on the exact same
+# resolved values. In particular, command-line --host/--port selections must
+# be visible to main.py rather than existing only as shell-local variables.
+export VEYRA_HOST="$HOST"
+export VEYRA_PORT="$PORT"
+
 if [ -x .venv/bin/python ]; then
   PYTHON_BIN="$ROOT/.venv/bin/python"
 else
@@ -57,12 +63,19 @@ else
   fi
 fi
 
-echo "==> Ensuring local state exists"
-"$PYTHON_BIN" - <<'PY'
+if [ "$MODE" = "foreground" ]; then
+  echo "==> Ensuring local state exists"
+  "$PYTHON_BIN" - <<'PY'
 from core.world_state import WorldStateStore
 
 WorldStateStore()
 PY
+else
+  # A running launchd instance owns the exclusive state-writer lease until
+  # bootout below. The replacement API initializes state after acquiring that
+  # lease, so a competing preflight writer would make every restart fail.
+  echo "==> State initialization delegated to the launchd API process"
+fi
 
 if [ "$MODE" = "launchd" ]; then
   if [ "$(uname -s)" != "Darwin" ]; then
@@ -84,7 +97,7 @@ if [ "$MODE" = "launchd" ]; then
   <array>
     <string>/bin/zsh</string>
     <string>-lc</string>
-    <string>cd "$ROOT" || exit 1; set -a; [ -f .env ] &amp;&amp; source .env; set +a; exec "$PYTHON_BIN" -B -m uvicorn main:app --host "$HOST" --port "$PORT"</string>
+    <string>cd "$ROOT" || exit 1; set -a; [ -f .env ] &amp;&amp; source .env; set +a; export VEYRA_HOST="$HOST" VEYRA_PORT="$PORT"; exec "$PYTHON_BIN" -B -m uvicorn main:app --host "$HOST" --port "$PORT"</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

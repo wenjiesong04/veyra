@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Iterable, Mapping
 
 from core.definitions import RiskLevel
 
@@ -41,11 +42,18 @@ _CAPABILITY_MINIMUM_LEVEL = {
     # The first playbook only performs a fresh authenticated transport
     # handshake. It does not restart a process or switch a provider.
     "agent.reconnect": AutonomyLevel.A2,
+    # A3 is confined to a Veyra-owned disposable sandbox. These capabilities
+    # do not authorize a source/workspace read, shell, Agent, network call, or
+    # promotion into a real environment.
+    "sandbox.json_candidate.stage": AutonomyLevel.A3,
+    "sandbox.json_candidate.verify": AutonomyLevel.A3,
 }
 _CAPABILITY_ALLOWED_MODES = {
     "agent.status.read": {"shadow", "scoped_canary"},
     "agent.capabilities.refresh": {"shadow", "scoped_canary"},
     "agent.reconnect": {"scoped_canary"},
+    "sandbox.json_candidate.stage": {"scoped_canary"},
+    "sandbox.json_candidate.verify": {"scoped_canary"},
 }
 
 
@@ -174,3 +182,203 @@ class DomainAutonomyProfile:
         except ValueError:
             return None
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+@dataclass(frozen=True, slots=True)
+class AutonomyDecision:
+    """Structured result from the immutable domain policy selector.
+
+    ``requested_level`` is diagnostic only. A caller, model, or Agent cannot
+    raise the selected profile by asking for A4/A5.
+    """
+
+    outcome: str
+    reason_code: str
+    profile_id: str | None
+    domain: str
+    capability: str
+    effective_level: AutonomyLevel
+    requested_level: str | None
+    certified: bool
+
+    @property
+    def allowed(self) -> bool:
+        return self.outcome == "allowed"
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "outcome": self.outcome,
+            "reason_code": self.reason_code,
+            "profile_id": self.profile_id,
+            "domain": self.domain,
+            "capability": self.capability,
+            "effective_level": self.effective_level.value,
+            "requested_level": self.requested_level,
+            "certified": self.certified,
+            "global_authority": False,
+        }
+
+
+class AutonomyPolicyRegistry:
+    """Immutable exact-profile selector for domain-scoped authority.
+
+    Profiles are supplied by trusted application assembly. There is
+    intentionally no runtime registration or mutation method.
+    """
+
+    def __init__(
+        self,
+        profiles: Iterable[DomainAutonomyProfile],
+    ) -> None:
+        selected: dict[str, DomainAutonomyProfile] = {}
+        for profile in profiles:
+            if not isinstance(profile, DomainAutonomyProfile):
+                raise TypeError("autonomy profiles must be DomainAutonomyProfile")
+            if not profile.profile_id or profile.profile_id != profile.profile_id.strip():
+                raise ValueError("autonomy profile_id must be normalized")
+            if profile.profile_id in selected:
+                raise ValueError(
+                    f"duplicate autonomy profile_id: {profile.profile_id}"
+                )
+            if profile.level in {AutonomyLevel.A4, AutonomyLevel.A5}:
+                raise ValueError(
+                    "A4/A5 profiles require a future certified authority loader"
+                )
+            selected[profile.profile_id] = profile
+        self._profiles: Mapping[str, DomainAutonomyProfile] = (
+            MappingProxyType(selected)
+        )
+
+    def profile(self, profile_id: str) -> DomainAutonomyProfile | None:
+        return self._profiles.get(str(profile_id or ""))
+
+    def decide(
+        self,
+        *,
+        profile_id: str,
+        domain: str,
+        capability: str,
+        risk_level: RiskLevel | str,
+        user_scope: str,
+        environment: str,
+        target_scope: str,
+        mode: str,
+        attempt_count: int,
+        cooldown_elapsed: bool,
+        requested_level: AutonomyLevel | str | None = None,
+        now: datetime | None = None,
+    ) -> AutonomyDecision:
+        requested = (
+            requested_level.value
+            if isinstance(requested_level, AutonomyLevel)
+            else str(requested_level)
+            if requested_level is not None
+            else None
+        )
+        if requested in {AutonomyLevel.A4.value, AutonomyLevel.A5.value}:
+            return self._decision(
+                outcome="not_certified",
+                reason_code="requested_level_not_certified",
+                profile=None,
+                domain=domain,
+                capability=capability,
+                requested_level=requested,
+            )
+        profile = self.profile(profile_id)
+        if profile is None:
+            return self._decision(
+                outcome="denied",
+                reason_code="unknown_profile",
+                profile=None,
+                domain=domain,
+                capability=capability,
+                requested_level=requested,
+            )
+        if domain != profile.domain:
+            return self._decision(
+                outcome="denied",
+                reason_code="domain_mismatch",
+                profile=profile,
+                domain=domain,
+                capability=capability,
+                requested_level=requested,
+            )
+        allowed = profile.permits(
+            capability=capability,
+            risk_level=risk_level,
+            user_scope=user_scope,
+            environment=environment,
+            target_scope=target_scope,
+            mode=mode,
+            attempt_count=attempt_count,
+            cooldown_elapsed=cooldown_elapsed,
+            now=now,
+        )
+        return self._decision(
+            outcome="allowed" if allowed else "denied",
+            reason_code="profile_permitted" if allowed else "profile_denied",
+            profile=profile,
+            domain=domain,
+            capability=capability,
+            requested_level=requested,
+        )
+
+    def public_status(self) -> dict[str, Any]:
+        return {
+            "scope": "domain_scoped",
+            "global_level": None,
+            "profiles": [
+                profile.to_public_dict()
+                for _, profile in sorted(self._profiles.items())
+            ],
+            "certification": {
+                AutonomyLevel.A4.value: "not_certified",
+                AutonomyLevel.A5.value: "not_certified",
+            },
+        }
+
+    @staticmethod
+    def _decision(
+        *,
+        outcome: str,
+        reason_code: str,
+        profile: DomainAutonomyProfile | None,
+        domain: str,
+        capability: str,
+        requested_level: str | None,
+    ) -> AutonomyDecision:
+        return AutonomyDecision(
+            outcome=outcome,
+            reason_code=reason_code,
+            profile_id=profile.profile_id if profile else None,
+            domain=str(domain or ""),
+            capability=str(capability or ""),
+            effective_level=(
+                profile.level
+                if outcome == "allowed" and profile is not None
+                else AutonomyLevel.A0
+            ),
+            requested_level=requested_level,
+            certified=False,
+        )
+
+
+JSON_SANDBOX_REPAIR_PROFILE = DomainAutonomyProfile(
+    profile_id="aut.sandbox_repair.json_candidate.v1",
+    policy_version=1,
+    level=AutonomyLevel.A3,
+    enabled=True,
+    revoked=False,
+    user_scope="local-user",
+    domain="sandbox_repair",
+    environment="local",
+    capabilities=(
+        "sandbox.json_candidate.stage",
+        "sandbox.json_candidate.verify",
+    ),
+    target_scope="veyra_private:sandbox_repair_json",
+    risk_ceiling=RiskLevel.R2,
+    max_attempts=1,
+    cooldown_seconds=0,
+    allowed_modes=("shadow", "scoped_canary"),
+)

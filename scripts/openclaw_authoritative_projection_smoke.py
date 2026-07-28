@@ -119,6 +119,14 @@ def main() -> int:
         base_url="ws://127.0.0.1:18789",
         governance_run_evidence_resolver=resolve,
     )
+    immediate._governed_dispatch_preflight = (  # type: ignore[method-assign]
+        lambda: {
+            "allowed": True,
+            "status": "validated",
+            "reasons": [],
+            "policy_effect": "none",
+        }
+    )
 
     def send_final(
         _message: str,

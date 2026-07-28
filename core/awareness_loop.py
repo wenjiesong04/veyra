@@ -54,6 +54,7 @@ from interface.agent_adapter import ExecutionResult
 from interface.channel_adapter import ChannelAdapter
 from interface.agent_registry import AgentRegistry
 from interface.event_schema import Decision, LoopResult, Route, VeyraEvent, utc_now_iso
+from interface.openclaw_adapter import OpenClawAdapter
 from memory_bridge.local_memory_bridge import LocalMemoryBridge
 from probes.git_probe import GitProbe
 from probes.hermes_probe import HermesProbe
@@ -139,7 +140,12 @@ class AwarenessLoop:
         )
         self.memory_policy_runtime = MemoryPolicyRuntime(state_store, lambda patch: self.memory_bridge.write_patch(patch))
         self.state_proposals = StateChangeProposalStore(state_store)
-        self.controller = VeyraController(self.capabilities)
+        self.controller = VeyraController(
+            self.capabilities,
+            agent_runtime_refresher=(
+                self._refresh_selected_agent_runtime_observation
+            ),
+        )
         self.runtime_trace = RuntimeTraceRecorder(state_store)
         event_awareness_config = state_store.read_json("ops_config.json").get(
             "event_awareness",
@@ -3642,6 +3648,49 @@ class AwarenessLoop:
         if fragment.endswith(("区", "县", "镇", "乡")):
             return f"{parent}{fragment}"
         return fragment
+
+    def _refresh_selected_agent_runtime_observation(self) -> None:
+        """Refresh exact OpenClaw evidence before an Agent route is gated.
+
+        An explicit Agent turn performs one bounded read-only refresh before
+        the Controller checks an expiring capability observation. Generic
+        providers remain diagnostic-only, and OpenClaw still repeats the
+        stricter Tool Proxy preflight immediately before prompt dispatch.
+        """
+
+        selected_name = self.agent_registry.selected_name()
+        if selected_name != "openclaw":
+            return
+        adapter = self.agent_registry.selected()
+        if type(adapter) is not OpenClawAdapter:
+            return
+        try:
+            status = adapter.connection_status(force_refresh=True)
+        except Exception:
+            status = {
+                "status": "unavailable",
+                "connected": False,
+                "validation": {
+                    "validated": False,
+                    "status": "validation_pending",
+                },
+            }
+        if not isinstance(status, dict):
+            status = {
+                "status": "unavailable",
+                "connected": False,
+                "validation": {
+                    "validated": False,
+                    "status": "validation_pending",
+                },
+            }
+        self.state_store.patch_json(
+            "executor_state.json",
+            {
+                "selected_agent": selected_name,
+                **status,
+            },
+        )
 
     def _update(self, event: VeyraEvent, result: LoopResult) -> None:
         risk_level = result.risk_level.value if hasattr(result.risk_level, "value") else str(result.risk_level)

@@ -41,6 +41,7 @@ from routers.commitments import build_commitments_router
 from routers.debug_audit import build_debug_audit_router
 from routers.local_setup import build_local_setup_router
 from routers.ops_runtime import build_ops_runtime_router
+from routers.phase5 import build_phase5_router
 from routers.runtime_observability import build_runtime_observability_router
 from routers.tool_governance import build_tool_governance_router
 from runtime.active_loop import ActiveRuntimeLoop
@@ -51,7 +52,10 @@ from runtime.cron import Cron
 from runtime.deployment_config import DeploymentConfigValidator
 from runtime.external_world_refresh import ExternalWorldRefresh
 from runtime.external_runtime_probe import ExternalRuntimeProbe
+from runtime.foresight_runtime import ForesightRuntime
+from runtime.learning_calibration_runtime import LearningCalibrationRuntime
 from runtime.ops_monitor import OpsMonitor
+from runtime.performance_portfolio import PerformancePortfolio
 from runtime.proactive_checks import ProactiveChecks
 from runtime.project_guardian import ProjectGuardianRuntime
 from runtime.project_guardian_attention_runtime import (
@@ -111,10 +115,15 @@ def _env_hosts(name: str) -> list[str] | None:
 
 state_store = WorldStateStore(exclusive_writer=True, writer_owner="veyra-api")
 tool_governance = ToolGovernanceRuntime(state_store)
+foresight_runtime = ForesightRuntime(
+    state_store,
+    tool_receipt_resolver=tool_governance.resolve_receipt,
+)
 openclaw_tool_broker = OpenClawToolBroker(
     state_store,
     tool_governance,
     sandbox_base=state_store.root / "runtime" / "openclaw_tool_sandboxes",
+    foresight_runtime=foresight_runtime,
 )
 runtime_entity = RuntimeEntity(state_store=state_store)
 commitment_core = CommitmentCore(state_store)
@@ -208,6 +217,12 @@ proactive_checks = ProactiveChecks(
     review_queue=review_queue,
     agent_adapter_resolver=awareness_loop.agent_registry.selected,
     agency=agency_core,
+)
+learning_calibration = LearningCalibrationRuntime(
+    state_store=state_store,
+)
+performance_portfolio = PerformancePortfolio(
+    state_store=state_store,
 )
 # Close the loop: approved proactive remediation / agent-restart reviews now execute.
 action_executor.proactive_executor = proactive_checks.execute_approved_proposal
@@ -330,10 +345,17 @@ agent_orchestrator = AgentOrchestrator(
 
 @app.middleware("http")
 async def guard_local_control_plane(request: Request, call_next):
+    server = request.scope.get("server")
+    actual_server_host = (
+        str(server[0])
+        if isinstance(server, (tuple, list)) and server
+        else None
+    )
     decision = local_control_policy.authorize(
         method=request.method,
         path=request.url.path,
         headers=request.headers,
+        actual_server_host=actual_server_host,
     )
     if not decision.allowed:
         return JSONResponse(
@@ -342,7 +364,9 @@ async def guard_local_control_plane(request: Request, call_next):
                 "status": "blocked",
                 "code": decision.code,
                 "reason": decision.reason,
-                "control_plane": local_control_policy.status(),
+                "control_plane": local_control_policy.status(
+                    actual_server_host=actual_server_host,
+                ),
             },
         )
     return await call_next(request)
@@ -658,6 +682,16 @@ app.include_router(
     build_runtime_observability_router(
         trace_recorder=awareness_loop.runtime_trace,
         metrics=routing_metrics,
+    )
+)
+app.include_router(
+    build_phase5_router(
+        state_store=state_store,
+        foresight_runtime=foresight_runtime,
+        learning_runtime=learning_calibration,
+        performance_portfolio=performance_portfolio,
+        sandbox_playbook=proactive_checks.sandbox_repair,
+        playbook_registry=proactive_checks.playbook_registry,
     )
 )
 app.include_router(

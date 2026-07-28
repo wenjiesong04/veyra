@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import os
 from dataclasses import dataclass
 from typing import Mapping
@@ -60,10 +61,25 @@ class LocalControlPolicy:
 
     @property
     def network_exposed(self) -> bool:
-        return self.bind_host not in LOOPBACK_HOSTS
+        return self._host_is_network_exposed(self.bind_host)
 
-    def status(self) -> dict[str, object]:
-        if not self.network_exposed:
+    def status(
+        self,
+        *,
+        actual_server_host: str | None = None,
+    ) -> dict[str, object]:
+        actual_host = self._normalized_server_host(actual_server_host)
+        actual_network_exposed = (
+            self._host_is_network_exposed(actual_host)
+            if actual_host is not None
+            else self.network_exposed
+        )
+        binding_mismatch = bool(
+            not self.network_exposed and actual_network_exposed
+        )
+        if binding_mismatch:
+            status = "blocked_binding_mismatch"
+        elif not actual_network_exposed:
             status = "local_only"
         elif self.token:
             status = "token_required"
@@ -73,6 +89,9 @@ class LocalControlPolicy:
             "status": status,
             "bind_host": self.bind_host,
             "network_exposed": self.network_exposed,
+            "actual_server_host": actual_host,
+            "actual_network_exposed": actual_network_exposed,
+            "binding_mismatch": binding_mismatch,
             "token_configured": bool(self.token),
             "origin_check": "enabled",
             "same_origin_allowed": True,
@@ -81,7 +100,14 @@ class LocalControlPolicy:
             "public_callback_paths": sorted(self.public_callback_paths),
         }
 
-    def authorize(self, *, method: str, path: str, headers: Mapping[str, str]) -> ControlDecision:
+    def authorize(
+        self,
+        *,
+        method: str,
+        path: str,
+        headers: Mapping[str, str],
+        actual_server_host: str | None = None,
+    ) -> ControlDecision:
         normalized_method = str(method or "GET").upper()
         if normalized_method == "OPTIONS":
             return ControlDecision(True)
@@ -95,12 +121,28 @@ class LocalControlPolicy:
                 reason="This browser origin is not allowed to mutate the Veyra control plane.",
             )
 
-        if not self.network_exposed:
+        actual_host = self._normalized_server_host(actual_server_host)
+        actual_network_exposed = (
+            self._host_is_network_exposed(actual_host)
+            if actual_host is not None
+            else self.network_exposed
+        )
+        if not actual_network_exposed:
             return ControlDecision(True, code="loopback_control_plane")
         if normalized_method in SAFE_METHODS and path in self.public_read_paths:
             return ControlDecision(True, code="public_health_read")
         if normalized_method not in SAFE_METHODS and path in self.public_callback_paths:
             return ControlDecision(True, code="signed_provider_callback")
+        if not self.network_exposed:
+            return ControlDecision(
+                False,
+                status_code=503,
+                code="listener_binding_mismatch",
+                reason=(
+                    "The actual server listener is network exposed while "
+                    "VEYRA_HOST declares a loopback-only control plane."
+                ),
+            )
         if not self.token:
             return ControlDecision(
                 False,
@@ -119,8 +161,47 @@ class LocalControlPolicy:
         return ControlDecision(True, code="control_token_validated")
 
     @staticmethod
+    def _normalized_server_host(value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip().lower()
+        if not normalized:
+            return None
+        if normalized.startswith("[") and normalized.endswith("]"):
+            normalized = normalized[1:-1]
+        try:
+            address = ipaddress.ip_address(normalized)
+        except ValueError:
+            # ASGI servers normally publish a numeric socket address. An
+            # unresolved Starlette ``testserver`` address is synthetic and
+            # not evidence of a listener. Other hostnames remain exposed.
+            return None if normalized == "testserver" else normalized
+        return str(address)
+
+    @staticmethod
+    def _host_is_network_exposed(host: str) -> bool:
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        if host in LOOPBACK_HOSTS:
+            return False
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            return True
+        if address.is_loopback:
+            return False
+        mapped = getattr(address, "ipv4_mapped", None)
+        return not bool(mapped and mapped.is_loopback)
+
+    @staticmethod
     def _is_same_origin(origin: str, headers: Mapping[str, str]) -> bool:
-        """Allow the console served by Veyra itself, regardless of API port."""
+        """Allow only an actual loopback console served by Veyra itself.
+
+        Treating any ``Origin == Host`` pair as local permits DNS rebinding:
+        an attacker-controlled hostname can resolve to 127.0.0.1 while the
+        browser supplies that same external hostname in both headers. Public
+        deployments must therefore use the explicit origin allowlist.
+        """
         host = str(headers.get("host") or headers.get("Host") or "").strip().lower()
         if not host:
             return False
@@ -128,7 +209,15 @@ class LocalControlPolicy:
             parsed = urlsplit(origin)
         except ValueError:
             return False
-        return parsed.scheme in {"http", "https"} and parsed.netloc.lower() == host
+        origin_host = str(parsed.hostname or "").strip().lower()
+        return bool(
+            parsed.scheme in {"http", "https"}
+            and parsed.netloc.lower() == host
+            and origin_host
+            and not LocalControlPolicy._host_is_network_exposed(
+                origin_host
+            )
+        )
 
     def _supplied_token(self, headers: Mapping[str, str]) -> str:
         authorization = str(headers.get("authorization") or headers.get("Authorization") or "").strip()

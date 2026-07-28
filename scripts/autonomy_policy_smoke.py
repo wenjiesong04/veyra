@@ -11,7 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.autonomy_policy import AutonomyLevel  # noqa: E402
+from core.autonomy_policy import (  # noqa: E402
+    AutonomyLevel,
+    AutonomyPolicyRegistry,
+    JSON_SANDBOX_REPAIR_PROFILE,
+)
 from core.definitions import RiskLevel  # noqa: E402
 from runtime.self_heal_playbook import (  # noqa: E402
     OPENCLAW_RECONNECT_PROFILE,
@@ -145,6 +149,80 @@ def main() -> None:
         and public["allowed_modes"] == ["shadow", "scoped_canary"],
         "profile is explicitly domain-scoped and non-global",
         public,
+    )
+    registry = AutonomyPolicyRegistry(
+        (
+            OPENCLAW_RECONNECT_PROFILE,
+            JSON_SANDBOX_REPAIR_PROFILE,
+        )
+    )
+    sandbox = registry.decide(
+        profile_id=JSON_SANDBOX_REPAIR_PROFILE.profile_id,
+        domain="sandbox_repair",
+        capability="sandbox.json_candidate.stage",
+        risk_level=RiskLevel.R2,
+        user_scope="local-user",
+        environment="local",
+        target_scope="veyra_private:sandbox_repair_json",
+        mode="scoped_canary",
+        attempt_count=0,
+        cooldown_elapsed=True,
+        requested_level=AutonomyLevel.A3,
+        now=now,
+    )
+    expect(
+        sandbox.allowed and sandbox.effective_level == AutonomyLevel.A3,
+        "exact sandbox-repair domain may select its fixed A3 profile",
+        sandbox.to_public_dict(),
+    )
+    cross_domain = registry.decide(
+        profile_id=JSON_SANDBOX_REPAIR_PROFILE.profile_id,
+        domain="runtime_health",
+        capability="sandbox.json_candidate.stage",
+        risk_level=RiskLevel.R2,
+        user_scope="local-user",
+        environment="local",
+        target_scope="veyra_private:sandbox_repair_json",
+        mode="scoped_canary",
+        attempt_count=0,
+        cooldown_elapsed=True,
+        now=now,
+    )
+    expect(
+        not cross_domain.allowed
+        and cross_domain.reason_code == "domain_mismatch"
+        and cross_domain.effective_level == AutonomyLevel.A0,
+        "A3 sandbox authority cannot cross domains",
+        cross_domain.to_public_dict(),
+    )
+    for requested in (AutonomyLevel.A4, AutonomyLevel.A5):
+        decision = registry.decide(
+            profile_id=JSON_SANDBOX_REPAIR_PROFILE.profile_id,
+            domain="sandbox_repair",
+            capability="sandbox.json_candidate.stage",
+            risk_level=RiskLevel.R2,
+            user_scope="local-user",
+            environment="local",
+            target_scope="veyra_private:sandbox_repair_json",
+            mode="scoped_canary",
+            attempt_count=0,
+            cooldown_elapsed=True,
+            requested_level=requested,
+            now=now,
+        )
+        expect(
+            decision.outcome == "not_certified"
+            and decision.effective_level == AutonomyLevel.A0,
+            f"{requested.value} caller request cannot mint authority",
+            decision.to_public_dict(),
+        )
+    policy_status = registry.public_status()
+    expect(
+        policy_status["global_level"] is None
+        and policy_status["certification"]
+        == {"A4": "not_certified", "A5": "not_certified"},
+        "policy registry exposes no global or certified A4/A5 authority",
+        policy_status,
     )
     print("autonomy_policy_smoke: ok")
 

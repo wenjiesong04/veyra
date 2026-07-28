@@ -80,9 +80,11 @@ CORE_MODULES: list[dict[str, str]] = [
     {"id": "runtime_cron", "path": "runtime/cron.py", "status": "p9_runtime_scheduler"},
     {"id": "attention_core", "path": "awareness/attention_core.py", "status": "mvp_foundation"},
     {"id": "project_guardian_attention", "path": "runtime/project_guardian_attention_runtime.py", "status": "phase2_shadow"},
-    {"id": "autonomy_policy", "path": "core/autonomy_policy.py", "status": "phase5_domain_scoped"},
+    {"id": "autonomy_policy", "path": "core/autonomy_policy.py", "status": "phase5_technical_complete_domain_scoped"},
+    {"id": "playbook_registry", "path": "runtime/playbook_registry.py", "status": "phase5_builtin_immutable"},
     {"id": "agent_transport_authority_fence", "path": "runtime/authority_fence.py", "status": "phase5_scoped_canary"},
-    {"id": "self_heal_playbook", "path": "runtime/self_heal_playbook.py", "status": "phase5_shadow"},
+    {"id": "self_heal_playbook", "path": "runtime/self_heal_playbook.py", "status": "phase5_a2_scoped_canary"},
+    {"id": "sandbox_repair_playbook", "path": "runtime/sandbox_repair_playbook.py", "status": "phase5_a3_private_sandbox_only"},
     {"id": "belief_uncertainty_core", "path": "awareness/belief_core.py", "status": "p8_deep_ttl"},
     {"id": "world_state", "path": "core/world_state.py", "status": "mvp_foundation"},
     {"id": "durable_case", "path": "runtime/durable_case_store.py", "status": "phase4_analysis_only"},
@@ -96,7 +98,14 @@ CORE_MODULES: list[dict[str, str]] = [
     {"id": "perception_layer", "path": "core/perception_layer.py", "status": "p6_model_assisted"},
     {"id": "persona_engine", "path": "core/persona_engine.py", "status": "mvp_foundation"},
     {"id": "decision_core", "path": "core/decision_core.py", "status": "p6_model_assisted"},
-    {"id": "foresight_engine", "path": "core/foresight_engine.py", "status": "mvp_foundation"},
+    {"id": "foresight_engine", "path": "core/foresight_engine.py", "status": "phase5_exact_effect_adapter"},
+    {"id": "foresight_contract", "path": "core/foresight_contract.py", "status": "phase5_exact_effect_contract"},
+    {"id": "foresight_runtime", "path": "runtime/foresight_runtime.py", "status": "phase5_residual_shadow_calibration"},
+    {"id": "learning_record", "path": "core/learning_record.py", "status": "phase5_exact_categorical_feedback"},
+    {"id": "learning_calibration", "path": "runtime/learning_calibration_runtime.py", "status": "phase5_shadow_calibration"},
+    {"id": "performance_portfolio", "path": "runtime/performance_portfolio.py", "status": "phase5_read_only_shadow"},
+    {"id": "provider_certification", "path": "interface/provider_certification.py", "status": "phase5_fail_closed_read_only"},
+    {"id": "phase5_control_plane", "path": "routers/phase5.py", "status": "phase5_technical_complete_shadow_calibration"},
     {"id": "guardian_execution_controller", "path": "core/guardian_controller.py", "status": "mvp_foundation"},
     {"id": "verifier", "path": "core/verifier.py", "status": "p4_completed"},
     {"id": "context_patch_builder", "path": "core/context_patch_builder.py", "status": "mvp_foundation"},
@@ -207,6 +216,27 @@ STATE_DEFINITIONS: list[dict[str, Any]] = [
         "freshness": "revision_backed",
     },
     {
+        "id": "sandbox_repair_state",
+        "file": "state/runtime/sandbox_repair_state.json",
+        "owner": "Runtime.JsonSandboxRepairPlaybook",
+        "purpose": "Private JSON candidate claims, exact input bindings, independent verification evidence, and terminal A3 sandbox outcomes; never a workspace or production promotion record.",
+        "freshness": "revision_backed",
+    },
+    {
+        "id": "foresight_runtime_state",
+        "file": "state/runtime/foresight_runtime_state.json",
+        "owner": "Runtime.ForesightRuntime",
+        "purpose": "Exact capability-effect assessments and authoritative receipt/effect residuals used only for read-only promotion eligibility.",
+        "freshness": "revision_backed",
+    },
+    {
+        "id": "learning_calibration_state",
+        "file": "state/runtime/learning_calibration_state.json",
+        "owner": "Runtime.LearningCalibrationRuntime",
+        "purpose": "Privacy-minimal categorical feedback bound to exact Project Guardian Attention assessments; policy effect is always none.",
+        "freshness": "revision_backed",
+    },
+    {
         "id": "executor_state",
         "file": "state/local/executor_state.json",
         "owner": "AgentAdapter",
@@ -279,6 +309,61 @@ STATE_DEFINITIONS: list[dict[str, Any]] = [
 ]
 
 
+PHASE5_COMPLETION: dict[str, Any] = {
+    "status": "technical_complete_shadow_calibration",
+    "validation_state": (
+        "local_live_acceptance_validated_remaining_evidence_pending"
+    ),
+    "global_autonomy_level": None,
+    "operational_ceiling": {
+        "A2": "selected_openclaw_transport_recovery_only",
+        "A3": "veyra_private_json_sandbox_only",
+        "A4": "not_certified",
+        "A5": "not_certified",
+    },
+    "control_surfaces": {
+        "playbook_registry": "builtin_immutable",
+        "foresight": "exact_effect_residual_and_eligibility_only",
+        "learning": "exact_categorical_feedback_shadow_only",
+        "performance_portfolio": "read_only_no_routing_effect",
+        "provider_certification": "fresh_exact_contract_fail_closed",
+    },
+    "provider_validation": {
+        "current_runtime_path": "kimi_via_openclaw",
+        "phase5_live_validation": (
+            "validated_local_shadow_and_private_a3_canary"
+        ),
+        "generic_provider_authority": (
+            "diagnostic_only_no_dispatch_memory_write_or_stop"
+        ),
+        "openclaw_dispatch_lock": (
+            "fresh_exact_tool_proxy_identity_scope_and_callbacks_per_prompt"
+        ),
+        "other_agent_runtimes": "validation_pending",
+    },
+    "validation_evidence": {
+        "automated_gate": "64_of_64_passed",
+        "openclaw_plugin": "27_of_27_passed",
+        "default_shadow": "zero_effects_validated",
+        "private_a3_canary": "sandbox_verified_candidate",
+        "current_agent_path": (
+            "kimi_openclaw_r0_result_observed_without_false_verification"
+        ),
+    },
+    "authority_exclusions": [
+        "notification",
+        "provider_or_model_auto_switch",
+        "process_restart",
+        "workspace_read",
+        "workspace_mutation",
+        "production_effect",
+        "candidate_promotion",
+        "capability_grant",
+        "autonomy_raise",
+    ],
+}
+
+
 IMPLEMENTATION_PHASES: list[dict[str, str]] = [
     {"phase": "P0", "name": "Foundation definitions", "status": "completed", "validation_state": "local_self_tested"},
     {"phase": "P1", "name": "State and probe hardening", "status": "completed", "validation_state": "local_self_tested"},
@@ -302,5 +387,6 @@ def architecture_snapshot() -> dict[str, Any]:
         "risk_levels": risk_catalog(),
         "lifecycle_statuses": lifecycle_statuses(),
         "operational_modes": operational_modes(),
+        "phase5_completion": PHASE5_COMPLETION,
         "implementation_phases": IMPLEMENTATION_PHASES,
     }

@@ -79,7 +79,7 @@ class AgentOrchestrator:
             adapter = self.registry.get(name)
             connection = adapter.connection_status()
             validation = connection.get("validation") if isinstance(connection.get("validation"), dict) else {}
-            if not bool(validation.get("validated") or connection.get("connected")):
+            if validation.get("validated") is not True:
                 skipped.append(
                     {
                         "name": name,

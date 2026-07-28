@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Proves the proactive remediation loop is closed: approving a review executes it.
-
-Previously, approving a proactive_remediation / agent_restart review returned
-not_supported. Now ActionExecutor.execute_review routes those proposals to the
-proactive executor: R2 reviews gather read-only evidence, and agent_restart attempts
-a reversible reconnect (and only runs a configured restart command via SafeShell).
-"""
+"""Proves reviewed diagnostics execute while restart reviews stay deny-only."""
 from __future__ import annotations
 
 import sys
@@ -96,29 +90,54 @@ def main() -> None:
         expect(result.get("operation") == "proactive_remediation", "operation tagged", result)
         expect(any(t.get("task_id") == "t1" for t in (result.get("drifting_tasks") or [])), "remediation surfaced the drifting task", result)
 
-        # agent_restart with a reachable adapter recovers via reversible reconnect.
+        # A generic review cannot bypass the registered Phase 5 playbook.
         store.write_json("executor_state.json", {"status": "unavailable", "connected": False})
-        recovered = execute_proposal(
+        restart_review = execute_proposal(
             executor,
-            {"type": "agent_restart", "target": "selected_agent"},
+            {
+                "type": "agent_restart",
+                "target": "selected_agent",
+                "action": {
+                    "type": "file_write",
+                    "path": str(Path(tmp) / "restart-bypass.txt"),
+                    "content": "must-not-run",
+                },
+            },
             "agent-restart-connected",
         )
-        expect(recovered.get("status") == "recovered" and recovered.get("method") == "reconnect", "agent_restart recovers via reconnect", recovered)
-        expect(store.read_json("executor_state.json").get("connected") is True, "executor marked connected after recovery", store.read_json("executor_state.json"))
+        expect(
+            restart_review.get("status") == "governance_only",
+            "agent_restart review carries no execution authority",
+            restart_review,
+        )
+        expect(
+            store.read_json("executor_state.json").get("connected") is False,
+            "restart review cannot project an unverified recovery",
+            store.read_json("executor_state.json"),
+        )
+        expect(
+            not (Path(tmp) / "restart-bypass.txt").exists(),
+            "agent_restart cannot smuggle a nested file action",
+            restart_review,
+        )
 
-        # agent_restart with an unreachable adapter and no configured command is a safe no-op.
+        # Adapter state cannot change that deny-only boundary.
         pc_down = ProactiveChecks(store, agency_root=str(Path(tmp) / "a2"), model_assist_enabled=False, agent_adapter_resolver=lambda: DownAdapter())
         executor_down = ActionExecutor(
             state_store=store,
             proactive_executor=pc_down.execute_approved_proposal,
             review_authorizer=review_queue.authorize_execution,
         )
-        noop = execute_proposal(
+        down_restart_review = execute_proposal(
             executor_down,
             {"type": "agent_restart", "target": "selected_agent"},
             "agent-restart-down",
         )
-        expect(noop.get("status") == "approved_no_op", "no restart command -> safe no-op, never auto-restarts", noop)
+        expect(
+            down_restart_review.get("status") == "governance_only",
+            "down agent restart remains governance-only",
+            down_restart_review,
+        )
 
         # Unwired executor degrades honestly instead of pretending success.
         bare = ActionExecutor(
@@ -137,9 +156,8 @@ def main() -> None:
 
         status_cases = [
             ("approved-noop", {"status": "approved_noop"}, "governance_only", False),
-            ("approved-no-op", noop, "governance_only", False),
+            ("restart-governance", restart_review, "governance_only", False),
             ("diagnosed", result, "executed", False),
-            ("recovered", recovered, "executed", False),
             ("refreshed", {"status": "refreshed"}, "executed", False),
             ("observed", {"status": "observed"}, "executed", False),
             ("probed-fallback", {"status": "probed_fallback"}, "executed", False),

@@ -33,6 +33,7 @@ from interface.agent_contract import (
     validate_task_packet_payload,
 )
 from interface.event_schema import VeyraTaskPacket
+from interface.provider_certification import certify_agent_provider
 
 
 DEFAULT_OPENCLAW_PROTOCOL_MIN = 3
@@ -70,6 +71,8 @@ def _ensure_crypto_available() -> bool:
 
 class OpenClawAdapter(AgentAdapter):
     """WebSocket Gateway adapter for a local OpenClaw runtime."""
+
+    trusted_native_provider_adapter = True
 
     def __init__(
         self,
@@ -139,6 +142,23 @@ class OpenClawAdapter(AgentAdapter):
             )
         if not self.gateway_url:
             return self._unconfigured_result(task_packet)
+        dispatch_preflight = self._governed_dispatch_preflight()
+        if dispatch_preflight.get("allowed") is not True:
+            return ExecutionResult(
+                task_id=task_packet.task_id,
+                executor="openclaw",
+                status="blocked",
+                result=(
+                    "OpenClaw dispatch is blocked until fresh, exact "
+                    "Veyra Tool Proxy enforcement is verified."
+                ),
+                raw={
+                    "configured": True,
+                    "dispatch_allowed": False,
+                    "reason": "openclaw_governed_dispatch_not_verified",
+                    "dispatch_preflight": dispatch_preflight,
+                },
+            )
         prompt = self.render_prompt(task_packet)
         # Isolate each task in its own agent conversation window. The Veyra dialogue/user
         # session id (e.g. feishu:ou_xxx:oc_xxx) must never be the OpenClaw sessionKey, and
@@ -903,12 +923,32 @@ class OpenClawAdapter(AgentAdapter):
                 base_url=self.gateway_url,
             )
         status = str(capabilities.get("status", "unknown"))
-        connected = status in {"available", "ok", "success"}
         configured = bool(self.gateway_url)
+        observed_at = datetime.now(timezone.utc)
+        capabilities = {
+            **capabilities,
+            "updated_at": observed_at.isoformat(),
+            "ttl_seconds": 300,
+        }
+        certification = certify_agent_provider(
+            runtime="openclaw",
+            capabilities=capabilities,
+            observed_at=observed_at,
+            now=observed_at,
+            ttl_seconds=300,
+            trusted_native_adapter=True,
+        )
+        connected = certification.get("validated") is True
         return {
             "name": "openclaw",
             "connected": connected,
-            "status": "available" if connected else status,
+            "status": (
+                "available"
+                if connected
+                else "compatibility_unverified"
+                if configured and status in {"available", "ok", "success"}
+                else status
+            ),
             "base_url": self.gateway_url,
             "protocol": "openclaw_gateway_ws",
             "contract_version": AGENT_CONTRACT_VERSION,
@@ -918,6 +958,7 @@ class OpenClawAdapter(AgentAdapter):
                 else self._phase4_capability_features()
             ),
             "auth_diagnostics": self._auth_diagnostics(),
+            "provider_certification": certification,
             "validation": {
                 "implemented": True,
                 "configured": configured,
@@ -927,6 +968,83 @@ class OpenClawAdapter(AgentAdapter):
                 "runtime_status": status,
             },
             "capabilities": capabilities,
+        }
+
+    def _governed_dispatch_preflight(self) -> dict[str, Any]:
+        """Require fresh scoped enforcement before any Agent prompt leaves Veyra."""
+
+        observed_at = datetime.now(timezone.utc)
+        try:
+            capabilities = self.fetch_capabilities(force_refresh=True)
+            certification = certify_agent_provider(
+                runtime="openclaw",
+                capabilities=capabilities,
+                observed_at=observed_at,
+                now=observed_at,
+                ttl_seconds=300,
+                trusted_native_adapter=True,
+            )
+        except Exception as exc:
+            return {
+                "allowed": False,
+                "status": "blocked",
+                "reasons": [
+                    f"capability_refresh_failed:{type(exc).__name__}"
+                ],
+                "observed_at": observed_at.isoformat(),
+                "tool_proxy_enforced": False,
+                "governance_callbacks_complete": False,
+                "policy_effect": "none",
+            }
+
+        features = (
+            capabilities.get("features")
+            if isinstance(capabilities.get("features"), dict)
+            else {}
+        )
+        callback_values = (
+            self._governance_dispatch_preparer,
+            self._governance_dispatch_canceller,
+            self._governance_run_evidence_resolver,
+            self._governance_status_resolver,
+        )
+        callbacks_complete = all(
+            callable(value) for value in callback_values
+        )
+        exact_scope = (
+            features.get("tool_proxy_enforcement_scope")
+            == "veyra_governed_openclaw_sessions"
+        )
+        identity_match = (
+            features.get("tool_proxy_identity_match") is True
+        )
+        enforced = features.get("tool_proxy_enforced") is True
+        reasons: list[str] = []
+        if certification.get("validated") is not True:
+            reasons.append("provider_certification_required")
+        if not enforced:
+            reasons.append("tool_proxy_enforcement_not_verified")
+        if not identity_match:
+            reasons.append("tool_proxy_identity_mismatch")
+        if not exact_scope:
+            reasons.append("tool_proxy_scope_mismatch")
+        if not callbacks_complete:
+            reasons.append("governance_callbacks_incomplete")
+        return {
+            "allowed": not reasons,
+            "status": "validated" if not reasons else "blocked",
+            "reasons": reasons,
+            "observed_at": observed_at.isoformat(),
+            "provider_certification_status": certification.get(
+                "certification_status"
+            ),
+            "tool_proxy_enforced": enforced,
+            "tool_proxy_identity_match": identity_match,
+            "tool_proxy_enforcement_scope": (
+                features.get("tool_proxy_enforcement_scope")
+            ),
+            "governance_callbacks_complete": callbacks_complete,
+            "policy_effect": "none",
         }
 
     def _cached_capabilities(self) -> dict[str, Any]:
@@ -1123,6 +1241,15 @@ class OpenClawAdapter(AgentAdapter):
                 ),
                 "tool_proxy_identity_match": (
                     governance_identity_match
+                ),
+                "governance_callbacks_complete": all(
+                    callable(value)
+                    for value in (
+                        self._governance_dispatch_preparer,
+                        self._governance_dispatch_canceller,
+                        self._governance_run_evidence_resolver,
+                        self._governance_status_resolver,
+                    )
                 ),
             },
             "governance_plugin": self._redact_payload(governance_plugin),

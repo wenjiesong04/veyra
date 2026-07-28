@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shlex
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from time import perf_counter
@@ -29,13 +28,26 @@ from probes.openclaw_probe import OpenClawProbe
 from probes.system_probe import SystemProbe
 from probes.web_probe import WebProbe
 from runtime.self_heal_playbook import (
+    IMPLEMENTATION_REVISION as OPENCLAW_RECONNECT_IMPLEMENTATION_REVISION,
+    OPENCLAW_RECONNECT_PROFILE,
     PLAYBOOK_ID,
     OpenClawReconnectPlaybook,
+)
+from runtime.playbook_registry import (
+    PlaybookRegistration,
+    PlaybookRegistry,
+    PlaybookRegistryError,
+)
+from runtime.sandbox_repair_playbook import (
+    IMPLEMENTATION_REVISION as JSON_REPAIR_IMPLEMENTATION_REVISION,
+    JSON_SANDBOX_REPAIR_PROFILE,
+    PLAYBOOK_ID as JSON_REPAIR_PLAYBOOK_ID,
+    JsonSandboxRepairPlaybook,
 )
 
 
 class ProactiveChecks:
-    """A2/A3 MVP: run low-risk read-only checks and surface state gaps.
+    """Domain-scoped proactive checks and bounded built-in playbooks.
 
     Beyond detection, a bounded remediation worker turns reviewed intentions into
     action: R1 read-only gaps are remediated in place (targeted re-probe / capability
@@ -70,6 +82,59 @@ class ProactiveChecks:
             adapter_resolver=agent_adapter_resolver,
             review_creator=self._create_self_heal_restart_review,
         )
+        self.sandbox_repair = JsonSandboxRepairPlaybook(
+            state_store=state_store,
+        )
+        self.playbook_registry = PlaybookRegistry(
+            (
+                PlaybookRegistration(
+                    playbook_id=PLAYBOOK_ID,
+                    version=self.self_heal.spec.version,
+                    implementation_revision=(
+                        OPENCLAW_RECONNECT_IMPLEMENTATION_REVISION
+                    ),
+                    domain=OPENCLAW_RECONNECT_PROFILE.domain,
+                    profile_id=OPENCLAW_RECONNECT_PROFILE.profile_id,
+                    maximum_level=(
+                        OPENCLAW_RECONNECT_PROFILE.level.value
+                    ),
+                    risk_floor=self.self_heal.spec.risk_floor,
+                    allowed_modes=(
+                        "disabled",
+                        "record_only",
+                        "shadow",
+                        "scoped_canary",
+                    ),
+                    runner=lambda request: self.self_heal.run(
+                        port_observation=(
+                            request if isinstance(request, dict) else None
+                        )
+                    ),
+                    status_reader=self.self_heal.status,
+                ),
+                PlaybookRegistration(
+                    playbook_id=JSON_REPAIR_PLAYBOOK_ID,
+                    version=self.sandbox_repair.spec.version,
+                    implementation_revision=(
+                        JSON_REPAIR_IMPLEMENTATION_REVISION
+                    ),
+                    domain=JSON_SANDBOX_REPAIR_PROFILE.domain,
+                    profile_id=JSON_SANDBOX_REPAIR_PROFILE.profile_id,
+                    maximum_level=(
+                        JSON_SANDBOX_REPAIR_PROFILE.level.value
+                    ),
+                    risk_floor=self.sandbox_repair.spec.risk_floor,
+                    allowed_modes=(
+                        "disabled",
+                        "record_only",
+                        "shadow",
+                        "scoped_canary",
+                    ),
+                    runner=self.sandbox_repair.run,
+                    status_reader=self.sandbox_repair.status,
+                ),
+            )
+        )
 
     def run_read_only(self, *, timeout_seconds: float = 12.0) -> dict:
         started = perf_counter()
@@ -91,7 +156,19 @@ class ProactiveChecks:
             self.perception.interpret_probe_result(result)
         gaps = []
         openclaw = results["openclaw"]
-        self_heal = self.self_heal.run(port_observation=openclaw)
+        try:
+            self_heal = self.playbook_registry.dispatch(
+                playbook_id=PLAYBOOK_ID,
+                version=self.self_heal.spec.version,
+                implementation_revision=(
+                    OPENCLAW_RECONNECT_IMPLEMENTATION_REVISION
+                ),
+                request=openclaw,
+            )
+        except PlaybookRegistryError:
+            self_heal = self.self_heal._fault_result(  # noqa: SLF001
+                "playbook_registry"
+            )
         if openclaw.get("status") != "listening":
             gaps.append({"target": "openclaw_runtime", "status": "unavailable", "suggestion": "Check OpenClaw runtime or configure its port."})
         git = results["git"]
@@ -109,13 +186,27 @@ class ProactiveChecks:
             self._run_context.self_heal_result = None
         output = {
             "status": "success",
-            "autonomy_level": "A3",
+            "autonomy_level": None,
+            "autonomy_scope": "domain_scoped",
+            "autonomy_domains": {
+                "runtime_health": self_heal.get(
+                    "effective_autonomy_level",
+                    "A0",
+                ),
+                "sandbox_repair": self.sandbox_repair.status().get(
+                    "effective_autonomy_level",
+                    "A0",
+                ),
+                "A4": "not_certified",
+                "A5": "not_certified",
+            },
             "model_assist_enabled": self.model_assist_enabled,
             "duration_ms": int((perf_counter() - started) * 1000),
             "results": results,
             "state_gaps": gaps,
             "intentions": reviewed_intentions,
             "self_heal": self_heal,
+            "playbook_registry": self.playbook_registry.status(),
         }
         self.state_store.append_jsonl("action_record.jsonl", {"route": "proactive_check", "status": "success", "artifacts": output})
         return output
@@ -231,14 +322,14 @@ class ProactiveChecks:
         return {"action": action, "status": "no_handler"}
 
     def execute_approved_proposal(self, proposal: dict[str, Any], approved_by: str = "") -> dict[str, Any]:
-        """Called after a user approves a proactive review. Lands the remediation.
+        """Execute only read-only remediation behind a canonical review claim."""
 
-        proactive_remediation gathers/refreshes read-only evidence for the gap.
-        agent_restart tries a reversible reconnect first, and only runs a configured
-        restart command (through SafeShell/ToolProxy) when reconnect fails.
-        """
+        del approved_by
         proposal_type = str(proposal.get("type") or "")
-        if proposal_type == "manual_agent_restart_review":
+        if proposal_type in {
+            "manual_agent_restart_review",
+            "agent_restart",
+        }:
             return {
                 "status": "governance_only",
                 "method": "none",
@@ -247,8 +338,6 @@ class ProactiveChecks:
                     "process-restart execution authority."
                 ),
             }
-        if proposal_type == "agent_restart":
-            return self._execute_agent_restart(approved_by)
         if proposal_type == "proactive_remediation":
             intention = {
                 "suggested_action": proposal.get("suggested_action"),
@@ -301,37 +390,6 @@ class ProactiveChecks:
             return {"action": action, "status": "diagnosed", "git": {"status": git.get("status"), "summary": git.get("summary"), "dirty": git.get("dirty")}}
         return {"action": action, "status": "diagnosed", "note": "surfaced for manual review", "gap": gap}
 
-    def _execute_agent_restart(self, approved_by: str = "") -> dict[str, Any]:
-        adapter = self._resolve_agent_adapter()
-        conn: dict[str, Any] = {}
-        if adapter is not None and hasattr(adapter, "connection_status"):
-            try:
-                conn = adapter.connection_status() or {}
-            except Exception as exc:
-                conn = {"status": "error", "error": str(exc)}
-        if bool(conn.get("connected")) or str(conn.get("status") or "") in {"available", "ok", "success"}:
-            self.state_store.patch_json(
-                "executor_state.json",
-                {
-                    "status": str(conn.get("status") or "available"),
-                    "connected": True,
-                    "updated_at": utc_now_iso(),
-                },
-            )
-            return {"status": "recovered", "method": "reconnect", "connection": self._compact_conn(conn)}
-        command = os.getenv("VEYRA_AGENT_RESTART_CMD", "").strip()
-        if command:
-            from tool_proxy.safe_shell import SafeShell
-
-            result = SafeShell(state_store=self.state_store).run(shlex.split(command), approved_by=approved_by or "agent_restart_review")
-            return {"status": str(result.get("status") or "executed"), "method": "restart_command", "tool_result": result}
-        return {
-            "status": "approved_no_op",
-            "method": "none",
-            "reason": "reconnect failed and no VEYRA_AGENT_RESTART_CMD configured; manual restart required",
-            "connection": self._compact_conn(conn),
-        }
-
     def _refresh_agent_capabilities(self) -> dict[str, Any]:
         result = getattr(self._run_context, "self_heal_result", None)
         if not isinstance(result, dict):
@@ -357,9 +415,6 @@ class ProactiveChecks:
             "status": str(result.get("status") or "observed"),
             "self_heal": result,
         }
-
-    def _compact_conn(self, conn: dict[str, Any]) -> dict[str, Any]:
-        return {key: conn.get(key) for key in ("status", "connected", "error") if key in conn}
 
     def _create_self_heal_restart_review(
         self,
@@ -436,14 +491,6 @@ class ProactiveChecks:
                 self.perception.interpret_probe_result(result)
                 return {"action": "refresh_probe_group", "status": "refreshed", "probe": key, "probe_status": result.get("status")}
         return {"action": "refresh_probe_group", "status": "no_probe_for_source", "source": source.strip()}
-
-    def _resolve_agent_adapter(self) -> Any:
-        if self._agent_adapter_resolver is None:
-            return None
-        try:
-            return self._agent_adapter_resolver()
-        except Exception:
-            return None
 
     def _create_remediation_review(self, intention: dict, foresight: dict, guardian: dict) -> dict[str, Any]:
         gap = intention.get("source_gap") if isinstance(intention.get("source_gap"), dict) else {}

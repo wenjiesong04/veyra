@@ -7,6 +7,7 @@ from typing import Any
 from core.model_client import redact_sensitive
 from core.world_state import WorldStateStore
 from interface.agent_registry import AgentRegistry
+from interface.provider_certification import certify_agent_provider
 from memory_bridge.local_memory_bridge import LocalMemoryBridge
 
 
@@ -152,10 +153,92 @@ class RuntimeMatrix:
             connection = adapter.connection_status()
         except Exception as exc:
             return {"name": name, "status": "error", "error": str(exc)}
+        capabilities = (
+            connection.get("capabilities")
+            if isinstance(connection.get("capabilities"), dict)
+            else connection
+        )
+        observed_at = self._now()
+        trusted_native_adapter = bool(
+            getattr(
+                adapter,
+                "trusted_native_provider_adapter",
+                False,
+            )
+        )
         try:
-            capabilities = adapter.fetch_capabilities()
-        except Exception as exc:
-            capabilities = {"status": "error", "error": str(exc)}
+            provider_certification = certify_agent_provider(
+                runtime=name,
+                capabilities=capabilities,
+                observed_at=observed_at,
+                now=observed_at,
+                ttl_seconds=self.ttl_seconds,
+                trusted_native_adapter=trusted_native_adapter,
+            )
+        except (TypeError, ValueError) as exc:
+            provider_certification = {
+                "certification_status": "unverified",
+                "validated": False,
+                "issues": [
+                    f"provider_certification_failed:{type(exc).__name__}"
+                ],
+                "read_only_dispatch_allowed": False,
+                "automatic_selection_allowed": False,
+                "provider_switch_allowed": False,
+                "side_effect_dispatch_allowed": False,
+                "policy_effect": "none",
+            }
+        adapter_binding = {
+            "trusted_native_adapter": trusted_native_adapter,
+            "source": "local_adapter_instance",
+        }
+        if provider_certification.get("validated") is not True:
+            row_status = self._row_status(
+                connection,
+                capabilities,
+                {"status": "blocked"},
+                {"status": "blocked"},
+                provider_certification,
+            )
+            return {
+                "name": name,
+                "status": row_status,
+                "validation": {
+                    "implemented": True,
+                    "configured": row_status != "not_configured",
+                    "validated": False,
+                    "status": (
+                        "not_configured"
+                        if row_status == "not_configured"
+                        else "validation_pending"
+                    ),
+                },
+                "adapter_binding": adapter_binding,
+                "connection": redact_sensitive(
+                    connection,
+                    max_string=1000,
+                ),
+                "capabilities": redact_sensitive(
+                    capabilities,
+                    max_string=1000,
+                ),
+                "provider_certification": redact_sensitive(
+                    provider_certification,
+                    max_string=1000,
+                ),
+                "memory": {
+                    "status": "blocked",
+                    "reason": "provider_certification_required",
+                    "write_probe": {
+                        "status": "skipped",
+                        "reason": "provider_certification_required",
+                    },
+                },
+                "task_status": {
+                    "status": "blocked",
+                    "reason": "provider_certification_required",
+                },
+            }
         try:
             memory = self.memory_bridge.provider_diagnostics(provider=name, session_id=f"runtime-matrix-{name}", write_probe=write_memory_probe)
         except Exception as exc:
@@ -164,7 +247,13 @@ class RuntimeMatrix:
             task_status = adapter.fetch_task_status("veyra_runtime_matrix_probe").to_dict()
         except Exception as exc:
             task_status = {"status": "error", "error": str(exc)}
-        row_status = self._row_status(connection, capabilities, memory, task_status)
+        row_status = self._row_status(
+            connection,
+            capabilities,
+            memory,
+            task_status,
+            provider_certification,
+        )
         return {
             "name": name,
             "status": row_status,
@@ -176,22 +265,34 @@ class RuntimeMatrix:
             },
             "connection": redact_sensitive(connection, max_string=1000),
             "capabilities": redact_sensitive(capabilities, max_string=1000),
+            "adapter_binding": adapter_binding,
+            "provider_certification": redact_sensitive(
+                provider_certification,
+                max_string=1000,
+            ),
             "memory": redact_sensitive(memory, max_string=1000),
             "task_status": redact_sensitive(task_status, max_string=1000),
         }
 
-    def _row_status(self, connection: dict[str, Any], capabilities: dict[str, Any], memory: dict[str, Any], task_status: dict[str, Any]) -> str:
+    def _row_status(
+        self,
+        connection: dict[str, Any],
+        capabilities: dict[str, Any],
+        memory: dict[str, Any],
+        task_status: dict[str, Any],
+        provider_certification: dict[str, Any],
+    ) -> str:
         statuses = {str(connection.get("status")), str(capabilities.get("status")), str(memory.get("status")), str(task_status.get("status"))}
         if "adapter_unconfigured" in statuses or "not_configured" in statuses:
             return "not_configured"
         if "error" in statuses or "unavailable" in statuses:
             return "error"
-        compatibility = capabilities.get("compatibility") if isinstance(capabilities.get("compatibility"), dict) else {}
         connection_validation = connection.get("validation") if isinstance(connection.get("validation"), dict) else {}
-        connection_ready = bool(connection.get("connected") or connection_validation.get("validated"))
+        connection_ready = connection_validation.get("validated") is True
         capabilities_ready = str(capabilities.get("status")) in {"available", "ok", "success"}
         task_poll_ready = str(task_status.get("status")) in {"success", "submitted", "running", "pending"}
         memory_acceptable = str(memory.get("status")) in {"success", "degraded"} and str(memory.get("summary", {}).get("status") if isinstance(memory.get("summary"), dict) else "") != "error"
-        if connection_ready and capabilities_ready and task_poll_ready and memory_acceptable and str(compatibility.get("status", "compatible")) != "incompatible":
+        provider_ready = provider_certification.get("validated") is True
+        if connection_ready and capabilities_ready and task_poll_ready and memory_acceptable and provider_ready:
             return "ready"
         return "degraded"

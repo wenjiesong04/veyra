@@ -1,14 +1,43 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from core.definitions import RiskLevel, risk_policy
+from core.foresight_contract import (
+    assess_tool_invocation as assess_canonical_tool_invocation,
+    capability_effect_contracts,
+)
 from core.reasoning_core import CoreReasoning
+from tool_proxy.governance_contract import ToolInvocation
 
 
 class ForesightEngine:
     def __init__(self, reasoning: CoreReasoning | None = None) -> None:
         self.reasoning = reasoning
+
+    def assess_tool_invocation(
+        self,
+        invocation: ToolInvocation,
+        *,
+        created_at: datetime | None = None,
+        valid_for_seconds: int = 900,
+    ) -> dict[str, Any]:
+        """Return the deterministic, invocation-bound effect assessment."""
+
+        return assess_canonical_tool_invocation(
+            invocation,
+            created_at=created_at,
+            valid_for_seconds=valid_for_seconds,
+        ).model_dump(mode="json")
+
+    def effect_contracts(self) -> tuple[dict[str, Any], ...]:
+        """Expose the fixed contract registry without adding capabilities."""
+
+        return tuple(
+            contract.model_dump(mode="json")
+            for contract in capability_effect_contracts()
+        )
 
     def predict_text_action(self, text: str, risk_level: RiskLevel, decision: dict[str, Any] | None = None) -> dict[str, object]:
         foresight = self._rule_predict_text_action(text, risk_level)

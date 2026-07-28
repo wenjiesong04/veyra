@@ -22,6 +22,7 @@ from runtime.authority_fence import (
 
 
 PLAYBOOK_ID = "self_heal.openclaw_reconnect.v1"
+IMPLEMENTATION_REVISION = "veyra.phase5.openclaw_reconnect.v1"
 STATE_SCHEMA_VERSION = "veyra.self_heal_state.v1"
 _SUCCESS_STATUSES = {"available", "ok", "success"}
 _COMPATIBLE_STATUSES = {"compatible"}
@@ -1558,6 +1559,13 @@ class OpenClawReconnectPlaybook:
     ) -> None:
         if not isinstance(capability_snapshot, dict):
             return
+        observed_snapshot = {
+            **capability_snapshot,
+            "updated_at": observed_at,
+            "ttl_seconds": int(
+                capability_snapshot.get("ttl_seconds") or 300
+            ),
+        }
 
         def update(executor: dict[str, Any]) -> None:
             executor.update(
@@ -1565,7 +1573,9 @@ class OpenClawReconnectPlaybook:
                     "selected_agent": "openclaw",
                     "status": "available",
                     "connected": True,
-                    "capability_snapshot": dict(capability_snapshot),
+                    "capabilities": observed_snapshot,
+                    "capability_snapshot": observed_snapshot,
+                    "ttl_seconds": observed_snapshot["ttl_seconds"],
                     "self_heal_observation": {
                         "playbook_id": PLAYBOOK_ID,
                         "status": "healthy",

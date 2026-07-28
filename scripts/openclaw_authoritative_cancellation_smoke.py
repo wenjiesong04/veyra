@@ -588,6 +588,14 @@ def check_submission_failure_cleanup() -> None:
 
     adapter._send_chat = fail_send  # type: ignore[assignment]
     adapter._gateway_request = gateway  # type: ignore[assignment]
+    adapter._governed_dispatch_preflight = (  # type: ignore[method-assign]
+        lambda: {
+            "allowed": True,
+            "status": "validated",
+            "reasons": [],
+            "policy_effect": "none",
+        }
+    )
     result = adapter.send_task(
         packet("task-submission-failure", session_key)
     )

@@ -20,6 +20,96 @@ def expect(condition: bool, label: str, details: object = None) -> None:
 def main() -> int:
     local = LocalControlPolicy(bind_host="127.0.0.1", token="")
     expect(local.authorize(method="POST", path="/tool-proxy/shell", headers={}).allowed, "loopback remains zero-config")
+    wildcard_mismatch = local.authorize(
+        method="POST",
+        path="/tool-proxy/shell",
+        headers={},
+        actual_server_host="0.0.0.0",
+    )
+    expect(
+        not wildcard_mismatch.allowed
+        and wildcard_mismatch.status_code == 503
+        and wildcard_mismatch.code == "listener_binding_mismatch",
+        "loopback declaration fails closed on a wildcard listener",
+        wildcard_mismatch,
+    )
+    public_mismatch = local.authorize(
+        method="GET",
+        path="/setup/status",
+        headers={},
+        actual_server_host="192.0.2.10",
+    )
+    expect(
+        not public_mismatch.allowed
+        and public_mismatch.code == "listener_binding_mismatch",
+        "loopback declaration fails closed on a public listener address",
+        public_mismatch,
+    )
+    named_mismatch = local.authorize(
+        method="GET",
+        path="/setup/status",
+        headers={},
+        actual_server_host="veyra.example",
+    )
+    expect(
+        not named_mismatch.allowed
+        and named_mismatch.code == "listener_binding_mismatch",
+        "loopback declaration fails closed on a named external listener",
+        named_mismatch,
+    )
+    expect(
+        local.authorize(
+            method="GET",
+            path="/health",
+            headers={},
+            actual_server_host="0.0.0.0",
+        ).allowed,
+        "public health rule remains available on a mismatched listener",
+    )
+    expect(
+        local.authorize(
+            method="POST",
+            path="/tool-proxy/shell",
+            headers={},
+            actual_server_host="::ffff:127.0.0.1",
+        ).allowed,
+        "IPv4-mapped loopback remains local",
+    )
+    mismatch_status = local.status(actual_server_host="0.0.0.0")
+    expect(
+        mismatch_status["status"] == "blocked_binding_mismatch"
+        and mismatch_status["binding_mismatch"] is True,
+        "binding mismatch is explicit in control status",
+        mismatch_status,
+    )
+    dns_rebinding = local.authorize(
+        method="POST",
+        path="/phase5/feedback",
+        headers={
+            "origin": "http://attacker.example",
+            "host": "attacker.example",
+        },
+        actual_server_host="127.0.0.1",
+    )
+    expect(
+        not dns_rebinding.allowed
+        and dns_rebinding.status_code == 403
+        and dns_rebinding.code == "origin_not_allowed",
+        "matching attacker Origin and Host cannot DNS-rebind loopback control",
+        dns_rebinding,
+    )
+    expect(
+        local.authorize(
+            method="POST",
+            path="/phase5/feedback",
+            headers={
+                "origin": "http://127.0.0.1:8000",
+                "host": "127.0.0.1:8000",
+            },
+            actual_server_host="127.0.0.1",
+        ).allowed,
+        "same-origin loopback console remains allowed",
+    )
 
     exposed_without_token = LocalControlPolicy(bind_host="0.0.0.0", token="")
     health = exposed_without_token.authorize(method="GET", path="/health", headers={})

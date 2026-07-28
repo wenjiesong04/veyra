@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -11,6 +12,7 @@ from urllib.request import Request, urlopen
 from interface.agent_contract import AGENT_CONTRACT_VERSION, normalize_capabilities, normalize_execution_payload, validate_task_packet_payload
 from interface.agent_adapter import AgentAdapter, ExecutionResult
 from interface.event_schema import VeyraTaskPacket
+from interface.provider_certification import certify_agent_provider
 
 
 @dataclass(slots=True)
@@ -65,13 +67,46 @@ class HttpAgentAdapter(AgentAdapter):
                 result="Invalid VeyraTaskPacket for Agent adapter.",
                 raw={"validation_errors": validation_errors, "task_packet": task_payload},
             )
-        payload = {
-            "contract_version": AGENT_CONTRACT_VERSION,
-            "task_packet": task_payload,
-            "rendered_prompt": self.render_prompt(task_packet),
-        }
-        response = self._request("POST", self.config.task_path, payload)
-        return self.receive_result({**response, "task_id": response.get("task_id", task_packet.task_id), "executor": self.config.name})
+        capabilities = self.fetch_capabilities()
+        certification = self._provider_certification(capabilities)
+        if certification.get("validated") is not True:
+            return ExecutionResult(
+                task_id=task_packet.task_id,
+                executor=self.config.name,
+                status="blocked",
+                result=(
+                    f"{self.config.name} dispatch is blocked until a fresh "
+                    "compatible Veyra Agent contract is verified."
+                ),
+                raw={
+                    "configured": True,
+                    "dispatch_allowed": False,
+                    "certification_status": certification.get(
+                        "certification_status"
+                    ),
+                    "certification_issues": certification.get("issues", []),
+                    "contract_version": AGENT_CONTRACT_VERSION,
+                },
+            )
+        return ExecutionResult(
+            task_id=task_packet.task_id,
+            executor=self.config.name,
+            status="blocked",
+            result=(
+                f"{self.config.name} is protocol-compatible, but generic "
+                "provider task dispatch has no locally enforced execution "
+                "profile."
+            ),
+            raw={
+                "configured": True,
+                "dispatch_allowed": False,
+                "reason": "generic_provider_dispatch_not_certified",
+                "certification_status": certification.get(
+                    "certification_status"
+                ),
+                "contract_version": AGENT_CONTRACT_VERSION,
+            },
+        )
 
     def fetch_capabilities(self) -> dict[str, Any]:
         if not self.base_url:
@@ -101,13 +136,39 @@ class HttpAgentAdapter(AgentAdapter):
     def fetch_memory_summary(self, session_id: str) -> dict[str, Any]:
         if not self.base_url:
             return super().fetch_memory_summary(session_id)
+        certification = self._provider_certification(
+            self.fetch_capabilities()
+        )
+        if certification.get("validated") is not True:
+            return {
+                "session_id": session_id,
+                "summary": "",
+                "runtime": self.config.name,
+                "status": "blocked",
+                "dispatch_allowed": False,
+                "certification_status": certification.get(
+                    "certification_status"
+                ),
+                "certification_issues": certification.get("issues", []),
+            }
         separator = "&" if "?" in self.config.memory_summary_path else "?"
         return self._request("GET", f"{self.config.memory_summary_path}{separator}{urlencode({'session_id': session_id})}")
 
-    def write_memory_patch(self, memory_patch: dict[str, Any]) -> None:
-        if self.base_url:
-            self._request("POST", self.config.memory_patch_path, memory_patch)
-        return None
+    def write_memory_patch(
+        self,
+        memory_patch: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not self.base_url:
+            return {
+                "status": "not_configured",
+                "dispatch_allowed": False,
+            }
+        del memory_patch
+        return {
+            "status": "blocked",
+            "dispatch_allowed": False,
+            "reason": "generic_provider_memory_write_not_certified",
+        }
 
     def fetch_task_status(self, task_id: str) -> ExecutionResult:
         if not self.base_url:
@@ -117,6 +178,26 @@ class HttpAgentAdapter(AgentAdapter):
                 status="adapter_unconfigured",
                 result=f"{self.config.name} adapter is not connected. Configure its base_url before polling tasks.",
                 raw={"configured": False},
+            )
+        certification = self._provider_certification(
+            self.fetch_capabilities()
+        )
+        if certification.get("validated") is not True:
+            return ExecutionResult(
+                task_id=task_id,
+                executor=self.config.name,
+                status="blocked",
+                result=(
+                    f"{self.config.name} task status is blocked until a "
+                    "fresh compatible Veyra Agent contract is verified."
+                ),
+                raw={
+                    "dispatch_allowed": False,
+                    "certification_status": certification.get(
+                        "certification_status"
+                    ),
+                    "certification_issues": certification.get("issues", []),
+                },
             )
         path = self.config.status_path_template.format(task_id=task_id)
         try:
@@ -134,11 +215,8 @@ class HttpAgentAdapter(AgentAdapter):
         return self.receive_result(response)
 
     def stop_task(self, task_id: str) -> bool:
-        if not self.base_url:
-            return False
-        path = self.config.stop_path_template.format(task_id=task_id)
-        response = self._request("POST", path, {})
-        return bool(response.get("stopped", True))
+        del task_id
+        return False
 
     def receive_result(self, raw_result: dict[str, Any]) -> ExecutionResult:
         payload = normalize_execution_payload(
@@ -158,22 +236,52 @@ class HttpAgentAdapter(AgentAdapter):
             status["validation"] = self._validation(False, False, str(status.get("status") or "adapter_unconfigured"))
             return status
         capabilities = self.fetch_capabilities()
-        compatibility_status = (
-            capabilities.get("compatibility", {}).get("status")
-            if isinstance(capabilities.get("compatibility"), dict)
-            else "unknown"
+        certification = self._provider_certification(capabilities)
+        capabilities = {
+            **capabilities,
+            "updated_at": certification.get("observed_at"),
+            "ttl_seconds": certification.get("ttl_seconds") or 300,
+        }
+        transport_connected = (
+            capabilities.get("status")
+            not in {"unavailable", "adapter_unconfigured"}
         )
+        validated = certification.get("validated") is True
         status = {
             "name": self.config.name,
-            "connected": capabilities.get("status") not in {"unavailable", "adapter_unconfigured"}
-            and compatibility_status not in {"incompatible", "unavailable", "unconfigured"},
-            "status": capabilities.get("status", "available"),
+            "connected": validated,
+            "transport_connected": transport_connected,
+            "status": (
+                capabilities.get("status", "available")
+                if validated
+                else "compatibility_unverified"
+                if transport_connected
+                else capabilities.get("status", "unavailable")
+            ),
             "base_url": self.base_url,
             "capabilities": capabilities,
+            "provider_certification": certification,
         }
-        status["validation"] = self._validation(True, bool(status["connected"]), str(status.get("status") or "unknown"))
+        status["validation"] = self._validation(
+            True,
+            validated,
+            str(status.get("status") or "unknown"),
+        )
         status["contract_version"] = AGENT_CONTRACT_VERSION
         return status
+
+    def _provider_certification(
+        self,
+        capabilities: dict[str, Any],
+    ) -> dict[str, Any]:
+        observed_at = datetime.now(timezone.utc)
+        return certify_agent_provider(
+            runtime=self.config.name,
+            capabilities=capabilities,
+            observed_at=observed_at,
+            now=observed_at,
+            ttl_seconds=300,
+        )
 
     def _unconfigured_result(self, task_packet: VeyraTaskPacket) -> ExecutionResult:
         prompt = self.render_prompt(task_packet)

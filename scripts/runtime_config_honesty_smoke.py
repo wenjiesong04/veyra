@@ -47,7 +47,15 @@ def main() -> None:
         state = agency.state()
         files = state["config_status"]["files"]
 
-        expect(state["config_status"]["autonomy_level"]["status"] == "fixed_default", "autonomy level is honest fixed default", state)
+        expect(
+            state["config_status"]["autonomy_level"]["status"]
+            == "domain_scoped"
+            and state["config_status"]["autonomy_level"]["value"] is None
+            and state["config_status"]["autonomy_level"]["certification"]
+            == {"A4": "not_certified", "A5": "not_certified"},
+            "autonomy status has no false process-wide A3",
+            state,
+        )
         expect("user_commitments" in files["goals.json"]["legacy_unused_keys"], "goals.user_commitments marked legacy unused", files["goals.json"])
         expect(files["self_policy.yaml"]["status"] == "legacy_unused", "self policy marked legacy unused", files["self_policy.yaml"])
         expect(files["preferences.json"]["status"] == "local_user_defaults", "preferences marked local-user default only", files["preferences.json"])

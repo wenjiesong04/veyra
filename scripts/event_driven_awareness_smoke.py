@@ -28,6 +28,10 @@ from core.situation_evaluator import SituationEvaluator  # noqa: E402
 from core.understanding_core import TurnUnderstanding  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
 from interface.agent_adapter import AgentAdapter, ExecutionResult  # noqa: E402
+from interface.agent_contract import (  # noqa: E402
+    AGENT_CONTRACT_VERSION,
+    normalize_capabilities,
+)
 from interface.event_normalizer import EventNormalizer  # noqa: E402
 from interface.event_schema import (  # noqa: E402
     Decision,
@@ -35,6 +39,7 @@ from interface.event_schema import (  # noqa: E402
     LoopResult,
     Route,
     VeyraTaskPacket,
+    utc_now_iso,
 )
 from routers.debug_audit import build_debug_audit_router  # noqa: E402
 from runtime.active_loop import ActiveRuntimeLoop  # noqa: E402
@@ -227,15 +232,55 @@ class OfflineAgentAdapter(AgentAdapter):
         )
 
     def fetch_capabilities(self) -> dict[str, Any]:
+        observed_at = utc_now_iso()
         return {
-            "runtime": self.executor,
-            "status": "available",
-            "connected": True,
-            "offline_fixture": True,
+            **normalize_capabilities(
+                {
+                    "runtime": "openclaw",
+                    "status": "available",
+                    "connected": True,
+                    "contract_version": AGENT_CONTRACT_VERSION,
+                "features": {
+                    "structured_task_packet": True,
+                    "rendered_prompt_fallback": True,
+                    "task_status": True,
+                    "stop_task": True,
+                    "tool_proxy_enforced": True,
+                    "tool_proxy_identity_match": True,
+                    "tool_proxy_enforcement_scope": (
+                        "veyra_governed_openclaw_sessions"
+                    ),
+                    "governance_callbacks_complete": True,
+                },
+                    "compatibility": {
+                        "status": "compatible",
+                        "native_adapter": False,
+                    },
+                    "offline_fixture": True,
+                },
+                runtime="openclaw",
+            ),
+            "updated_at": observed_at,
+            "ttl_seconds": 300,
         }
 
     def connection_status(self) -> dict[str, Any]:
-        return self.fetch_capabilities()
+        capabilities = self.fetch_capabilities()
+        return {
+            "name": "openclaw",
+            "runtime": "openclaw",
+            "status": "available",
+            "connected": True,
+            "capabilities": capabilities,
+            "validation": {
+                "implemented": True,
+                "configured": True,
+                "connected": True,
+                "validated": True,
+                "status": "validated",
+                "runtime_status": "available",
+            },
+        }
 
     def fetch_memory_summary(self, session_id: str) -> dict[str, Any]:
         return {
@@ -949,6 +994,17 @@ def build_offline_route_loop(
     selected_agent = loop.agent_registry.selected_name()
     loop.agent_registry._adapters[selected_agent] = OfflineAgentAdapter()
     loop.agent_adapter = loop.agent_registry.selected()
+    observed_capabilities = loop.agent_adapter.fetch_capabilities()
+    loop.state_store.patch_json(
+        "executor_state.json",
+        {
+            "selected_agent": selected_agent,
+            "status": "available",
+            "connected": True,
+            "capabilities": observed_capabilities,
+            "ttl_seconds": 300,
+        },
+    )
     loop.probes["system"] = OfflineProbe()
 
     def fixed_understanding(**kwargs: Any) -> TurnUnderstanding:

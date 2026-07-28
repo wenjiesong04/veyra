@@ -164,11 +164,12 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
         if callable(invalidate):
             invalidate()
         snapshot = adapter.fetch_capabilities()
+        observed_at = utc_now_iso()
         snapshot.update(
             {
                 "runtime": snapshot.get("runtime") or selected_agent,
                 "source": "agent_adapter.fetch_capabilities",
-                "updated_at": utc_now_iso(),
+                "updated_at": observed_at,
                 "ttl_seconds": 300,
             }
         )
@@ -176,9 +177,12 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
             "executor_state.json",
             {
                 "selected_agent": selected_agent,
+                "capabilities": snapshot,
                 "capability_snapshot": snapshot,
                 "status": snapshot.get("status") or "unknown",
                 "connected": snapshot.get("connected"),
+                "updated_at": observed_at,
+                "ttl_seconds": 300,
             },
         )
         return loop.capabilities.snapshot()

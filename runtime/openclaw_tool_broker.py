@@ -187,11 +187,13 @@ class OpenClawToolBroker:
         governance: ToolGovernanceRuntime,
         *,
         sandbox_base: str | Path,
+        foresight_runtime: Any | None = None,
         clock: Any | None = None,
         dispatch_ttl: timedelta = timedelta(minutes=15),
     ) -> None:
         self.state_store = state_store
         self.governance = governance
+        self.foresight_runtime = foresight_runtime
         self._dispatch_prepare_lock = threading.Lock()
         self._dispatch_tokens: dict[str, str] = {}
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -605,6 +607,8 @@ class OpenClawToolBroker:
                 "toolCallId": call_id,
                 "toolName": host_tool,
             }
+        preflight_claim_id: str | None = None
+        issued: Any | None = None
         try:
             if dispatch.get("session_key") != session_key:
                 raise OpenClawHookDenied("OpenClaw session key mismatch")
@@ -618,6 +622,13 @@ class OpenClawToolBroker:
                 host_tool_name=host_tool,
                 params=params,
             )
+            preflight_claim_id = self._claim_preflight_call(
+                dispatch=dispatch,
+                invocation=invocation,
+                host_tool_name=host_tool,
+                params_digest=canonical_sha256(dict(params)),
+            )
+            foresight = self._register_foresight(invocation)
             issued = self.governance.issue_grant(
                 invocation,
                 approval_id="phase3_scoped_sandbox_policy",
@@ -660,6 +671,7 @@ class OpenClawToolBroker:
                 "tool_kind": invocation.tool_kind,
                 "params_digest": canonical_sha256(dict(params)),
                 "invocation": invocation.model_dump(mode="json"),
+                "foresight": foresight,
                 "grant_id": issued.grant.grant_id,
                 "reservation_id": envelope.decision.reservation_id,
                 "execution_token_digest": execution_token_digest,
@@ -687,8 +699,23 @@ class OpenClawToolBroker:
                     )
                 call_key = self._call_key(run, call_id)
                 call_index = self._mapping(document, "call_index")
-                if call_key in call_index:
-                    raise OpenClawHookConflict("tool call replay")
+                if call_index.get(call_key) != preflight_claim_id:
+                    raise OpenClawHookConflict(
+                        "preflight call claim changed before commit"
+                    )
+                attempts = self._mapping(document, "attempts")
+                claimed = attempts.get(preflight_claim_id)
+                if (
+                    not isinstance(claimed, dict)
+                    or claimed.get("status") != "preflight_claimed"
+                    or claimed.get("invocation_digest")
+                    != invocation.invocation_digest
+                    or claimed.get("params_digest")
+                    != attempt["params_digest"]
+                ):
+                    raise OpenClawHookConflict(
+                        "preflight call claim is missing or inconsistent"
+                    )
                 token_index = self._mapping(
                     document,
                     "execution_token_index",
@@ -697,10 +724,10 @@ class OpenClawToolBroker:
                     raise OpenClawHookConflict(
                         "execution token digest collision"
                     )
-                self._mapping(document, "attempts")[attempt_id] = attempt
+                attempts.pop(str(preflight_claim_id), None)
+                attempts[attempt_id] = attempt
                 call_index[call_key] = attempt_id
                 token_index[execution_token_digest] = attempt_id
-                self._increment(document, "preflight_total")
                 self._increment(document, "preflight_allowed")
 
             self.state_store.mutate_json(HOOK_STATE_FILE, persist)
@@ -736,6 +763,19 @@ class OpenClawToolBroker:
             ValueError,
         ) as exc:
             reason = self._bounded_reason(exc)
+            if issued is not None:
+                try:
+                    self.governance.revoke_grant(
+                        issued.grant.grant_id,
+                        reason="broker_preflight_not_committed",
+                    )
+                except Exception:
+                    pass
+            if preflight_claim_id is not None:
+                self._close_preflight_claim(
+                    claim_id=preflight_claim_id,
+                    reason=reason,
+                )
             self._record_blocked_preflight(
                 run_id=run,
                 tool_call_id=call_id,
@@ -878,6 +918,7 @@ class OpenClawToolBroker:
                 state=completion_state,
                 result_digest=result_digest,
             )
+            foresight = self._reconcile_foresight(attempt)
             return {
                 "status": result.get("status"),
                 "result": result,
@@ -890,10 +931,12 @@ class OpenClawToolBroker:
                 "effectEvidenceDigest": (
                     effect.evidence_digest if effect is not None else None
                 ),
+                "foresight": foresight,
             }
         except Exception as exc:
             reason = self._bounded_reason(exc)
             if not observation_recorded:
+                terminal_failure_recorded = False
                 try:
                     failure_result = {
                         "status": "error",
@@ -934,6 +977,7 @@ class OpenClawToolBroker:
                         state="observed_failure",
                         result_digest=result_digest,
                     )
+                    terminal_failure_recorded = True
                 except Exception:
                     self._mark_indeterminate(
                         attempt_id=str(attempt["attempt_id"]),
@@ -941,6 +985,11 @@ class OpenClawToolBroker:
                         reservation_token=reservation_token,
                         reason=reason,
                     )
+                if terminal_failure_recorded:
+                    # Calibration is best-effort and can never mask the
+                    # original executor exception. The authoritative failure
+                    # receipt is already terminal at this point.
+                    self._reconcile_foresight(attempt)
             raise OpenClawToolBrokerError(reason) from exc
 
     def observe(
@@ -1388,6 +1437,105 @@ class OpenClawToolBroker:
             ).run(list(argv) if isinstance(argv, list) else [])
         raise OpenClawHookDenied("tool is not executable by Veyra")
 
+    def _register_foresight(
+        self,
+        invocation: ToolInvocation,
+    ) -> dict[str, Any] | None:
+        """Persist an exact prediction before any scoped execution grant."""
+
+        if self.foresight_runtime is None:
+            return None
+        try:
+            projection = self.foresight_runtime.register_sandbox_trial(
+                invocation
+            )
+        except Exception as exc:
+            raise OpenClawHookDenied(
+                "foresight prediction registration failed closed: "
+                f"{type(exc).__name__}"
+            ) from exc
+        assessment_id = str(projection.get("assessment_id") or "")
+        if (
+            projection.get("status") != "registered"
+            or not assessment_id
+            or projection.get("execution_authority_enabled") is not False
+            or projection.get("grant_issued") is not False
+        ):
+            raise OpenClawHookDenied(
+                "foresight prediction did not return a no-authority "
+                "registered assessment"
+            )
+        return {
+            "status": "registered",
+            "assessment_id": assessment_id,
+            "assessment_digest": projection.get("assessment_digest"),
+            "invocation_digest": projection.get("invocation_digest"),
+            "contract_digest": projection.get("contract_digest"),
+            "graph_digest": projection.get("graph_digest"),
+            "replayed": projection.get("replayed") is True,
+            "execution_authority_enabled": False,
+            "promotion_authority_enabled": False,
+        }
+
+    def _reconcile_foresight(
+        self,
+        attempt: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Calibrate after the authoritative effect without changing it."""
+
+        registered = (
+            attempt.get("foresight")
+            if isinstance(attempt.get("foresight"), Mapping)
+            else None
+        )
+        if self.foresight_runtime is None or registered is None:
+            return {
+                "status": "not_configured",
+                "policy_effect": "none",
+                "promotion_applied": False,
+            }
+        assessment_id = str(registered.get("assessment_id") or "")
+        if not assessment_id:
+            return {
+                "status": "degraded",
+                "reason": "foresight_assessment_identity_missing",
+                "policy_effect": "none",
+                "promotion_applied": False,
+            }
+        try:
+            projection = self.foresight_runtime.reconcile(assessment_id)
+        except Exception as exc:
+            return {
+                "status": "degraded",
+                "assessment_id": assessment_id,
+                "reason": f"foresight_reconcile_failed:{type(exc).__name__}",
+                "policy_effect": "none",
+                "promotion_applied": False,
+            }
+        residual = (
+            projection.get("residual")
+            if isinstance(projection.get("residual"), Mapping)
+            else {}
+        )
+        promotion = (
+            projection.get("promotion")
+            if isinstance(projection.get("promotion"), Mapping)
+            else {}
+        )
+        return {
+            "status": str(projection.get("status") or "indeterminate"),
+            "assessment_id": assessment_id,
+            "residual_status": residual.get("status"),
+            "residual_digest": residual.get("residual_digest"),
+            "promotion_status": promotion.get("status"),
+            "promotion_reason": promotion.get("reason"),
+            "eligibility_only": promotion.get("eligibility_only") is True,
+            "policy_effect": "none",
+            "promotion_applied": False,
+            "execution_authority_enabled": False,
+            "promotion_authority_enabled": False,
+        }
+
     def _verify_effect(
         self,
         *,
@@ -1604,6 +1752,92 @@ class OpenClawToolBroker:
         if not isinstance(attempt, dict):
             raise OpenClawHookDenied("tool call has no preflight reservation")
         return dict(attempt)
+
+    def _claim_preflight_call(
+        self,
+        *,
+        dispatch: Mapping[str, Any],
+        invocation: ToolInvocation,
+        host_tool_name: str,
+        params_digest: str,
+    ) -> str:
+        """Atomically consume one run/call identity before any grant exists."""
+
+        run_id = invocation.binding.run_id
+        call_id = invocation.tool_call_id
+        call_key = self._call_key(run_id, call_id)
+        claim_id = f"preflight_{call_key[:24]}"
+        claimed_at = self._now().isoformat()
+
+        def claim(document: dict[str, Any]) -> None:
+            self._validate_document(document)
+            stored_dispatch = self._mapping(
+                document,
+                "dispatches",
+            ).get(run_id)
+            if (
+                not isinstance(stored_dispatch, dict)
+                or stored_dispatch.get("status") != "active"
+                or self._binding(stored_dispatch)
+                != invocation.binding
+                or self._binding(stored_dispatch)
+                != self._binding(dispatch)
+            ):
+                raise OpenClawHookDenied(
+                    "governed dispatch was cancelled before call claim"
+                )
+            call_index = self._mapping(document, "call_index")
+            if call_key in call_index:
+                raise OpenClawHookConflict("tool call replay")
+            attempts = self._mapping(document, "attempts")
+            if claim_id in attempts:
+                raise OpenClawHookConflict(
+                    "preflight claim identity collision"
+                )
+            attempts[claim_id] = {
+                "attempt_id": claim_id,
+                "run_id": run_id,
+                "session_key": str(dispatch.get("session_key") or ""),
+                "tool_call_id": call_id,
+                "host_tool_name": host_tool_name,
+                "tool_name": invocation.tool_name,
+                "tool_kind": invocation.tool_kind,
+                "params_digest": params_digest,
+                "invocation_digest": invocation.invocation_digest,
+                "status": "preflight_claimed",
+                "preflight_at": claimed_at,
+                "execution_started_at": None,
+                "execution_completed_at": None,
+            }
+            call_index[call_key] = claim_id
+            self._increment(document, "preflight_total")
+
+        self.state_store.mutate_json(HOOK_STATE_FILE, claim)
+        return claim_id
+
+    def _close_preflight_claim(
+        self,
+        *,
+        claim_id: str,
+        reason: str,
+    ) -> None:
+        def close(document: dict[str, Any]) -> None:
+            self._validate_document(document)
+            attempt = self._mapping(document, "attempts").get(claim_id)
+            if not isinstance(attempt, dict):
+                return
+            if attempt.get("status") == "blocked":
+                return
+            if attempt.get("status") != "preflight_claimed":
+                raise OpenClawHookConflict(
+                    "preflight claim already entered another state"
+                )
+            attempt["status"] = "blocked"
+            attempt["reason"] = str(reason or "")[:600]
+            attempt["execution_completed_at"] = self._now().isoformat()
+            self._increment(document, "preflight_blocked")
+
+        self.state_store.mutate_json(HOOK_STATE_FILE, close)
 
     def _active_dispatch(
         self,

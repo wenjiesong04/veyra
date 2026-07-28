@@ -86,7 +86,10 @@ STATE_FILE_LAYOUT: dict[str, str] = {
     "project_guardian_signal_state.json": f"{STATE_RUNTIME}/project_guardian_signal_state.json",
     "project_guardian_producer_state.json": f"{STATE_RUNTIME}/project_guardian_producer_state.json",
     "project_guardian_attention_state.json": f"{STATE_RUNTIME}/project_guardian_attention_state.json",
+    "learning_calibration_state.json": f"{STATE_RUNTIME}/learning_calibration_state.json",
+    "foresight_runtime_state.json": f"{STATE_RUNTIME}/foresight_runtime_state.json",
     "self_heal_state.json": f"{STATE_RUNTIME}/self_heal_state.json",
+    "sandbox_repair_state.json": f"{STATE_RUNTIME}/sandbox_repair_state.json",
     "rollback_state.json": f"{STATE_RUNTIME}/rollback_state.json",
     "replay_runtime_state.json": f"{STATE_RUNTIME}/replay_runtime_state.json",
     "ops_soak_state.json": f"{STATE_RUNTIME}/ops_soak_state.json",
@@ -135,7 +138,10 @@ STATE_METADATA: dict[str, dict[str, Any]] = {
     "project_guardian_signal_state.json": {"source": "project_guardian_signal_ledger", "ttl_seconds": 0, "confidence": 0.9},
     "project_guardian_producer_state.json": {"source": "project_guardian_producers", "ttl_seconds": 0, "confidence": 0.95},
     "project_guardian_attention_state.json": {"source": "project_guardian_attention", "ttl_seconds": 0, "confidence": 0.82},
+    "learning_calibration_state.json": {"source": "learning_calibration", "ttl_seconds": 0, "confidence": 1.0},
+    "foresight_runtime_state.json": {"source": "foresight_runtime", "ttl_seconds": 0, "confidence": 1.0},
     "self_heal_state.json": {"source": "self_heal_playbook", "ttl_seconds": 0, "confidence": 1.0},
+    "sandbox_repair_state.json": {"source": "sandbox_repair_playbook", "ttl_seconds": 0, "confidence": 1.0},
     "feishu_ws_state.json": {"source": "feishu_ws_runner", "ttl_seconds": 600, "confidence": 0.65},
     "ops_runtime_matrix.json": {"source": "runtime_matrix", "ttl_seconds": 1800, "confidence": 0.74},
     "ops_config.json": {"source": "ops_config", "ttl_seconds": 0, "confidence": 0.8},
@@ -155,7 +161,10 @@ DURABLE_STATE_FILES = CONFIG_STATE_FILES | {
     "project_guardian_signal_state.json",
     "project_guardian_producer_state.json",
     "project_guardian_attention_state.json",
+    "learning_calibration_state.json",
+    "foresight_runtime_state.json",
     "self_heal_state.json",
+    "sandbox_repair_state.json",
 }
 
 _ROOT_LOCKS_GUARD = threading.Lock()
@@ -662,9 +671,32 @@ class WorldStateStore:
                 "last_run": None,
                 "updated_at": None,
             },
+            "learning_calibration_state.json": {
+                "schema_version": "veyra.learning_calibration_state.v1",
+                "records": {},
+                "feedback_index": {},
+                "active_by_binding": {},
+                "record_count": 0,
+                "active_count": 0,
+                "policy_effect": "none",
+                "updated_at": None,
+            },
+            "foresight_runtime_state.json": {
+                "schema_version": "veyra.foresight_runtime_state.v1",
+                "assessments": {},
+                "invocation_index": {},
+                "updated_at": None,
+            },
             "self_heal_state.json": {
                 "schema_version": "veyra.self_heal_state.v1",
                 "playbooks": {},
+                "updated_at": None,
+            },
+            "sandbox_repair_state.json": {
+                "schema_version": "veyra.sandbox_repair_state.v1",
+                "operations": {},
+                "request_index": {},
+                "last_operation_id": None,
                 "updated_at": None,
             },
             "feishu_ws_state.json": {"status": "stopped", "last_event_at": None},
@@ -701,6 +733,18 @@ class WorldStateStore:
                 },
                 "self_heal": {
                     "openclaw_reconnect": {
+                        "mode": "shadow",
+                        "mode_epoch": 0,
+                        "allowed_modes": [
+                            "disabled",
+                            "record_only",
+                            "shadow",
+                            "scoped_canary",
+                        ],
+                    },
+                },
+                "playbooks": {
+                    "sandbox_repair_json": {
                         "mode": "shadow",
                         "mode_epoch": 0,
                         "allowed_modes": [

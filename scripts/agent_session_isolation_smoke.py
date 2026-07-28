@@ -391,6 +391,14 @@ def _check_openclaw_adapter_uses_packet_session_key() -> None:
     from interface.openclaw_adapter import OpenClawAdapter
 
     adapter = OpenClawAdapter(base_url="http://127.0.0.1:18789")
+    adapter._governed_dispatch_preflight = (  # type: ignore[method-assign]
+        lambda: {
+            "allowed": True,
+            "status": "validated",
+            "reasons": [],
+            "policy_effect": "none",
+        }
+    )
     captured: dict[str, Any] = {}
 
     def fake_send_chat(message: str, *, session_key: str | None = None) -> dict[str, Any]:

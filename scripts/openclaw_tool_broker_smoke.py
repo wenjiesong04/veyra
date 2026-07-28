@@ -19,6 +19,7 @@ from core.world_state import WorldStateStore
 from interface.agent_adapter import ExecutionResult
 from interface.event_schema import VeyraTaskPacket
 from routers.tool_governance import build_tool_governance_router
+from runtime.foresight_runtime import ForesightRuntime
 from runtime.openclaw_tool_broker import (
     HOOK_STATE_FILE,
     HOOK_PLUGIN_IMPLEMENTATION_REVISION,
@@ -26,6 +27,7 @@ from runtime.openclaw_tool_broker import (
     OpenClawHookConflict,
     OpenClawHookDenied,
     OpenClawToolBroker,
+    OpenClawToolBrokerError,
     project_current_hook_enforcement,
 )
 from runtime.tool_governance_runtime import ToolGovernanceRuntime
@@ -65,10 +67,16 @@ def main() -> None:
         clock = lambda: now[0]
         store = WorldStateStore(root / "state")
         governance = ToolGovernanceRuntime(store, clock=clock)
+        foresight = ForesightRuntime(
+            store,
+            tool_receipt_resolver=governance.resolve_receipt,
+            now=clock,
+        )
         broker = OpenClawToolBroker(
             store,
             governance,
             sandbox_base=root / "sandboxes",
+            foresight_runtime=foresight,
             clock=clock,
         )
         registration = broker.prepare_dispatch(
@@ -198,6 +206,52 @@ def main() -> None:
             dispatch_token=registration.dispatch_token,
         )
         expect(allowed["allow"] is True, "sandbox write must reserve", allowed)
+        replay_counts_before = {
+            "assessments": foresight.status()["assessment_count"],
+            "grants": len(
+                store.read_json("tool_governance_state.json")["grants"]
+            ),
+            "calls": len(
+                store.read_json("tool_governance_state.json")["calls"]
+            ),
+        }
+        replay_results = [
+            broker.preflight(
+                run_id=registration.run_id,
+                session_key=registration.session_key,
+                tool_call_id="call_write",
+                tool_name="veyra_file_write",
+                params={
+                    "path": "sentinel.txt",
+                    "content": f"replay-{index}",
+                },
+                dispatch_token=registration.dispatch_token,
+            )
+            for index in range(16)
+        ]
+        replay_counts_after = {
+            "assessments": foresight.status()["assessment_count"],
+            "grants": len(
+                store.read_json("tool_governance_state.json")["grants"]
+            ),
+            "calls": len(
+                store.read_json("tool_governance_state.json")["calls"]
+            ),
+        }
+        expect(
+            all(
+                item["allow"] is False
+                and item["reason"] == "tool call replay"
+                for item in replay_results
+            )
+            and replay_counts_after == replay_counts_before,
+            "same-call param drift is rejected before Foresight or grant admission",
+            {
+                "before": replay_counts_before,
+                "after": replay_counts_after,
+                "results": replay_results,
+            },
+        )
         executed = broker.execute(
             run_id=registration.run_id,
             tool_call_id="call_write",
@@ -208,6 +262,16 @@ def main() -> None:
             execution_token=allowed["executionToken"],
         )
         expect(executed["status"] == "ok", "sandbox write must execute", executed)
+        expect(
+            executed.get("foresight", {}).get("status") == "exact"
+            and executed.get("foresight", {}).get("promotion_status")
+            == "eligible"
+            and executed.get("foresight", {}).get("eligibility_only") is True
+            and executed.get("foresight", {}).get("promotion_applied") is False
+            and foresight.status().get("residual_counts", {}).get("exact") == 1,
+            "governed sandbox effect must close its pre-registered exact prediction without promotion",
+            executed.get("foresight"),
+        )
         sentinel = Path(registration.sandbox_root) / "sentinel.txt"
         expect(
             sentinel.read_text(encoding="utf-8") == "phase3-ok",
@@ -291,6 +355,68 @@ def main() -> None:
         expect(
             not (Path(registration.sandbox_root) / "tamper.txt").exists(),
             "param tamper caused a side effect",
+        )
+
+        failure_reserved = broker.preflight(
+            run_id=registration.run_id,
+            session_key=registration.session_key,
+            tool_call_id="call_executor_failure",
+            tool_name="veyra_file_write",
+            params={"path": "failure.txt", "content": "never"},
+            dispatch_token=registration.dispatch_token,
+        )
+        expect(
+            failure_reserved["allow"] is True,
+            "executor failure setup must reserve",
+            failure_reserved,
+        )
+        indeterminate_before = foresight.status()[
+            "residual_counts"
+        ]["indeterminate"]
+        original_execute_tool = broker._execute_tool
+
+        def fail_executor(**_kwargs: object) -> dict[str, object]:
+            raise RuntimeError("deterministic executor failure")
+
+        broker._execute_tool = fail_executor  # type: ignore[method-assign]
+        try:
+            broker.execute(
+                run_id=registration.run_id,
+                tool_call_id="call_executor_failure",
+                tool_name="veyra_file_write",
+                params={"path": "failure.txt", "content": "never"},
+                dispatch_token=registration.dispatch_token,
+                reservation_token=(
+                    failure_reserved["reservationToken"]
+                ),
+                execution_token=failure_reserved["executionToken"],
+            )
+        except OpenClawToolBrokerError:
+            pass
+        else:
+            raise AssertionError(
+                "deterministic executor failure was not surfaced"
+            )
+        finally:
+            broker._execute_tool = original_execute_tool  # type: ignore[method-assign]
+        failed_receipt = governance.resolve_receipt(
+            registration.run_id,
+            "call_executor_failure",
+        )
+        expect(
+            isinstance(failed_receipt, dict)
+            and failed_receipt.get("ledger_state")
+            == "observed_failure"
+            and foresight.status()["residual_counts"]["indeterminate"]
+            == indeterminate_before + 1
+            and not (
+                Path(registration.sandbox_root) / "failure.txt"
+            ).exists(),
+            "authoritative executor failure closes Foresight without masking the error",
+            {
+                "receipt": failed_receipt,
+                "foresight": foresight.status(),
+            },
         )
 
         revoked = broker.preflight(

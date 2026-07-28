@@ -422,9 +422,16 @@ class AgencyCore:
         unused_goal_keys = [key for key in goal_keys if key not in {"selected_agent_must_be_available"}]
         return {
             "autonomy_level": {
-                "value": "A3",
-                "status": "fixed_default",
-                "reason": "A0-A5 policy selection is not implemented yet.",
+                "value": None,
+                "status": "domain_scoped",
+                "reason": (
+                    "There is no process-wide autonomy level; each built-in "
+                    "playbook is selected by an exact domain profile."
+                ),
+                "certification": {
+                    "A4": "not_certified",
+                    "A5": "not_certified",
+                },
             },
             "files": {
                 "goals.json": {

@@ -4,7 +4,7 @@ import os
 from typing import Any, Callable
 
 from core.world_state import WorldStateStore
-from interface.agent_adapter import AgentAdapter
+from interface.agent_adapter import AgentAdapter, UnavailableAgentAdapter
 from interface.custom_agent_adapter import CustomAgentAdapter
 from interface.hermes_adapter import HermesAdapter
 from interface.openclaw_adapter import OpenClawAdapter
@@ -72,11 +72,34 @@ class AgentRegistry:
         return self.state_store.read_json("agent_config.json")
 
     def selected_name(self) -> str:
-        selected = str(self.config().get("selected_agent") or "openclaw")
-        return selected if selected in self._adapters else "openclaw"
+        return str(self.config().get("selected_agent") or "openclaw")
 
     def selected(self) -> AgentAdapter:
-        return self.get(self.selected_name())
+        selected = self.selected_name()
+        try:
+            return self.get(selected)
+        except KeyError:
+            config = self.config()
+            agents = (
+                config.get("agents")
+                if isinstance(config.get("agents"), dict)
+                else {}
+            )
+            selected_config = (
+                agents.get(selected)
+                if isinstance(agents.get(selected), dict)
+                else None
+            )
+            reason = (
+                "selected_runtime_disabled"
+                if isinstance(selected_config, dict)
+                and selected_config.get("enabled") is False
+                else "selected_runtime_not_configured"
+            )
+            return UnavailableAgentAdapter(
+                selected,
+                reason_code=reason,
+            )
 
     def names(self) -> list[str]:
         if not self._adapters:
@@ -86,7 +109,10 @@ class AgentRegistry:
     def get(self, name: str) -> AgentAdapter:
         if name not in self._adapters:
             self.refresh()
-        return self._adapters.get(name) or self._build_openclaw_adapter({})
+        adapter = self._adapters.get(name)
+        if adapter is None:
+            raise KeyError(f"Unknown or disabled agent runtime: {name}")
+        return adapter
 
     def configure_openclaw_governance(
         self,
@@ -106,9 +132,14 @@ class AgentRegistry:
 
     def list_status(self) -> dict[str, Any]:
         selected = self.selected_name()
+        selected_adapter = self.selected()
         return {
             "selected_agent": selected,
-            "agents": {name: adapter.connection_status() for name, adapter in self._adapters.items()},
+            "selected_status": selected_adapter.connection_status(),
+            "agents": {
+                name: adapter.connection_status()
+                for name, adapter in self._adapters.items()
+            },
         }
 
     def select(self, name: str) -> dict[str, Any]:
