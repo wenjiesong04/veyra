@@ -90,6 +90,19 @@ class ActionExecutor:
             }
         approval_id = review_id
         proposal_type = str(proposal.get("type") or "")
+        if (
+            proposal_type == "manual_agent_restart_review"
+            or proposal.get("execution_authority_enabled") is False
+        ):
+            return {
+                "status": "governance_only",
+                "reason": (
+                    "This review records a manual decision and carries no "
+                    "execution authority."
+                ),
+                "approved_by": approval_id,
+                "operation": proposal_type or "non_executable_review",
+            }
         if proposal_type in {"proactive_remediation", "agent_restart"}:
             if self.proactive_executor is None:
                 return {"status": "not_supported", "reason": f"no proactive executor configured for {proposal_type}", "proposal": proposal}

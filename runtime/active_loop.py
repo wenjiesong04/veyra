@@ -299,6 +299,23 @@ class ActiveRuntimeLoop:
                     for item in refreshed[:8]
                     if isinstance(item, dict)
                 ]
+            self_heal = value.get("self_heal")
+            if isinstance(self_heal, dict):
+                compact["self_heal"] = {
+                    key: self_heal.get(key)
+                    for key in (
+                        "playbook_id",
+                        "status",
+                        "mode",
+                        "effective_autonomy_level",
+                        "failure_confirmation_count",
+                        "attempt_count",
+                        "cooldown_until",
+                        "breaker_open",
+                        "review_id",
+                    )
+                    if key in self_heal
+                }
             return compact
         return value
 

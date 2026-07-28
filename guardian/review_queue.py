@@ -175,6 +175,75 @@ class ReviewQueue:
         self.state_store.append_jsonl("action_record.jsonl", {"event_id": event_id, "route": "human_review", "status": "pending", "artifacts": {"review": review}})
         return review
 
+    def create_once(
+        self,
+        *,
+        dedupe_key: str,
+        event_id: str,
+        task_text: str,
+        risk_level: str,
+        foresight: dict[str, Any],
+        guardian_decision: dict[str, Any],
+        proposal: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically admit one semantic review across retries and crashes."""
+
+        normalized_key = str(dedupe_key or "").strip()
+        if not normalized_key:
+            raise ValueError("dedupe_key is required")
+        candidate = compact_review_item(
+            {
+                "review_id": f"rev_{uuid4().hex[:12]}",
+                "dedupe_key": normalized_key,
+                "event_id": event_id,
+                "task_text": task_text,
+                "risk_level": risk_level,
+                "status": "pending",
+                "foresight": compact_foresight(foresight),
+                "guardian_decision": compact_guardian_decision(
+                    guardian_decision
+                ),
+                "proposal": proposal,
+                "execution_result": None,
+                "created_at": utc_now_iso(),
+                "decided_at": None,
+                "decision_reason": None,
+            }
+        )
+        selected: dict[str, Any] | None = None
+        created = False
+
+        def admit(state: dict[str, Any]) -> None:
+            nonlocal selected, created
+            items = state.setdefault("items", [])
+            if not isinstance(items, list):
+                state["items"] = items = []
+            for item in items:
+                if (
+                    isinstance(item, dict)
+                    and item.get("dedupe_key") == normalized_key
+                ):
+                    selected = dict(item)
+                    return
+            items.append(candidate)
+            selected = dict(candidate)
+            created = True
+
+        self.state_store.mutate_json("review_queue.json", admit)
+        if selected is None:
+            raise RuntimeError("review admission did not produce a result")
+        if created:
+            self.state_store.append_jsonl(
+                "action_record.jsonl",
+                {
+                    "event_id": event_id,
+                    "route": "human_review",
+                    "status": "pending",
+                    "artifacts": {"review": selected},
+                },
+            )
+        return selected
+
     def list(self, status: str | None = None) -> list[dict[str, Any]]:
         items = self.state_store.read_json("review_queue.json").get("items", [])
         if status:

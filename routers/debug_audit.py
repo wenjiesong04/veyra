@@ -412,6 +412,10 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     async def proactive_check() -> dict[str, Any]:
         return deps["proactive_checks"].run_read_only()
 
+    @router.get("/proactive/self-heal/status")
+    async def proactive_self_heal_status() -> dict[str, Any]:
+        return deps["proactive_checks"].self_heal.status()
+
     @router.post("/state/refresh-stale")
     async def refresh_stale_state() -> dict[str, Any]:
         return deps["state_refresh"].refresh_stale()
@@ -821,6 +825,9 @@ def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
     public.pop("project_guardian_signal_state", None)
     public.pop("project_guardian_producer_state", None)
     public.pop("project_guardian_attention_state", None)
+    # The durable playbook record contains target/incident/operation bindings.
+    # Expose only the deliberately compact self-heal status endpoint.
+    public.pop("self_heal_state", None)
     private_task_state = (
         payload.get("task_state")
         if isinstance(payload.get("task_state"), dict)

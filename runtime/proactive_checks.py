@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shlex
+import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from time import perf_counter
 from typing import Callable, Any
@@ -26,6 +28,10 @@ from probes.network_probe import NetworkProbe
 from probes.openclaw_probe import OpenClawProbe
 from probes.system_probe import SystemProbe
 from probes.web_probe import WebProbe
+from runtime.self_heal_playbook import (
+    PLAYBOOK_ID,
+    OpenClawReconnectPlaybook,
+)
 
 
 class ProactiveChecks:
@@ -58,13 +64,20 @@ class ProactiveChecks:
         self.guardian = GuardianController()
         self.review_queue = review_queue or ReviewQueue(state_store)
         self._agent_adapter_resolver = agent_adapter_resolver
+        self._run_context = threading.local()
+        self.self_heal = OpenClawReconnectPlaybook(
+            state_store=state_store,
+            adapter_resolver=agent_adapter_resolver,
+            review_creator=self._create_self_heal_restart_review,
+        )
 
     def run_read_only(self, *, timeout_seconds: float = 12.0) -> dict:
         started = perf_counter()
+        openclaw_port = self.self_heal.configured_port() or 18789
         probes: dict[str, Callable[[], dict[str, Any]]] = {
             "system": lambda: SystemProbe().run(""),
             "git": lambda: GitProbe().run(""),
-            "openclaw": lambda: OpenClawProbe().run("18789"),
+            "openclaw": lambda: OpenClawProbe().run(str(openclaw_port)),
             "hermes": lambda: HermesProbe().run(""),
             "network": lambda: NetworkProbe().run("localhost"),
             "web": lambda: WebProbe().run("http://127.0.0.1:8000/"),
@@ -78,13 +91,22 @@ class ProactiveChecks:
             self.perception.interpret_probe_result(result)
         gaps = []
         openclaw = results["openclaw"]
+        self_heal = self.self_heal.run(port_observation=openclaw)
         if openclaw.get("status") != "listening":
             gaps.append({"target": "openclaw_runtime", "status": "unavailable", "suggestion": "Check OpenClaw runtime or configure its port."})
         git = results["git"]
         if git.get("dirty"):
             gaps.append({"target": "git_workspace", "status": "dirty", "suggestion": "Review changes before risky operations."})
         intentions = self.agency.sync_intentions(self.state_store.read_all())
-        reviewed_intentions = [self._review_intention(item) for item in intentions if item.get("status") == "pending"]
+        self._run_context.self_heal_result = self_heal
+        try:
+            reviewed_intentions = [
+                self._review_intention(item)
+                for item in intentions
+                if item.get("status") == "pending"
+            ]
+        finally:
+            self._run_context.self_heal_result = None
         output = {
             "status": "success",
             "autonomy_level": "A3",
@@ -93,6 +115,7 @@ class ProactiveChecks:
             "results": results,
             "state_gaps": gaps,
             "intentions": reviewed_intentions,
+            "self_heal": self_heal,
         }
         self.state_store.append_jsonl("action_record.jsonl", {"route": "proactive_check", "status": "success", "artifacts": output})
         return output
@@ -189,7 +212,11 @@ class ProactiveChecks:
             if action == "refresh_agent_capabilities":
                 return self._refresh_agent_capabilities()
             if action == "probe_executor_status":
-                return self._self_heal_agent(gap)
+                return {
+                    "action": action,
+                    "status": "observed",
+                    "self_heal": self.self_heal.status(),
+                }
             if action in {"refresh_probe_group", "refresh_probe"} or action.startswith("refresh_state"):
                 return self._refresh_probe_for_target(gap)
             if action == "review_core_model_config":
@@ -211,6 +238,15 @@ class ProactiveChecks:
         restart command (through SafeShell/ToolProxy) when reconnect fails.
         """
         proposal_type = str(proposal.get("type") or "")
+        if proposal_type == "manual_agent_restart_review":
+            return {
+                "status": "governance_only",
+                "method": "none",
+                "reason": (
+                    "Phase 5 records the manual restart decision but has no "
+                    "process-restart execution authority."
+                ),
+            }
         if proposal_type == "agent_restart":
             return self._execute_agent_restart(approved_by)
         if proposal_type == "proactive_remediation":
@@ -297,102 +333,81 @@ class ProactiveChecks:
         }
 
     def _refresh_agent_capabilities(self) -> dict[str, Any]:
-        adapter = self._resolve_agent_adapter()
-        if adapter is not None and hasattr(adapter, "fetch_capabilities"):
-            caps = adapter.fetch_capabilities()
-            if isinstance(caps, dict) and caps:
-                def update_capabilities(executor: dict[str, Any]) -> None:
-                    snapshot = (
-                        executor.get("capability_snapshot")
-                        if isinstance(executor.get("capability_snapshot"), dict)
-                        else {}
-                    )
-                    executor["capability_snapshot"] = {
-                        **snapshot,
-                        **caps,
-                        "freshness": "fresh",
-                        "refreshed_at": utc_now_iso(),
-                    }
-                    executor["updated_at"] = utc_now_iso()
-
-                self.state_store.mutate_json("executor_state.json", update_capabilities)
-                return {"action": "refresh_agent_capabilities", "status": "refreshed", "source": "agent_adapter"}
-        result = OpenClawProbe().run("18789")
-        self.perception.interpret_probe_result(result)
-        return {"action": "refresh_agent_capabilities", "status": "probed_fallback", "probe_status": result.get("status")}
+        result = getattr(self._run_context, "self_heal_result", None)
+        if not isinstance(result, dict):
+            result = self.self_heal.run()
+        return {
+            "action": "refresh_agent_capabilities",
+            "status": (
+                "refreshed"
+                if result.get("status") in {"healthy", "recovered"}
+                else "observed"
+            ),
+            "source": "self_heal_cycle_snapshot",
+            "self_heal": result,
+        }
 
     def _self_heal_agent(self, gap: dict) -> dict[str, Any]:
-        """Reversible self-heal first; only escalate the irreversible restart to review.
+        """Compatibility entry point delegated to the sole Phase 5 controller."""
 
-        Reconnect/verify is reversible and runs automatically. A real process restart is
-        irreversible (R4) and is never auto-executed - it is escalated to a review the
-        user can approve, and only when active commitments actually depend on the agent.
-        """
-        openclaw = OpenClawProbe().run("18789")
-        self.perception.interpret_probe_result(openclaw)
-        adapter = self._resolve_agent_adapter()
-        conn: dict[str, Any] = {}
-        if adapter is not None and hasattr(adapter, "connection_status"):
-            try:
-                conn = adapter.connection_status() or {}
-            except Exception as exc:
-                conn = {"status": "error", "error": str(exc)}
-        connected = bool(conn.get("connected")) or str(conn.get("status") or "") in {"available", "ok", "success"}
-        if connected:
-            self.state_store.patch_json(
-                "executor_state.json",
-                {
-                    "status": str(conn.get("status") or "available"),
-                    "connected": True,
-                    "updated_at": utc_now_iso(),
-                },
-            )
-            return {"action": "probe_executor_status", "status": "refreshed", "self_heal": "reconnected", "connection": self._compact_conn(conn)}
-        if self.agency._active_commitments() and not self._has_pending_restart_review():
-            review = self._create_restart_review(gap, conn)
-            return {
-                "action": "probe_executor_status",
-                "status": "observed",
-                "self_heal": "reconnect_failed_escalated_to_review",
-                "review_id": str(review.get("review_id")) if isinstance(review, dict) else None,
-            }
-        return {"action": "probe_executor_status", "status": "observed", "self_heal": "reconnect_failed", "connection": self._compact_conn(conn)}
+        del gap
+        result = self.self_heal.run()
+        return {
+            "action": "probe_executor_status",
+            "status": str(result.get("status") or "observed"),
+            "self_heal": result,
+        }
 
     def _compact_conn(self, conn: dict[str, Any]) -> dict[str, Any]:
         return {key: conn.get(key) for key in ("status", "connected", "error") if key in conn}
 
-    def _has_pending_restart_review(self) -> bool:
-        try:
-            items = self.review_queue.list("pending")
-        except Exception:
-            return False
-        return any(isinstance(item, dict) and (item.get("proposal") or {}).get("type") == "agent_restart" for item in items)
-
-    def _create_restart_review(self, gap: dict, conn: dict[str, Any]) -> dict[str, Any]:
-        text = "restart selected agent runtime to recover delivery (irreversible, requires approval)"
+    def _create_self_heal_restart_review(
+        self,
+        self_heal_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        text = (
+            "manually review restarting the selected Agent runtime after the "
+            "bounded reconnect playbook opened its circuit"
+        )
         decision = Decision(
             route=Route.HUMAN_REVIEW,
             risk_level=RiskLevel.R4,
-            reason="agent self-heal escalation: reversible reconnect failed",
+            reason="self-heal circuit open after bounded transport refresh failures",
             requires_confirmation=True,
             intent="action",
             complexity="simple",
             capability="human_review",
-            signals=["agency:self_heal", "risk:R4"],
-            constraints=["irreversible restart requires explicit approval"],
+            signals=[
+                f"playbook:{PLAYBOOK_ID}",
+                "self_heal:circuit_open",
+                "risk:R4",
+            ],
+            constraints=[
+                "Phase 5 playbook cannot execute a process restart",
+                "manual diagnosis and a separate explicit action are required",
+            ],
         )
         foresight = self.foresight.predict_text_action(text, RiskLevel.R4, decision=decision.to_dict())
         guardian = self.guardian.review_text_action(text=text, decision=decision, foresight=foresight)
+        dedupe_key = str(
+            self_heal_result.get("review_dedupe_key") or ""
+        ).strip()
+        if not dedupe_key:
+            raise ValueError("self-heal review context is unavailable")
+        event_digest = hashlib.sha256(dedupe_key.encode("utf-8")).hexdigest()[:24]
         proposal = {
-            "type": "agent_restart",
-            "target": gap.get("target") or "selected_agent",
-            "reason": "reversible reconnect failed",
-            "connection": self._compact_conn(conn),
+            "type": "manual_agent_restart_review",
+            "target": "selected_agent",
+            "reason": "bounded OpenClaw transport refresh circuit opened",
+            "playbook_id": PLAYBOOK_ID,
+            "attempt_count": int(self_heal_result.get("attempt_count") or 0),
             "risk_guess": RiskLevel.R4.value,
             "reversible": "no",
+            "execution_authority_enabled": False,
         }
-        return self.review_queue.create(
-            event_id=f"self_heal_{gap.get('gap_id') or 'selected_agent'}",
+        return self.review_queue.create_once(
+            dedupe_key=dedupe_key,
+            event_id=f"self_heal_{event_digest}",
             task_text=text,
             risk_level=RiskLevel.R4.value,
             foresight=foresight,
@@ -402,8 +417,12 @@ class ProactiveChecks:
 
     def _refresh_probe_for_target(self, gap: dict) -> dict[str, Any]:
         source = (str(gap.get("target") or "") + " " + str(gap.get("gap_id") or "")).lower()
+        openclaw_port = self.self_heal.configured_port() or 18789
         probe_plan: list[tuple[str, Callable[[], dict[str, Any]]]] = [
-            ("openclaw", lambda: OpenClawProbe().run("18789")),
+            (
+                "openclaw",
+                lambda: OpenClawProbe().run(str(openclaw_port)),
+            ),
             ("hermes", lambda: HermesProbe().run("")),
             ("git", lambda: GitProbe().run("")),
             ("network", lambda: NetworkProbe().run("localhost")),
