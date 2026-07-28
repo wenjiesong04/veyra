@@ -103,11 +103,12 @@ Veyra 更新世界状态、承诺、经验和下一次主动行为
 
 这不是通用工作流引擎或无限多轮 Agent 会话。当前每个 Case 只有一次 bounded Agent reply 预算；`AWAITING_EVIDENCE / PROPOSED / PAUSED` 之后的 evidence supply、plan selection、授权、执行和验证循环尚未开放。状态继续使用现有有界 JSON 原子存储，没有 SQLite 迁移，也没有引入 HMAC 归档、密钥轮换、旧索引迁移或压缩预算。其他模型/provider 需要分别完成 capability、严格输出质量和 live compatibility 验证，不能由 Kimi 的成功自动继承。
 
-### 1.4 当前已经落地的 Phase 5.1 OpenClaw 传输自愈切片
+### 1.4 当前已经落地的 Phase 5 technical complete / shadow calibration
 
-当前版本只实现 Phase 5 的第一个窄切片：在固定本地 OpenClaw target 上观察并恢复 Gateway 传输。它默认 `shadow`，没有获得进程重启、provider/model 切换、Agent 调用、工具执行、workspace 修改或自我扩权能力：
+当前版本已完成 Phase 5 冻结范围内的技术闭环，但“完成”只表示 `technical_complete_shadow_calibration`，不表示开放更高自治。系统没有全局 autonomy level；当前最高实际权限分别是固定本地 OpenClaw 传输恢复域的 A2，以及 Veyra 自有一次性私有 JSON sandbox 的 A3。A4/A5 均为 `not_certified`，默认模式仍不产生通知、provider/model 自动切换、真实 workspace 修改、生产副作用、候选晋级或自我扩权：
 
-- `core/autonomy_policy.py` 定义了不可变、domain-scoped 的 A0–A5 表达；本切片只实例化 `runtime_health` 的固定 A2 profile。权限精确绑定 local user、local environment、selected OpenClaw target、R1 ceiling、capability、运行模式、attempt budget、cooldown 和 policy revision；它不是全局自治等级，也不让其他 domain 自动继承 A2；
+- `core/autonomy_policy.py` 定义了不可变、domain-scoped 的 A0–A5 表达；当前只实例化 `runtime_health` 的固定 A2 profile 与 `sandbox_repair` 的固定 A3 profile。权限精确绑定 local user、local environment、target scope、risk ceiling、capability、运行模式、attempt budget、cooldown 和 policy revision；它们不是全局自治等级，也不能让其他 domain 继承 A2/A3。调用者或模型请求 A4/A5 只会得到 `not_certified`；
+- `runtime/playbook_registry.py` 只装载代码内建、不可动态注册的 playbook，并按 exact playbook ID、version 与 implementation revision 调度；公开 catalog 不包含 callable。未知、重复、identity/mode 错配或试图安装 A4/A5 的注册都会 fail closed；
 - `self_heal.openclaw_reconnect.v1` 默认 `shadow`，只有显式 `scoped_canary + mode_epoch` 才能进入恢复分支。触发前必须有两轮不同、至少间隔 1 秒且不超过 360 秒窗口的 fresh observation；每轮同时包含失败的 exact-port TCP Probe 和失败的 OpenClaw Gateway protocol/capability Probe。两轮完整证据链与 count 一起持久化，残缺、过旧组合或未知状态不能触发恢复；
 - action-scope binding 同时包含选定 Agent 的完整业务配置摘要、规范 endpoint、adapter type 和 autonomy-policy revision，因此 protocol range、timeout、auth source、RPC path 等任一 selected-config 变化都会阻止旧观察或旧 adapter 结果提交；runtime identity 另以 endpoint + 显式 `self_heal_identity_epoch` 分账，无关的顶层 agent-config 写入不能清空已建立的 identity baseline。配置 endpoint 与实际 adapter endpoint 不同、target disabled、非本地 host、未知 operation schema、损坏 ops/state 或 scope/mode 变化都不会调用恢复；
 - 恢复只允许一次 cache invalidation + force-refresh Gateway handshake，再由 fresh TCP 和严格 capability snapshot 双重验证。capability 必须证明兼容协议、健康、required methods、Phase 4 exact-run 特性、当前 enforced Tool Proxy profile 和 active task count 为零；成功前不会把 executor 标记 available。shadow 永不投影 executor；
@@ -115,10 +116,17 @@ Veyra 更新世界状态、承诺、经验和下一次主动行为
 - OpenClaw broker dispatch admission、Tool Governance session admission、self-heal transport call 和相关 config 写共用 authority fence。正常 config 变更与当前有界 run 按先后顺序线性提交；调用超时后仍允许持久化 revoke/disable，但该操作保持 `indeterminate`，后台 worker 真正结束前 Agent admission 继续关闭，迟到结果不能触发自动重放或 executor 投影。durable dispatch/attempt/session ledger 只接受明确终态 allowlist，任意 pending Agent task 或未知状态都 fail closed。该 fence 是既有 single-writer Veyra 进程内边界，不宣称约束另一个 Veyra 进程、OpenClaw 自身或未注册的外部 Agent session；
 - 最多两次 attempt，第一次失败后固定冷却 300 秒，第二次失败、identity mismatch 或不确定结果开启 circuit breaker。breaker 只允许周期 L1 观察，并以稳定 dedupe key 创建一个 R4 `manual_agent_restart_review`；该 review 在 `ActionExecutor` 边界被硬编码为 governance-only，即使 proposal 夹带 shell/file action 也没有执行 authority；
 - 私有 durable record 不进入通用 `/state`；专用 status 只公开静态 policy/spec、mode、计数、breaker、结果、有效 autonomy level、紧凑 verifier 摘要和明确禁止的 effect，不公开 target/identity/operation digest、完整 capability snapshot、tool/skill catalog 或原始错误。`disabled / record_only / shadow / cooldown / breaker / fault` 下，全部 9 个公开 Route 的完整输出、status 和 risk 仍逐字段等价。
+- `sandbox_repair.json_candidate.v1` 默认 `shadow` 且零写入；显式 `scoped_canary` 只接受有界、严格 canonical JSON object 与 exact digest，在 `state/runtime/sandbox_repairs/` 下的 Veyra 私有 operation 目录写入 candidate 与 manifest，再重新打开、hash、parse 做独立验证。它不接收 caller path，不允许 symlink escape、shell、network、Agent、restart、provider switch、workspace/生产写入或 candidate promotion；claim 后崩溃保持 `indeterminate`，不自动重放；
+- `core/foresight_contract.py` 与 `runtime/foresight_runtime.py` 为固定 capability 建立版本化 exact effect/dependency contract，绑定 invocation、target、scope、identity 与 digest。preview 是零持久、零执行；sandbox trial 必须在既有受治理执行前先持久化 prediction，之后只接受 Veyra 自有 resolver 返回的 `AuthoritativeToolReceipt + VerifiedToolEffect`，形成 `exact / mismatch / indeterminate` residual。promotion API 只报告 eligibility，不应用晋级、签发 Grant、批准 Review、切换 mode 或提高 autonomy；
+- `core/learning_record.py` 与 `runtime/learning_calibration_runtime.py` 只接收精确绑定当前 Project Guardian Attention assessment/candidate/revision 的显式分类反馈：`useful / not_useful / too_frequent / wrong_timing / wrong_evidence`。不持久化自由文本，支持幂等、冲突拒绝与显式 correction/supersede；诊断标签不进入 usefulness 分母，所有记录固定 `promotion_status=candidate / policy_effect=none`；
+- `runtime/performance_portfolio.py` 只从有界权威投影生成 Agent/tool/source/provider 的描述性组合指标，并明确排除 unknown 对成功率分母的污染；execution success 还必须来自持久、版本化且按 trace/task/executor/status/evidence 摘要精确绑定的 verifier observation，任意非空 evidence、旧 trace、缺失/过期时间或错绑 receipt 只能成为 unknown。该私有绑定不会进入 Route 公开 artifact，portfolio 也不改变 route、model/provider 权重、权限或执行。`interface/provider_certification.py` 要求 fresh exact runtime identity、连接状态、兼容性、adapter contract 与 required features 同时成立；配置存在、transport connected 或 generic capability 宣称均不能单独建立可用性。所有 generic `HttpAgentAdapter` 即使 exact certification 为 validated，也永远只用于 diagnostics，不能 task dispatch、memory write 或 stop；OpenClaw 每次 prompt 外发前还必须重新取得 trusted native adapter、fresh exact provider certification、`tool_proxy_enforced=true`、exact identity/scope 与四个 governance callback 完整证据，否则零 dispatch；
+- `/phase5` 控制面只公开边界化 status、portfolio、Foresight status、provider certification，以及严格的分类 feedback/private-sandbox candidate 命令；它不能发送通知、自动切换 provider/model、读取或修改 workspace、产生生产副作用、晋级候选、签发 capability 或提高 autonomy。
 
-这只证明“固定本地 OpenClaw 传输的有界观察与 scoped canary 恢复”已经形成代码和自动化闭环，不等于整个 Phase 5 完成。当前 Kimi 仍只是 OpenClaw 后面的模型配置，本 playbook 不调用 Kimi，也不绑定某个聊天模型；其他 Agent runtime/provider 若要获得自愈，必须定义自己的 exact target、capability、verifier、identity 和 live canary，不能复用 OpenClaw 的授权结论。
+因此 Phase 5 可以按冻结范围记为**技术完成、shadow calibration**，但不能写成 A4/A5 或生产自治完成。当前运行路径仍是 Kimi/Moonshot 配置的 OpenClaw；Kimi 只是 OpenClaw 后面的模型/provider，不进入自治权限规则。其他 Agent runtime/provider 一律保持 `validation_pending`，必须分别提供 fresh exact capability、compatibility、required feature 和 live validation，不能继承 Kimi + OpenClaw 的证据，也不会被系统自动选择或切换。
 
-2026-07-28 的真实 default-shadow 验收在重启 Veyra、保持 OpenClaw 进程不动的条件下得到 `shadow_healthy / attempt_count=0 / breaker_open=false / review_id=null`；exact-port TCP 与 Gateway protocol/capability verifier 同轮通过，Gateway active task 为 0。一次真实 `/proactive/check` 前后，executor state、OpenClaw broker ledger、Tool Governance ledger、pending review 数、Git status 和 OpenClaw PID（99863）均未变化；专用 status GET 也未改变 self-heal state。此验收没有制造真实断网，不能替代 scoped-canary 故障演练。同期 `/health` 为 `degraded`，来自既有 stale model/belief、memory fallback 和 pending review 等运维告警；Agent 为 `available / validated`，Feishu websocket 为 `running` 但 `last_event_after_start=false`，因此不能把它写成 fresh inbound 证明。
+2026-07-28 已对本次 Phase 5 changeset 完成一次本地 live acceptance：Python gate 为 `64/64`，OpenClaw governance plugin 为 `27/27`，Python compileall 与 Web browser/desktop frontend build 均通过；重启 Veyra 全程保持 OpenClaw PID 与启动时间不变。`/health` 恢复为既有 `degraded`（memory workspace fallback、无本进程 Feishu 入站事件、历史 pending reviews/stale beliefs），`/agent/status` 对当前 Kimi/Moonshot + OpenClaw 路径取得 fresh exact v2 certification，并同时证明 `tool_proxy_enforced=true`、identity match、`scope=veyra_governed_openclaw_sessions` 与四个 governance callback 完整；Feishu websocket 为 `running/thread_alive=true`，但 `last_event_after_start=false`，因此没有伪称本轮真实 Feishu 入站验证。`/phase5/status` 保持 `technical_complete_shadow_calibration`，A3 仅为 Veyra 私有 JSON sandbox，A4/A5 仍为 `not_certified`。
+
+真实默认-shadow candidate 返回 `shadow_candidate_valid / attempt_count=0 / evidence_status=unverified`；调用前后 review queue、Tool Governance、OpenClaw broker、Foresight、sandbox state、ops config、sandbox file set、Git tracked/untracked 内容摘要和 OpenClaw PID 逐项不变。随后只在 Veyra 停止、单写者锁释放时把固定 JSON playbook 临时切换为 `scoped_canary`，一次 live operation 得到 `sandbox_verified_candidate / A3 / verified_in_private_sandbox`，只新增私有 candidate/manifest 与 digest-bound operation record；review、Tool Governance、broker、Foresight、真实 workspace 和 OpenClaw 进程仍不变，`production_effect_status=not_started / promotion_authorized=false`，结束后 mode epoch 已恢复到默认 `shadow`。真实 `/events/message` 覆盖 direct identity 与带结构化证据的 time probe；缺少附件事实时保持 `ASK_USER`。显式 R0 `/agents/invoke` 经 Kimi + OpenClaw 返回预期单行结果、`tool_calls=[] / changed_files=[]`，而 Verifier 因没有结构化持久执行证据正确保持 `needs_more_probe`，没有把模型成功文本误标为 verified。仍未完成、也不能由 fixture 冒充的证据是：真实断网/恢复故障演练、恢复成功率与误触发率、长期 residual/portfolio 样本、Attention held-out usefulness，以及其他 Agent runtime/provider 的独立 live validation。
 
 ## 2. “像贾维斯”在本项目中的可实现含义
 
@@ -192,7 +200,7 @@ Guardian、授权系统、Tool Proxy、Verifier、审计、密钥管理、签名
 - `PARTIAL`：只覆盖目标的一部分，不能按完整能力宣传；
 - `TARGET`：设计目标，尚未实现。
 
-Phase 4 已实现分析/提案限定的 `Durable Case` 子集；带 plan selection、授权、执行、验证、补偿和长期 wakeup 的完整 Case 仍是 `TARGET`。覆盖任意工具/环境的完整 `CapabilityGrant`、全局 100% pre-tool enforcement、多事件 Situation Engine、Foresight v2 和通用自治自愈同样不是当前安全不变量；Phase 5.1 只新增固定本地 OpenClaw 传输的 default-shadow/scoped-canary playbook。Phase 3 已从 contract-only ledger 推进到一个**经真实 Kimi/OpenClaw governed run 验证的窄范围执行切片**：只有预注册的 Veyra → OpenClaw governed session、三个固定自定义工具和 Veyra 管理的逐 run sandbox 可以进入 server-side broker。本次实现/运行快照在 `scope=veyra_governed_openclaw_sessions` 下取得 `canary.status=validated`，且 fresh plugin-active/revision 检查使公开组合状态为 `tool_proxy_enforced=true`；`pre_tool_coverage=1.0` 只表示当前 broker state 累计记录的 execution starts 全都有 reservation，不是本次 run 或当前 implementation revision 专属分母，也不是所有 OpenClaw tool call 的全局覆盖率。它不能等同于任意 OpenClaw session、原生工具、真实 workspace 或生产环境已经获得受治理执行权。
+Phase 4 已实现分析/提案限定的 `Durable Case` 子集；带 plan selection、授权、执行、验证、补偿和长期 wakeup 的完整 Case 仍是 `TARGET`。覆盖任意工具/环境的完整 `CapabilityGrant`、全局 100% pre-tool enforcement、多事件 Situation Engine 和通用生产自治仍不是当前安全不变量。Phase 5 已完成冻结的技术范围：不可变内建 playbook registry、固定 OpenClaw A2、Veyra 私有 JSON sandbox A3、exact-effect Foresight residual、Attention 分类反馈、只读 performance portfolio 与 fail-closed provider certification；A4/A5 继续 `not_certified`，当前状态为 technical complete / shadow calibration，本地 live acceptance 已完成但长期与故障演练证据仍待积累。Phase 3 曾从 contract-only ledger 推进到一个**经真实 Kimi/OpenClaw governed run 验证的窄范围执行切片**：只有预注册的 Veyra → OpenClaw governed session、三个固定自定义工具和 Veyra 管理的逐 run sandbox 可以进入 server-side broker。那次历史运行快照在 `scope=veyra_governed_openclaw_sessions` 下取得 `canary.status=validated`，且当时的 fresh plugin-active/revision 检查使公开组合状态为 `tool_proxy_enforced=true`；它不是本次 Phase 5 changeset 的 fresh tool canary。`pre_tool_coverage=1.0` 只表示对应 broker state 累计记录的 execution starts 全都有 reservation，不是当前 implementation revision 专属分母，也不是所有 OpenClaw tool call 的全局覆盖率。它不能等同于任意 OpenClaw session、原生工具、真实 workspace 或生产环境已经获得受治理执行权。
 
 | 能力 | 当前代码 | 已有价值 | 主要差距 |
 |---|---|---|---|
@@ -200,16 +208,16 @@ Phase 4 已实现分析/提案限定的 `Durable Case` 子集；带 plan selecti
 | 持续循环 | `runtime/active_loop.py`、`cron.py`、`proactive_checks.py` | 能定时心跳、刷新状态、检查 Agent、运行 commitment；Phase 4 已接入有界 Case round-robin recovery | 主要仍是固定周期轮询；没有通用事件优先级、长期 durable wakeup 或完整工作流恢复 |
 | 世界状态 | `core/world_state.py` | 有原子写、writer lease、JSON/JSONL、TTL 健康 | 多个文件是状态快照，关系和来源链难查询；不同领域的权威边界仍需统一 |
 | Observation/Belief | `core/perception_layer.py`、`awareness/claim_schema.py`、`belief_core.py` | 区分 source、confidence、TTL、fresh/stale/conflict | Evidence 仍嵌在 Claim 中；没有可追溯证据图、实体关系、有效时间和假设层 |
-| Attention | `awareness/attention_core.py`、`awareness/project_guardian_attention.py`、`runtime/project_guardian_attention_runtime.py` | `PARTIAL`：Project Guardian 已有确定性 score、显式 Goal/policy 绑定、pause/quiet hours/dismiss precedence、反事实 disposition 和同用户显式分组 | 仍只覆盖 Project Guardian；不调用真实 Probe/Agent，不发送通知，不消费预算或启动 cooldown，也不是通用 Attention/Situation Engine |
+| Attention | `awareness/attention_core.py`、`awareness/project_guardian_attention.py`、`runtime/project_guardian_attention_runtime.py`、`runtime/learning_calibration_runtime.py` | `PARTIAL`：Project Guardian 已有确定性 score、显式 Goal/policy 绑定、pause/quiet hours/dismiss precedence、反事实 disposition、同用户显式分组，以及 exact assessment/candidate/revision 绑定的分类反馈 | 仍只覆盖 Project Guardian；不调用真实 Probe/Agent，不发送通知，不消费预算或启动 cooldown，也不是通用 Attention/Situation Engine；真实 usefulness 样本与人工评测仍待完成 |
 | Goal/Commitment | `core/commitment_core.py`、`proactive_intent*.py`、`proactive_authorization.py` | 有目标、计划、确认、暂停、取消、推送和用户隔离 | Goal、Commitment、Situation、Case、Agent task 尚未成为同一事务 |
-| Agency | `core/agency_core.py`、`core/autonomy_policy.py` | 能从状态差距生成 bounded intention；Phase 5.1 已有一个固定 `runtime_health` A2 profile | 通用 intention 仍使用历史固定等级；尚无跨 domain 的 A0–A5 选择、晋级或学习 |
+| Agency | `core/agency_core.py`、`core/autonomy_policy.py`、`runtime/playbook_registry.py`、`runtime/self_heal_playbook.py`、`runtime/sandbox_repair_playbook.py` | `CURRENT / SCOPED`：不可变 registry 只承载固定 OpenClaw A2 与 Veyra 私有 JSON sandbox A3；没有全局等级，A4/A5 明确 `not_certified`；私有 A3 live canary 已验证并恢复默认 shadow | 不具备跨 domain 自治晋级、真实 workspace/生产权限或动态 playbook；A2 真实断网/恢复故障演练、长期成功率与误触发率仍待完成 |
 | 理解和决策 | `understanding_core.py`、`cognition_pipeline.py`、`decision_core.py` | 模型优先理解、证据路由和多种执行路径已存在 | 普通请求会出现重复认知；部分后续策略仍依赖开放词表；长期情境与一次性 turn 没有统一 |
-| Foresight | `core/foresight_engine.py` | 已能提出副作用、前置条件和更安全替代 | 当前主要是重启/删除等规则加模型建议，不是可校准的效果预测和模拟 |
-| Agent 委托 | `task_packet_builder.py`、`delegation_policy.py`、`openclaw_adapter.py`、`interface/agent_dialogue_contract.py` | `VERIFIED / SCOPED`：当前 Kimi/Moonshot 配置已通过 OpenClaw 完成真实 governed Agent run；Phase 4 已真实接受严格 `EVIDENCE_REQUEST`，并走通 exact observation、撤权闭合和公开投影 | 当前只是一轮 `TASK_REQUEST → EVIDENCE_REQUEST/CHALLENGE/OPTION_SET`；evidence supply、plan selection、逐步授权和其他模型/provider live 验证仍未完成 |
+| Foresight | `core/foresight_engine.py`、`core/foresight_contract.py`、`runtime/foresight_runtime.py` | `CURRENT / SHADOW CALIBRATION`：固定 capability 的 exact invocation/target/effect graph、权威 receipt/effect reconciliation 与 `exact/mismatch/indeterminate` residual 已接通；promotion 只读报告 eligibility | 尚不是任意工具的通用模拟器；未覆盖真实 workspace/生产预演，也不会自动晋级、签发 Grant 或改变 autonomy |
+| Agent 委托 | `task_packet_builder.py`、`delegation_policy.py`、`openclaw_adapter.py`、`interface/agent_dialogue_contract.py`、`interface/provider_certification.py` | `VERIFIED / CURRENT CONNECTION + HISTORICAL SCOPED TOOL EVIDENCE`：本次 Kimi/Moonshot + OpenClaw fresh exact certification 和 R0 无工具真实调用已通过；Phase 4 曾真实接受严格 `EVIDENCE_REQUEST`，Phase 3 曾走通 scoped governed tool canary。Phase 5 无证据的模型成功仍保持 `needs_more_probe` | 当前只是一轮 `TASK_REQUEST → EVIDENCE_REQUEST/CHALLENGE/OPTION_SET`；evidence supply、plan selection、逐步授权和其他模型/provider live 验证仍未完成。generic provider 即使协议认证通过也只有 diagnostics，无 task dispatch/memory write/stop 权限；OpenClaw 还须在每次 dispatch 前通过 fresh exact Tool Proxy preflight |
 | 持久任务 | `core/durable_case.py`、`runtime/durable_case_store.py`、`runtime/bounded_agent_negotiation.py`、`runtime/agent_task_tracker.py` | `VERIFIED / SCOPED`：已有 owner scope、revision CAS、幂等 operation、checkpoint/dialogue、取消、trace outbox、round-robin crash recovery 和 HTTP 生命周期投影 | 仅承载 foreground Agent 分析 Case；尚未把 Goal、Commitment、Situation、授权执行和长期 wakeup 统一成完整事务 |
 | 执行治理 | `guardian/`、`tool_proxy/`、`execution/`、`runtime/openclaw_tool_broker.py`、`apps/openclaw/veyra-governance/` | `VERIFIED / SCOPED`：已有严格 Grant/receipt/effect 合同、server-side broker、OpenClaw pre/execute/observe bridge；真实 canary 直接覆盖授权 Veyra write、同 run native write block 和 traversal block | 当前只覆盖注册的 Veyra session 和逐 run sandbox；live run 没有逐项覆盖所有原生/自定义工具，不能声称所有 OpenClaw/Agent tool call 必经 Veyra |
 | 验证/恢复 | `core/verifier.py`、`rollback_audit/` | 有结构化验证、权威 receipt/effect 投影、精确 snapshot/trace/restore；canonical review 文件写入执行前必须先生成同 scope snapshot；scoped live hook write/effect canary 已通过 | 更广工具的独立 effect verifier 和通用 rollback 仍未实现；本次 canary 不是未来版本永久有效证明 |
-| 学习/自改进 | `runtime/self_improvement.py`、`memory_bridge/` | 能记录能力缺口，默认不自行改源码是正确边界 | 没有统一的 outcome learning、预测校准、策略候选晋级和安全扩展生命周期 |
+| 学习/自改进 | `core/learning_record.py`、`runtime/learning_calibration_runtime.py`、`runtime/performance_portfolio.py`、`runtime/self_improvement.py`、`memory_bridge/` | `CURRENT / SHADOW ONLY`：支持 exact-bound 分类 feedback、显式 correction/supersede，以及 Agent/tool/source/provider 的只读描述性 portfolio；全部固定 `policy_effect=none` | 真实样本量、人工 usefulness、长期校准和 formal promotion evidence 尚未完成；不会改 route/weight/provider、风险、Grant 或 autonomy |
 
 目标不是删除这些部件，而是让它们成为同一个闭环的投影、策略和执行器。
 
@@ -633,7 +641,7 @@ Veyra 不能因为引入 Agent 协商就放弃自己的模型优先控制级理�
 
 Agent 接入必须保持**模型和供应商中立**。Veyra 面向的是版本化的 runtime adapter、能力目录、任务合同和治理 hook，而不是把 Kimi、OpenAI、Anthropic 或任一模型供应商写进权限规则。OpenClaw 是当前选定的 Agent Runtime，Kimi 可以是其当前模型/provider 配置，但切换模型或 provider 只能改变 adapter 的连接、认证、能力与质量验证，不能改变 `CapabilityGrant`、风险下限、scope、Review、Tool Proxy 或 Verifier 的权威边界。
 
-本次 Phase 3 live canary 已通过当前 OpenClaw Kimi/Moonshot 配置完成真实 governed Agent 调用并产生真实工具调用，因此当前本机、当前配置和本次运行快照的 provider 连接与认证可记为 `validated`。当前 attestation 不绑定 provider/model/auth config digest，因此这些配置变化不会自动使旧证据失效，运营规则要求变化后重新运行 live canary。其他模型/provider 仍需独立完成 adapter capability、认证和 live compatibility 验证；`connected=true`、插件 `active` 或工具 catalog 单独仍不能替代真实调用证据。Kimi 的成功不改变模型/provider 中立的治理合同，也不扩大任何 scope。
+既有 Phase 3 live canary 曾通过当时的 OpenClaw Kimi/Moonshot 配置完成真实 governed Agent 工具调用；它是历史 scoped tool evidence，不代表当前任意配置永久 validated。本次 Phase 5 live acceptance 重新验证了当前 OpenClaw 的 fresh exact provider contract、Tool Proxy identity/scope/callback preflight，并通过显式 R0 无工具调用取得 Kimi 实际响应；因为该响应没有结构化持久执行证据，Verifier 正确保持 `needs_more_probe`。当前 attestation 仍不绑定 provider/model/auth config digest，因此这些配置变化不会自动使旧证据失效，运营规则要求变化后重新运行相应 live validation。其他模型/provider 仍需独立完成 adapter capability、认证和 live compatibility 验证；`connected=true`、插件 `active` 或工具 catalog 单独仍不能替代真实调用证据。Kimi 的成功不改变模型/provider 中立的治理合同，也不扩大任何 scope。
 
 ### 12.2 消息类型
 
@@ -771,7 +779,9 @@ Foresight 不应被设计成一个“能预知未来”的模型。可靠实现�
 4. **Agent/模型场景生成**：补充可能遗漏的失败模式、假设和替代方案。
 5. **校准反馈**：持续比较 predicted effect 和 observed effect，降低不可靠来源或 playbook 的自治范围。
 
-建议的 `ForesightAssessment`：
+Phase 5 当前实现了这个目标的窄、确定性版本：`core/foresight_contract.py` 为固定 capability 冻结版本化 effect contract 与 dependency graph，所有预测由 exact `ToolInvocation`、规范 target/scope/identity 和 digest 派生；模型建议只能补充非权威候选，不能覆盖 deterministic risk、effect、verifier、rollback 或 trial mode。`runtime/foresight_runtime.py` 的 preview 不写状态、不触发执行；sandbox trial 必须先持久化 assessment，再通过 Veyra 自有 resolver 对账严格的 `AuthoritativeToolReceipt + VerifiedToolEffect`，缺失、过期、跨 run/call、身份错配或失败证据都形成 `indeterminate/mismatch`，不会伪造成功。它只输出 promotion eligibility，固定 `promotion_applied=false / grant_issued=false / execution_authority_enabled=false`。
+
+下面仍是更完整目标形态的概念 `ForesightAssessment`；当前实现使用更严格的版本化 schema，不能把概念示例当作可调用 API：
 
 ```json
 {
@@ -808,6 +818,8 @@ Foresight 不能：
 - 签发权限；
 - 用高置信文本替代 dry-run 或真实测试；
 - 承诺所有动作可以 rollback。
+
+当前 exact-effect 合同只覆盖已登记 capability，不代表任意 Agent/tool 已获得可校准模拟；真实 workspace/生产 dry-run 与故障样本仍为后续边界。即使 residual 为 `exact`，也只说明本次预测与权威 sandbox effect 一致，不自动授予生产晋级。
 
 Anthropic 的工程建议强调，从简单可组合模式开始，为 Agent 提供环境反馈和真实 ground truth，并只在测量显示收益时增加自治复杂度。[Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents)
 
@@ -1014,7 +1026,7 @@ OpenClaw adapter 会把执行 session 规范化为 canonical `agent:<agentId>:<a
 
 停止不是只调用 `chat.abort`。Veyra 先按 exact run 撤销 broker dispatch/Grant/reservation，再以 `sessionKey + runId + bindingDigest` 调用插件 `cancelSession`，最后请求 Agent abort；插件拒绝错配 identity，重复取消幂等，取消与 reserve/bind/execute 的竞态在 server ledger 再次检查。若任一层无法确认关闭，状态保持 `cancellation_unconfirmed` 或 `too_late`，不能宣称已取消。
 
-本次真实 governed canary 中，当前 Kimi/Moonshot 配置发起了真实工具调用：授权的 `veyra_file_write` 在逐 run sandbox 写入 sentinel，并由独立读取形成 `observed_success / VerifiedToolEffect`；同 run 的 native `write` 被 hook 精确阻断且目标文件不存在；父目录 traversal 的 Veyra write 被 broker 阻断且 sandbox 外目标不存在；8 次 `veyra_shell_probe ["true"]` 也通过同一 reservation/execute/observe 链完成。最终 `started_without_reservation=0`，实现 identity 与 fresh plugin-active 状态匹配，公开组合状态为 scoped `validated / tool_proxy_enforced=true`。
+既有 Phase 3 真实 governed canary 中，当时的 Kimi/Moonshot 配置发起了真实工具调用：授权的 `veyra_file_write` 在逐 run sandbox 写入 sentinel，并由独立读取形成 `observed_success / VerifiedToolEffect`；同 run 的 native `write` 被 hook 精确阻断且目标文件不存在；父目录 traversal 的 Veyra write 被 broker 阻断且 sandbox 外目标不存在；8 次 `veyra_shell_probe ["true"]` 也通过同一 reservation/execute/observe 链完成。最终 `started_without_reservation=0`，当时的实现 identity 与 fresh plugin-active 状态匹配，公开组合状态为 scoped `validated / tool_proxy_enforced=true`。这是历史 scoped evidence，不是本次 Phase 5 changeset 的 fresh live 验证。
 
 这次 live canary 没有逐项执行全部 native/custom tools，也没有在同一 live run 中逐项覆盖无 Grant、参数篡改、过期、重放和跨 scope；这些属于定向自动化 gate 证据，不能冒充同一 live run 的直接证据。`pre_tool_coverage=1.0` 的分母是当前 broker state 中累计的 `execution_started`，没有按 canary run 或 implementation revision 分桶，不是所有 OpenClaw tool call 的全局覆盖率。官方 hook 行为和字段见 [OpenClaw Plugin hooks](https://docs.openclaw.ai/plugins/hooks)。
 
@@ -1088,20 +1100,31 @@ OpenAI Agents SDK 的 HITL 也采用具体 tool call 暂停、保存 run state�
 - playbook 的成功率、恢复时间、误触发和回滚率；
 - 路由、方案选择和 verifier 的错误模式。
 
+Phase 5 当前只把其中两个窄面落地为 shadow calibration：
+
+- Project Guardian Attention 只接受用户显式提交的 `useful / not_useful / too_frequent / wrong_timing / wrong_evidence`，并精确绑定当前 assessment、candidate 与各自 revision；自由文本、dismiss 推断、错绑或旧 revision 都不能成为学习证据；
+- `runtime/performance_portfolio.py` 从有界的权威 decision/model/execution/Guardian/provider 投影生成只读描述性指标，按 freshness 和 source health 标明证据质量；unknown 不进入成功率分母，低支持度不会伪装成稳定结论。
+
+两条路径都固定 `policy_effect=none`，不能改变 route、model/provider 权重、provider selection、risk floor、CapabilityGrant、执行权或 autonomy。它们提供校准观测，不是在线策略学习。
+
 ### 18.2 LearningRecord
 
 ```json
 {
+  "schema_version": "veyra.learning_record.v1",
   "learning_id": "learn_...",
-  "scope": {"user_id": "local-user", "domain": "runtime_health"},
-  "kind": "prediction_calibration",
-  "candidate": {},
-  "evidence_refs": ["outcome_...", "feedback_..."],
-  "confidence": 0.72,
-  "status": "candidate",
-  "expires_at": null,
-  "requires_confirmation": false,
+  "feedback_id": "feedback_...",
+  "user_id": "local-user",
+  "assessment_id": "assessment_...",
+  "assessment_revision": "revision_...",
+  "candidate_id": "candidate_...",
+  "candidate_revision": "revision_...",
+  "binding_digest": "...",
+  "label": "useful",
+  "status": "active",
+  "promotion_status": "candidate",
   "policy_effect": "none",
+  "source": "explicit_user_feedback",
   "created_at": "..."
 }
 ```
@@ -1393,21 +1416,29 @@ awareness/attention_scheduler.py
 core/perspective_core.py
 core/goal_portfolio.py
 core/deliberation_engine.py
-core/autonomy_policy.py                       # Phase 5.1 已实现固定 domain profile
+core/autonomy_policy.py                       # Phase 5 已实现固定 A2/A3 domain profile
+core/foresight_contract.py                    # Phase 5 已实现 exact effect contract
+core/learning_record.py                       # Phase 5 已实现分类反馈合同
 core/initiative_policy.py
 
 interface/agent_negotiation.py
+interface/provider_certification.py           # Phase 5 已实现 fail-closed 只读认证
 tool_proxy/governance_bridge.py
 
 runtime/learning_loop.py
-runtime/authority_fence.py                    # Phase 5.1 已实现 Agent transport fence
-runtime/self_heal_playbook.py                 # Phase 5.1 已实现 OpenClaw 窄 playbook
-runtime/playbook_registry.py
+runtime/authority_fence.py                    # Phase 5 已实现 Agent transport fence
+runtime/self_heal_playbook.py                 # Phase 5 已实现 OpenClaw A2 窄 playbook
+runtime/playbook_registry.py                  # Phase 5 已实现不可变内建 registry
+runtime/sandbox_repair_playbook.py            # Phase 5 已实现私有 JSON A3
+runtime/foresight_runtime.py                  # Phase 5 已实现 residual/eligibility
+runtime/learning_calibration_runtime.py       # Phase 5 已实现 shadow feedback
+runtime/performance_portfolio.py              # Phase 5 已实现只读 portfolio
+routers/phase5.py                             # Phase 5 控制面
 
 apps/openclaw/veyra-governance/
 ```
 
-列入该图不代表一次全部实现；未标注“Phase 4/5.1 已实现”的项目仍是建议名称或目标职责，必须按垂直闭环逐步落地。尤其不要为了名称对齐而把当前有界 JSON Case 迁移到数据库或重写 `AwarenessLoop`。
+列入该图不代表一次全部实现；未标注“Phase 4/5 已实现”的项目仍是建议名称或目标职责，必须按垂直闭环逐步落地。尤其不要为了名称对齐而把当前有界 JSON Case 迁移到数据库或重写 `AwarenessLoop`。
 
 ### 23.3 逐步拆分超大中心文件
 
@@ -1530,9 +1561,11 @@ CANCELLING 只能进入 CANCELLED / FAILED / INDETERMINATE
 
 Phase 1–2 的新链继续严格 `record_only / shadow / read-only`，不能借 Phase 3 获得执行权。Phase 3 只允许 canary 所需的逐 run 隔离 sandbox 和当前三个固定 Veyra executor；真实 workspace、外部系统或生产环境副作用必须重新具备 target-specific Grant、auth-derived user scope、独立 verifier、必要的 snapshot/compensation 和该 scope 自己的 fresh canary 后另行晋级。broker 的 reservation coverage 不能当成全局 hook coverage，也不能因为已有 Review、插件或 `execution_authority_enabled` 字段就提前开启。
 
-### 24.6 当前只启用 Phase 5.1 窄范围自愈
+### 24.6 Phase 5 技术完成、只进入 shadow calibration
 
-第一个 `self_heal.openclaw_reconnect.v1` 已在 Phase 3 scoped pre-tool enforcement 与独立 verifier 之后实现，但默认保持 `shadow`。显式 `scoped_canary` 只允许固定本地 OpenClaw 的 status/capability refresh/reconnect：两轮完整双 Probe、最多两次、5 分钟冷却、未知状态和 active effect fail closed、超时不可重放、runtime identity 变化熔断。失败只创建没有执行 authority 的人工 restart Review；它不能重启进程、切换 provider/model、调用 Agent、执行工具或修改 workspace。
+Phase 5 的实际 authority ceiling 由两个互不继承的窄域组成：`self_heal.openclaw_reconnect.v1` 是固定本地 OpenClaw 的 A2 status/capability refresh/reconnect；`sandbox_repair.json_candidate.v1` 是 Veyra 私有一次性 JSON candidate 的 A3 stage/verify。前者需要两轮完整双 Probe、最多两次、5 分钟冷却、unknown/active effect fail closed、timeout 不可重放和 runtime identity drift 熔断；失败只创建 governance-only Review，不能重启进程。后者只在显式 scoped canary 下写私有 state-root sandbox，并以 exact digest 与独立 reopen/hash/parse 验证，不能访问真实 workspace、shell、network 或生产 target。两者都经不可变 built-in registry 的 exact ID/version/revision 调度；A4/A5 没有 operational profile，固定 `not_certified`。
+
+Foresight residual、Attention 分类 feedback、performance portfolio 与 provider certification 都是 read-only/shadow calibration 面：它们只能报告 evidence、误差、support、freshness 或 eligibility，不能执行 promotion、修改策略、选择/切换 provider、发通知、签发 Grant 或提高 autonomy。当前 Kimi + OpenClaw 是现有运行路径；其他模型/Agent runtime 必须独立认证，保持 `validation_pending`。
 
 ### 24.7 每个切片的完成定义
 
@@ -1554,7 +1587,7 @@ Phase 1–2 的新链继续严格 `record_only / shadow / read-only`，不能借
 - 只有实测压缩 CPU、磁盘和恢复时延越过预算后，才增加压缩预算与调度复杂度；
 - 任何恢复都必须从独立小提交、当前数据格式和故障注入开始，不能直接应用旧 stash，也不能为此迁移数据库。
 
-这些是后续可重新评估的设计素材，不是当前 Phase 5.1 的依赖或完成条件。
+这些是后续可重新评估的设计素材，不是当前 Phase 5 技术完成的依赖或完成条件。
 
 ## 25. 完整路线图
 
@@ -1591,7 +1624,7 @@ Phase 1–2 的新链继续严格 `record_only / shadow / read-only`，不能借
 - `IMPLEMENTED / SAFE TOOL BOUNDARY`：SafeFile/SafeShell 都要求显式 sandbox root。路径按固定 root identity、逐级 directory fd 与 `O_NOFOLLOW` 解析，拒绝 `..`、symlink、目录/FIFO 和越界目标，读写有 byte budget，写入采用同目录临时文件、identity recheck、原子 replace 与 fsync。SafeShell 不是通用 shell：只允许固定 identity/digest 的 `echo/printf/true/false` direct argv，拒绝 wrapper、pipeline、重定向、多命令、控制字符和 caller env，使用固定 cwd、clean env、timeout、输出上限和 process-group kill；shell invocation 当前不接受 derived target；
 - `IMPLEMENTED / REVIEW CLAIM + SNAPSHOT FIRST`：重复或并发 approve 先原子生成一次性 claim；ActionExecutor 在边界重新读取 canonical review、校验 token 与 proposal digest 后才进入 `executing`。canonical review 的普通文件写入在同一 local sandbox 内串行执行，必须先由 RollbackManager 生成 exact existing-file snapshot 或 missing-file tombstone，snapshot 缺失、scope 不一致或失败时零写入；restore 还需要另一份 canonical review claim，公开 restore 路由不能传入执行授权。任意 `approved_by` 字符串仍只是诊断字段，敏感 `ask_user` 文件写入在缺少专用不可伪造 execution context 时继续 fail closed；
 - `IMPLEMENTED / AUTHORITATIVE PROJECTION`：只有 observed receipt 对应的 `VerifiedToolEffect` 才能进入权威 changed-files/tool-call 投影；effect 逐条绑定 receipt/run/call/tool/invocation/result/targets digest，changed files 必须是授权 exact target。Agent 自报 trace、proposal、tool call、changed file 或自然语言成功不能建立 authority，也不能让结果升级为 `verified_success`；
-- `VALIDATED / SCOPED LIVE CANARY`：当前 Kimi/OpenClaw governed run 已真实产生工具调用；授权 sandbox write 成功并形成权威 receipt/effect，同 run native write 被 hook 阻断，parent traversal 被 broker 阻断，两个禁止目标均未创建，8 次 R0 shell probe 也通过 exact reservation/execute/observe，且 `started_without_reservation=0`。实现 identity 绑定和 fresh plugin-active 检查共同使公开组合状态为 `canary.status=validated / tool_proxy_enforced=true`，只适用于 `veyra_governed_openclaw_sessions`。无 Grant、参数篡改、过期、重放和跨 scope 的 fail-closed 性质由定向自动化 gate 覆盖，不冒充同一 live run 的直接证据；
+- `HISTORICALLY VALIDATED / SCOPED PHASE 3 LIVE CANARY`：既有 Kimi/OpenClaw governed run 曾真实产生工具调用；授权 sandbox write 成功并形成权威 receipt/effect，同 run native write 被 hook 阻断，parent traversal 被 broker 阻断，两个禁止目标均未创建，8 次 R0 shell probe 也通过 exact reservation/execute/observe，且当时 `started_without_reservation=0`。当时的实现 identity 绑定和 fresh plugin-active 检查共同使公开组合状态为 `canary.status=validated / tool_proxy_enforced=true`，只适用于 `veyra_governed_openclaw_sessions`，不验证本次 Phase 5 changeset。无 Grant、参数篡改、过期、重放和跨 scope 的 fail-closed 性质由定向自动化 gate 覆盖，不冒充同一 live run 的直接证据；
 - `REMAINING SCOPE / EXCLUSIONS`：OpenClaw R2 写入目前只落到逐 run 隔离 sandbox，不修改真实 workspace，也不宣称每个 disposable sandbox write 都有 snapshot；通用 browser/API 执行、任意 shell、directory/prefix/glob scope、完整数据流策略、真实 workspace/生产 side effect、全局/其他 Agent runtime enforcement 和多用户 auth-derived scope 都未开放。进程内 context 不提供跨 Gateway 进程或 host 重启恢复；host restart 必须终止旧 run 并进入 unavailable/indeterminate，随后重新注册。当前私有、gitignored broker ledger 仍为诊断保留完整 `ToolInvocation.arguments`，可能包含 sandbox 写入原文；它不进入模型、公开状态或 token 路径，但在真实 workspace/生产晋级前仍需 terminal/cancel 后压缩为 digest/target/receipt 并定义 retention。Veyra 的治理合同保持模型/provider 中立，不因 Kimi 或未来 provider 更换而放宽。HMAC、归档索引、密钥轮换、旧索引迁移、压缩预算和数据库迁移仍明确不进入本阶段；
 - `HONESTY LOCK`：`tool_proxy_enforced=true` 只能与 exact scope、当前 fresh plugin-active 状态、匹配的 broker policy/registry/executor + plugin protocol/revision、累计 `started_without_reservation=0` 和本次 canary evidence 一起解释；单独读取持久 broker attestation 不能证明此刻插件仍 active。自动 identity 失效只覆盖显式 `policy_revision / registry_revision / executor_id / plugin protocol / plugin implementation revision`，不是 source hash，也不自动绑定 OpenClaw host version、provider/model/auth 或全部配置。任何相关版本、源码、provider 或关键配置变化后，重新宣称 current validation 前都要显式 bump revision（适用时）并执行 fresh canary。该结果不能外推为全局 Agent 执行治理。
 
@@ -1601,17 +1634,20 @@ Phase 1–2 的新链继续严格 `record_only / shadow / read-only`，不能借
 - `IMPLEMENTED / BOUNDED DIALOGUE`：`TASK_REQUEST / EVIDENCE_REQUEST / CHALLENGE / OPTION_SET` 采用 exact parent/revision/turn/task/operation/scope 绑定；自由文本、coercion、extra field、错绑和歧义 JSON fail closed。Agent proposal 不建立事实、权限、执行或验证；
 - `IMPLEMENTED / EXACT RUNTIME BINDING`：Case identity 在 dispatch 前持久化，caller-supplied run、idempotent submit、callback-as-hint、exact refetch、terminal provenance 和 broker/plugin/Agent authority closure 已接入；process restart、partial registration、重复 submit、迟到 callback 和 provider 并发隔离均有回归；
 - `IMPLEMENTED / PUBLIC BOUNDARY`：Case API、LoopResult、callback、poll、refresh、stop 和 `/state` 不公开 provider run/session/binding/token/raw 或全局 pending context；普通 direct/probe 及 Phase 1 全部 9 Route 的公开 response/status/risk 保持原链；
-- `VALIDATED / CURRENT KIMI + OPENCLAW`：重启后的真实实现请求进入 Agent 路由并得到严格 `EVIDENCE_REQUEST`，Case 到达 `AWAITING_EVIDENCE`、effect state 为 `not_started`、authority session 归零、重复 intake 去重且 Git diff 不变；另一个 Kimi 双 JSON-block 输出暴露并验证了结构解析/撤权 canonical identity 的真实问题，修复后进入 gate；
+- `HISTORICALLY VALIDATED / KIMI + OPENCLAW`：Phase 4 的真实实现请求曾进入 Agent 路由并得到严格 `EVIDENCE_REQUEST`，Case 到达 `AWAITING_EVIDENCE`、effect state 为 `not_started`、authority session 归零、重复 intake 去重且 Git diff 不变；另一个 Kimi 双 JSON-block 输出曾暴露并验证结构解析/撤权 canonical identity 的真实问题，修复后进入 gate。以上属于 Phase 4 历史证据，不作为本次 Phase 5 fresh Case evidence；
 - `REMAINING`：evidence/context patch 回合、plan selection、第二轮及更多轮协商、授权/执行/验证状态、通用 DAG、长期 wakeup、数据库迁移和其他模型/provider live validation 尚未实现。Agent 仍只读或 sandbox proposal，副作用继续受 Phase 3 权威边界控制。
 
 ### Phase 5：有界自治、Self-Heal、Foresight 与学习校准
 
-- `IMPLEMENTED / DEFAULT SHADOW`：已冻结 domain-scoped A0–A5 policy 表达，并实现固定 `runtime_health` A2 profile 与 `self_heal.openclaw_reconnect.v1`；默认只观察，disabled/record-only/shadow 没有 reconnect authority；
-- `IMPLEMENTED / EXPLICIT SCOPED CANARY`：两轮持久双 Probe、exact target/config/identity binding、known-terminal activity gate、最多两次、300 秒 cooldown、operation CAS、timeout indeterminate、circuit breaker、稳定单一 R4 governance-only review 和 fresh 双 verifier 已接通；它只恢复固定本地 OpenClaw Gateway transport；
-- `VALIDATED / AUTOMATED`：确定性 recovery、partial verifier、并发单 attempt、cooldown、breaker、crash/timeout、损坏和未知状态、scope/mode/endpoint drift、runtime identity drift、隐私、非执行 review，以及全部 9 Route × 6 个运行状态的非弱化进入 gate；
-- `VALIDATION BOUNDARY`：真实运行只应在默认 shadow 下证明当前 OpenClaw healthy observation、零 attempt、零 review、executor/Tool ledger/Git 无副作用；真实断网 canary、真实恢复成功率和误触发率仍需单独、有意安排的故障演练，不能由 fixture 冒充；
-- `REMAINING`：通用 playbook registry、sandbox repair、A3–A5 晋级、capability effect/dependency graph、dry-run/sandbox promotion、prediction residual、Attention/notification usefulness learning、Agent/tool/source performance portfolio，以及其他 Agent runtime/provider 的独立适配与 live validation；
-- `EXCLUDED`：进程重启、provider/model 自动切换、Agent 诊断、工具执行、真实 workspace 修改、生产 side effect、自修改、HMAC/密钥轮换/旧索引迁移/压缩预算和数据库迁移均不属于本切片。
+- `TECHNICAL COMPLETE / SHADOW CALIBRATION`：已冻结 domain-scoped A0–A5 policy 表达与不可变 built-in playbook registry；不存在全局 autonomy level。当前 operational ceiling 只有固定 OpenClaw runtime-health A2，以及 Veyra 私有 JSON candidate stage/verify A3；A4/A5 均为 `not_certified`；
+- `IMPLEMENTED / OPENCLAW A2`：`self_heal.openclaw_reconnect.v1` 已接通两轮持久双 Probe、exact target/config/identity binding、known-terminal activity gate、最多两次、300 秒 cooldown、operation CAS、timeout indeterminate、circuit breaker、稳定单一 R4 governance-only review 与 fresh 双 verifier。它只允许固定本地 OpenClaw status/capability refresh/reconnect，不能重启进程；
+- `IMPLEMENTED / PRIVATE JSON A3`：`sandbox_repair.json_candidate.v1` 默认 shadow 零写入；显式 scoped canary 只把 strict canonical JSON 写入 Veyra 私有 state-root sandbox，并以 exact digest 与独立 reopen/hash/parse 形成候选验证。caller path、symlink escape、shell、network、Agent、workspace/生产 effect 和 promotion 均被禁止；
+- `IMPLEMENTED / FORESIGHT CALIBRATION`：固定 capability 的 exact effect/dependency contract、prediction-before-execution、权威 receipt/effect reconciliation 与 `exact/mismatch/indeterminate` residual 已接通；promotion 只读报告 eligibility，永不应用 promotion、Grant、Review、mode 或 autonomy 变化；
+- `IMPLEMENTED / LEARNING AND PORTFOLIO SHADOW`：Attention 只接受 exact-bound 的五种显式分类 feedback，支持幂等与 correction/supersede，不保存自由文本；read-only portfolio 汇总 Agent/tool/source/provider 的权威有界投影。两者都固定 `policy_effect=none`，不改变 route、weight、provider、risk、权限或执行；
+- `IMPLEMENTED / PROVIDER FAIL-CLOSED`：provider certification 要求 fresh exact runtime identity、compatibility、adapter contract 与 required features。所有 generic `HttpAgentAdapter` 即使 certification validated 也只有 diagnostics，task dispatch、memory write 与 stop 永远无 authority；OpenClaw 每次 prompt 外发前必须 force-refresh，并同时验证 trusted native adapter、fresh exact provider certification、`tool_proxy_enforced=true`、identity match、`scope=veyra_governed_openclaw_sessions` 与四个 governance callbacks 完整，否则零 dispatch。当前运行路径是 Kimi/Moonshot + OpenClaw；其他模型/provider 全部保持 `validation_pending`，不存在自动选择或切换；
+- `VALIDATED / LOCAL LIVE + AUTOMATED`：本次 changeset 的 Python gate `64/64`、OpenClaw plugin `27/27`、compileall 与 Web browser/desktop frontend build 已通过；重启后的 `/phase5/status` 保持 `technical_complete_shadow_calibration`。当前 Kimi + OpenClaw 取得 fresh exact certification，显式 R0 真实调用成功且无工具/文件变化；Verifier 对无结构化执行证据的成功文本保持 `needs_more_probe`。default-shadow candidate 前后 review/Tool Governance/broker/Foresight/sandbox/config/Git/OpenClaw PID 全部不变；私有 A3 canary 得到 `sandbox_verified_candidate`，只写 Veyra state-root 私有 candidate/manifest，随后已恢复 shadow。`/health=degraded` 来自既有 memory fallback、无本轮 Feishu 入站、历史 pending reviews/stale beliefs；Feishu websocket 为 running，但 `last_event_after_start=false` 不能当作 fresh channel acceptance；
+- `REMAINING EVIDENCE, NOT REMAINING IMPLEMENTATION`：真实断网/恢复故障演练、恢复成功率与误触发率、Attention usefulness 的合格 held-out 样本和双人人工评测、长期 residual/portfolio 样本量，以及每个额外 Agent runtime/provider 的独立 live validation；
+- `EXCLUDED`：通知、进程重启、provider/model 自动切换、真实 workspace 读写、生产 side effect、候选自动晋级、自修改、A4/A5 operational authority、HMAC/密钥轮换/旧索引迁移/压缩预算和数据库迁移均不属于 Phase 5 完成范围。
 
 ### Phase 6：安全扩展与多 Agent 协作
 
