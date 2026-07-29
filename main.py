@@ -25,7 +25,7 @@ from interface.agent_adapter import ExecutionResult
 from interface.event_normalizer import EventNormalizer
 from interface.event_schema import Decision, Route, utc_now_iso
 from interface.feishu_adapter import FeishuAdapter
-from interface.feishu_ws_runner import FeishuWsRunner
+from interface.feishu_ws_runner import FeishuWsRunner, feishu_connection_snapshot
 from interface.intake_gateway import IntakeGateway
 from interface.local_control_guard import LocalControlPolicy
 from pydantic import Field
@@ -1413,8 +1413,13 @@ def _mvp_validation_snapshot(agent_status_data: dict[str, Any]) -> dict[str, Any
     model_validation = model_status.get("validation") if isinstance(model_status.get("validation"), dict) else {}
     matrix_status = runtime_matrix.status()
     feishu_status_data = feishu_ws_runner.status()
-    feishu_connected = bool(feishu_status_data.get("thread_alive"))
-    feishu_fresh = bool(feishu_status_data.get("last_event_after_start"))
+    feishu_connection = feishu_connection_snapshot(feishu_status_data)
+    feishu_connected = bool(feishu_connection.get("connected"))
+    feishu_fresh = bool(
+        feishu_status_data.get("last_processed_after_start")
+        and feishu_status_data.get("last_reply_sent_after_start")
+        and not feishu_status_data.get("processing_failure_unrecovered")
+    )
     control_status = local_control_policy.status()
 
     return {
@@ -1463,12 +1468,24 @@ def _mvp_validation_snapshot(agent_status_data: dict[str, Any]) -> dict[str, Any
             "implementation": "implemented",
             "status": "validated"
             if feishu_connected and feishu_fresh
+            else "processing_failed"
+            if feishu_connected and feishu_status_data.get("processing_failure_unrecovered")
+            else "waiting_for_event"
+            if feishu_connected and not feishu_status_data.get("last_event_after_start")
+            else "processing_incomplete"
+            if feishu_connected and not feishu_status_data.get("last_processed_after_start")
+            else "reply_unverified"
+            if feishu_connected and not feishu_status_data.get("last_reply_sent_after_start")
             else "waiting_for_event"
             if feishu_connected
             else str(feishu_status_data.get("status") or "not_configured"),
             "validated": feishu_connected and feishu_fresh,
-            "thread_alive": feishu_connected,
+            "connected": feishu_connected,
+            "thread_alive": bool(feishu_status_data.get("thread_alive")),
             "last_event_after_start": feishu_status_data.get("last_event_after_start"),
+            "last_processed_after_start": feishu_status_data.get("last_processed_after_start"),
+            "last_reply_sent_after_start": feishu_status_data.get("last_reply_sent_after_start"),
+            "processing_failure_unrecovered": feishu_status_data.get("processing_failure_unrecovered"),
         },
         "local_control_security": {
             "implementation": "implemented",

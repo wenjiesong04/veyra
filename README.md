@@ -32,7 +32,7 @@ The desktop package includes a local backend sidecar, so users can open `Veyra` 
 
 Requirements:
 
-- Python 3.11+
+- Python 3.11.x
 - Node.js/npm, only needed to rebuild the local console
 - Optional: local OpenClaw Gateway at `http://127.0.0.1:18789`
 - Optional: your own Feishu app credentials for local WebSocket or callback intake
@@ -40,8 +40,15 @@ Requirements:
 ```bash
 git clone https://github.com/wenjiesong04/veyra.git
 cd veyra
-cp .env.example .env
+conda activate veyra
+install -m 600 .env.example .env
 ./scripts/install_local.sh
+```
+
+For a non-Conda installation, select an absolute Python 3.11 interpreter explicitly so the installer can create `.venv`:
+
+```bash
+PYTHON=/absolute/path/to/python3.11 ./scripts/install_local.sh
 ```
 
 Edit `.env` for only the services you use:
@@ -66,6 +73,7 @@ FEISHU_DEFAULT_RECEIVE_ID=
 Start the API in the foreground:
 
 ```bash
+./scripts/start_local.sh --check-runtime
 ./scripts/start_local.sh --foreground
 ```
 
@@ -74,6 +82,8 @@ On macOS, run it under the user LaunchAgent instead:
 ```bash
 ./scripts/start_local.sh --launchd
 ```
+
+`start_local.sh` accepts only an explicitly selected `VEYRA_PYTHON`/legacy `PYTHON`, an active Conda environment named `veyra`, or the project `.venv`. It validates Python 3.11, every pinned runtime dependency, and the macOS TLS CA before starting or replacing the LaunchAgent; it never falls back to an arbitrary `python3` on `PATH`.
 
 Check the local runtime:
 
@@ -128,7 +138,7 @@ User/Event
 ## FastAPI
 
 ```bash
-python3 -B -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+python -B -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 Selected operational endpoints are listed below. The mechanically checked
@@ -268,7 +278,7 @@ cd web
 npm install
 npm run build
 cd ..
-python3 -B -m uvicorn main:app --host 127.0.0.1 --port 8000
+./scripts/start_local.sh --foreground
 ```
 
 Open:
@@ -291,14 +301,14 @@ The Vite dev server proxies API calls to `http://127.0.0.1:8000`.
 Run the current gate smoke suite:
 
 ```bash
-python3 scripts/run_smokes.py --group gate --timeout 90
-python3 -m compileall awareness core decision execution foresight guardian interface memory_bridge probes rollback_audit routers runtime skills tool_proxy main.py cli.py desktop_backend.py scripts
+python scripts/run_smokes.py --group gate --timeout 90
+python -m compileall awareness core decision execution foresight guardian interface memory_bridge probes rollback_audit routers runtime skills tool_proxy main.py cli.py desktop_backend.py scripts
 ```
 
 Run the broader core governance loop, review approval, Tool Proxy, rollback, Memory Bridge, proactive check, and readiness checks in one command:
 
 ```bash
-python3 scripts/mvp_self_test.py
+python scripts/mvp_self_test.py
 ```
 
 Self-tests use temporary `VEYRA_STATE_ROOT` and `VEYRA_AGENCY_ROOT` directories so they do not pollute the local runtime state or tracked agency files.
@@ -466,7 +476,7 @@ OpenClaw uses the same WebSocket Gateway protocol as the local OpenClaw Control 
 For OpenClaw deployments with Control UI auth enabled, set `OPENCLAW_GATEWAY_TOKEN` to the dashboard token. If that environment variable is not set, Veyra can read the local dashboard token from `~/.openclaw/openclaw.json` at runtime; set `VEYRA_OPENCLAW_USE_LOCAL_CONFIG=0` to disable that fallback. Veyra stores its generated OpenClaw device identity in `state/local/openclaw_device.json` and ignores that file in git because it contains local signing material. The adapter writes this credential atomically with file mode `0600`; its standard `state/local` parent is restricted to `0700`, and an existing legacy file is tightened before it is read.
 OpenClaw status and execution artifacts are redacted and summarized before being exposed through Veyra state endpoints, so gateway tokens, device tokens, signatures, private keys, host paths, and full runtime snapshots are not copied into `/agent/status` or audit logs.
 
-Agent runtime version changes are handled at the adapter boundary. VeyraCore depends on the `AgentAdapter` contract, while `OpenClawAdapter` negotiates the gateway protocol, checks advertised methods, and soft-fails optional methods such as `tools.catalog` and `skills.status`. If OpenClaw raises its gateway protocol, set `OPENCLAW_PROTOCOL_MIN` / `OPENCLAW_PROTOCOL_MAX` before changing core code, then verify with `GET /agent/status` and `python3 scripts/mvp_self_test.py`. After an OpenClaw host/plugin version, provider/model/auth configuration, or governance revision change, rerun the real Phase 3 live canary; status checks and offline self-tests alone do not renew enforcement validation.
+Agent runtime version changes are handled at the adapter boundary. VeyraCore depends on the `AgentAdapter` contract, while `OpenClawAdapter` negotiates the gateway protocol, checks advertised methods, and soft-fails optional methods such as `tools.catalog` and `skills.status`. If OpenClaw raises its gateway protocol, set `OPENCLAW_PROTOCOL_MIN` / `OPENCLAW_PROTOCOL_MAX` before changing core code, then verify with `GET /agent/status` and `python scripts/mvp_self_test.py`. After an OpenClaw host/plugin version, provider/model/auth configuration, or governance revision change, rerun the real Phase 3 live canary; status checks and offline self-tests alone do not renew enforcement validation.
 
 Hermes and Custom HTTP adapters expect these runtime endpoints by default:
 

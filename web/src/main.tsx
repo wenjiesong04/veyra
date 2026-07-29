@@ -846,14 +846,16 @@ function App() {
   const setupAgent = asRecord(setupStatus?.agent);
   const setupFeishu = asRecord(setupStatus?.feishu_setup);
   const feishuReadiness = String(setupFeishu.readiness ?? "not_configured");
-  const feishuReadinessLabel =
-    feishuReadiness === "receiving"
-      ? "receiving"
-      : feishuReadiness === "waiting_for_event"
-        ? "waiting for message"
-        : feishuReadiness === "configured_not_running"
-          ? "configured"
-          : "not configured";
+  const feishuReadinessLabels: Record<string, string> = {
+    receiving: "receiving",
+    processing_failed: "processing failed",
+    waiting_for_event: "waiting for message",
+    connecting: "connecting",
+    not_ready: "not ready",
+    configured_not_running: "configured, stopped",
+    not_configured: "not configured"
+  };
+  const feishuReadinessLabel = feishuReadinessLabels[feishuReadiness] ?? feishuReadiness;
 
   return (
     <main className="appShell">

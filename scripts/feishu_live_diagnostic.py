@@ -13,17 +13,25 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from core.env_loader import load_runtime_env  # noqa: E402
+from interface.feishu_ws_runner import feishu_connection_snapshot  # noqa: E402
 
+
+load_runtime_env()
 BASE_URL = os.getenv("VEYRA_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 
 
 def request_json(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None, timeout: float = 15.0) -> dict[str, Any]:
     data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    token = str(os.getenv("VEYRA_LOCAL_API_TOKEN") or "").strip()
+    if token:
+        headers["X-Veyra-Token"] = token
     request = Request(
         f"{BASE_URL}{path}",
         data=data,
         method=method,
-        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        headers=headers,
     )
     with urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8") or "{}")
@@ -80,16 +88,33 @@ def main() -> int:
     ws_alive = bool(ws_status.get("thread_alive"))
     ws_configured = bool(ws_status.get("configured"))
     last_event_after_start = bool(ws_status.get("last_event_after_start"))
-    inbound_ready = bool(ws_alive and ws_configured and last_event_after_start)
-    if ws_configured and ws_alive and not last_event_after_start:
+    last_processed_after_start = bool(ws_status.get("last_processed_after_start"))
+    last_reply_sent_after_start = bool(ws_status.get("last_reply_sent_after_start"))
+    processing_failure_unrecovered = bool(ws_status.get("processing_failure_unrecovered"))
+    connection = feishu_connection_snapshot(ws_status)
+    ws_connected = bool(connection.get("connected"))
+    inbound_ready = bool(
+        ws_connected
+        and last_processed_after_start
+        and not processing_failure_unrecovered
+    )
+    if ws_connected and not last_event_after_start:
         warnings.append("Feishu WS is alive, but no inbound event has arrived since this Veyra process started")
+    elif ws_connected and not last_processed_after_start:
+        warnings.append("Feishu WS received an event, but no message has completed Veyra processing in this process")
+    elif ws_connected and not last_reply_sent_after_start:
+        warnings.append("Feishu WS processed a message, but no provider-sent reply is proven in this process")
+    if processing_failure_unrecovered:
+        warnings.append("Feishu WS has an unrecovered current-run processing failure")
     if not ws_configured:
         warnings.append("Feishu WS is not fully configured")
     if not ws_alive:
         warnings.append("Feishu WS worker is not alive")
+    elif not ws_connected:
+        warnings.append("Feishu WS worker is alive, but no current-run connection has been established")
 
     session_id, session_source = choose_session(sessions, outbox)
-    send_enabled = os.getenv("VEYRA_FEISHU_DIAGNOSTIC_SEND", "1").strip().lower() not in {"0", "false", "no"}
+    send_enabled = os.getenv("VEYRA_FEISHU_DIAGNOSTIC_SEND", "0").strip().lower() not in {"0", "false", "no"}
     send_body: dict[str, Any] = {"status": "skipped", "reason": "VEYRA_FEISHU_DIAGNOSTIC_SEND disabled"}
     provider_sent = False
     if send_enabled:
@@ -109,11 +134,19 @@ def main() -> int:
             warnings.append("Feishu outbound provider self-test did not reach provider_sent")
 
     result = {
-        "status": "success" if provider_sent and (ws_alive or not ws_configured) else "degraded",
+        "status": "success"
+        if inbound_ready
+        and last_reply_sent_after_start
+        and (not send_enabled or provider_sent)
+        else "degraded",
         "base_url": BASE_URL,
         "inbound_ready": inbound_ready,
-        "outbound_ready": provider_sent,
+        "outbound_ready": bool(provider_sent or last_reply_sent_after_start),
+        "connected": ws_connected,
         "last_event_after_start": last_event_after_start,
+        "last_processed_after_start": last_processed_after_start,
+        "last_reply_sent_after_start": last_reply_sent_after_start,
+        "processing_failure_unrecovered": processing_failure_unrecovered,
         "provider_sent": provider_sent,
         "session_source": session_source,
         "ws_status": {
@@ -139,8 +172,11 @@ def main() -> int:
         "warnings": warnings,
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    print("feishu live diagnostic passed")
-    return 0
+    if result["status"] == "success":
+        print("feishu live diagnostic passed")
+        return 0
+    print("feishu live diagnostic incomplete", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

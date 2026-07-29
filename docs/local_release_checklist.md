@@ -12,7 +12,7 @@ This release target is local-first: users clone Veyra from GitHub, configure the
 ## Fresh Clone Acceptance
 
 ```bash
-cp .env.example .env
+install -m 600 .env.example .env
 ./scripts/install_local.sh
 ./scripts/start_local.sh --foreground
 ```
@@ -71,8 +71,9 @@ After configuring Feishu and OpenClaw locally:
 
 1. Start Veyra with `./scripts/start_local.sh --launchd` on macOS or `--foreground` elsewhere.
 2. Confirm `/agent/status` shows OpenClaw `validated`.
-3. Confirm `/integrations/feishu/ws/status` has `configured=true` and a live thread after `/integrations/feishu/ws/start`.
-4. Send real Feishu messages covering direct answer, time/weather probe, safe Agent handoff, commitment confirm/cancel/status, and duplicate intake.
-5. Inspect `/runtime/traces/recent`, `/runtime/soak/status`, and `/runtime/metrics/summary`.
+3. Confirm `/integrations/feishu/ws/status` has `configured=true`, `connected=true`, and a current-run `last_connected_at` after `/integrations/feishu/ws/start`; `thread_alive=true` alone is only a reconnect worker.
+4. If claiming full Feishu E2E, send a real message and require current-run `last_processed_after_start=true`, `last_reply_sent_after_start=true`, no unrecovered processing failure, a websocket runtime trace, and a `provider_sent` outbox record with an external message id.
+5. Send real Feishu messages covering direct answer, time/weather probe, safe Agent handoff, commitment confirm/cancel/status, and duplicate intake.
+6. Inspect `/runtime/traces/recent`, `/runtime/soak/status`, and `/runtime/metrics/summary`.
 
 Do not mark a release ready until live traces show the intended routes without uncontrolled tool execution.

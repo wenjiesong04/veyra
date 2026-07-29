@@ -10,7 +10,9 @@ contains 211 Starlette/FastAPI route objects: 206 callable product
 static mount. The explicit `GET /console` bootstrap route is one of the 206
 product routes and is distinct from that mount.
 
-Current `main.py` line count: 1625.
+The exact `main.py` line count is intentionally not used as an acceptance
+signal; route inventory and isolated import checks are the maintained
+mechanical evidence.
 
 ## Router Split
 

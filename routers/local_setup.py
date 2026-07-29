@@ -15,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from interface.event_schema import utc_now_iso
+from interface.feishu_ws_runner import feishu_connection_snapshot
 
 
 ALLOWED_ENV_KEYS = {
@@ -420,23 +421,20 @@ def _feishu_diagnostics(feishu_status: dict[str, Any]) -> dict[str, Any]:
     thread_alive = bool(feishu_status.get("thread_alive"))
     last_event_after_start = bool(feishu_status.get("last_event_after_start"))
     status = str(feishu_status.get("status") or "unknown")
-    if configured and thread_alive and last_event_after_start:
-        readiness = "receiving"
-    elif configured and thread_alive:
-        readiness = "waiting_for_event"
-    elif configured:
-        readiness = "configured_not_running"
-    else:
-        readiness = "not_configured"
+    connection = feishu_connection_snapshot(feishu_status)
     return {
         "configured": configured,
         "enabled": bool(config.get("enabled")),
         "connection_mode": str(config.get("connection_mode") or "callback"),
         "status": status,
+        "connected": connection["connected"],
         "thread_alive": thread_alive,
         "last_event_after_start": last_event_after_start,
+        "last_processed_after_start": bool(feishu_status.get("last_processed_after_start")),
+        "last_reply_sent_after_start": bool(feishu_status.get("last_reply_sent_after_start")),
+        "processing_failure_unrecovered": bool(feishu_status.get("processing_failure_unrecovered")),
         "last_event_at": feishu_status.get("last_event_at"),
-        "readiness": readiness,
+        "readiness": connection["readiness"],
         "app_id_set": bool(config.get("app_id")),
         "app_secret_set": bool(config.get("app_secret")),
         "default_receive_id_set": bool(config.get("default_receive_id")),

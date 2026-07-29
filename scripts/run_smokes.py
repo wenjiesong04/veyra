@@ -16,6 +16,7 @@ GATE_SMOKES = [
     "persona_deep_binding_smoke.py",
     "capability_registry_unified_smoke.py",
     "local_setup_smoke.py",
+    "start_local_runtime_smoke.py",
     "proactive_review_execution_smoke.py",
     "agency_state_source_smoke.py",
     "user_profile_isolation_smoke.py",

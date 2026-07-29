@@ -14,6 +14,56 @@ from interface.event_schema import utc_now_iso
 from interface.feishu_adapter import FeishuAdapter
 
 
+FEISHU_CONNECTED_STATUSES = frozenset({"running", "already_running"})
+FEISHU_CONNECTING_STATUSES = frozenset({"starting", "connecting", "reconnecting"})
+FEISHU_ERROR_STATUSES = frozenset({"connect_error", "dependency_missing", "error", "stale"})
+
+
+def feishu_connection_snapshot(status_payload: dict[str, Any]) -> dict[str, Any]:
+    configured = bool(status_payload.get("configured"))
+    thread_alive = bool(status_payload.get("thread_alive"))
+    status = str(status_payload.get("status") or "unknown")
+    started_at = str(status_payload.get("started_at") or "")
+    last_connected_at = str(status_payload.get("last_connected_at") or "")
+    last_event_after_start = bool(status_payload.get("last_event_after_start"))
+    connected_after_start = bool(
+        (last_connected_at and (not started_at or last_connected_at >= started_at))
+        or last_event_after_start
+    )
+    connected = bool(
+        configured
+        and thread_alive
+        and status in FEISHU_CONNECTED_STATUSES
+        and connected_after_start
+    )
+
+    processing_failure_unrecovered = bool(status_payload.get("processing_failure_unrecovered"))
+    if not configured:
+        readiness = "not_configured"
+    elif connected and processing_failure_unrecovered:
+        readiness = "processing_failed"
+    elif connected and last_event_after_start:
+        readiness = "receiving"
+    elif connected:
+        readiness = "waiting_for_event"
+    elif status in FEISHU_CONNECTING_STATUSES and thread_alive:
+        readiness = "connecting"
+    elif status in FEISHU_ERROR_STATUSES or thread_alive:
+        readiness = "not_ready"
+    else:
+        readiness = "configured_not_running"
+
+    return {
+        "connected": connected,
+        "connected_after_start": connected_after_start,
+        "readiness": readiness,
+        "status": status,
+        "thread_alive": thread_alive,
+        "last_event_after_start": last_event_after_start,
+        "processing_failure_unrecovered": processing_failure_unrecovered,
+    }
+
+
 class FeishuWsRunner:
     """Feishu long-connection runner for local Veyra-first operation."""
 
@@ -29,8 +79,21 @@ class FeishuWsRunner:
         config = self._config()
         started_at = str(state.get("started_at") or "")
         last_event_at = str(state.get("last_event_at") or "")
+        last_processed_at = str(state.get("last_processed_at") or "")
+        last_reply_sent_at = str(state.get("last_reply_sent_at") or "")
         status = str(state.get("status") or "stopped")
         last_event_after_start = bool(last_event_at and (not started_at or last_event_at >= started_at))
+        last_processed_after_start = bool(last_processed_at and (not started_at or last_processed_at >= started_at))
+        last_reply_sent_after_start = bool(
+            last_processed_after_start
+            and last_reply_sent_at
+            and last_reply_sent_at >= last_processed_at
+        )
+        last_event_failure_at = str(state.get("last_event_failure_at") or "")
+        processing_failure_unrecovered = bool(
+            last_event_failure_at
+            and (not last_processed_at or last_event_failure_at >= last_processed_at)
+        )
         diagnostics: list[str] = []
         if status in {"running", "starting"} and not alive:
             status = "stale"
@@ -39,18 +102,29 @@ class FeishuWsRunner:
             diagnostics.append("Feishu websocket worker is alive but has not completed the websocket connection.")
         if alive and started_at and not last_event_after_start:
             diagnostics.append("No Feishu events have been received since this websocket runner started.")
+        if processing_failure_unrecovered:
+            diagnostics.append("The latest Feishu event reached the websocket worker but failed during Veyra processing.")
+        elif last_processed_after_start and not last_reply_sent_after_start:
+            diagnostics.append("The latest processed Feishu message has no provider-sent reply evidence.")
         last_error = str(state.get("last_error") or "")
         if "CERTIFICATE_VERIFY_FAILED" in last_error:
             diagnostics.append("Feishu websocket TLS verification failed; configure FEISHU_CA_BUNDLE or the system trust store.")
-        return {
+        result = {
             **state,
             "status": status,
             "thread_alive": alive,
             "configured": bool(self._secret(config, "app_id", "FEISHU_APP_ID") and self._secret(config, "app_secret", "FEISHU_APP_SECRET")),
             "last_event_after_start": last_event_after_start,
+            "last_processed_after_start": last_processed_after_start,
+            "last_reply_sent_after_start": last_reply_sent_after_start,
+            "processing_failure_unrecovered": processing_failure_unrecovered,
             "diagnostics": diagnostics,
             "channel_config": redact_sensitive(config),
         }
+        connection = feishu_connection_snapshot(result)
+        result["connected"] = connection["connected"]
+        result["readiness"] = connection["readiness"]
+        return result
 
     def import_openclaw_config(self, *, path: str | None = None, enable: bool = True) -> dict[str, Any]:
         config_path = Path(path or Path.home() / ".openclaw" / "openclaw.json")
@@ -107,6 +181,9 @@ class FeishuWsRunner:
                 "started_at": utc_now_iso(),
                 "last_event_at": None,
                 "last_result": None,
+                "last_processed_at": None,
+                "last_reply_sent_at": None,
+                "last_event_failure_at": None,
                 "previous_last_event_at": previous.get("last_event_at"),
                 "previous_last_result": redact_sensitive(previous.get("last_result"), max_string=1800),
                 "last_error": None,
@@ -133,15 +210,17 @@ class FeishuWsRunner:
             self._write_state({**self._read_state(), "status": "dependency_missing", "last_error": str(exc), "updated_at": utc_now_iso()})
             return
 
-        ssl_context, tls_info = self._ssl_context(config)
-        self._install_lark_ws_hooks(lark_ws_client, ssl_context=ssl_context, tls_info=tls_info)
+        tls_info: dict[str, Any] = {"verify": True, "mode": "initialization_failed"}
+        try:
+            ssl_context, tls_info = self._ssl_context(config)
+            self._install_lark_ws_hooks(lark_ws_client, ssl_context=ssl_context, tls_info=tls_info)
+        except Exception as exc:
+            self._mark_ws_connect_failed(exc, tls_info)
+            return
 
         def handle_message(data: Any) -> None:
             event = self._event_from_sdk_payload(lark, data)
-            result = self.adapter.handle_message_event(event, header={"event_type": "im.message.receive_v1"}, source="websocket")
-            state = self._read_state()
-            state.update({"status": "running", "last_event_at": utc_now_iso(), "last_result": redact_sensitive(result, max_string=1800), "last_error": None, "tls": tls_info, "updated_at": utc_now_iso()})
-            self._write_state(state)
+            self._handle_message_event(event, tls_info=tls_info)
 
         try:
             handler = lark.EventDispatcherHandler.builder(
@@ -162,6 +241,64 @@ class FeishuWsRunner:
             client.start()
         except Exception as exc:
             self._write_state({**self._read_state(), "status": "error", "last_error": redact_sensitive(str(exc)), "error_type": type(exc).__name__, "tls": tls_info, "updated_at": utc_now_iso()})
+
+    def _handle_message_event(self, event: dict[str, Any], *, tls_info: dict[str, Any]) -> dict[str, Any]:
+        observed_at = utc_now_iso()
+        try:
+            result = self.adapter.handle_message_event(
+                event,
+                header={"event_type": "im.message.receive_v1"},
+                source="websocket",
+            )
+        except Exception as exc:
+            state = self._read_state()
+            state.update(
+                {
+                    "status": "running",
+                    "last_event_at": observed_at,
+                    "last_event_failure_at": observed_at,
+                    "last_result": {
+                        "status": "processing_error",
+                        "source": "websocket",
+                        "error_type": type(exc).__name__,
+                    },
+                    "last_error": redact_sensitive(str(exc), max_string=600),
+                    "error_type": type(exc).__name__,
+                    "tls": tls_info,
+                    "updated_at": utc_now_iso(),
+                }
+            )
+            self._write_state(state)
+            raise
+
+        receipt = result.get("receipt") if isinstance(result.get("receipt"), dict) else {}
+        receipt_status = str(receipt.get("status") or "")
+        outbox = receipt.get("outbox") if isinstance(receipt.get("outbox"), dict) else {}
+        outbox_messages = receipt.get("outbox_messages") if isinstance(receipt.get("outbox_messages"), list) else []
+        deliveries = [outbox, *(item for item in outbox_messages if isinstance(item, dict))]
+        reply_provider_sent = any(
+            str(item.get("delivery_status") or "") == "provider_sent"
+            for item in deliveries
+        )
+        state = self._read_state()
+        state.update(
+            {
+                "status": "running",
+                "last_event_at": observed_at,
+                "last_result": redact_sensitive(result, max_string=1800),
+                "last_error": None,
+                "error_type": None,
+                "tls": tls_info,
+                "updated_at": utc_now_iso(),
+            }
+        )
+        if receipt_status == "delivered":
+            state["last_event_failure_at"] = None
+            state["last_processed_at"] = observed_at
+        if receipt_status == "delivered" and reply_provider_sent:
+            state["last_reply_sent_at"] = observed_at
+        self._write_state(state)
+        return result
 
     def _event_from_sdk_payload(self, lark: Any, data: Any) -> dict[str, Any]:
         try:
@@ -220,8 +357,12 @@ class FeishuWsRunner:
         ]
         for candidate in candidates:
             path = str(candidate or "").strip()
-            if path and Path(path).expanduser().exists():
-                return str(Path(path).expanduser())
+            if not path:
+                continue
+            expanded = Path(path).expanduser()
+            if not expanded.is_file():
+                raise ValueError(f"Configured Feishu CA bundle is not a readable file: {self._public_path(str(expanded))}")
+            return str(expanded)
         return ""
 
     def _install_lark_ws_hooks(self, lark_ws_client: Any, *, ssl_context: ssl.SSLContext, tls_info: dict[str, Any]) -> None:

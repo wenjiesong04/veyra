@@ -2,7 +2,7 @@
 
 > 状态：目标架构与实施蓝图
 >
-> 设计核验基线：2026-07-29；以当前代码、Git、自动化 gate 和重启后的真实运行证据为准
+> 设计核验基线：2026-07-30；以当前代码、Git、自动化 gate 和重启后的真实运行证据为准
 >
 > 适用范围：Veyra 本地控制面、选定 Agent Runtime、主动感知、长期任务、治理执行与学习闭环
 >
@@ -222,6 +222,19 @@ Veyra 更新世界状态、承诺、经验和下一次主动行为
 - 本次验收快照的 `/health=critical` 只有既有 Feishu self-signed TLS/connect error 处于 critical；OpenClaw 的 Veyra-private scoped fallback 和 10 条 stale Belief 是 info，5 条历史 pending review 是 warning。首次健康读取还显示 core-model transport stale，真实 direct turn 随后已成功走模型主链并恢复 model=ok。Feishu worker 存活但 `last_event_after_start=false`，不能视为 fresh channel acceptance。
 
 因此，Veyra cognition、Agent context、Commitment/intake 控制面与明确列出的 Memory API 已达到 `VERIFIED / INTERNAL LOGICAL ISOLATION`；数据库未迁移，legacy 数据未删除，HMAC/密钥轮换/旧索引/压缩加固仍未恢复。auth-derived principal、operator diagnostics 全面租户化、OpenClaw native Memory scope 证明和跨 session bridge 长期召回仍未完成。Phase 6 仍停在 6.2c；截至 2026-07-29 的验收环境没有 Docker、Podman、Colima/Lima、bwrap、firejail 或 nsjail，只有 deprecated `sandbox-exec`，所以 trusted isolated generation/runner 仍是下一条真实实现边界，不能在现有进程或 SafeShell 中运行候选来冒充完成。
+
+### 1.10 继续 Phase 6 前已修正的本地运行环境与飞书连接真值
+
+2026-07-30 修正了一项启动配置回归。这是运行环境与观测真值修复，**不是新的 Phase 6 自扩展能力**：
+
+- 项目受支持的运行时固定为 Python 3.11.x；当前本机权威 Conda SDK 是 `/opt/anaconda3/envs/veyra/bin/python`（`3.11.15`）。旧 `start_local.sh` 在没有 `.venv` 时会静默回退 PATH `python3`，使 2026-07-29 生成的 LaunchAgent 固定到全局 Python 3.13。该解释器没有可用默认 CA，导致飞书 TLS 校验失败；正确 3.11 解释器的 CA 为 `/opt/anaconda3/envs/veyra/ssl/cert.pem`，访问飞书 OpenAPI 实测返回 HTTP 200；
+- `scripts/veyra_python_runtime.sh` 现在统一解析显式 `VEYRA_PYTHON`、已激活且身份匹配的 Conda `veyra`、项目 `.venv` 或显式 legacy `PYTHON`，不再隐式使用 PATH `python3`。启动前必须同时通过 Python 3.11、环境身份、全部 pinned requirements、关键 import 和 macOS 可读 CA 预检；任一失败都会在状态初始化、plist 替换和 `launchctl bootout` 前 fail closed；
+- `install_local.sh` 使用同一解释器身份规则。激活 Conda `veyra` 时直接同步该环境；非 Conda 安装必须显式给出绝对 Python 3.11，再创建项目 `.venv`。`start_local.sh --check-runtime` 提供无启动副作用的预检；LaunchAgent plist 先写同目录临时文件、通过 `plutil -lint`、收紧为 `0600`，再原子替换并嵌入 exact validated interpreter；
+- 飞书公开状态不再把“自动重连线程仍存活”当作“WebSocket 已连接”。`connected` 现在还要求 configured、current-run `last_connected_at` 证据和运行态；`readiness` 明确区分 `not_configured / connecting / not_ready / configured_not_running / waiting_for_event / receiving / processing_failed`。本地设置、MVP 状态、复现诊断和 live diagnostic 共用该语义；live diagnostic 默认不发送消息，且缺少真实入站或 provider-sent 出站时返回非零，不再输出假通过；
+- 修复后的 LaunchAgent、`ps/lsof` 与 `/setup/status.platform.python` 均证明 Veyra 运行在 `3.11.15`，OpenClaw PID 与启动时间未改变。一次 exact-runtime 验收进程取得飞书本进程 `last_connected_at`，随后收到两条真实 websocket 消息，分别完成 `direct_answer / success` 与 `probe / verified_success`，两条同会话回复都得到 `provider_sent` 和不同的外部 message id；provider 对每条消息的重复投递均被 intake 幂等识别为 `duplicate`，没有再次回复。最终事务式 LaunchAgent 进程另行证明 fresh TLS/WebSocket connection 和诊断消息 `provider_sent`，并独立收到、处理一条真实 `direct_answer`，返回带关联 event/message id 和外部 message id 的 `provider_sent` 回复；随后重复投递再次被抑制，进程间证据没有复用；
+- 当前自动化为 Python gate `91/91`、OpenClaw governance plugin `32/32`，完整 compileall 与 runtime-specific regression 均通过。错误 Python 3.13、无受管环境、缺依赖和无效解释器都会在替换 LaunchAgent 前被拒绝；既有 plist 在失败测试中保持字节不变。
+
+该修复没有增加 Agent、工具、扩展执行、签名、canary 或 promotion 权限。Phase 6 仍停在 6.2c；下一条实现边界仍是 trusted isolated generation/runner。飞书本轮只证明当前 Python/CA/SDK 配置下的真实收、处理、回复链路，不替代长时间 soak，也不证明其他模型、provider 或 channel 自动继承兼容性。
 
 ## 2. “像贾维斯”在本项目中的可实现含义
 
@@ -1778,7 +1791,7 @@ Foresight residual、Attention 分类 feedback、performance portfolio 与 provi
 - `VALIDATED / REAL ARTIFACT SCENARIO`：真实主进程候选/artifact 完成 `SPEC_QUARANTINED → SPEC_GATE_PASSED → ARTIFACT_QUARANTINED → BLOCKED_CANDIDATE → ARTIFACT_REVOKED`；危险 import-time sentinel 未执行，两次 Veyra restart 后 submit/revoke replay 均为 state/audit no-op，核心状态/Git/OpenClaw PID 与 execution 计数不变；
 - `IMPLEMENTED / LIVE VALIDATED / PHASE 6.2c`：exact private source reopen、fixed-version syntax parse、窄 AST policy、source-free durable report、CAS/replay/integrity、prerequisite revoke/expiry blocking 与零动态 authority 已接入；不生成、不 compile/import/eval/exec、不运行动态测试、不调用候选；
 - `VALIDATED / REAL SOURCE-CHECK SCENARIO`：良性 `extspec_7c3f9898df088050ad8edce1 / extart_47149f55e9788dde7f2e6d63 / extcheck_49612f38b7ce417d244820cf` 跨 Veyra restart 保持 pass、完整性 validated 且 replay 为 state/audit no-op；带顶层 `/tmp` 写入的 `extcheck_e60aed1ec84f78f70075a518` 被 `top_level_shape_invalid` 拒绝且 sentinel 不存在。Spec revoke 后旧 pass 变为 `BLOCKED_PREREQUISITE`，新 operation fail closed，OpenClaw PID/执行计数与核心状态不变；
-- `VALIDATED / AUTOMATED`：当前 Python gate `90/90`、OpenClaw governance plugin `32/32`、compileall、Web browser/desktop frontend builds 与使用现有 stub sidecar 的 Tauri macOS shell `.app` bundle 通过；fresh PyInstaller backend sidecar 与可发布 desktop package 本轮未验证。全部 9 个公开 Route 在 3 个 Event modes 与 collaboration/spec/artifact/source-check 各自 populated/corrupt 下完成 216 组完整 response/status/risk 非弱化对照；
+- `VALIDATED / AUTOMATED`：当前 Python gate `91/91`、OpenClaw governance plugin `32/32`、compileall、Web browser/desktop frontend builds 与使用现有 stub sidecar 的 Tauri macOS shell `.app` bundle 通过；fresh PyInstaller backend sidecar 与可发布 desktop package 本轮未验证。全部 9 个公开 Route 在 3 个 Event modes 与 collaboration/spec/artifact/source-check 各自 populated/corrupt 下完成 216 组完整 response/status/risk 非弱化对照；
 - `PARTIAL`：provider-neutral 合同已存在，但跨 provider/runtime 协作、其他模型独立 live compatibility、自动专家选择和并行 Agent 尚未实现；
 - `TARGET`：CapabilityGap 自动接线、trusted isolated generation/runner、动态 unit/contract/security/fuzz 与行为测试、签名 trust-root registry、extension shadow/read-only execution canary/scoped canary、监控、真实 rollback 与人工/治理晋级；
 - 任何生产晋级继续受人和治理策略控制。

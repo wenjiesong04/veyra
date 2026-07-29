@@ -27,8 +27,12 @@ type FeishuDiagnostics = {
   enabled?: boolean;
   connection_mode?: string;
   status?: string;
+  connected?: boolean;
   thread_alive?: boolean;
   last_event_after_start?: boolean;
+  last_processed_after_start?: boolean;
+  last_reply_sent_after_start?: boolean;
+  processing_failure_unrecovered?: boolean;
   readiness?: string;
   app_id_set?: boolean;
   app_secret_set?: boolean;
@@ -530,13 +534,43 @@ export function SetupWizard({ open, onClose, onComplete, setupStatus, coreModelS
                 </div>
                 <div className="wizardCard">
                   <span>WebSocket</span>
-                  <strong>{feishuStatus?.thread_alive ? "running" : "not running"}</strong>
+                  <strong>
+                    {feishuStatus?.connected
+                      ? "connected"
+                      : feishuStatus?.readiness === "connecting"
+                        ? "connecting"
+                        : feishuStatus?.thread_alive
+                          ? "worker only"
+                          : "not running"}
+                  </strong>
                   <small>{feishuStatus?.status ?? "unknown"}</small>
                 </div>
                 <div className="wizardCard">
                   <span>Inbound test</span>
-                  <strong>{feishuStatus?.last_event_after_start ? "received" : feishuStatus?.thread_alive ? "waiting" : "pending"}</strong>
-                  <small>{feishuStatus?.last_event_after_start ? "fresh event received" : "send a Feishu message to verify intake"}</small>
+                  <strong>
+                    {feishuStatus?.processing_failure_unrecovered
+                      ? "processing failed"
+                      : feishuStatus?.last_processed_after_start && feishuStatus?.last_reply_sent_after_start
+                      ? "reply verified"
+                      : feishuStatus?.last_event_after_start
+                        ? "received, incomplete"
+                        : feishuStatus?.connected
+                          ? "waiting"
+                          : feishuStatus?.readiness === "connecting"
+                            ? "connecting"
+                            : feishuStatus?.readiness === "not_ready"
+                              ? "not ready"
+                              : "pending"}
+                  </strong>
+                  <small>
+                    {feishuStatus?.processing_failure_unrecovered
+                      ? "inspect diagnostics; the latest processing failure is unresolved"
+                      : feishuStatus?.last_processed_after_start && feishuStatus?.last_reply_sent_after_start
+                      ? "fresh message processed and provider-sent reply observed"
+                      : feishuStatus?.last_event_after_start
+                        ? "inspect diagnostics; full processing/reply proof is missing"
+                        : "send a Feishu message to verify intake"}
+                  </small>
                 </div>
               </div>
               {!skipFeishu && useFeishu ? (
@@ -585,7 +619,19 @@ export function SetupWizard({ open, onClose, onComplete, setupStatus, coreModelS
                 </div>
                 <div className="wizardCard">
                   <span>Feishu</span>
-                  <strong>{skipFeishu || !useFeishu ? "skipped" : feishuStatus?.thread_alive ? "running" : "needs setup"}</strong>
+                  <strong>
+                    {skipFeishu || !useFeishu
+                      ? "skipped"
+                      : feishuStatus?.connected
+                        ? feishuStatus?.processing_failure_unrecovered
+                          ? "processing failed"
+                          : feishuStatus?.last_processed_after_start && feishuStatus?.last_reply_sent_after_start
+                            ? "validated"
+                            : "connected"
+                        : feishuStatus?.readiness === "connecting"
+                          ? "connecting"
+                          : "needs setup"}
+                  </strong>
                 </div>
               </div>
             </>

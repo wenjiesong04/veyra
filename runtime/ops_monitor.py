@@ -217,7 +217,22 @@ class OpsMonitor:
         if not config.get("enabled"):
             return []
         raw_status = str(status.get("status") or "unknown")
-        if raw_status in {"running", "already_running"} and status.get("thread_alive"):
+        if status.get("connected") is True:
+            if status.get("processing_failure_unrecovered") is True:
+                return [
+                    {
+                        "component": "feishu",
+                        "severity": "warning",
+                        "code": "feishu_latest_event_processing_failed",
+                        "message": "The latest Feishu websocket event failed during Veyra processing.",
+                        "details": {
+                            "status": raw_status,
+                            "last_event_at": status.get("last_event_at"),
+                            "error_type": status.get("error_type"),
+                            "diagnostics": status.get("diagnostics"),
+                        },
+                    }
+                ]
             if status.get("last_event_after_start") is False:
                 return [
                     {
@@ -230,6 +245,32 @@ class OpsMonitor:
                             "thread_alive": status.get("thread_alive"),
                             "last_event_at": status.get("last_event_at"),
                             "started_at": status.get("started_at"),
+                        },
+                    }
+                ]
+            if status.get("last_processed_after_start") is False:
+                return [
+                    {
+                        "component": "feishu",
+                        "severity": "warning",
+                        "code": "feishu_no_successful_current_run_processing",
+                        "message": "Feishu received an event in this process, but no message has completed Veyra processing.",
+                        "details": {
+                            "status": raw_status,
+                            "last_event_at": status.get("last_event_at"),
+                        },
+                    }
+                ]
+            if status.get("last_reply_sent_after_start") is False:
+                return [
+                    {
+                        "component": "feishu",
+                        "severity": "warning",
+                        "code": "feishu_no_current_run_reply",
+                        "message": "Feishu processed a message in this process, but no provider-sent reply is proven.",
+                        "details": {
+                            "status": raw_status,
+                            "last_processed_at": status.get("last_processed_at"),
                         },
                     }
                 ]
