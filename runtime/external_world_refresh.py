@@ -4,6 +4,10 @@ import hashlib
 from typing import Any
 from urllib.parse import urlparse
 
+from core.context_scope import (
+    OPERATOR_GLOBAL_SCOPE,
+    probe_scope_metadata,
+)
 from core.model_client import redact_sensitive
 from core.perception_layer import PerceptionLayer
 from core.reasoning_core import CoreReasoning
@@ -33,6 +37,7 @@ class ExternalWorldRefresh:
         skipped: list[dict[str, Any]] = []
         for raw_item in watchlist[:limit]:
             item = self._normalize_watch_item(raw_item)
+            scope_metadata = probe_scope_metadata(item)
             target = str(item.get("target") or "").strip()
             try:
                 if not item.get("enabled", True):
@@ -42,13 +47,28 @@ class ExternalWorldRefresh:
                     skipped.append({"target": "", "reason": "missing_target"})
                     continue
                 if item.get("kind") == "learning_search":
-                    refreshed.append(self._refresh_learning_search(item))
+                    refreshed.append(
+                        self._scoped_refresh_result(
+                            self._refresh_learning_search(item),
+                            scope_metadata,
+                        )
+                    )
                     continue
                 if item.get("kind") == "external_search":
-                    refreshed.append(self._refresh_external_search(item))
+                    refreshed.append(
+                        self._scoped_refresh_result(
+                            self._refresh_external_search(item),
+                            scope_metadata,
+                        )
+                    )
                     continue
-                probe_result = self._probe_target(target)
-                state_patch = self.perception.interpret_probe_result(probe_result)
+                probe_result = {
+                    **self._probe_target(target),
+                    **scope_metadata,
+                }
+                state_patch: dict[str, Any] = {}
+                if scope_metadata.get("scope_kind") == OPERATOR_GLOBAL_SCOPE:
+                    state_patch = self.perception.interpret_probe_result(probe_result)
                 assist = self.reasoning.external_world_assist(
                     target=target,
                     probe_result=probe_result,
@@ -57,6 +77,7 @@ class ExternalWorldRefresh:
                 refreshed.append(
                     {
                         "target": target,
+                        **scope_metadata,
                         "kind": item.get("kind") or self._kind_for_target(target),
                         "status": probe_result.get("status"),
                         "summary": self._summary_for(target, probe_result, assist),
@@ -71,6 +92,7 @@ class ExternalWorldRefresh:
                 refreshed.append(
                     {
                         "target": target,
+                        **scope_metadata,
                         "kind": item.get("kind") or self._kind_for_target(target),
                         "status": "error",
                         "summary": f"External watch refresh failed without blocking active loop: {type(exc).__name__}: {str(exc)[:240]}",
@@ -132,6 +154,7 @@ class ExternalWorldRefresh:
                     "topic": topic,
                     "goal_id": goal_id,
                     "user_id": goal.get("user_id"),
+                    "session_id": goal.get("session_id"),
                     "commitment_id": goal.get("commitment_id"),
                     "query": self._learning_query(topic),
                     "reason": "authorized_learning_goal",
@@ -152,6 +175,7 @@ class ExternalWorldRefresh:
             "kind": "learning_search",
             "goal_id": item.get("goal_id"),
             "user_id": item.get("user_id"),
+            "session_id": item.get("session_id"),
             "commitment_id": item.get("commitment_id"),
             "topic": topic,
             "query": query,
@@ -175,6 +199,7 @@ class ExternalWorldRefresh:
             "kind": "external_search",
             "watchlist_id": item.get("watchlist_id"),
             "user_id": item.get("user_id"),
+            "session_id": item.get("session_id"),
             "commitment_id": item.get("commitment_id"),
             "topic": topic,
             "query": query,
@@ -195,10 +220,18 @@ class ExternalWorldRefresh:
         if user_id:
             profiles = user_world.get("profiles_by_user") if isinstance(user_world.get("profiles_by_user"), dict) else {}
             scoped = profiles.get(user_id) if isinstance(profiles.get(user_id), dict) else {}
-            goal = str(scoped.get("current_goal") or "").strip()
-            if goal:
-                return goal
+            return str(scoped.get("current_goal") or "").strip()
         return str(user_world.get("current_goal") or "").strip()
+
+    @staticmethod
+    def _scoped_refresh_result(
+        result: dict[str, Any],
+        scope_metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            **result,
+            **scope_metadata,
+        }
 
     def _safe_search(self, query: str, *, max_results: int) -> dict[str, Any]:
         try:
@@ -276,14 +309,17 @@ class ExternalWorldRefresh:
         for refresh in refreshed:
             if refresh.get("kind") not in {"learning_search", "external_search"}:
                 continue
+            scope_metadata = probe_scope_metadata(refresh)
+            scope_key = self._scope_dedupe_key(scope_metadata)
             for result in refresh.get("results", []) if isinstance(refresh.get("results"), list) else []:
                 if not isinstance(result, dict) or not (result.get("url") or result.get("title")):
                     continue
                 dedupe_key = str(result.get("dedupe_key") or result.get("url") or f"{refresh.get('topic')}:{result.get('source')}:{result.get('title')}")
-                item_id = self._stable_id("knowledge", dedupe_key)
+                item_id = self._stable_id("knowledge", f"{scope_key}:{dedupe_key}")
                 by_key[item_id] = {
                     "item_id": item_id,
                     "dedupe_key": dedupe_key,
+                    **scope_metadata,
                     "goal_id": refresh.get("goal_id"),
                     "topic": refresh.get("topic"),
                     "title": result.get("title"),
@@ -305,16 +341,22 @@ class ExternalWorldRefresh:
         for refresh in refreshed:
             if refresh.get("kind") not in {"learning_search", "external_search"} or not refresh.get("commitment_id"):
                 continue
+            scope_metadata = probe_scope_metadata(refresh)
+            scope_key = self._scope_dedupe_key(scope_metadata)
             for result in refresh.get("results", []) if isinstance(refresh.get("results"), list) else []:
                 if not isinstance(result, dict) or not (result.get("url") or result.get("title")) or float(result.get("score") or 0) < 0.6:
                     continue
                 dedupe_key = str(result.get("dedupe_key") or result.get("url") or result.get("title") or "")
-                candidate_id = self._stable_id("push", f"{refresh.get('commitment_id')}:{dedupe_key}")
+                candidate_id = self._stable_id(
+                    "push",
+                    f"{scope_key}:{refresh.get('commitment_id')}:{dedupe_key}",
+                )
                 current = by_key.get(candidate_id, {})
                 by_key[candidate_id] = {
                     **current,
                     "candidate_id": candidate_id,
                     "dedupe_key": dedupe_key,
+                    **scope_metadata,
                     "commitment_id": refresh.get("commitment_id"),
                     "goal_id": refresh.get("goal_id"),
                     "topic": refresh.get("topic"),
@@ -370,6 +412,16 @@ class ExternalWorldRefresh:
     def _stable_id(self, prefix: str, value: str) -> str:
         digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
         return f"{prefix}_{digest}"
+
+    def _scope_dedupe_key(self, scope_metadata: dict[str, Any]) -> str:
+        return "|".join(
+            [
+                str(scope_metadata.get("scope_kind") or ""),
+                str(scope_metadata.get("user_id") or ""),
+                str(scope_metadata.get("session_id") or ""),
+                str(scope_metadata.get("scope_status") or ""),
+            ]
+        )
 
     def _host(self, url: str) -> str:
         return urlparse(url).netloc.lower()

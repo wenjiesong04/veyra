@@ -1404,7 +1404,9 @@ def _mvp_validation_snapshot(agent_status_data: dict[str, Any]) -> dict[str, Any
         and proxy_validation.get("status") == "validated"
     )
 
-    memory_status = awareness_loop.memory_bridge.provider_status()
+    memory_status = awareness_loop.memory_bridge.provider_status(
+        probe=False
+    )
     memory_validations = memory_status.get("validation") if isinstance(memory_status.get("validation"), dict) else {}
     selected_memory = memory_validations.get("selected") if isinstance(memory_validations.get("selected"), dict) else {}
     model_status = awareness_loop.core_reasoning.status()

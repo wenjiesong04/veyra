@@ -13,6 +13,10 @@ from interface.event_normalizer import EventNormalizer
 from interface.event_schema import LoopResult
 from interface.session_mapper import SessionMapper
 from interface.event_schema import utc_now_iso
+from memory_bridge.scope import framed_sha256, normalize_scope_component
+
+
+_INTAKE_DEDUPE_SCOPE_VERSION = "veyra-intake-dedupe-v2"
 
 
 class IntakeGateway:
@@ -71,6 +75,13 @@ class IntakeGateway:
             return {"status": "blocked", "reason": "channel or user is not allowed", "channel": channel_id}
         mapped_session = self.session_mapper.map(channel_id, user_id, session_id)
         dedupe_id = message_id or f"msg_{uuid4().hex[:12]}"
+        dedupe_owner = self._dedupe_owner(
+            channel=channel_id,
+            user_id=user_id,
+            mapped_session=mapped_session,
+            message_id=dedupe_id,
+        )
+        internal_dedupe_key = self._dedupe_key(dedupe_owner)
 
         event = self.normalizer.user_message(text=text, channel=channel_id, user_id=user_id, session_id=mapped_session, metadata=metadata or {})
         inbox_item = compact_channel_inbox_item(
@@ -85,7 +96,11 @@ class IntakeGateway:
                 "received_at": utc_now_iso(),
             }
         )
-        previous = self._reserve_inbox(dedupe_id, inbox_item, mapped_session=mapped_session)
+        previous = self._reserve_inbox(
+            internal_dedupe_key,
+            inbox_item,
+            owner=dedupe_owner,
+        )
         if previous:
             self._record_intake_trace(
                 text=text,
@@ -109,7 +124,11 @@ class IntakeGateway:
         try:
             result = self.awareness_loop.handle_event(event)
         except Exception as exc:
-            self._release_failed_reservation(dedupe_id, error=exc)
+            self._release_failed_reservation(
+                internal_dedupe_key,
+                owner=dedupe_owner,
+                error=exc,
+            )
             raise
         adapter = ChannelAdapter(self.state_store, channel=channel_id)
         deliveries: list[dict[str, Any]] = []
@@ -148,7 +167,12 @@ class IntakeGateway:
         def finalize_channel_state(state: dict[str, Any]) -> dict[str, Any]:
             seen = state.setdefault("seen_message_ids", {})
             if isinstance(seen, dict):
-                seen[dedupe_id] = {
+                reservation = seen.get(internal_dedupe_key)
+                if not self._seen_entry_matches(reservation, dedupe_owner):
+                    return state
+                seen[internal_dedupe_key] = {
+                    "scope_version": _INTAKE_DEDUPE_SCOPE_VERSION,
+                    "owner": dict(dedupe_owner),
                     "event_id": event.event_id,
                     "session_id": mapped_session,
                     "processed_at": utc_now_iso(),
@@ -252,7 +276,13 @@ class IntakeGateway:
         state["inbox"] = [compact_channel_inbox_item(entry) for entry in inbox[-200:]]
         self._write_channel_state(state)
 
-    def _reserve_inbox(self, dedupe_id: str, item: dict[str, Any], *, mapped_session: str) -> dict[str, Any]:
+    def _reserve_inbox(
+        self,
+        internal_dedupe_key: str,
+        item: dict[str, Any],
+        *,
+        owner: dict[str, str],
+    ) -> dict[str, Any]:
         if not self.state_store:
             return {}
         previous: dict[str, Any] = {}
@@ -263,13 +293,15 @@ class IntakeGateway:
             if not isinstance(seen, dict):
                 seen = {}
                 state["seen_message_ids"] = seen
-            existing = seen.get(dedupe_id)
-            if isinstance(existing, dict):
-                previous = dict(existing)
+            existing = seen.get(internal_dedupe_key)
+            if self._seen_entry_matches(existing, owner):
+                previous = self._public_previous(existing)
                 return state
-            seen[dedupe_id] = {
+            seen[internal_dedupe_key] = {
+                "scope_version": _INTAKE_DEDUPE_SCOPE_VERSION,
+                "owner": dict(owner),
                 "event_id": item.get("event_id"),
-                "session_id": mapped_session,
+                "session_id": owner["session_id"],
                 "reserved_at": utc_now_iso(),
                 "status": "processing",
             }
@@ -284,22 +316,31 @@ class IntakeGateway:
         self.state_store.mutate_json("channel_state.json", reserve)
         return previous
 
-    def _release_failed_reservation(self, dedupe_id: str, *, error: Exception) -> None:
+    def _release_failed_reservation(
+        self,
+        internal_dedupe_key: str,
+        *,
+        owner: dict[str, str],
+        error: Exception,
+    ) -> None:
         if not self.state_store:
             return
 
         def release(state: dict[str, Any]) -> dict[str, Any]:
             seen = state.get("seen_message_ids")
             if isinstance(seen, dict):
-                reservation = seen.get(dedupe_id)
-                if isinstance(reservation, dict) and reservation.get("status") == "processing":
-                    seen.pop(dedupe_id, None)
+                reservation = seen.get(internal_dedupe_key)
+                if (
+                    self._seen_entry_matches(reservation, owner)
+                    and reservation.get("status") == "processing"
+                ):
+                    seen.pop(internal_dedupe_key, None)
             failures = state.setdefault("intake_failures", [])
             if not isinstance(failures, list):
                 failures = []
             failures.append(
                 {
-                    "message_id": dedupe_id,
+                    "message_id": owner["message_id"],
                     "failed_at": utc_now_iso(),
                     "error_type": type(error).__name__,
                     "reason": redact_sensitive(str(error))[:300],
@@ -309,6 +350,67 @@ class IntakeGateway:
             return state
 
         self.state_store.mutate_json("channel_state.json", release)
+
+    @staticmethod
+    def _dedupe_owner(
+        *,
+        channel: str,
+        user_id: str,
+        mapped_session: str,
+        message_id: str,
+    ) -> dict[str, str]:
+        return {
+            "channel": normalize_scope_component(channel, "channel"),
+            "user_id": normalize_scope_component(user_id, "user_id"),
+            "session_id": normalize_scope_component(
+                mapped_session,
+                "mapped_session_id",
+            ),
+            # The provider's message identity is an opaque value. Keep its
+            # exact text instead of delimiter-normalizing it.
+            "message_id": str(message_id),
+        }
+
+    @staticmethod
+    def _dedupe_key(owner: dict[str, str]) -> str:
+        digest = framed_sha256(
+            _INTAKE_DEDUPE_SCOPE_VERSION,
+            owner["channel"],
+            owner["user_id"],
+            owner["session_id"],
+            owner["message_id"],
+        )
+        return f"intake-dedupe-v2-{digest}"
+
+    @staticmethod
+    def _seen_entry_matches(
+        entry: Any,
+        owner: dict[str, str],
+    ) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        entry_owner = entry.get("owner")
+        return (
+            entry.get("scope_version") == _INTAKE_DEDUPE_SCOPE_VERSION
+            and isinstance(entry_owner, dict)
+            and entry_owner == owner
+        )
+
+    @staticmethod
+    def _public_previous(entry: Any) -> dict[str, Any]:
+        if not isinstance(entry, dict):
+            return {}
+        return {
+            key: entry[key]
+            for key in (
+                "event_id",
+                "session_id",
+                "reserved_at",
+                "processed_at",
+                "status",
+            )
+            if key in entry
+        }
 
     def _record_intake_trace(
         self,

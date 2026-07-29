@@ -58,6 +58,19 @@ class StateRefresh:
                 continue
             target = self._target_for_claim(claim)
             raw = probe.run(target)
+            raw = {
+                **raw,
+                **{
+                    key: claim.get(key)
+                    for key in (
+                        "scope_kind",
+                        "tenant_derived",
+                        "user_id",
+                        "session_id",
+                    )
+                    if claim.get(key) is not None
+                },
+            }
             patch = self.perception.interpret_probe_result(raw)
             refreshed.append({"claim": claim.get("key") or claim.get("claim"), "probe_result": raw, "state_patch": patch})
         skipped = [

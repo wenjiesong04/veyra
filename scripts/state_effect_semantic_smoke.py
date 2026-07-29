@@ -208,9 +208,12 @@ class CountingLocalMemory:
         session_id: str,
         focus: list[str] | None = None,
         provider: str = "local",
+        *,
+        user_id: str,
     ) -> dict[str, Any]:
         del focus, provider
         return {
+            "user_id": user_id,
             "session_id": session_id,
             "provider": "local",
             "summary": "",

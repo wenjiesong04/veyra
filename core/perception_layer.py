@@ -5,6 +5,12 @@ from typing import Any
 
 from awareness.belief_core import BeliefCore
 from awareness.claim_schema import make_claim
+from core.context_scope import (
+    OPERATOR_GLOBAL_SCOPE,
+    TENANT_SCOPE,
+    probe_scope_metadata,
+    tenant_scope_storage_key,
+)
 from core.reasoning_core import CoreReasoning
 from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
@@ -22,8 +28,13 @@ class PerceptionLayer:
         observed_at = str(probe_result.get("observed_at") or probe_result.get("timestamp") or utc_now_iso())
         ttl_seconds = int(probe_result.get("ttl_seconds") or 60)
         confidence = float(probe_result.get("confidence") or 0.75)
+        scope_metadata = probe_scope_metadata(
+            probe_result,
+            probe_name=str(probe_name),
+        )
         enriched = {
             **probe_result,
+            **scope_metadata,
             "source": probe_result.get("source") or probe_name,
             "observed_at": observed_at,
             "timestamp": probe_result.get("timestamp") or observed_at,
@@ -51,20 +62,56 @@ class PerceptionLayer:
         model_interpretation = observation.pop("model_interpretation", None)
 
         def update_local_world(local_world: dict[str, Any]) -> dict[str, Any]:
-            probes = local_world.setdefault("probes", {})
-            if not isinstance(probes, dict):
-                probes = {}
-                local_world["probes"] = probes
-            probes[probe_name] = observation
+            if scope_metadata.get("scope_kind") == OPERATOR_GLOBAL_SCOPE:
+                probes = local_world.setdefault("probes", {})
+                if not isinstance(probes, dict):
+                    probes = {}
+                    local_world["probes"] = probes
+                probes[probe_name] = observation
+            elif (
+                scope_metadata.get("scope_kind") == TENANT_SCOPE
+                and scope_metadata.get("user_id")
+                and scope_metadata.get("session_id")
+                and not scope_metadata.get("scope_status")
+            ):
+                scoped_probes = local_world.setdefault(
+                    "scoped_probes",
+                    {},
+                )
+                if not isinstance(scoped_probes, dict):
+                    scoped_probes = {}
+                    local_world["scoped_probes"] = scoped_probes
+                scope_key = tenant_scope_storage_key(
+                    scope_metadata["user_id"],
+                    scope_metadata["session_id"],
+                )
+                scope_bucket = (
+                    scoped_probes.get(scope_key)
+                    if isinstance(scoped_probes.get(scope_key), dict)
+                    else {}
+                )
+                scope_bucket[probe_name] = observation
+                scoped_probes[scope_key] = scope_bucket
             local_world["last_probe_at"] = observed_at
             return local_world
 
         self.state_store.mutate_json("local_world.json", update_local_world)
 
         claims = self._claims_from_probe(enriched) + self._claims_from_model(enriched, model_assist)
+        for claim in claims:
+            claim.update(scope_metadata)
         self.belief.upsert_claims(claims)
+        local_path = (
+            "local_world.probes"
+            if scope_metadata.get("scope_kind") == OPERATOR_GLOBAL_SCOPE
+            else "local_world.scoped_probes"
+            if scope_metadata.get("user_id")
+            and scope_metadata.get("session_id")
+            and not scope_metadata.get("scope_status")
+            else "local_world.not_persisted"
+        )
         result = {
-            "local_world.probes": {probe_name: enriched},
+            local_path: {probe_name: enriched},
             "belief.claims": claims,
         }
         if model_interpretation:

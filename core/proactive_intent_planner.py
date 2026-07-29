@@ -4,11 +4,19 @@ import json
 import re
 from typing import Any
 
+from core.context_scope import (
+    OPERATOR_GLOBAL_SCOPE,
+    exact_owner_visible,
+    owner_scope,
+    scope_kind,
+    visible_probe_map,
+)
 from core.model_client import CoreModelClient, redact_sensitive
 from core.proactive_intent import PROACTIVE_INTENT_TYPES, PROACTIVE_NEXT_ACTIONS, ProactiveIntent
 from core.schedule_parser import has_explicit_schedule_time, parse_schedule_text
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent, utc_now_iso
+from memory_bridge.scope import normalize_scope_component
 
 
 PROACTIVE_INTENT_SYSTEM = (
@@ -103,7 +111,11 @@ class ProactiveIntentPlanner:
                 "session_id": event.source.session_id,
                 "channel_id": event.source.channel,
             },
-            "world_context": self._planner_context(memory_summary),
+            "world_context": self._planner_context(
+                memory_summary,
+                user_id=event.source.user_id,
+                session_id=event.source.session_id,
+            ),
             "allowed_intent_types": sorted(PROACTIVE_INTENT_TYPES),
             "allowed_next_actions": sorted(PROACTIVE_NEXT_ACTIONS),
             "required_json_fields": {
@@ -377,21 +389,172 @@ class ProactiveIntentPlanner:
         )
         return ProactiveIntent.from_dict(data)
 
-    def _planner_context(self, memory_summary: dict[str, Any]) -> dict[str, Any]:
+    def _planner_context(
+        self,
+        memory_summary: dict[str, Any],
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        try:
+            user_scope = normalize_scope_component(user_id, "user_id")
+            session_scope = normalize_scope_component(
+                session_id,
+                "session_id",
+            )
+        except ValueError:
+            return {
+                "scope_status": "invalid_owner",
+                "user_world": {},
+                "local_world": {},
+                "external_world": {
+                    "watchlist": [],
+                    "summaries": [],
+                    "knowledge_items": [],
+                    "push_candidates": [],
+                    "knowledge_count": 0,
+                    "push_candidate_count": 0,
+                },
+                "memory_summary": {},
+                "commitment_scope": "exact_user",
+                "active_commitments": [],
+                "paused_commitments": [],
+            }
+        user_world = self.state_store.read_json("user_world.json")
+        local_world = self.state_store.read_json("local_world.json")
+        external_world = self.state_store.read_json("external_world.json")
         return redact_sensitive(
             {
-                "user_world": self.state_store.read_json("user_world.json"),
-                "local_world": self._compact_local_world(self.state_store.read_json("local_world.json")),
-                "external_world": self._compact_external_world(self.state_store.read_json("external_world.json")),
-                "memory_summary": memory_summary,
-                "active_commitments": self._commitments("active"),
-                "paused_commitments": self._commitments("paused"),
+                "scope_status": "exact_owner",
+                "user_world": self._scoped_user_world(
+                    user_world,
+                    user_id=user_scope,
+                    session_id=session_scope,
+                ),
+                "local_world": self._compact_local_world(
+                    local_world,
+                    user_id=user_scope,
+                    session_id=session_scope,
+                ),
+                "external_world": self._compact_external_world(
+                    external_world,
+                    user_id=user_scope,
+                    session_id=session_scope,
+                ),
+                "memory_summary": self._scoped_memory_summary(
+                    memory_summary,
+                    user_id=user_scope,
+                    session_id=session_scope,
+                ),
+                "commitment_scope": "exact_user",
+                "active_commitments": self._commitments(
+                    "active",
+                    user_id=user_scope,
+                ),
+                "paused_commitments": self._commitments(
+                    "paused",
+                    user_id=user_scope,
+                ),
             },
             max_string=1600,
             max_list=12,
         )
 
-    def _commitments(self, status: str) -> list[dict[str, Any]]:
+    def _scoped_user_world(
+        self,
+        user_world: dict[str, Any],
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        profiles = (
+            user_world.get("profiles_by_user")
+            if isinstance(user_world.get("profiles_by_user"), dict)
+            else {}
+        )
+        scoped = (
+            profiles.get(user_id)
+            if isinstance(profiles.get(user_id), dict)
+            else {}
+        )
+        if not scoped:
+            return {}
+        if self._profile_scope_conflicts(
+            scoped,
+            user_id=user_id,
+            session_id=session_id,
+        ):
+            return {}
+        return {
+            **scoped,
+            "user_id": user_id,
+        }
+
+    @staticmethod
+    def _profile_scope_conflicts(
+        scoped: dict[str, Any],
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> bool:
+        declared_kind = scope_kind(scoped)
+        if declared_kind in {"invalid", OPERATOR_GLOBAL_SCOPE}:
+            return True
+        containers = [scoped]
+        for key in ("task_context", "owner", "scope"):
+            nested = scoped.get(key)
+            if isinstance(nested, dict):
+                containers.append(nested)
+        explicit_users = {
+            str(container.get("user_id") or "").strip()
+            for container in containers
+            if str(container.get("user_id") or "").strip()
+        }
+        explicit_sessions = {
+            str(container.get("session_id") or "").strip()
+            for container in containers
+            if str(container.get("session_id") or "").strip()
+        }
+        if len(explicit_users) > 1 or len(explicit_sessions) > 1:
+            return True
+        try:
+            if explicit_users and normalize_scope_component(
+                next(iter(explicit_users)),
+                "user_id",
+            ) != user_id:
+                return True
+            if explicit_sessions and normalize_scope_component(
+                next(iter(explicit_sessions)),
+                "session_id",
+            ) != session_id:
+                return True
+        except ValueError:
+            return True
+        return False
+
+    @staticmethod
+    def _scoped_memory_summary(
+        memory_summary: dict[str, Any],
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        if not isinstance(memory_summary, dict) or not memory_summary:
+            return {}
+        if not exact_owner_visible(
+            memory_summary,
+            user_id=user_id,
+            session_id=session_id,
+        ):
+            return {}
+        return memory_summary
+
+    def _commitments(
+        self,
+        status: str,
+        *,
+        user_id: str,
+    ) -> list[dict[str, Any]]:
         state = self.state_store.read_json("user_commitments.json")
         items = state.get("commitments") if isinstance(state.get("commitments"), list) else []
         return [
@@ -405,26 +568,179 @@ class ProactiveIntentPlanner:
                 "session_id": item.get("session_id"),
             }
             for item in items
-            if isinstance(item, dict) and item.get("status") == status
+            if (
+                isinstance(item, dict)
+                and item.get("status") == status
+                and self._commitment_visible_to_user(
+                    item,
+                    user_id=user_id,
+                )
+            )
         ][-20:]
 
-    def _compact_local_world(self, local_world: dict[str, Any]) -> dict[str, Any]:
-        probes = local_world.get("probes") if isinstance(local_world.get("probes"), dict) else {}
+    @staticmethod
+    def _commitment_visible_to_user(
+        item: dict[str, Any],
+        *,
+        user_id: str,
+    ) -> bool:
+        owner_state, item_user, _ = owner_scope(item)
+        kind = scope_kind(item)
+        return (
+            owner_state == "exact"
+            and kind not in {"invalid", OPERATOR_GLOBAL_SCOPE}
+            and item_user == user_id
+        )
+
+    def _compact_local_world(
+        self,
+        local_world: dict[str, Any],
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        probes = visible_probe_map(
+            local_world,
+            user_id=user_id,
+            session_id=session_id,
+        )
         return {
-            "current_project": local_world.get("current_project"),
             "last_probe_at": local_world.get("last_probe_at"),
             "probe_names": list(probes.keys())[:20],
         }
 
-    def _compact_external_world(self, external_world: dict[str, Any]) -> dict[str, Any]:
-        watchlist = external_world.get("watchlist") if isinstance(external_world.get("watchlist"), list) else []
+    def _compact_external_world(
+        self,
+        external_world: dict[str, Any],
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        watchlist = self._visible_external_items(
+            external_world,
+            "watchlist",
+            user_id=user_id,
+            session_id=session_id,
+        )
+        summaries = self._visible_external_items(
+            external_world,
+            "summaries",
+            user_id=user_id,
+            session_id=session_id,
+        )
+        knowledge_items = self._visible_external_items(
+            external_world,
+            "knowledge_items",
+            user_id=user_id,
+            session_id=session_id,
+        )
+        push_candidates = self._visible_external_items(
+            external_world,
+            "push_candidates",
+            user_id=user_id,
+            session_id=session_id,
+        )
         return {
             "watchlist": [
-                {"target": item.get("target"), "kind": item.get("kind"), "topic": item.get("topic"), "enabled": item.get("enabled", True)}
+                {
+                    "target": item.get("target"),
+                    "kind": item.get("kind"),
+                    "topic": item.get("topic"),
+                    "enabled": item.get("enabled", True),
+                    "scope_kind": scope_kind(item) or "tenant",
+                }
                 for item in watchlist[-20:]
-                if isinstance(item, dict)
             ],
-            "knowledge_count": len(external_world.get("knowledge_items") if isinstance(external_world.get("knowledge_items"), list) else []),
+            "summaries": [
+                self._compact_external_item(
+                    item,
+                    fields=(
+                        "target",
+                        "kind",
+                        "topic",
+                        "status",
+                        "summary",
+                        "observed_at",
+                    ),
+                )
+                for item in summaries[-12:]
+            ],
+            "knowledge_items": [
+                self._compact_external_item(
+                    item,
+                    fields=(
+                        "topic",
+                        "title",
+                        "summary",
+                        "source",
+                        "status",
+                        "observed_at",
+                    ),
+                )
+                for item in knowledge_items[-12:]
+            ],
+            "push_candidates": [
+                self._compact_external_item(
+                    item,
+                    fields=(
+                        "topic",
+                        "title",
+                        "summary",
+                        "source",
+                        "status",
+                        "created_at",
+                    ),
+                )
+                for item in push_candidates[-12:]
+            ],
+            "knowledge_count": len(knowledge_items),
+            "push_candidate_count": len(push_candidates),
+        }
+
+    def _visible_external_items(
+        self,
+        external_world: dict[str, Any],
+        field: str,
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> list[dict[str, Any]]:
+        items = (
+            external_world.get(field)
+            if isinstance(external_world.get(field), list)
+            else []
+        )
+        return [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and (
+                exact_owner_visible(
+                    item,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+                or self._explicit_operator_global(item)
+            )
+        ]
+
+    @staticmethod
+    def _explicit_operator_global(item: dict[str, Any]) -> bool:
+        owner_state, _, _ = owner_scope(item)
+        return (
+            owner_state == "ownerless"
+            and scope_kind(item) == OPERATOR_GLOBAL_SCOPE
+        )
+
+    @staticmethod
+    def _compact_external_item(
+        item: dict[str, Any],
+        *,
+        fields: tuple[str, ...],
+    ) -> dict[str, Any]:
+        return {
+            **{field: item.get(field) for field in fields},
+            "scope_kind": scope_kind(item) or "tenant",
         }
 
     def _trace(self, intent: ProactiveIntent, planner_result: dict[str, Any]) -> None:

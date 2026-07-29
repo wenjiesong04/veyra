@@ -232,7 +232,15 @@ class UnderstandingCore:
         awareness_snapshot: dict[str, Any] | None = None,
         allow_model: bool = True,
     ) -> TurnUnderstanding:
-        snapshot = awareness_snapshot if isinstance(awareness_snapshot, dict) else self._awareness_snapshot(text=text, attention_focus=attention_focus)
+        snapshot = (
+            awareness_snapshot
+            if isinstance(awareness_snapshot, dict)
+            else self._awareness_snapshot(
+                text=text,
+                attention_focus=attention_focus,
+                event=event,
+            )
+        )
         fallback = self.fallback(text=text, attention_focus=attention_focus, event=event, awareness_snapshot=snapshot)
         fallback = _contextualize_read_only_fallback(fallback, text=text, turn_context=turn_context or {})
         if allow_model:
@@ -553,10 +561,25 @@ class UnderstandingCore:
         }
         return TurnUnderstanding.from_payload(payload, source_text=text)
 
-    def _awareness_snapshot(self, *, text: str, attention_focus: list[str]) -> dict[str, Any]:
+    def _awareness_snapshot(
+        self,
+        *,
+        text: str,
+        attention_focus: list[str],
+        event: VeyraEvent | None = None,
+    ) -> dict[str, Any]:
         if not self.assembler:
             return {"status": "unavailable"}
-        return self.assembler.snapshot(user_message=text, attention_focus=attention_focus)
+        return self.assembler.snapshot(
+            user_message=text,
+            attention_focus=attention_focus,
+            user_id=str(event.source.user_id or "").strip() if event else "",
+            session_id=(
+                str(event.source.session_id or "").strip()
+                if event
+                else ""
+            ),
+        )
 
     def _retrieval_hints_for(self, data: dict[str, Any]) -> list[str]:
         hints = ["conversation"]

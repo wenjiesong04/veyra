@@ -3,6 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from core.context_scope import (
+    OPERATOR_GLOBAL_SCOPE,
+    TENANT_SCOPE,
+    is_operator_global_probe,
+    owner_scope,
+    scope_kind,
+)
 from interface.event_schema import utc_now_iso
 
 
@@ -73,19 +80,31 @@ def refresh_claim_status(claim: dict[str, Any], now: datetime | None = None, *, 
 
 
 def detect_conflicts(claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    latest_by_key: dict[str, dict[str, Any]] = {}
+    prepared: list[dict[str, Any]] = []
     for claim in claims:
-        key = str(claim.get("key") or claim.get("claim") or "")
-        if not key:
+        updated = dict(claim)
+        if "conflicts_with" in updated:
+            updated.pop("conflicts_with", None)
+            if updated.get("status") == "conflict":
+                updated["status"] = "fresh"
+                if updated.get("next_action") == "refresh_probe":
+                    updated.pop("next_action", None)
+                updated = refresh_claim_status(updated)
+        prepared.append(updated)
+
+    latest_by_key: dict[tuple[str, ...], dict[str, Any]] = {}
+    for claim in prepared:
+        identity = claim_identity_key(claim)
+        if not identity:
             continue
-        current = latest_by_key.get(key)
+        current = latest_by_key.get(identity)
         if current is None or str(claim.get("updated_at", "")) >= str(current.get("updated_at", "")):
-            latest_by_key[key] = claim
+            latest_by_key[identity] = claim
 
     result: list[dict[str, Any]] = []
-    for claim in claims:
-        key = str(claim.get("key") or claim.get("claim") or "")
-        latest = latest_by_key.get(key)
+    for claim in prepared:
+        identity = claim_identity_key(claim)
+        latest = latest_by_key.get(identity)
         updated = dict(claim)
         if latest and _claim_value(updated) != _claim_value(latest) and updated.get("status") != "stale":
             updated["status"] = "conflict"
@@ -93,6 +112,40 @@ def detect_conflicts(claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
             updated["conflicts_with"] = latest.get("updated_at")
         result.append(updated)
     return result
+
+
+def claim_identity_key(
+    claim: dict[str, Any],
+) -> tuple[str, ...] | None:
+    """Bind Belief replacement and conflict detection to visibility scope."""
+
+    key = str(claim.get("key") or claim.get("claim") or "").strip()
+    if not key:
+        return None
+    owner_state, user_id, session_id = owner_scope(claim)
+    kind = scope_kind(claim)
+    if owner_state == "exact" and kind not in {
+        "invalid",
+        OPERATOR_GLOBAL_SCOPE,
+    }:
+        return ("tenant", user_id, session_id, key)
+    if (
+        owner_state == "ownerless"
+        and kind != TENANT_SCOPE
+        and (
+            kind == OPERATOR_GLOBAL_SCOPE
+            or is_operator_global_probe(claim)
+        )
+    ):
+        return ("operator_global", key)
+    if (
+        owner_state == "invalid"
+        or kind == "invalid"
+        or kind == TENANT_SCOPE
+        or bool(claim.get("tenant_derived"))
+    ):
+        return None
+    return ("legacy_ownerless", key)
 
 
 def _claim_value(claim: dict[str, Any]) -> Any:

@@ -21,6 +21,7 @@ GATE_SMOKES = [
     "user_profile_isolation_smoke.py",
     "user_profile_generalization_smoke.py",
     "commitment_smoke.py",
+    "commitment_scope_smoke.py",
     "cognition_pipeline_smoke.py",
     "tool_proxy_guard_smoke.py",
     "tool_governance_runtime_smoke.py",
@@ -44,6 +45,7 @@ GATE_SMOKES = [
     "project_guardian_attention_runtime_smoke.py",
     "project_guardian_http_contract_smoke.py",
     "project_guardian_replay_smoke.py",
+    "belief_read_purity_smoke.py",
     "state_integrity_smoke.py",
     "state_truth_isolation_smoke.py",
     "runtime_truth_smoke.py",
@@ -91,6 +93,12 @@ GATE_SMOKES = [
     "openclaw_reconnect_http_contract_smoke.py",
     "self_heal_route_non_regression_smoke.py",
     "memory_integrity_smoke.py",
+    "memory_quality_smoke.py",
+    "openclaw_memory_contract_smoke.py",
+    "openclaw_workspace_memory_smoke.py",
+    "memory_api_isolation_smoke.py",
+    "memory_context_scope_smoke.py",
+    "proactive_planner_scope_smoke.py",
     "state_mutation_concurrency_smoke.py",
 ]
 

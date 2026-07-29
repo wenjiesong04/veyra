@@ -240,7 +240,14 @@ class RuntimeMatrix:
                 },
             }
         try:
-            memory = self.memory_bridge.provider_diagnostics(provider=name, session_id=f"runtime-matrix-{name}", write_probe=write_memory_probe)
+            memory = self.memory_bridge.provider_diagnostics(
+                provider=name,
+                user_id="local-operator",
+                session_id=f"runtime-matrix-{name}",
+                write_probe=write_memory_probe,
+                record=write_memory_probe,
+                persist=write_memory_probe,
+            )
         except Exception as exc:
             memory = {"status": "error", "error": str(exc)}
         try:

@@ -15,7 +15,7 @@ from core.agent_session_router import AgentSessionRouter
 from core.capability_registry import CapabilityRegistry
 from core.context_patch_builder import ContextPatchBuilder
 from core.compact_external_lookup import CompactExternalLookup
-from core.context_scope import ContextScopeFilter
+from core.context_scope import ContextScopeFilter, exact_owner_visible
 from core.execution_tier import (
     TIER_L0_DIRECT_ANSWER,
     TIER_L1_COMPACT_EXTERNAL,
@@ -537,7 +537,11 @@ class AwarenessLoop:
             # polling/status traffic may resolve another historical provider
             # concurrently and must never redirect this user's context.
             selected_adapter = self.agent_registry.selected()
-            memory_summary = self.memory_bridge.read_summary(event.source.session_id, attention_focus)
+            memory_summary = self.memory_bridge.read_summary(
+                event.source.session_id,
+                attention_focus,
+                user_id=event.source.user_id,
+            )
             context_patch = self.context_builder.build(text, attention_focus, decision=decision.to_dict(), foresight=foresight, event=event)
             context_patch["memory_summary"] = memory_summary
             semantic_frame = model_assist.get("semantic_frame") if isinstance(model_assist.get("semantic_frame"), dict) else {}
@@ -583,6 +587,7 @@ class AwarenessLoop:
                     },
                 )
             session_plan = self.agent_session_router.resolve(
+                user_id=event.source.user_id,
                 dialogue_session_id=event.source.session_id,
                 text=text,
             )
@@ -670,6 +675,7 @@ class AwarenessLoop:
                 )
             else:
                 self.agent_session_router.record(
+                    user_id=event.source.user_id,
                     dialogue_session_id=event.source.session_id,
                     agent_execution_session_id=(
                         packet.agent_execution_session_id
@@ -1541,7 +1547,9 @@ class AwarenessLoop:
                 artifacts={"decision": decision.to_dict(), "next_action": "use a supported probe"},
             )
         raw = self._invoke_probe(probe_name=probe_name, probe=probe, text=text, decision=decision, event=event)
-        state_patch = self.perception.interpret_probe_result(raw)
+        state_patch = self.perception.interpret_probe_result(
+            self._scoped_probe_result(raw, event)
+        )
         belief_state = self.belief.refresh()
         verified = self.verifier.verify_probe_result(raw)
         answer_assist = (
@@ -1583,6 +1591,19 @@ class AwarenessLoop:
                 "uncertainty": self.uncertainty.uncertainty_summary(belief_state.get("claims", [])),
             },
         )
+
+    @staticmethod
+    def _scoped_probe_result(
+        probe_result: dict[str, Any],
+        event: VeyraEvent,
+    ) -> dict[str, Any]:
+        return {
+            **probe_result,
+            "scope_kind": "tenant",
+            "tenant_derived": True,
+            "user_id": str(event.source.user_id or "").strip(),
+            "session_id": str(event.source.session_id or "").strip(),
+        }
 
     def _invoke_probe(self, *, probe_name: str, probe: Any, text: str, decision: Decision, event: VeyraEvent) -> dict[str, Any]:
         model_assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
@@ -1684,7 +1705,10 @@ class AwarenessLoop:
         if self._semantic_effect_allowed(decision, "proactive.create") and self._is_proactive_weather_request(text):
             return "可以，你要我每天几点发哪个城市/地区的天气？"
         if self._is_learning_memory_question(text):
-            topic = self._current_learning_topic(event.source.user_id)
+            topic = self._current_learning_topic(
+                event.source.user_id,
+                event.source.session_id,
+            )
             if topic:
                 return f"记得。你现在在学习「{topic}」。我会把它作为当前学习目标来组织后续建议。"
             return "我现在没有找到明确的学习目标记录；你可以直接告诉我要学习的主题，我会记录到 Veyra memory。"
@@ -2005,7 +2029,10 @@ class AwarenessLoop:
         if self._is_tracking_memory_question(text):
             return {"reason": "tracking_memory_question", "response": self._tracking_memory_response(event)}
         if self._is_learning_memory_question(text):
-            topic = self._current_learning_topic(event.source.user_id)
+            topic = self._current_learning_topic(
+                event.source.user_id,
+                event.source.session_id,
+            )
             response = (
                 f"记得。你现在在学习「{topic}」。我会把它作为当前学习目标来组织后续建议。"
                 if topic
@@ -2525,15 +2552,23 @@ class AwarenessLoop:
 
     def _state_item_visible_to_event(self, item: dict[str, Any], event: VeyraEvent) -> bool:
         context = item.get("task_context") if isinstance(item.get("task_context"), dict) else {}
-        item_user = str(item.get("user_id") or context.get("user_id") or "").strip()
-        item_session = str(item.get("session_id") or context.get("session_id") or "").strip()
-        if item_user and item_user != event.source.user_id:
+        direct_user = str(item.get("user_id") or "").strip()
+        context_user = str(context.get("user_id") or "").strip()
+        direct_session = str(item.get("session_id") or "").strip()
+        context_session = str(context.get("session_id") or "").strip()
+        if direct_user and context_user and direct_user != context_user:
             return False
-        if item_session and item_session != event.source.session_id:
+        if (
+            direct_session
+            and context_session
+            and direct_session != context_session
+        ):
             return False
-        if item_user or item_session:
-            return True
-        return event.source.user_id in {"", "local-user"}
+        item_user = direct_user or context_user
+        item_session = direct_session or context_session
+        if not item_user or item_user != event.source.user_id:
+            return False
+        return not item_session or item_session == event.source.session_id
 
     def _latest_timestamp(self, items: list[Any]) -> str | None:
         values: list[str] = []
@@ -2661,10 +2696,15 @@ class AwarenessLoop:
         return compact in {"继续", "继续昨天那个项目", "继续上次那个项目", "接着刚才"} or "continue previous project" in lowered
 
     def _project_context_response(self, event: VeyraEvent | None = None) -> str:
+        if event is None:
+            return ""
         user_world = self.state_store.read_json("user_world.json")
-        scoped = self._scoped_user_profile(user_world, event.source.user_id if event else None)
-        project = str(scoped.get("current_project") or user_world.get("current_project") or "").strip()
-        goal = str(scoped.get("current_goal") or user_world.get("current_goal") or "").strip()
+        scoped = self._scoped_user_profile(
+            user_world,
+            event.source.user_id,
+        )
+        project = str(scoped.get("current_project") or "").strip()
+        goal = str(scoped.get("current_goal") or "").strip()
         if not project and goal.startswith("project:"):
             project = goal.split(":", 1)[1]
         if not project:
@@ -2673,7 +2713,10 @@ class AwarenessLoop:
             for item in reversed(history):
                 if not isinstance(item, dict):
                     continue
-                if event and item.get("session_id") and str(item.get("session_id")) != event.source.session_id:
+                if event and not self._state_item_visible_to_event(
+                    item,
+                    event,
+                ):
                     continue
                 message = str(item.get("message") or "")
                 if "Veyra" in message:
@@ -2687,9 +2730,18 @@ class AwarenessLoop:
         return f"继续「{project}」这个上下文。你可以直接说要继续哪一块，我会按当前项目状态、风险和可用能力决定直答、probe、Agent 或 Guardian review。"
 
     def _user_context_planning_response(self, text: str, event: VeyraEvent | None = None) -> str:
+        if event is None:
+            return ""
         user_world = self.state_store.read_json("user_world.json")
-        scoped = self._scoped_user_profile(user_world, event.source.user_id if event else None)
-        profile = scoped.get("profile") if isinstance(scoped.get("profile"), dict) else user_world.get("profile") if isinstance(user_world.get("profile"), dict) else {}
+        scoped = self._scoped_user_profile(
+            user_world,
+            event.source.user_id,
+        )
+        profile = (
+            scoped.get("profile")
+            if isinstance(scoped.get("profile"), dict)
+            else {}
+        )
         lowered = (text or "").lower()
         if any(marker in text for marker in ("三个月学习路线", "学习路线", "学习计划")):
             program = profile.get("program") if isinstance(profile.get("program"), dict) else (
@@ -2721,7 +2773,7 @@ class AwarenessLoop:
         scoped = profiles.get(user_id) if isinstance(profiles.get(user_id), dict) else {}
         return scoped
 
-    def _current_learning_topic(self, user_id: str) -> str:
+    def _current_learning_topic(self, user_id: str, session_id: str) -> str:
         goals_state = self.state_store.read_json("user_goals.json")
         goals = goals_state.get("goals") if isinstance(goals_state.get("goals"), list) else []
         for goal in reversed(goals):
@@ -2749,15 +2801,24 @@ class AwarenessLoop:
         topic = str(scoped.get("learning_topic") or "").strip()
         if topic:
             return topic
-        topic = str(user_world.get("learning_topic") or "").strip() if user_id in {"", "local-user"} else ""
-        if topic:
-            return topic
         memory_state = self.state_store.read_json("agent_memory.json")
         items = memory_state.get("items") if isinstance(memory_state.get("items"), list) else []
         for item in reversed(items):
             if not isinstance(item, dict):
                 continue
             patch = item.get("patch") if isinstance(item.get("patch"), dict) else {}
+            direct_user = str(item.get("user_id") or "").strip()
+            patch_user = str(patch.get("user_id") or "").strip()
+            direct_session = str(item.get("session_id") or "").strip()
+            patch_session = str(patch.get("session_id") or "").strip()
+            if direct_user and patch_user and direct_user != patch_user:
+                continue
+            if direct_session and patch_session and direct_session != patch_session:
+                continue
+            item_user = direct_user or patch_user
+            item_session = direct_session or patch_session
+            if item_user != user_id or item_session != session_id:
+                continue
             if patch.get("memory_type") == "learning_goal":
                 topic = str(patch.get("topic") or item.get("topic") or "").strip()
                 if topic:
@@ -2986,7 +3047,9 @@ class AwarenessLoop:
         if weather_allowed and self._looks_like_weather_followup(text, slots):
             location = self._resolve_weather_location_for_turn(text, slots)
             raw = self.probes["weather_probe"].run(text, location=location or None)
-            state_patch = self.perception.interpret_probe_result(raw)
+            state_patch = self.perception.interpret_probe_result(
+                self._scoped_probe_result(raw, event)
+            )
             verified = self.verifier.verify_probe_result(raw)
             trace = self.execution_trace.record(
                 {
@@ -3136,7 +3199,11 @@ class AwarenessLoop:
         for item in reversed(inbox):
             if not isinstance(item, dict):
                 continue
-            if str(item.get("session_id") or "") != event.source.session_id:
+            if not exact_owner_visible(
+                item,
+                user_id=event.source.user_id,
+                session_id=event.source.session_id,
+            ):
                 continue
             if str(item.get("event_id") or "") == event.event_id:
                 continue
@@ -3219,17 +3286,80 @@ class AwarenessLoop:
 
     def _last_outbound_message(self, event: VeyraEvent) -> dict[str, Any]:
         channel_state = self.state_store.read_json("channel_state.json")
+        inbox = (
+            channel_state.get("inbox")
+            if isinstance(channel_state.get("inbox"), list)
+            else []
+        )
+        owned_event_ids = {
+            str(item.get("event_id"))
+            for item in inbox
+            if isinstance(item, dict)
+            and item.get("event_id")
+            and exact_owner_visible(
+                item,
+                user_id=event.source.user_id,
+                session_id=event.source.session_id,
+            )
+        }
         outbox = channel_state.get("outbox") if isinstance(channel_state.get("outbox"), list) else []
         for item in reversed(outbox):
             if not isinstance(item, dict):
                 continue
             if str(item.get("session_id") or "") != event.source.session_id:
                 continue
+            metadata = (
+                item.get("metadata")
+                if isinstance(item.get("metadata"), dict)
+                else {}
+            )
+            direct_user = str(item.get("user_id") or "").strip()
+            metadata_user = str(metadata.get("user_id") or "").strip()
+            direct_session = str(item.get("session_id") or "").strip()
+            metadata_session = str(
+                metadata.get("session_id") or ""
+            ).strip()
+            direct_event_id = str(item.get("event_id") or "").strip()
+            metadata_event_id = str(
+                metadata.get("event_id") or ""
+            ).strip()
+            if (
+                direct_user
+                and metadata_user
+                and direct_user != metadata_user
+            ):
+                continue
+            if (
+                metadata_session
+                and direct_session != metadata_session
+            ):
+                continue
+            if (
+                direct_event_id
+                and metadata_event_id
+                and direct_event_id != metadata_event_id
+            ):
+                continue
+            item_user = direct_user or metadata_user
+            item_event_id = direct_event_id or metadata_event_id
+            if item_user:
+                if item_user != event.source.user_id:
+                    continue
+                if (
+                    item_event_id
+                    and item_event_id not in owned_event_ids
+                ):
+                    continue
+            elif (
+                not item_event_id
+                or item_event_id not in owned_event_ids
+            ):
+                continue
             message = str(item.get("message") or item.get("response") or "").strip()
             if message:
                 return {
                     "message": message,
-                    "route": (item.get("metadata") if isinstance(item.get("metadata"), dict) else {}).get("route"),
+                    "route": metadata.get("route"),
                     "created_at": item.get("created_at"),
                 }
         return {}
@@ -3298,7 +3428,14 @@ class AwarenessLoop:
         state = self.state_store.read_json("task_state.json")
         slots_by_session = state.get("conversation_slots") if isinstance(state.get("conversation_slots"), dict) else {}
         slots = slots_by_session.get(event.source.session_id) if isinstance(slots_by_session, dict) else {}
-        return dict(slots) if isinstance(slots, dict) else {}
+        if not isinstance(slots, dict):
+            return {}
+        if (
+            str(slots.get("user_id") or "") != event.source.user_id
+            or str(slots.get("session_id") or "") != event.source.session_id
+        ):
+            return {}
+        return dict(slots)
 
     def _persist_conversation_slots(self, event: VeyraEvent, result: LoopResult) -> None:
         persisted_slots: dict[str, Any] = {}
@@ -3307,7 +3444,21 @@ class AwarenessLoop:
             nonlocal persisted_slots
             slots_by_session = state.get("conversation_slots") if isinstance(state.get("conversation_slots"), dict) else {}
             slots_by_session = dict(slots_by_session)
-            slots = dict(slots_by_session.get(event.source.session_id) or {})
+            existing_slots = slots_by_session.get(event.source.session_id)
+            if (
+                isinstance(existing_slots, dict)
+                and str(existing_slots.get("user_id") or "")
+                == event.source.user_id
+                and str(existing_slots.get("session_id") or "")
+                == event.source.session_id
+            ):
+                slots = dict(existing_slots)
+            else:
+                # Ownerless legacy slots and a same-session record owned by a
+                # different user are not valid continuation context.
+                slots = {}
+            slots["user_id"] = event.source.user_id
+            slots["session_id"] = event.source.session_id
             text = str(event.payload.get("text") or "")
             slots["last_intent"] = self._intent_from_result(result)
             slots["last_topic"] = self._topic_from_turn(text, result, slots)
@@ -3697,7 +3848,15 @@ class AwarenessLoop:
         self.state_store.patch_json("risk_state.json", {"current_risk": risk_level})
         self.state_store.patch_json(
             "task_state.json",
-            {"current_task": {"event_id": event.event_id, "route": result.route.value, "status": result.status}},
+            {
+                "current_task": {
+                    "event_id": event.event_id,
+                    "user_id": event.source.user_id,
+                    "session_id": event.source.session_id,
+                    "route": result.route.value,
+                    "status": result.status,
+                }
+            },
         )
         self._append_task_history(event, result)
         self.state_store.append_jsonl(
@@ -3999,6 +4158,7 @@ class AwarenessLoop:
     def _append_task_history(self, event: VeyraEvent, result: LoopResult) -> None:
         item = {
             "event_id": event.event_id,
+            "user_id": event.source.user_id,
             "session_id": event.source.session_id,
             "route": result.route.value,
             "status": result.status,

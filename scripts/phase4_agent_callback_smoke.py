@@ -852,7 +852,50 @@ def poll_binding_checks(root: Path) -> None:
     loop.target_adapter.fetch_results[run_id] = terminal_execution(
         prepared, "poll"
     )
-    response = loop.client.get(f"/agent/tasks/{run_id}")
+    cached = loop.client.get(
+        f"/agent/tasks/{run_id}",
+        params={
+            "user_id": USER_ID,
+            "session_id": "session-event-poll",
+        },
+    )
+    cached_case = loop.durable_case_store.get_case(
+        case_id=prepared["binding"]["case_id"],
+        user_id=USER_ID,
+        workspace_id=WORKSPACE_ID,
+    )
+    expect(
+        cached.status_code == 200
+        and cached.json()["status"] == "cached"
+        and cached_case["status"] == "DELIBERATING"
+        and loop.target_adapter.fetch_calls == [],
+        "GET task status is an owner-scoped pure snapshot",
+        {
+            "response": cached.text,
+            "case": cached_case,
+            "fetch_calls": loop.target_adapter.fetch_calls,
+        },
+    )
+    wrong_owner = loop.client.get(
+        f"/agent/tasks/{run_id}",
+        params={
+            "user_id": "other-user",
+            "session_id": "session-event-poll",
+        },
+    )
+    expect(
+        wrong_owner.status_code == 404
+        and loop.target_adapter.fetch_calls == [],
+        "task snapshot hides another user's task without polling",
+        wrong_owner.text,
+    )
+    response = loop.client.post(
+        f"/agent/tasks/{run_id}/refresh",
+        params={
+            "user_id": USER_ID,
+            "session_id": "session-event-poll",
+        },
+    )
     body = response.json()
     expect(response.status_code == 200, "Case task poll succeeds", body)
     expect(
@@ -907,8 +950,12 @@ def poll_binding_checks(root: Path) -> None:
             },
         )
     )
-    rejected = queue_timeout.client.get(
-        f"/agent/tasks/{queue_run}"
+    rejected = queue_timeout.client.post(
+        f"/agent/tasks/{queue_run}/refresh",
+        params={
+            "user_id": USER_ID,
+            "session_id": "session-event-poll-queue-timeout",
+        },
     )
     queue_case = queue_timeout.durable_case_store.get_case(
         case_id=queue_prepared["binding"]["case_id"],
@@ -1012,7 +1059,26 @@ def stop_binding_checks(root: Path) -> None:
     loop = LoopFixture(root / "stop")
     prepared = loop.prepare_registered_case("event-stop")
     run_id = prepared["binding"]["runtime_run_id"]
-    response = loop.client.post(f"/agent/tasks/{run_id}/stop")
+    wrong_owner = loop.client.post(
+        f"/agent/tasks/{run_id}/stop",
+        params={
+            "user_id": "other-user",
+            "session_id": "session-event-stop",
+        },
+    )
+    expect(
+        wrong_owner.status_code == 404
+        and loop.target_adapter.cancel_calls == [],
+        "task stop hides another user's task and leaves authority intact",
+        wrong_owner.text,
+    )
+    response = loop.client.post(
+        f"/agent/tasks/{run_id}/stop",
+        params={
+            "user_id": USER_ID,
+            "session_id": "session-event-stop",
+        },
+    )
     body = response.json()
     expect(response.status_code == 200, "Case task stop succeeds", body)
     expect(

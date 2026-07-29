@@ -255,7 +255,7 @@ P5 完成后，Veyra 进入产品化硬化，而不是继续堆新模块。当�
 - P10 ContextDriftDetector 在 TurnContextBuilder 后、Core reasoning 前检测 context 过大、stale belief 注入、governance/persona 污染、上一轮 Agent 错误影响、persona 异常切换和 memory 过度注入；高分时压缩 context、移除 stale beliefs、降低历史权重并记录 warning。
 - P10 ToolProxy guard smoke 覆盖文件读、普通文件写、`rm -rf`、`.env` 读取、restart service、`git push --force`；所有高危动作必须有 trace，不能直接执行。
 - P10 本地发行硬化增加 `.env.example`、`scripts/install_local.sh`、`scripts/start_local.sh`、`scripts/status_local.sh`、`scripts/reset_local_state.sh`、`apps/desktop` Tauri 桌面壳、`scripts/start_desktop_dev.sh`、`scripts/build_desktop.sh`、`/setup/status`、`/setup/env` 和 GitHub gate smoke workflow；GitHub release 不应包含本地 `state/`、secret、OpenClaw device 或个人 commitments。
-- P10 `main.py` 第一阶段已做 route layer split；当前 `main.py` 为 1192 行，FastAPI routes 共 138 条，其中 133 条是 callable product/API routes，另有 `/console` static mount。路由清单和 domain 分类见 `docs/main_route_inventory.md`。
+- P10 之后 route layer split 已继续覆盖 Cases、Tool Governance、Project Guardian、Phase 5 和 Phase 6 控制面；当前 `main.py` 为 1625 行。隔离导入得到 211 个 Starlette/FastAPI route objects：206 条 callable product `APIRoute`、4 条 OpenAPI/Swagger/Redoc framework route，以及 `/console` static mount。完整清单和 domain 分类见 `docs/main_route_inventory.md`。
 
 后续仍需要的是真实环境验收，而不是本地功能补洞。接口现在明确区分 `implemented`、`configured`、`validated`、`validation_pending`，未配置或未连通的真实运行时不会被标成已连接：
 

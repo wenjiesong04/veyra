@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, ConfigDict
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
 from core.definitions import RiskLevel, lifecycle_statuses, operational_modes, risk_catalog
 from core.model_client import redact_sensitive
 from interface.event_schema import utc_now_iso
+from memory_bridge.scope import normalize_scope_component
 from runtime.project_guardian_producers import ProjectGuardianGoalConflict
 from runtime.project_guardian_attention_runtime import (
     ProjectGuardianAttentionConflict,
@@ -32,6 +33,14 @@ class CoreModelConfigRequest(BaseModel):
 
 
 class ExternalWatchRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        str_strip_whitespace=True,
+    )
+
+    user_id: str = Field(min_length=1, max_length=240)
+    session_id: str = Field(min_length=1, max_length=240)
     target: str
     kind: str | None = None
     reason: str = ""
@@ -303,8 +312,40 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
         return {"items": deps["state_store"].read_jsonl("rollback_log.jsonl", limit=limit)}
 
     @router.get("/logs/memory")
-    async def memory_logs(limit: int = 100) -> dict[str, Any]:
-        return {"items": deps["state_store"].read_jsonl("memory_log.jsonl", limit=limit)}
+    async def memory_logs(
+        *,
+        user_id: str = Query(min_length=1, max_length=240),
+        session_id: str = Query(min_length=1, max_length=240),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        try:
+            user_scope = normalize_scope_component(
+                user_id,
+                "user_id",
+            )
+            session_scope = normalize_scope_component(
+                session_id,
+                "session_id",
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=str(exc),
+            ) from exc
+        rows = deps["state_store"].read_jsonl(
+            "memory_log.jsonl",
+            limit=10_000,
+        )
+        scoped = [
+            row
+            for row in rows
+            if _memory_log_visible(
+                row,
+                user_id=user_scope,
+                session_id=session_scope,
+            )
+        ]
+        return {"items": scoped[-limit:]}
 
     @router.get("/logs/core-model")
     async def core_model_logs(limit: int = 100) -> dict[str, Any]:
@@ -431,7 +472,22 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     @router.post("/external/watchlist")
     async def add_external_watch(request: ExternalWatchRequest) -> dict[str, Any]:
         state_store = deps["state_store"]
-        item = request.model_dump()
+        try:
+            user_scope = normalize_scope_component(
+                request.user_id,
+                "user_id",
+            )
+            session_scope = normalize_scope_component(
+                request.session_id,
+                "session_id",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        item = {
+            **request.model_dump(),
+            "user_id": user_scope,
+            "session_id": session_scope,
+        }
 
         def update_watchlist(external: dict[str, Any]) -> None:
             watchlist = external.setdefault("watchlist", [])
@@ -440,7 +496,12 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
             existing = [
                 entry
                 for entry in watchlist
-                if isinstance(entry, dict) and entry.get("target") == request.target
+                if (
+                    isinstance(entry, dict)
+                    and entry.get("target") == request.target
+                    and entry.get("user_id") == user_scope
+                    and entry.get("session_id") == session_scope
+                )
             ]
             if existing:
                 existing[0].update(item)
@@ -816,15 +877,16 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
 
 def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
     public = redact_sensitive(payload)
-    # Event, situation, Durable Case, Guardian, Phase 6 collaboration, and
-    # ExtensionSpec quarantine projections are tenant-scoped. Durable Case,
-    # collaboration, and extension documents also carry private bindings or
-    # manifest content, so they must only be exposed through owner-scoped
-    # projections.
+    # Event, situation, Memory, Durable Case, Guardian, Phase 6 collaboration,
+    # and ExtensionSpec quarantine projections are tenant-scoped. Memory,
+    # Durable Case, collaboration, and extension documents also carry private
+    # bindings or user content, so they must only be exposed through
+    # owner-scoped projections.
     # The generic state endpoint has no authenticated tenant identity, so it
     # must not expose any of these collections.
     public.pop("event_inbox", None)
     public.pop("situation_state", None)
+    public.pop("agent_memory", None)
     public.pop("durable_case_state", None)
     public.pop("phase6_collaboration_state", None)
     public.pop("phase6_extension_spec_state", None)
@@ -884,3 +946,25 @@ def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
             core_model["api_key_set"] = bool(original.get("api_key")) if isinstance(original, dict) else False
             core_model["api_key"] = "<redacted>" if core_model.get("api_key") else ""
     return public
+
+
+def _memory_log_visible(
+    row: Any,
+    *,
+    user_id: str,
+    session_id: str,
+) -> bool:
+    if not isinstance(row, dict):
+        return False
+    item = row.get("item") if isinstance(row.get("item"), dict) else {}
+    patch = item.get("patch") if isinstance(item.get("patch"), dict) else {}
+    item_user = str(item.get("user_id") or "").strip()
+    item_session = str(item.get("session_id") or "").strip()
+    patch_user = str(patch.get("user_id") or "").strip()
+    patch_session = str(patch.get("session_id") or "").strip()
+    return (
+        bool(item_user)
+        and bool(item_session)
+        and item_user == patch_user == user_id
+        and item_session == patch_session == session_id
+    )

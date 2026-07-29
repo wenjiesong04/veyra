@@ -292,8 +292,55 @@ def main() -> int:
             verification={"status": "needs_more_probe", "next_action": "configure_or_refresh_agent_runtime"},
         )
         still_pending = app_module.state_store.read_json("task_state.json").get("pending_agent_tasks", [])
-        expect(any(item.get("task_id") == "retry_later" for item in still_pending), "transient adapter poll keeps pending task", still_pending)
+        expect(
+            not any(
+                item.get("task_id") == "retry_later"
+                for item in still_pending
+            ),
+            "terminal adapter_unconfigured result retires pending task",
+            still_pending,
+        )
 
+        agent_frame = {
+            "schema_version": "veyra.semantic_frame.v1",
+            "acts": [
+                {
+                    "act_id": "p6-model-agent",
+                    "kind": "workspace_task",
+                    "goal": "完善 Veyra 的模型认知链路",
+                    "operation": "implement_component",
+                    "target": {
+                        "type": "codebase",
+                        "value": "Veyra",
+                        "attributes": {},
+                    },
+                    "polarity": "positive",
+                    "explicitness": "explicit",
+                    "source_quote": {
+                        "text": "完善 Veyra 的模型认知链路",
+                        "start": 0,
+                        "end": 16,
+                    },
+                    "speaker": "user",
+                    "authority": "direct_user",
+                    "mention_mode": "normal_use",
+                    "evidence_need": "unknown",
+                    "referent": {
+                        "surface": "",
+                        "resolved": "",
+                        "status": "not_applicable",
+                        "candidates": [],
+                    },
+                    "condition": None,
+                    "modality": "asserted",
+                    "arguments": {},
+                }
+            ],
+            "relations": [],
+            "ambiguities": [],
+            "resolver_status": "resolved",
+            "source": "p6_self_test",
+        }
         model_decision = DecisionCore(
             app_module.state_store,
             reasoning=FakeCoreReasoning(
@@ -307,9 +354,20 @@ def main() -> int:
                     "signals": ["model:implementation"],
                     "solution_outline": ["read state", "delegate bounded implementation", "verify result"],
                     "agent_context": {"handoff": "include state and proposed solution"},
+                    "semantic_frame": agent_frame,
                 }
             ),
-        ).decide("完善 Veyra 的模型认知链路", [])
+        ).decide(
+            "完善 Veyra 的模型认知链路",
+            [],
+            turn_understanding={
+                "user_message": "完善 Veyra 的模型认知链路",
+                "intent": "implementation",
+                "task_type": "workspace_task",
+                "suggested_mode": "governed_execution",
+                "semantic_frame": agent_frame,
+            },
+        )
         expect(model_decision.route == Route.AGENT, "core model can select agent route", model_decision.to_dict())
         expect(bool(model_decision.model_assist.get("solution_outline")), "core model keeps solution outline", model_decision.to_dict())
 
@@ -319,14 +377,90 @@ def main() -> int:
         ).decide("rm -rf /tmp/veyra-danger", [])
         expect(blocked_decision.route == Route.BLOCK and blocked_decision.risk_level.value == "R5", "core model cannot lower R5 risk", blocked_decision.to_dict())
 
-        time_decision = DecisionCore(app_module.state_store, reasoning=FakeCoreReasoning()).decide("现在东京时间是几点", [])
+        def read_turn(
+            text: str,
+            *,
+            operation: str,
+            target_type: str,
+            target_value: str,
+            evidence_need: str,
+            arguments: dict[str, Any],
+        ) -> dict[str, Any]:
+            return {
+                "user_message": text,
+                "intent": "information",
+                "task_type": "current_fact",
+                "suggested_mode": "runtime_evidence",
+                "semantic_frame": {
+                    "schema_version": "veyra.semantic_frame.v1",
+                    "acts": [
+                        {
+                            "act_id": f"p6-read-{operation}",
+                            "kind": "question",
+                            "goal": text,
+                            "operation": operation,
+                            "target": {
+                                "type": target_type,
+                                "value": target_value,
+                                "attributes": {},
+                            },
+                            "polarity": "positive",
+                            "explicitness": "explicit",
+                            "source_quote": {
+                                "text": text,
+                                "start": 0,
+                                "end": len(text),
+                            },
+                            "speaker": "user",
+                            "authority": "direct_user",
+                            "mention_mode": "normal_use",
+                            "evidence_need": evidence_need,
+                            "referent": {
+                                "surface": "",
+                                "resolved": "",
+                                "status": "not_applicable",
+                                "candidates": [],
+                            },
+                            "condition": None,
+                            "modality": "asserted",
+                            "arguments": arguments,
+                        }
+                    ],
+                    "relations": [],
+                    "ambiguities": [],
+                    "resolver_status": "resolved",
+                    "source": "p6_self_test",
+                },
+            }
+
+        time_text = "现在东京时间是几点"
+        time_turn = read_turn(
+            time_text,
+            operation="query_current_time",
+            target_type="timezone",
+            target_value="Asia/Tokyo",
+            evidence_need="fresh_current_time",
+            arguments={"timezone": "Asia/Tokyo"},
+        )
+        time_decision = DecisionCore(
+            app_module.state_store,
+            reasoning=FakeCoreReasoning(),
+        ).decide(
+            time_text,
+            [],
+            turn_understanding=time_turn,
+        )
         expect(time_decision.route == Route.PROBE and time_decision.selected_probe == "time", "volatile time question routes to time probe", time_decision.to_dict())
         time_probe = TimeProbe().run("现在东京时间是几点")
         expect(time_probe["probe"] == "time_probe" and time_probe["details"]["timezone"] == "Asia/Tokyo", "time probe returns Tokyo evidence", time_probe)
         time_preserved = DecisionCore(
             app_module.state_store,
             reasoning=FakeCoreReasoning(decision={"status": "model_assisted", "route": "direct_answer", "risk_level": "R0", "reason": "guessed", "draft_response": "猜一个时间"}),
-        ).decide("现在东京时间是几点", [])
+        ).decide(
+            time_text,
+            [],
+            turn_understanding=time_turn,
+        )
         expect(
             time_preserved.route == Route.PROBE
             and (
@@ -342,7 +476,22 @@ def main() -> int:
         expect(capabilities["capabilities"]["weather_probe"]["available"] is True, "weather_probe is a native read-only probe", capabilities)
         turn_context = TurnContextBuilder(app_module.state_store).build(user_message="今天北京天气怎么样", attention_focus=["weather"])
         expect("available_capabilities" in turn_context and "local_world" not in turn_context, "turn context is scoped and capability-aware", turn_context)
-        weather_decision = DecisionCore(app_module.state_store, reasoning=FakeCoreReasoning()).decide("今天北京天气怎么样", [])
+        weather_text = "今天北京天气怎么样"
+        weather_decision = DecisionCore(
+            app_module.state_store,
+            reasoning=FakeCoreReasoning(),
+        ).decide(
+            weather_text,
+            [],
+            turn_understanding=read_turn(
+                weather_text,
+                operation="query_current_weather",
+                target_type="weather",
+                target_value="北京",
+                evidence_need="fresh_external_weather",
+                arguments={"location": "北京"},
+            ),
+        )
         expect(
             weather_decision.route == Route.PROBE
             and weather_decision.freshness_required
@@ -446,9 +595,42 @@ def main() -> int:
             "agent_memory.json",
             {
                 "items": [
-                    {"patch": {"task": "unrelated", "result": "ignore"}, "freshness": "fresh", "trust": "observed"},
-                    {"patch": {"task": "openclaw restart", "result": "check gateway token first"}, "freshness": "fresh", "trust": "observed"},
-                    {"patch": {"task": "frontend css", "result": "not relevant"}, "freshness": "fresh", "trust": "observed"},
+                    {
+                        "user_id": "p6",
+                        "session_id": "p6",
+                        "patch": {
+                            "user_id": "p6",
+                            "session_id": "p6",
+                            "task": "unrelated",
+                            "result": "ignore",
+                        },
+                        "freshness": "fresh",
+                        "trust": "observed",
+                    },
+                    {
+                        "user_id": "p6",
+                        "session_id": "p6",
+                        "patch": {
+                            "user_id": "p6",
+                            "session_id": "p6",
+                            "task": "openclaw restart",
+                            "result": "check gateway token first",
+                        },
+                        "freshness": "fresh",
+                        "trust": "observed",
+                    },
+                    {
+                        "user_id": "p6",
+                        "session_id": "p6",
+                        "patch": {
+                            "user_id": "p6",
+                            "session_id": "p6",
+                            "task": "frontend css",
+                            "result": "not relevant",
+                        },
+                        "freshness": "fresh",
+                        "trust": "observed",
+                    },
                 ]
             },
         )
@@ -458,7 +640,7 @@ def main() -> int:
             adapter_getter=lambda provider: adapter,
             provider_names=lambda: ["openclaw", "hermes", "custom"],
             reasoning=FakeCoreReasoning(memory={"status": "model_assisted", "selected_indexes": [1], "relevance_notes": "OpenClaw memory is most relevant."}),
-        ).read_summary("p6", ["openclaw"])
+        ).read_summary("p6", ["openclaw"], user_id="p6")
         expect(len(model_memory["summary"]) == 1 and "openclaw" in str(model_memory["summary"][0]).lower(), "core model ranks memory relevance", model_memory)
         routed_memory = LocalMemoryBridge(
             app_module.state_store,
@@ -467,10 +649,33 @@ def main() -> int:
             provider_names=lambda: ["openclaw", "hermes", "custom"],
         )
         provider_status = routed_memory.provider_status()
-        all_summary = routed_memory.read_summary("p6", provider="all")
-        hermes_write = routed_memory.write_patch({"session_id": "p6", "task": "route memory", "result": "ok"}, provider="hermes")
-        hermes_diagnostics = routed_memory.provider_diagnostics(provider="hermes", session_id="p6", write_probe=True)
-        all_diagnostics = routed_memory.provider_diagnostics(provider="all", session_id="p6")
+        all_summary = routed_memory.read_summary(
+            "p6",
+            provider="all",
+            user_id="p6",
+        )
+        hermes_write = routed_memory.write_patch(
+            {
+                "user_id": "p6",
+                "session_id": "p6",
+                "task": "route memory",
+                "result": "ok",
+            },
+            provider="hermes",
+        )
+        hermes_diagnostics = routed_memory.provider_diagnostics(
+            provider="hermes",
+            user_id="p6",
+            session_id="p6",
+            write_probe=True,
+            record=True,
+            persist=True,
+        )
+        all_diagnostics = routed_memory.provider_diagnostics(
+            provider="all",
+            user_id="p6",
+            session_id="p6",
+        )
         expect("hermes" in provider_status["providers"] and "all" in provider_status["providers"], "memory providers are explicit", provider_status)
         expect(all_summary["external_summary"]["provider"] == "all" and all_summary["external_summary"]["summary"], "memory summary can fan out across providers", all_summary)
         expect(hermes_write["external_write"]["provider"] == "hermes" and hermes_write["external_write"]["status"] == "submitted", "memory patch can target provider", hermes_write)
@@ -529,7 +734,13 @@ def main() -> int:
             },
         )
         expect(r2.status_code == 200, "R2 proposal accepted", r2.text)
-        expect(r2.json()["status"] == "ok", "R2 proposal executed through tool proxy", r2.json())
+        expect(
+            r2.json()["status"] == "needs_governed_execution"
+            and r2.json()["verification"]["status"]
+            == "needs_more_probe",
+            "R2 proposal cannot mint execution authority",
+            r2.json(),
+        )
 
         r3 = client.post(
             "/actions/proposals",
@@ -543,7 +754,13 @@ def main() -> int:
         expect(r3.json()["status"] == "needs_confirmation", "R3 proposal enters review", r3.json())
         review_id = r3.json()["review"]["review_id"]
         approved = client.post(f"/reviews/{review_id}/approve", json={"reason": "p6_self_test"})
-        expect(approved.json()["execution_result"]["status"] == "ok", "approved review executes safe file", approved.json())
+        expect(
+            approved.status_code == 409
+            and "authoritative review claim resolver"
+            in approved.text,
+            "review cannot execute without an authoritative claim resolver",
+            approved.text,
+        )
 
         r5 = client.post(
             "/actions/proposals",
@@ -612,26 +829,59 @@ def main() -> int:
         expect(web["probe"] == "web_probe" and web["status"] in {"ok", "http_error", "unavailable"}, "web probe envelope", web)
 
         memory = LocalMemoryBridge(app_module.state_store, adapter_resolver=lambda: adapter)
-        safe = memory.write_patch({"session_id": "p6", "task": "remember openclaw probe strategy", "result": "check status"})
-        blocked = memory.write_patch({"session_id": "p6", "token": "secret-token"})
-        summary = memory.read_summary("p6", ["openclaw"])
+        safe = memory.write_patch(
+            {
+                "user_id": "p6",
+                "session_id": "p6",
+                "task": "remember openclaw probe strategy",
+                "result": "check status",
+            }
+        )
+        blocked = memory.write_patch(
+            {"user_id": "p6", "session_id": "p6", "token": "secret-token"}
+        )
+        summary = memory.read_summary("p6", ["openclaw"], user_id="p6")
         expect(safe["status"] == "written", "memory safe write", safe)
         expect(blocked["status"] == "blocked", "memory sensitive write blocked", blocked)
         expect("summary" in summary and "external_summary" in summary, "memory summary includes external slot", summary)
 
         providers_response = client.get("/memory/providers")
-        provider_diagnostics_response = client.get("/memory/providers/diagnostics?provider=local&session_id=p6")
-        summary_response = client.get("/memory/summary?session_id=p6&provider=local")
-        patch_response = client.post("/memory/patch", json={"provider": "local", "patch": {"session_id": "p6", "task": "local provider", "result": "ok"}})
+        provider_diagnostics_response = client.get(
+            "/memory/providers/diagnostics?provider=local&user_id=p6&session_id=p6"
+        )
+        summary_response = client.get(
+            "/memory/summary?user_id=p6&session_id=p6&provider=local"
+        )
+        patch_response = client.post(
+            "/memory/patch",
+            json={
+                "provider": "local",
+                "user_id": "p6",
+                "session_id": "p6",
+                "patch": {"task": "local provider", "result": "ok"},
+            },
+        )
         expect(providers_response.status_code == 200 and "selected" in providers_response.json()["providers"], "memory providers endpoint", providers_response.text)
         expect(provider_diagnostics_response.status_code == 200 and provider_diagnostics_response.json()["status"] == "success", "memory provider diagnostics endpoint", provider_diagnostics_response.text)
         expect(summary_response.status_code == 200 and summary_response.json()["provider"] == "local", "memory summary provider endpoint", summary_response.text)
         expect(patch_response.status_code == 200 and patch_response.json()["external_write"]["status"] == "local_only", "memory patch provider endpoint", patch_response.text)
 
-        polled = client.get("/agent/tasks/task_unknown")
-        expect(polled.status_code == 200, "agent task polling endpoint", polled.text)
-        stopped = client.post("/agent/tasks/task_unknown/stop")
-        expect(stopped.status_code == 200, "agent task stop endpoint", stopped.text)
+        polled = client.get(
+            "/agent/tasks/task_unknown?user_id=p6&session_id=p6"
+        )
+        expect(
+            polled.status_code == 404,
+            "unowned Agent task status fails closed",
+            polled.text,
+        )
+        stopped = client.post(
+            "/agent/tasks/task_unknown/stop?user_id=p6&session_id=p6"
+        )
+        expect(
+            stopped.status_code == 404,
+            "unowned Agent task stop fails closed",
+            stopped.text,
+        )
 
         callback = client.post(
             "/agent/results",
@@ -643,7 +893,14 @@ def main() -> int:
                 "raw": {"session_id": "p6", "evidence": [{"source": "p6_callback"}]},
             },
         )
-        expect(callback.status_code == 200 and callback.json()["status"] == "verified_success", "agent result callback", callback.text)
+        expect(
+            callback.status_code == 200
+            and callback.json()["status"] == "needs_more_probe"
+            and callback.json()["memory_policy_execution"]["status"]
+            == "skipped",
+            "unregistered callback cannot claim verification or memory authority",
+            callback.text,
+        )
 
         trace_id = callback.json()["execution_trace"]["trace_id"]
         journal = client.get(f"/audit/journal?trace_id={trace_id}")
@@ -659,12 +916,13 @@ def main() -> int:
             "/tool-proxy/file/write",
             json={"path": str(restore_target), "content": "after\n", "reason": "p6 replay compensation"},
         ).json()
-        restore_trace_id = write_for_restore["tool_trace"]["trace_id"]
-        replay_proposal = client.post(f"/audit/replay/{restore_trace_id}/propose").json()
-        restore_review_id = replay_proposal["review"]["review_id"]
-        approved_restore = client.post(f"/reviews/{restore_review_id}/approve", json={"reason": "p6 replay restore"}).json()
-        expect(replay_proposal["status"] == "needs_confirmation", "audit replay compensation review endpoint", replay_proposal)
-        expect(approved_restore["execution_result"]["status"] == "restored" and restore_target.read_text(encoding="utf-8") == "before\n", "approved replay compensation restores snapshot", approved_restore)
+        expect(
+            write_for_restore["status"]
+            in {"blocked", "needs_action_proposal"}
+            and restore_target.read_text(encoding="utf-8") == "before\n",
+            "direct Tool Proxy file write cannot bypass proposal governance",
+            write_for_restore,
+        )
 
         app_module.state_store.write_json(
             "belief_state.json",
@@ -685,7 +943,15 @@ def main() -> int:
         stale_refresh = client.post("/state/refresh-stale")
         expect(stale_refresh.status_code == 200 and stale_refresh.json()["refreshed"], "stale belief refresh endpoint", stale_refresh.text)
 
-        watch = client.post("/external/watchlist", json={"target": "localhost", "reason": "p6_self_test"})
+        watch = client.post(
+            "/external/watchlist",
+            json={
+                "user_id": "p6",
+                "session_id": "p6",
+                "target": "localhost",
+                "reason": "p6_self_test",
+            },
+        )
         expect(watch.status_code == 200 and watch.json()["watchlist"], "external watchlist endpoint", watch.text)
         external_refresh = client.post("/external/refresh?limit=1")
         expect(external_refresh.status_code == 200 and external_refresh.json()["refreshed"], "external refresh endpoint", external_refresh.text)

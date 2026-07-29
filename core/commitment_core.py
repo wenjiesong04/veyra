@@ -11,6 +11,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from core.definitions import RiskLevel
+from core.context_scope import exact_owner_visible, owner_scope
 from core.proactive_authorization import AuthorizationPolicy
 from core.proactive_intent import ProactiveIntent, WatchlistDraft
 from core.proactive_intent_planner import ProactiveIntentPlanner
@@ -21,6 +22,7 @@ from core.proactive_templates import ProactiveTemplateRegistry, watchlist_id_for
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent, utc_now_iso
 from memory_bridge.local_memory_bridge import LocalMemoryBridge
+from memory_bridge.scope import framed_sha256, normalize_scope_component
 from runtime.self_improvement import SelfImprovementProposalRegistry
 
 
@@ -106,10 +108,28 @@ class CommitmentCore:
             filtered = [item for item in filtered if item.get("status") == status]
         return filtered
 
-    def get_commitment(self, commitment_id: str) -> dict[str, Any] | None:
+    def get_commitment(
+        self,
+        commitment_id: str,
+        *,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any] | None:
         for item in self.list_commitments():
-            if item.get("commitment_id") == commitment_id:
-                return item
+            if item.get("commitment_id") != commitment_id:
+                continue
+            if user_id is not None or session_id is not None:
+                if (
+                    user_id is None
+                    or session_id is None
+                    or not exact_owner_visible(
+                        item,
+                        user_id=user_id,
+                        session_id=session_id,
+                    )
+                ):
+                    continue
+            return item
         return None
 
     def create_commitment(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -204,7 +224,13 @@ class CommitmentCore:
         self.authorization.record_commitment(item)
         return item
 
-    def confirm_commitment(self, commitment_id: str) -> dict[str, Any] | None:
+    def confirm_commitment(
+        self,
+        commitment_id: str,
+        *,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any] | None:
         return self._patch_commitment(
             commitment_id,
             {
@@ -212,13 +238,37 @@ class CommitmentCore:
                 "confirmed_at": utc_now_iso(),
             },
             recompute_next_run=True,
+            user_id=user_id,
+            session_id=session_id,
         )
 
-    def pause_commitment(self, commitment_id: str) -> dict[str, Any] | None:
-        return self._patch_commitment(commitment_id, {"status": "paused"})
+    def pause_commitment(
+        self,
+        commitment_id: str,
+        *,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        return self._patch_commitment(
+            commitment_id,
+            {"status": "paused"},
+            user_id=user_id,
+            session_id=session_id,
+        )
 
-    def cancel_commitment(self, commitment_id: str) -> dict[str, Any] | None:
-        return self._patch_commitment(commitment_id, {"status": "cancelled"})
+    def cancel_commitment(
+        self,
+        commitment_id: str,
+        *,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        return self._patch_commitment(
+            commitment_id,
+            {"status": "cancelled"},
+            user_id=user_id,
+            session_id=session_id,
+        )
 
     def due_commitments(self, *, limit: int = 20, now: datetime | None = None) -> list[dict[str, Any]]:
         self.heal_invalid_commitments()
@@ -326,7 +376,10 @@ class CommitmentCore:
         if semantic_intent.get("operation") == "query_status":
             return self.answer_commitment_status(semantic_intent, event=event)
 
-        pending = self._pending_for_session(event.source.session_id)
+        pending = self._pending_for_session(
+            event.source.session_id,
+            user_id=event.source.user_id,
+        )
         if pending and (semantic_intent.get("operation") == "confirm" or self._is_affirmation(lowered)):
             confirmed = self._confirm_pending_commitment(pending, user_text=user_text)
             if confirmed:
@@ -759,7 +812,10 @@ class CommitmentCore:
         """
         text = user_text or ""
         lowered = text.lower()
-        pending = self._pending_for_session(event.source.session_id)
+        pending = self._pending_for_session(
+            event.source.session_id,
+            user_id=event.source.user_id,
+        )
         operation = self._semantic_operation(text=text, lowered=lowered, pending=pending)
         scope = "all" if self._semantic_all_scope(text, lowered) else "matching"
         target_type = self._semantic_target_type(text, lowered, scope=scope)
@@ -1141,7 +1197,9 @@ class CommitmentCore:
                 ttl=1800,
                 status="active",
                 source_intent_id=str(change_set.get("changeset_id") or ""),
-            )
+            ),
+            user_id=event.source.user_id,
+            session_id=event.source.session_id,
         )
         commitment = self.create_commitment(
             {
@@ -1282,7 +1340,10 @@ class CommitmentCore:
             matches = [item for item in candidates if self._commitment_matches_needle(item, needle)]
             return {"matches": matches, "candidates": candidates, "ambiguous": False}
 
-        recent_topic = self._recent_commitment_topic_for_session(event.source.session_id)
+        recent_topic = self._recent_commitment_topic_for_session(
+            event.source.session_id,
+            user_id=event.source.user_id,
+        )
         if recent_topic:
             matches = [item for item in candidates if self._commitment_matches_needle(item, recent_topic)]
             if matches:
@@ -1513,11 +1574,21 @@ class CommitmentCore:
             text = text.replace(token, "")
         return text
 
-    def _recent_commitment_topic_for_session(self, session_id: str) -> str:
+    def _recent_commitment_topic_for_session(
+        self,
+        session_id: str,
+        *,
+        user_id: str,
+    ) -> str:
         state = self.state_store.read_json("task_state.json")
         slots_by_session = state.get("conversation_slots") if isinstance(state.get("conversation_slots"), dict) else {}
         slots = slots_by_session.get(session_id) if isinstance(slots_by_session, dict) else {}
         if not isinstance(slots, dict):
+            return ""
+        if (
+            str(slots.get("user_id") or "") != user_id
+            or str(slots.get("session_id") or "") != session_id
+        ):
             return ""
         for key in ("last_commitment_topic", "last_search_query", "last_topic"):
             value = str(slots.get(key) or "").strip()
@@ -1554,12 +1625,25 @@ class CommitmentCore:
         for item in watchlists:
             if not isinstance(item, dict):
                 continue
+            if not exact_owner_visible(
+                item,
+                user_id=event.source.user_id,
+                session_id=event.source.session_id,
+            ):
+                continue
             commitment_id = str(item.get("commitment_id") or "")
-            owner_ok = True
             if commitment_id:
                 commitment = self.get_commitment(commitment_id)
-                owner_ok = not commitment or commitment.get("user_id") == event.source.user_id
-            if owner_ok and self._normalize_match_text(topic) in self._normalize_match_text(str(item.get("topic") or item.get("query") or "")):
+                if (
+                    not commitment
+                    or not exact_owner_visible(
+                        commitment,
+                        user_id=event.source.user_id,
+                        session_id=event.source.session_id,
+                    )
+                ):
+                    continue
+            if self._normalize_match_text(topic) in self._normalize_match_text(str(item.get("topic") or item.get("query") or "")):
                 matched.append(item)
         return matched
 
@@ -1735,9 +1819,57 @@ class CommitmentCore:
         *,
         commitment: dict[str, Any] | None = None,
         goal: dict[str, Any] | None = None,
+        user_id: str | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         payload = draft.to_dict()
-        watchlist_id = watchlist_id_for(str(payload.get("topic") or ""), str(payload.get("query") or ""))
+        owner_users = {
+            str(value).strip()
+            for value in (
+                user_id,
+                (commitment or {}).get("user_id"),
+                (goal or {}).get("user_id"),
+            )
+            if str(value or "").strip()
+        }
+        owner_sessions = {
+            str(value).strip()
+            for value in (
+                session_id,
+                (commitment or {}).get("session_id"),
+                (goal or {}).get("session_id"),
+            )
+            if str(value or "").strip()
+        }
+        if len(owner_users) != 1 or len(owner_sessions) != 1:
+            return {
+                "status": "blocked",
+                "reason": "invalid_watchlist_owner",
+            }
+        try:
+            owner_user = normalize_scope_component(
+                next(iter(owner_users)),
+                "user_id",
+            )
+            owner_session = normalize_scope_component(
+                next(iter(owner_sessions)),
+                "session_id",
+            )
+        except ValueError:
+            return {
+                "status": "blocked",
+                "reason": "invalid_watchlist_owner",
+            }
+        base_watchlist_id = watchlist_id_for(
+            str(payload.get("topic") or ""),
+            str(payload.get("query") or ""),
+        )
+        scope_digest = framed_sha256(
+            "veyra-watchlist-scope-v1",
+            owner_user,
+            owner_session,
+        )
+        watchlist_id = f"{base_watchlist_id}_{scope_digest[:12]}"
         item = {
             "watchlist_id": watchlist_id,
             "target": f"external:{watchlist_id}",
@@ -1754,8 +1886,10 @@ class CommitmentCore:
             "source_intent_id": payload.get("source_intent_id"),
             "commitment_id": (commitment or {}).get("commitment_id"),
             "goal_id": (goal or {}).get("goal_id"),
-            "user_id": (commitment or {}).get("user_id") or (goal or {}).get("user_id"),
-            "session_id": (commitment or {}).get("session_id"),
+            "user_id": owner_user,
+            "session_id": owner_session,
+            "scope_kind": "tenant",
+            "tenant_derived": True,
             "created_at": utc_now_iso(),
             "updated_at": utc_now_iso(),
         }
@@ -1774,6 +1908,16 @@ class CommitmentCore:
                 None,
             )
             if existing_index is not None:
+                if not exact_owner_visible(
+                    watchlist[existing_index],
+                    user_id=owner_user,
+                    session_id=owner_session,
+                ):
+                    stored_item = {
+                        "status": "blocked",
+                        "reason": "watchlist_owner_conflict",
+                    }
+                    return external
                 stored_item = {
                     **watchlist[existing_index],
                     **{key: value for key, value in item.items() if value not in (None, "", [])},
@@ -1793,12 +1937,38 @@ class CommitmentCore:
         watchlist_id = str(payload.get("watchlist_id") or "")
         if not watchlist_id:
             return
+        try:
+            owner_user = normalize_scope_component(
+                commitment.get("user_id"),
+                "user_id",
+            )
+            owner_session = normalize_scope_component(
+                commitment.get("session_id"),
+                "session_id",
+            )
+        except ValueError:
+            return
         def update_watchlist(external: dict[str, Any]) -> dict[str, Any]:
             watchlist = external.get("watchlist") if isinstance(external.get("watchlist"), list) else []
             changed = False
             for item in watchlist:
                 if not isinstance(item, dict) or item.get("watchlist_id") != watchlist_id:
                     continue
+                item_owner_state, item_user, item_session = owner_scope(
+                    item
+                )
+                if item_owner_state == "invalid":
+                    continue
+                if item_owner_state == "exact" and (
+                    item_user != owner_user
+                    or item_session != owner_session
+                ):
+                    continue
+                if item_owner_state == "ownerless":
+                    item["user_id"] = owner_user
+                    item["session_id"] = owner_session
+                    item["scope_kind"] = "tenant"
+                    item["tenant_derived"] = True
                 status = str(commitment.get("status") or "")
                 item["commitment_id"] = commitment.get("commitment_id")
                 if status == "active":
@@ -1846,6 +2016,7 @@ class CommitmentCore:
         if updated and self._nested_effect_allowed("memory.write"):
             self.memory_bridge.write_patch(
                 {
+                    "user_id": intent.user_id,
                     "session_id": intent.session_id,
                     "memory_type": "proactive_authorization",
                     "topic": intent.topic or "proactive_commitments",
@@ -1963,6 +2134,7 @@ class CommitmentCore:
         self._sync_learning_goal_to_user_world(goal, digest)
         memory_write = self.memory_bridge.write_patch(
             {
+                "user_id": event.source.user_id,
                 "session_id": event.source.session_id,
                 "memory_type": "learning_goal",
                 "topic": topic,
@@ -2091,10 +2263,22 @@ class CommitmentCore:
         goal_id = payload.get("goal_id")
         if not goal_id:
             return
+        commitment_owner_state, commitment_user, _ = owner_scope(commitment)
+        if commitment_owner_state != "exact":
+            return
+
         def sync_permission(state: dict[str, Any]) -> dict[str, Any]:
             goals = state.get("goals") if isinstance(state.get("goals"), list) else []
             for goal in goals:
                 if not isinstance(goal, dict) or goal.get("goal_id") != goal_id:
+                    continue
+                goal_owner_state, goal_user, _ = owner_scope(goal)
+                # Goal/commitment continuity is user-scoped across sessions, but
+                # ownerless, conflicting, and cross-user bindings fail closed.
+                if (
+                    goal_owner_state != "exact"
+                    or goal_user != commitment_user
+                ):
                     continue
                 goal["commitment_id"] = commitment.get("commitment_id")
                 permissions = goal.setdefault("permissions", {})
@@ -2374,8 +2558,23 @@ class CommitmentCore:
             }
         return None
 
-    def _pending_for_session(self, session_id: str) -> dict[str, Any] | None:
-        pending = self.list_commitments(session_id=session_id, status="pending_confirmation")
+    def _pending_for_session(
+        self,
+        session_id: str,
+        *,
+        user_id: str,
+    ) -> dict[str, Any] | None:
+        pending = [
+            item
+            for item in self.list_commitments(
+                status="pending_confirmation"
+            )
+            if exact_owner_visible(
+                item,
+                user_id=user_id,
+                session_id=session_id,
+            )
+        ]
         return pending[-1] if pending else None
 
     def _confirm_pending_commitment(self, pending: dict[str, Any], *, user_text: str) -> dict[str, Any] | None:
@@ -2406,7 +2605,15 @@ class CommitmentCore:
             return self._default_learning_schedule(text)
         return None
 
-    def _patch_commitment(self, commitment_id: str, patch: dict[str, Any], *, recompute_next_run: bool = False) -> dict[str, Any] | None:
+    def _patch_commitment(
+        self,
+        commitment_id: str,
+        patch: dict[str, Any],
+        *,
+        recompute_next_run: bool = False,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any] | None:
         updated = None
 
         def update_commitment_state(state: dict[str, Any]) -> dict[str, Any]:
@@ -2415,6 +2622,17 @@ class CommitmentCore:
             for index, item in enumerate(commitments):
                 if not isinstance(item, dict) or item.get("commitment_id") != commitment_id:
                     continue
+                if user_id is not None or session_id is not None:
+                    if (
+                        user_id is None
+                        or session_id is None
+                        or not exact_owner_visible(
+                            item,
+                            user_id=user_id,
+                            session_id=session_id,
+                        )
+                    ):
+                        continue
                 item.update(patch)
                 item["updated_at"] = utc_now_iso()
                 if recompute_next_run:
@@ -2489,9 +2707,6 @@ class CommitmentCore:
         location = str(scoped_preferences.get("default_location") or "").strip()
         if location:
             return location
-        if self._should_mirror_legacy_user(user_id) or not profiles:
-            preferences = user_world.get("preferences") if isinstance(user_world.get("preferences"), dict) else {}
-            return str(preferences.get("default_location") or "").strip()
         return ""
 
     def _scoped_user_world(self, user_world: dict[str, Any], user_id: str) -> dict[str, Any]:

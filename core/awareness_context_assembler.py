@@ -4,6 +4,7 @@ from typing import Any
 
 from awareness.belief_core import BeliefCore
 from awareness.uncertainty_core import UncertaintyCore
+from core.context_scope import visible_probe_map
 from core.model_client import redact_sensitive
 from core.world_state import WorldStateStore
 
@@ -27,19 +28,37 @@ class AwarenessContextAssembler:
         user_message: str,
         attention_focus: list[str],
         evidence_kind: str = "",
+        user_id: str = "",
+        session_id: str = "",
     ) -> dict[str, Any]:
-        belief_state = self.belief.refresh()
-        claims = belief_state.get("claims") if isinstance(belief_state.get("claims"), list) else []
-        relevant = self.belief.relevant_claims(attention_focus, limit=12)
+        visible_claims = self.belief.relevant_claims(
+            [],
+            limit=250,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        relevant = self.belief.relevant_claims(
+            attention_focus,
+            limit=12,
+            user_id=user_id,
+            session_id=session_id,
+        )
         fresh = [self._claim_brief(c) for c in relevant if str(c.get("status") or "fresh") in {"fresh", "conflict"}]
         stale = [self._claim_brief(c) for c in relevant if str(c.get("status") or "") in {"stale", "expired"} or c.get("next_action")]
         local_world = self.state_store.read_json("local_world.json")
-        probe_cache = self._probe_cache(local_world, attention_focus=attention_focus, evidence_kind=evidence_kind)
-        belief_summary = belief_state.get("summary") if isinstance(belief_state.get("summary"), dict) else {}
+        probe_cache = self._probe_cache(
+            local_world,
+            attention_focus=attention_focus,
+            evidence_kind=evidence_kind,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        belief_summary = self.belief.summary_from_claims(visible_claims)
         return redact_sensitive(
             {
                 "attention_focus": attention_focus[:8],
                 "belief_summary": {
+                    "total": belief_summary.get("total"),
                     "fresh": belief_summary.get("fresh"),
                     "stale": belief_summary.get("stale"),
                     "conflict": belief_summary.get("conflict"),
@@ -125,8 +144,14 @@ class AwarenessContextAssembler:
         *,
         attention_focus: list[str],
         evidence_kind: str,
+        user_id: str,
+        session_id: str,
     ) -> list[dict[str, Any]]:
-        probes = local_world.get("probes") if isinstance(local_world.get("probes"), dict) else {}
+        probes = visible_probe_map(
+            local_world,
+            user_id=user_id,
+            session_id=session_id,
+        )
         items: list[dict[str, Any]] = []
         for name, payload in probes.items():
             if not isinstance(payload, dict):

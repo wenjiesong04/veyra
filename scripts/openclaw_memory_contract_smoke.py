@@ -20,7 +20,11 @@ def expect(condition: bool, label: str, detail: object = None) -> None:
 
 class ContractOpenClawAdapter(OpenClawAdapter):
     def __init__(self) -> None:
-        super().__init__(base_url="ws://127.0.0.1:18789", api_key="contract-test")
+        super().__init__(
+            base_url="ws://127.0.0.1:18789",
+            api_key="contract-test",
+            native_memory_scope_verified=True,
+        )
         self.calls: list[dict[str, Any]] = []
 
     def _gateway_request(self, method: str, params: dict[str, Any], *, scopes: list[str] | None = None) -> dict[str, Any]:
@@ -47,7 +51,17 @@ def main() -> int:
     expect("learning plan" in str(summary.get("summary")), "memory summary text is surfaced", summary)
     expect(write.get("status") == "submitted", "memory patch status is surfaced", write)
     expect([call["method"] for call in adapter.calls] == ["memory.summary", "memory.patch"], "OpenClaw memory methods are called in contract order", adapter.calls)
-    expect(adapter.calls[0]["params"] == {"sessionId": "session-1", "sessionKey": adapter.session_key}, "memory.summary params match gateway contract", adapter.calls[0])
+    expect(
+        adapter.calls[0]["params"]
+        == {"sessionId": "session-1", "sessionKey": "session-1"},
+        "memory.summary binds both gateway scope fields to the derived owner/session scope",
+        adapter.calls[0],
+    )
+    expect(
+        adapter.calls[1]["params"]["sessionKey"] == "session-1",
+        "memory.patch binds the gateway session key to the derived owner/session scope",
+        adapter.calls[1],
+    )
     expect(adapter.calls[1]["params"]["patch"]["session_id"] == "session-1", "memory.patch includes normalized patch", adapter.calls[1])
     expect("operator.admin" in adapter.calls[0]["scopes"], "memory summary requests memory admin scope", adapter.calls[0])
     expect("operator.admin" in adapter.calls[1]["scopes"], "memory patch requests memory admin scope", adapter.calls[1])

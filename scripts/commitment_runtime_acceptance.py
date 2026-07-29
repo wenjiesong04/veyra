@@ -177,7 +177,10 @@ def run_happy_path(client: Any, state_root: Path | None, report: Report) -> str:
     outbox = outbox_for_commitment(client, commitment_id)
     expect(len(outbox) >= 1, "outbox records commitment push", outbox[:1])
 
-    refreshed = client.get(f"/commitments/{commitment_id}")
+    refreshed = client.get(
+        f"/commitments/{commitment_id}"
+        "?user_id=accept-user&session_id=accept-session"
+    )
     updated = refreshed["commitment"]
     history = updated.get("push_history") if isinstance(updated.get("push_history"), list) else []
     expect(len(history) >= 1, "push_history appended", history)
@@ -227,7 +230,10 @@ def run_security_checks(client: Any, state_root: Path | None, report: Report) ->
     pending_due = client.post("/commitments/run-due", {"limit": 10, "reason": "acceptance_pending"})
     processed = pending_due.get("processed") if isinstance(pending_due.get("processed"), list) else []
     expect(not any(row.get("commitment_id") == pending_id and row.get("status") in {"queued", "delivered"} for row in processed), "pending not delivered", processed)
-    pending_state = client.get(f"/commitments/{pending_id}")["commitment"]
+    pending_state = client.get(
+        f"/commitments/{pending_id}"
+        "?user_id=accept-user&session_id=accept-pending"
+    )["commitment"]
     expect(len(pending_state.get("push_history") or []) == 0, "pending has no push_history", pending_state)
 
     paused = client.post(
@@ -243,7 +249,10 @@ def run_security_checks(client: Any, state_root: Path | None, report: Report) ->
         },
     )
     paused_id = paused["commitment"]["commitment_id"]
-    client.post(f"/commitments/{paused_id}/pause")
+    client.post(
+        f"/commitments/{paused_id}/pause"
+        "?user_id=accept-user&session_id=accept-paused"
+    )
     paused_due = client.post("/commitments/run-due", {"limit": 10, "reason": "acceptance_paused"})
     processed = paused_due.get("processed") if isinstance(paused_due.get("processed"), list) else []
     expect(not any(row.get("commitment_id") == paused_id for row in processed), "paused not in due processed", processed)
@@ -261,7 +270,10 @@ def run_security_checks(client: Any, state_root: Path | None, report: Report) ->
         },
     )
     cancel_id = cancelled["commitment"]["commitment_id"]
-    client.post(f"/commitments/{cancel_id}/cancel")
+    client.post(
+        f"/commitments/{cancel_id}/cancel"
+        "?user_id=accept-user&session_id=accept-cancel"
+    )
     cancel_due = client.post("/commitments/run-due", {"limit": 10, "reason": "acceptance_cancel"})
     processed = cancel_due.get("processed") if isinstance(cancel_due.get("processed"), list) else []
     expect(not any(row.get("commitment_id") == cancel_id for row in processed), "cancelled not processed", processed)
@@ -331,13 +343,19 @@ def run_guardian_block_embedded(_app_factory: Callable[[], Any], _state_root: Pa
             },
         )
         block_id = blocked["commitment"]["commitment_id"]
-        before = client.get(f"/commitments/{block_id}")["commitment"]
+        before = client.get(
+            f"/commitments/{block_id}"
+            "?user_id=accept-user&session_id=accept-block"
+        )["commitment"]
         next_before = before.get("next_run_at")
         result = client.post("/commitments/run-due", {"limit": 5, "reason": "acceptance_guardian"})
         row = next((item for item in result.get("processed", []) if item.get("commitment_id") == block_id), {})
         expect(row.get("status") == "blocked", "guardian blocks push", row)
         expect(not outbox_for_commitment(client, block_id), "blocked push not in outbox", row)
-        after = client.get(f"/commitments/{block_id}")["commitment"]
+        after = client.get(
+            f"/commitments/{block_id}"
+            "?user_id=accept-user&session_id=accept-block"
+        )["commitment"]
         expect(after.get("next_run_at") == next_before, "blocked push does not advance next_run_at", after)
     finally:
         GuardianController.review_text_action = original  # type: ignore[method-assign]

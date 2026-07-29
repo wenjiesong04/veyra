@@ -46,6 +46,14 @@ class MemoryPolicyRuntime:
         policy = normalize_memory_policy(decision.memory_policy)
         if policy == "forget":
             return {"status": "skipped", "policy": policy, "reason": "turn marked forget"}
+        user_id = str(event.source.user_id or "").strip()
+        session_id = str(event.source.session_id or "").strip()
+        if not user_id or not session_id:
+            return {
+                "status": "skipped",
+                "policy": policy,
+                "reason": "authoritative user and session are required for memory",
+            }
         if policy == "short_term":
             return self._write_short_term(event, decision, result)
         if not self._semantic_memory_allowed(decision):
@@ -74,7 +82,8 @@ class MemoryPolicyRuntime:
         if result.status not in {"success", "verified_success"}:
             return {"status": "skipped", "policy": policy, "reason": f"result status {result.status} is not stable enough for long-term memory"}
         patch = {
-            "session_id": event.source.session_id,
+            "user_id": user_id,
+            "session_id": session_id,
             "task": str(event.payload.get("text", ""))[:1200],
             "route": result.route.value,
             "status": result.status,
@@ -98,9 +107,9 @@ class MemoryPolicyRuntime:
         return self._commit_long_term_memory(
             patch=patch,
             writer=self.long_term_writer,
-            identity_parts=(event.event_id, "turn_memory"),
+            identity_parts=(user_id, session_id, event.event_id, "turn_memory"),
             decision=decision,
-            base={"policy": policy},
+            base={"policy": policy, "user_id": user_id, "session_id": session_id},
             preconditions=[
                 "semantic policy explicitly authorizes memory.write",
                 "turn result is stable enough for durable memory",
@@ -131,6 +140,7 @@ class MemoryPolicyRuntime:
 
         policy = normalize_memory_policy(task_context.get("memory_policy"), default="forget")
         task_id = str(getattr(execution, "task_id", "") or task_context.get("task_id") or "")
+        user_id = str(task_context.get("user_id") or "").strip()
         session_id = str(task_context.get("session_id") or "")
         correlation_id = str(
             task_context.get("correlation_id")
@@ -141,6 +151,7 @@ class MemoryPolicyRuntime:
         base = {
             "policy": policy,
             "task_id": task_id,
+            "user_id": user_id,
             "session_id": session_id,
             "correlation_id": correlation_id,
             "context_authority": str(task_context.get("authority") or "missing"),
@@ -154,6 +165,12 @@ class MemoryPolicyRuntime:
             }
         if policy == "forget":
             return {**base, "status": "skipped", "reason": "original task marked forget"}
+        if not user_id or not session_id:
+            return {
+                **base,
+                "status": "skipped",
+                "reason": "authoritative original task user or session is missing",
+            }
         if policy == "short_term":
             return self._write_agent_short_term(
                 task_context=task_context,
@@ -173,8 +190,6 @@ class MemoryPolicyRuntime:
                 "status": "skipped",
                 "reason": "durable Agent memory requires a terminal successful execution",
             }
-        if not session_id:
-            return {**base, "status": "skipped", "reason": "original task session is missing"}
         task_packet = task_context.get("task_packet") if isinstance(task_context.get("task_packet"), dict) else {}
         task = str(
             task_context.get("user_goal")
@@ -184,6 +199,7 @@ class MemoryPolicyRuntime:
             or task_id
         )
         patch = {
+            "user_id": user_id,
             "session_id": session_id,
             "task": task[:1200],
             "task_id": task_id,
@@ -209,7 +225,13 @@ class MemoryPolicyRuntime:
         return self._commit_long_term_memory(
             patch=patch,
             writer=writer,
-            identity_parts=(correlation_id, task_id or "agent_result", "verified_agent_memory"),
+            identity_parts=(
+                user_id,
+                session_id,
+                correlation_id,
+                task_id or "agent_result",
+                "verified_agent_memory",
+            ),
             decision=None,
             base=base,
             preconditions=[
@@ -229,6 +251,14 @@ class MemoryPolicyRuntime:
         base: dict[str, Any],
         preconditions: list[str],
     ) -> dict[str, Any]:
+        if not str(patch.get("user_id") or "").strip() or not str(
+            patch.get("session_id") or ""
+        ).strip():
+            return {
+                **base,
+                "status": "skipped",
+                "reason": "durable memory patch is missing authoritative user or session",
+            }
         key = deterministic_idempotency_key(*identity_parts, namespace="veyra.memory-write.v1")
         proposal = self._existing_or_create_proposal(
             idempotency_key=key,
@@ -345,6 +375,7 @@ class MemoryPolicyRuntime:
         expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
         item = {
             "event_id": event.event_id,
+            "user_id": event.source.user_id,
             "session_id": event.source.session_id,
             "route": result.route.value,
             "status": result.status,
@@ -383,6 +414,7 @@ class MemoryPolicyRuntime:
         item = {
             "event_id": str(task_context.get("event_id") or base["correlation_id"]),
             "task_id": base["task_id"],
+            "user_id": base["user_id"],
             "session_id": base["session_id"],
             "correlation_id": base["correlation_id"],
             "route": str(task_context.get("route") or "agent"),

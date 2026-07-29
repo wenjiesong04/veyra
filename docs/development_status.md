@@ -2,9 +2,13 @@
 
 Updated after Runtime Stabilization and local release hardening.
 
-Veyra has moved from feature-complete MVP into local-first release hardening. The target is a GitHub-downloadable personal production runtime: users run Veyra locally and configure their own model/OpenClaw/Feishu surfaces. Configuration, state, and audit data are local by default; enabled integrations still receive the request data needed to operate. This is not a SaaS target. Per-user and per-session isolation is enforced for channel, task, commitment, watchlist, and callback state. A first-stage Tauri desktop shell now exists under `apps/desktop` with product name `Veyra` for macOS, Windows, and Linux.
+Veyra has moved from feature-complete MVP into local-first release hardening. The target is a GitHub-downloadable personal production runtime: users run Veyra locally and configure their own model/OpenClaw/Feishu surfaces. Configuration, state, and audit data are local by default; enabled integrations still receive the request data needed to operate. This is not a SaaS target. Internal logical isolation is enforced for channel intake/dedupe, Agent task/session/continuation, Memory/context, Belief/probe, commitment/watchlist/push, and callback state. A first-stage Tauri desktop shell now exists under `apps/desktop` with product name `Veyra` for macOS, Windows, and Linux.
 
-The code-level awareness/governance loop is implemented. Runtime surfaces now distinguish implementation, configuration, observed validation, degradation, and stale evidence. External OpenClaw Tool Proxy enforcement and native Memory remain validation-pending until their real protocol surfaces produce fresh evidence.
+The code-level awareness/governance loop is implemented. Runtime surfaces now distinguish implementation, configuration, observed validation, degradation, and stale evidence. The OpenClaw Tool Governance bridge is live-validated only for explicitly registered `veyra_governed_openclaw_sessions`; broader native-tool/runtime coverage remains unverified. Native OpenClaw Memory remains validation-pending and disabled until its owner/session protocol surface produces direct scope evidence.
+
+Memory isolation is currently an internal loopback boundary, not authenticated multi-tenancy. Agent bridge/task/history/tail/slot/ExternalWorld state uses exact user/session scope; profile/project/location/goal/commitment continuity is user-scoped. Belief identity, tenant probe caches, proactive-planner context, follow-up/Agent continuation, commitment controls, watchlists, push candidates, and intake dedupe now carry the same owner boundary. `/state` and several operator diagnostics remain administrator-wide, API identities are caller-declared, and native OpenClaw Memory is disabled until its owner/session semantics are directly certified. Its temporary fallback is a Veyra-private, owner/session-scoped mirror outside OpenClaw's workspace and memory index; unsafe mirror configuration fails closed. Explicitly listed Memory/provider/Agent/belief/task GET routes are pure cached reads; this claim does not cover every operator GET such as `/mvp/status`.
+
+The 2026-07-29 isolation acceptance passed all `90/90` Python gate smokes, `32/32` OpenClaw governance plugin tests, Python compileall, browser/desktop Web builds, and a Tauri macOS `.app` shell build using the existing stub sidecar. After restarting only Veyra, OpenClaw kept PID `58174`; the live read-only runner-boundary request returned `direct_answer / success / R0` with no Agent/tool/execution artifact. `/health` remains `critical` only because the configured Feishu websocket has a self-signed TLS/connect failure; native OpenClaw Memory remains disabled with the private scoped fallback, 5 historic reviews remain pending, and stale Beliefs remain operational debt.
 
 ## Data Reality
 
@@ -22,6 +26,8 @@ Current local `state/` data may contain older self-test records from earlier dev
 | Console UI data | Backend API fetches | Live API data, no seeded fake dashboard objects |
 
 ## Phase Progress
+
+The P0-P10 table below is the earlier runtime-delivery roadmap; it is not the newer proactive-cognition Phase 1-6 sequence in `docs/veyra_proactive_cognitive_architecture.md`. In that newer sequence, Phases 1-5 are complete only within their explicitly bounded/shadow scopes, while Phase 6 remains `PARTIAL` through 6.2c. A trusted isolated runner, dynamic candidate tests, signing, execution canary, promotion, general Situation Engine, long-running negotiation, and broader model/runtime validation are not complete.
 
 | Phase | Status | Implemented result |
 | --- | --- | --- |
@@ -42,11 +48,11 @@ Current local `state/` data may contain older self-test records from earlier dev
 | Block from original design | Current implementation |
 | --- | --- |
 | Veyra Core | Implemented core loop plus scheduled active awareness ticks, model-assisted reasoning for intent/route, foresight, memory relevance, ExternalWorld interpretation, perception, and agency gaps. P4 adds evidence-backed verification. |
-| Interface Adapter / Agent Adapter | Implemented Intake/EventNormalizer, local multi-channel routing/dedupe/outbox, Feishu OpenAPI channel delivery/callback, AgentRegistry, certification matrix, and multi-Agent invocation. OpenClaw, Hermes, and Custom adapters share the v1 task/result/capability contract. |
+| Interface Adapter / Agent Adapter | Implemented Intake/EventNormalizer, local multi-channel routing/dedupe/outbox, Feishu OpenAPI channel delivery/callback, AgentRegistry, certification matrix, and multi-Agent invocation. OpenClaw, Hermes, and Custom adapters share the `veyra.agent_adapter.v2` task/result/capability contract. |
 | Probe Tools | Implemented system, git, port, process, file, network, web, log, MCP, OpenClaw, Hermes probe modules with standardized result envelopes where wired. |
 | Memory Bridge | Local Memory is implemented. External providers become `validated` only after an explicit capability or a fresh write/read roundtrip; normalized defaults and Agent connection state are not evidence. Short-term callback memory is TTL-bound and long-term writes require authoritative original task context plus verified completion. |
 | Skill | Implemented registry/runtime and built-in skill definitions. Skills route through AwarenessLoop and now record execution trace. |
-| Tool Proxy | SafeShell, SafeFile, SafeBrowser, and SafeAPI are implemented with policy review and standard traces. Verifier fails closed on missing Agent tool evidence. OpenClaw-side enforcement remains `validation_pending` until a real pre-tool/tool-event hook is available and live-tested. |
+| Tool Proxy | SafeShell, SafeFile, SafeBrowser, and SafeAPI are implemented with policy review and standard traces. Verifier fails closed on missing Agent tool evidence. The OpenClaw plugin's real pre-tool/execute/observe bridge has fresh scoped validation for registered governed sessions; unregistered sessions, other runtimes, cross-process recovery, and real-workspace/production execution are not covered. |
 | Rollback / Audit | Implemented snapshot, diff, restore, rollback log, policy trace, tool trace, execution trace, ActionJournal timeline, time-travel summary, non-destructive replay plans, replay compensation review proposals, automatic replay runtime scan/run state, and explicit guarded auto-execute. |
 | Web / Desktop Control UI | Implemented React/Vite console served at `/console`, backed by live Veyra APIs and built into `ui/console`. A Tauri desktop shell named `Veyra` reuses the console through a desktop-specific build under `apps/desktop/dist`. |
 
@@ -79,13 +85,13 @@ Current local `state/` data may contain older self-test records from earlier dev
 
 | Surface | Purpose |
 | --- | --- |
-| `/runtime`, `/state`, `/heartbeat`, `/runtime/active-loop`, `/runtime/active-loop/*`, `/runtime/cron/*`, `/runtime/traces/*`, `/runtime/soak/status` | Runtime identity, state cache, heartbeat, continuous awareness loop control, bounded scheduler control, real-message routing traces, and Feishu soak status |
+| `/runtime`, `/state`, `/heartbeat`, `/runtime/active-loop`, `/runtime/active-loop/*`, `/runtime/cron/*`, `/runtime/traces/*`, `/runtime/soak/status` | Runtime identity, operator-wide local state projection, heartbeat, continuous awareness loop control, bounded scheduler control, real-message routing traces, and Feishu soak status; `/state` is not a tenant API |
 | `/architecture`, `/definitions`, `/mvp/status`, `/capabilities/snapshot`, `/capabilities/refresh` | Architecture metadata, risk/lifecycle/mode definitions, implementation flags, validation status, and unified capability discovery |
-| `/commitments`, `/commitments/*` | Local user commitments, explicit confirmation/pause/cancel controls, and due-run push execution |
+| `/commitments`, `/commitments/*` | User-scoped list, exact user/session detail and confirmation/pause/cancel controls, plus an explicitly operator-wide due-run scheduler |
 | `/events/message`, `/channels`, `/channels/{channel}/config`, `/channels/{channel}/messages`, `/channels/{channel}/send`, `/channels/outbox`, `/channels/sessions`, `/integrations/feishu/events`, `/integrations/feishu/import-openclaw`, `/integrations/feishu/ws/*` | Standard user-message event entry plus local/Feishu multi-channel intake, config, dedupe, session, delivery, callback, OpenClaw config import, WebSocket long connection, and outbox state |
 | `/core/model/status`, `/core/model/config`, `/logs/core-model` | Core model config/status and redacted model reasoning audit |
-| `/memory/providers`, `/memory/providers/diagnostics`, `/memory/summary`, `/memory/patch`, `/belief/status`, `/belief/refresh` | Memory provider discovery, diagnostics, summary reads, filtered writes, and Belief TTL lifecycle management |
-| `/external/watchlist`, `/external/refresh` | Add/update ExternalWorld watch targets and refresh them through read-only probes |
+| `/memory/providers`, `/memory/providers/diagnostics`, `/memory/summary`, `/memory/summary/resolve`, `/memory/patch`, `/belief/status`, `/belief/refresh` | Pure cached provider/summary reads, explicit active Memory resolution/diagnostics, exact owner/session filtered writes, and pure-read/explicit-refresh Belief TTL lifecycle management |
+| `/external/watchlist`, `/external/refresh` | Add/update exact owner/session ExternalWorld targets and refresh them through read-only probes while retaining scope |
 | `/agent/contract`, `/agent/status`, `/agents`, `/agents/select`, `/agents/{name}/config`, `/agents/certification`, `/agents/certification/run`, `/agents/invoke` | Agent contract, Tool Proxy contract, status, selection, adapter configuration, certification matrix, and validated multi-Agent invocation |
 | `/actions/proposals`, `/reviews/*` | Action review and human confirmation flow |
 | `/tool-proxy/*`, `/tool-proxy/status`, `/tool-proxy/config` | Safe shell/file/browser/API execution boundary with optional Browser/API executor configuration and host allowlists |
@@ -93,7 +99,7 @@ Current local `state/` data may contain older self-test records from earlier dev
 | `/personas/status` | Persona mode, channel, risk, route, Agent, token budget, and policy binding audit |
 | `/ops/health`, `/ops/alerts`, `/ops/alerts/dispatch`, `/ops/alerting`, `/ops/deployment`, `/ops/deployment/config`, `/ops/runtime-matrix`, `/ops/runtime-matrix/run`, `/ops/external-runtime`, `/ops/external-runtime/probe`, `/ops/reviews/diagnostic`, `/ops/reviews/*`, `/ops/soak`, `/ops/soak/status`, `/ops/soak/start`, `/ops/soak/stop`, `/ops/safety/red-team`, `/ops/retention`, `/ops/retention/enforce` | Operational health, alerts, local/webhook alert dispatch, deployment readiness/config validation, runtime matrix with validation metadata, external runtime summary, stale-review hygiene, bounded/session soak, red-team safety, and retention checks/enforcement |
 | `/runtime/metrics/summary`, `/runtime/metrics/routes`, `/runtime/metrics/model-cost`, `/runtime/metrics/failures` | Backend-first telemetry dashboard data: route distribution, latency, Core model/Agent/Probe counts, failure list, context size, token-volume estimate, and OpenClaw call share |
-| `/logs/events`, `/logs/actions`, `/logs/tools`, `/logs/policy`, `/logs/execution`, `/logs/rollback`, `/logs/memory` | Audit and trace surfaces |
+| `/logs/events`, `/logs/actions`, `/logs/tools`, `/logs/policy`, `/logs/execution`, `/logs/rollback`, `/logs/memory?user_id=...&session_id=...` | Audit and trace surfaces; Memory log reads require exact owner/session scope and hide legacy ownerless rows |
 | `/console` | Awareness & Agent Control Console |
 
 ## Design Compliance

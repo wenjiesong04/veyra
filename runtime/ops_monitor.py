@@ -126,7 +126,10 @@ class OpsMonitor:
                     "component": "memory",
                     "severity": "info",
                     "code": "openclaw_workspace_memory_fallback",
-                    "message": "OpenClaw memory RPC is unavailable; workspace memory fallback is enabled.",
+                    "message": (
+                        "OpenClaw native memory RPC is unavailable; "
+                        "Veyra-private scoped fallback is enabled."
+                    ),
                     "details": {"features": {"memory_summary": features.get("memory_summary"), "memory_patch": features.get("memory_patch")}},
                 }
             )

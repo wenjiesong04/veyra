@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from interface.openclaw_adapter import OpenClawAdapter  # noqa: E402
+from memory_bridge.scope import framed_sha256  # noqa: E402
 
 
 BASE_URL = os.getenv("VEYRA_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
@@ -58,8 +59,9 @@ def external_write_path(write_result: dict[str, Any]) -> Path | None:
 def main() -> int:
     marker = f"veyra-memory-roundtrip-{uuid4().hex[:10]}"
     session_id = f"memory-roundtrip-{uuid4().hex[:8]}"
-    summary = f"{marker}: User is validating OpenClaw workspace memory fallback roundtrip."
+    summary = f"{marker}: User is validating Veyra private Memory fallback roundtrip."
     patch = {
+        "user_id": "memory-roundtrip-live",
         "session_id": session_id,
         "memory_type": "roundtrip_probe",
         "topic": "openclaw_workspace_memory_roundtrip",
@@ -70,7 +72,17 @@ def main() -> int:
     }
 
     agent_status = get_json("/agent/status", timeout=15.0)
-    write = request_json("POST", "/memory/patch", {"provider": "selected", "patch": patch}, timeout=45.0)
+    write = request_json(
+        "POST",
+        "/memory/patch",
+        {
+            "provider": "selected",
+            "user_id": "memory-roundtrip-live",
+            "session_id": session_id,
+            "patch": patch,
+        },
+        timeout=45.0,
+    )
     expect(write.get("status") == "written", "Veyra memory patch is accepted", write)
 
     fallback_path = external_write_path(write)
@@ -85,7 +97,16 @@ def main() -> int:
         fallback_verified = marker in fallback_text
     expect(fallback_status != "workspace_file_fallback" or fallback_verified, "workspace fallback file contains marker when fallback is used", {"path": str(fallback_path), "status": fallback_status})
 
-    veyra_summary = get_json("/memory/summary", {"session_id": session_id, "provider": "selected"}, timeout=45.0)
+    veyra_summary = request_json(
+        "POST",
+        "/memory/summary/resolve",
+        {
+            "user_id": "memory-roundtrip-live",
+            "session_id": session_id,
+            "provider": "selected",
+        },
+        timeout=45.0,
+    )
     veyra_summary_text = str(veyra_summary.get("external_summary", {}).get("summary") if isinstance(veyra_summary.get("external_summary"), dict) else "")
     fallback_read_verified = marker in veyra_summary_text or marker in str(veyra_summary.get("summary") or "")
     expect(fallback_read_verified or fallback_verified, "Veyra can read the roundtrip marker from local/fallback memory", veyra_summary)
@@ -94,7 +115,12 @@ def main() -> int:
     features = agent_status.get("capabilities", {}).get("features") if isinstance(agent_status.get("capabilities"), dict) else {}
     if isinstance(features, dict) and features.get("memory_summary") and features.get("memory_patch"):
         adapter = OpenClawAdapter(timeout=12.0)
-        gateway_summary = adapter.fetch_memory_summary(session_id)
+        scoped_session_id = "veyra-memory-v2-" + framed_sha256(
+            "veyra-memory-scope-v2",
+            "memory-roundtrip-live",
+            session_id,
+        )[:32]
+        gateway_summary = adapter.fetch_memory_summary(scoped_session_id)
         native_gateway = {
             "status": "verified" if marker in str(gateway_summary.get("summary") or "") else "not_found",
             "summary_status": gateway_summary.get("status"),
@@ -103,7 +129,7 @@ def main() -> int:
     else:
         native_gateway = {
             "status": "not_verified",
-            "limitation": "OpenClaw gateway currently does not advertise memory.summary/memory.patch; verified workspace fallback file roundtrip instead of native new-context retrieval.",
+            "limitation": "OpenClaw gateway currently does not advertise memory.summary/memory.patch; verified Veyra-private fallback roundtrip instead of native new-context retrieval.",
             "features": features,
         }
 

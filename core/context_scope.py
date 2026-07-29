@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from urllib.parse import urlparse
 
 from core.model_client import redact_sensitive
+from memory_bridge.scope import framed_sha256, normalize_scope_component
+
 
 # Statuses that mean "this is a diagnostic / fallback payload", not real task-relevant
 # agent memory. These must never be dumped into the agent prompt; they go to audit only.
@@ -186,3 +189,297 @@ def _cap_any(value: Any, limit: int) -> Any:
     if isinstance(value, dict):
         return value
     return _cap_text(value, limit)
+
+
+TENANT_SCOPE = "tenant"
+OPERATOR_GLOBAL_SCOPE = "operator_global"
+
+_SAFE_OPERATOR_GLOBAL_PROBES = {
+    "git_probe",
+    "hermes_probe",
+    "mcp_probe",
+    "openclaw_probe",
+    "port_probe",
+    "process_probe",
+    "system_probe",
+    "time_probe",
+}
+_SCOPE_CONTAINER_KEYS = ("task_context", "evidence", "owner", "scope")
+_SCOPE_KIND_KEYS = ("scope_kind", "visibility_scope")
+
+
+def owner_scope(item: Any) -> tuple[str, str, str]:
+    """Resolve an owner envelope as (state, user_id, session_id).
+
+    state is one of exact, ownerless, or invalid. Conflicting direct/nested
+    owner fields and partial owner envelopes are invalid and therefore fail
+    closed at context boundaries.
+    """
+
+    if not isinstance(item, dict):
+        return ("invalid", "", "")
+    containers = _scope_containers(item)
+    users = _field_values(containers, "user_id")
+    sessions = _field_values(containers, "session_id")
+    if len(users) > 1 or len(sessions) > 1:
+        return ("invalid", "", "")
+    user_id = next(iter(users), "")
+    session_id = next(iter(sessions), "")
+    if bool(user_id) != bool(session_id):
+        return ("invalid", user_id, session_id)
+    if not user_id:
+        return ("ownerless", "", "")
+    try:
+        user_id = normalize_scope_component(user_id, "user_id")
+        session_id = normalize_scope_component(
+            session_id,
+            "session_id",
+        )
+    except ValueError:
+        return ("invalid", "", "")
+    return ("exact", user_id, session_id)
+
+
+def scope_kind(item: Any) -> str:
+    """Return one scope kind, or invalid when nested scope metadata conflicts."""
+
+    if not isinstance(item, dict):
+        return "invalid"
+    values: set[str] = set()
+    for container in _scope_containers(item):
+        for key in _SCOPE_KIND_KEYS:
+            value = str(container.get(key) or "").strip().lower()
+            if value:
+                values.add(value)
+        nested_scope = container.get("scope")
+        if isinstance(nested_scope, dict):
+            value = str(nested_scope.get("kind") or "").strip().lower()
+            if value:
+                values.add(value)
+    if len(values) > 1:
+        return "invalid"
+    return next(iter(values), "")
+
+
+def item_visible_to_scope(
+    item: Any,
+    *,
+    user_id: str,
+    session_id: str,
+    probe_name: str | None = None,
+) -> bool:
+    """Allow exact tenant data or explicitly defined operator-global probes."""
+
+    if not isinstance(item, dict):
+        return False
+    owner_state, _, _ = owner_scope(item)
+    kind = scope_kind(item)
+    if owner_state == "invalid" or kind == "invalid":
+        return False
+    if owner_state == "exact":
+        return exact_owner_visible(
+            item,
+            user_id=user_id,
+            session_id=session_id,
+        )
+    if kind == TENANT_SCOPE or _tenant_derived(item):
+        return False
+    return kind == OPERATOR_GLOBAL_SCOPE or is_operator_global_probe(
+        item,
+        probe_name=probe_name,
+    )
+
+
+def exact_owner_visible(
+    item: Any,
+    *,
+    user_id: str,
+    session_id: str,
+) -> bool:
+    """Require one consistent, complete owner envelope with an exact match."""
+
+    owner_state, item_user, item_session = owner_scope(item)
+    kind = scope_kind(item)
+    try:
+        requested_user = normalize_scope_component(user_id, "user_id")
+        requested_session = normalize_scope_component(
+            session_id,
+            "session_id",
+        )
+    except ValueError:
+        return False
+    return (
+        owner_state == "exact"
+        and kind not in {"invalid", OPERATOR_GLOBAL_SCOPE}
+        and item_user == requested_user
+        and item_session == requested_session
+    )
+
+
+def tenant_scope_storage_key(user_id: Any, session_id: Any) -> str:
+    """Return a collision-safe private cache key for one exact tenant scope."""
+
+    normalized_user = normalize_scope_component(user_id, "user_id")
+    normalized_session = normalize_scope_component(
+        session_id,
+        "session_id",
+    )
+    return "scope-" + framed_sha256(
+        "veyra-context-scope-v1",
+        normalized_user,
+        normalized_session,
+    )[:32]
+
+
+def visible_probe_map(
+    local_world: dict[str, Any],
+    *,
+    user_id: str,
+    session_id: str,
+) -> dict[str, dict[str, Any]]:
+    """Project operator-global plus exact tenant probe caches for one turn."""
+
+    visible: dict[str, dict[str, Any]] = {}
+    probes = (
+        local_world.get("probes")
+        if isinstance(local_world.get("probes"), dict)
+        else {}
+    )
+    for name, payload in probes.items():
+        if isinstance(payload, dict) and item_visible_to_scope(
+            payload,
+            user_id=user_id,
+            session_id=session_id,
+            probe_name=str(name),
+        ):
+            visible[str(name)] = payload
+    try:
+        scope_key = tenant_scope_storage_key(user_id, session_id)
+    except ValueError:
+        return visible
+    scoped_root = (
+        local_world.get("scoped_probes")
+        if isinstance(local_world.get("scoped_probes"), dict)
+        else {}
+    )
+    scoped = (
+        scoped_root.get(scope_key)
+        if isinstance(scoped_root.get(scope_key), dict)
+        else {}
+    )
+    for name, payload in scoped.items():
+        if isinstance(payload, dict) and exact_owner_visible(
+            payload,
+            user_id=user_id,
+            session_id=session_id,
+        ):
+            visible[str(name)] = payload
+    return visible
+
+
+def probe_scope_metadata(
+    probe_result: dict[str, Any],
+    *,
+    probe_name: str | None = None,
+) -> dict[str, Any]:
+    """Build canonical scope metadata for a persisted probe and its claims."""
+
+    owner_state, user_id, session_id = owner_scope(probe_result)
+    kind = scope_kind(probe_result)
+    if owner_state == "exact" and kind not in {
+        "invalid",
+        OPERATOR_GLOBAL_SCOPE,
+    }:
+        return {
+            "scope_kind": TENANT_SCOPE,
+            "tenant_derived": True,
+            "user_id": user_id,
+            "session_id": session_id,
+        }
+    if (
+        owner_state == "ownerless"
+        and kind != TENANT_SCOPE
+        and (
+            kind == OPERATOR_GLOBAL_SCOPE
+            or is_operator_global_probe(probe_result, probe_name=probe_name)
+        )
+    ):
+        return {"scope_kind": OPERATOR_GLOBAL_SCOPE}
+    return {
+        "scope_kind": TENANT_SCOPE,
+        "tenant_derived": True,
+        "scope_status": "invalid" if owner_state == "invalid" or kind == "invalid" else "ownerless",
+    }
+
+
+def is_operator_global_probe(
+    item: dict[str, Any],
+    *,
+    probe_name: str | None = None,
+) -> bool:
+    """Recognize the narrow legacy/system probe set safe to share globally."""
+
+    evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
+    raw_name = str(
+        probe_name
+        or item.get("probe")
+        or evidence.get("probe")
+        or item.get("source")
+        or ""
+    ).strip().lower()
+    if raw_name.startswith("core_model:"):
+        raw_name = raw_name.split(":", 1)[1]
+    if raw_name in _SAFE_OPERATOR_GLOBAL_PROBES:
+        return True
+    if raw_name not in {"network_probe", "web_probe"}:
+        return False
+    target = str(
+        item.get("target")
+        or item.get("host")
+        or evidence.get("target")
+        or evidence.get("host")
+        or ""
+    ).strip()
+    return _is_loopback_target(target)
+
+
+def _scope_containers(item: dict[str, Any]) -> list[dict[str, Any]]:
+    containers = [item]
+    for key in _SCOPE_CONTAINER_KEYS:
+        nested = item.get(key)
+        if isinstance(nested, dict) and nested not in containers:
+            containers.append(nested)
+            nested_scope = nested.get("scope")
+            if isinstance(nested_scope, dict) and nested_scope not in containers:
+                containers.append(nested_scope)
+    return containers
+
+
+def _field_values(
+    containers: list[dict[str, Any]],
+    field: str,
+) -> set[str]:
+    return {
+        value
+        for container in containers
+        if (value := str(container.get(field) or "").strip())
+    }
+
+
+def _tenant_derived(item: dict[str, Any]) -> bool:
+    return any(
+        bool(container.get("tenant_derived"))
+        for container in _scope_containers(item)
+    )
+
+
+def _is_loopback_target(target: str) -> bool:
+    lowered = target.lower()
+    if not lowered:
+        return False
+    candidate = lowered if "://" in lowered else f"//{lowered}"
+    parsed = urlparse(candidate)
+    host = str(parsed.hostname or "").strip("[]")
+    if not host and lowered in {"localhost", "127.0.0.1", "::1"}:
+        host = lowered
+    return host in {"localhost", "127.0.0.1", "::1"}

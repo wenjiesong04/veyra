@@ -1,25 +1,55 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
 from interface.agent_adapter import ExecutionResult
 from interface.agent_contract import contract_summary
+from memory_bridge.scope import normalize_scope_component
 from tool_proxy.agent_tool_contract import agent_tool_proxy_contract
 
 
 class MemoryPatchRequest(BaseModel):
+    model_config = ConfigDict(
+        strict=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    user_id: str = Field(min_length=1, max_length=240)
+    session_id: str = Field(min_length=1, max_length=240)
     patch: dict[str, Any]
-    provider: str = "selected"
+    provider: str = Field(default="selected", min_length=1, max_length=120)
 
 
 class MemoryDiagnosticsRequest(BaseModel):
-    provider: str = "all"
-    session_id: str = "memory-diagnostics"
+    model_config = ConfigDict(
+        strict=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    provider: str = Field(default="all", min_length=1, max_length=120)
+    user_id: str = Field(default="local-user", min_length=1, max_length=240)
+    session_id: str = Field(default="memory-diagnostics", min_length=1, max_length=240)
     write_probe: bool = False
+
+
+class MemorySummaryRequest(BaseModel):
+    model_config = ConfigDict(
+        strict=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    provider: str = Field(default="selected", min_length=1, max_length=120)
+    user_id: str = Field(min_length=1, max_length=240)
+    session_id: str = Field(min_length=1, max_length=240)
+    focus: list[str] = Field(default_factory=list, max_length=20)
 
 
 class AgentSelectRequest(BaseModel):
@@ -84,6 +114,113 @@ class AgentResultRequest(BaseModel):
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
+PUBLIC_MEMORY_CONTENT_FIELDS = {
+    "memory_type",
+    "result",
+    "summary",
+    "tags",
+    "task",
+    "topic",
+}
+
+
+def _required_memory_identifier(value: str, field: str) -> str:
+    try:
+        return normalize_scope_component(value, field)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        ) from exc
+
+
+def _memory_provider(bridge: Any, provider: str) -> str:
+    normalized = _required_memory_identifier(provider, "provider")
+    status = bridge.provider_status(probe=False)
+    providers = (
+        status.get("providers")
+        if isinstance(status.get("providers"), list)
+        else []
+    )
+    if normalized not in providers:
+        raise HTTPException(
+            status_code=422,
+            detail="unknown memory provider",
+        )
+    return normalized
+
+
+def _agent_status_snapshot(deps: dict[str, Any]) -> dict[str, Any]:
+    state = deps["state_store"].read_json("executor_state.json")
+    state = state if isinstance(state, dict) else {}
+    selected = str(state.get("selected_agent") or "openclaw")
+    agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
+    selected_status = (
+        agents.get(selected)
+        if isinstance(agents.get(selected), dict)
+        else {
+            key: value
+            for key, value in state.items()
+            if key not in {"agents", "selected_agent"}
+        }
+    )
+    snapshot = dict(selected_status) if isinstance(selected_status, dict) else {}
+    snapshot.setdefault("name", selected)
+    snapshot.setdefault("status", "not_observed")
+    snapshot.setdefault("connected", False)
+    observed_at = str(
+        snapshot.get("updated_at")
+        or state.get("updated_at")
+        or ""
+    )
+    try:
+        ttl_seconds = int(
+            snapshot.get("ttl_seconds")
+            or state.get("ttl_seconds")
+            or 300
+        )
+    except (TypeError, ValueError):
+        ttl_seconds = 300
+    freshness = "unknown"
+    age_seconds: int | None = None
+    if observed_at:
+        try:
+            parsed = datetime.fromisoformat(
+                observed_at.replace("Z", "+00:00")
+            )
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            age_seconds = max(
+                0,
+                int(
+                    (
+                        datetime.now(timezone.utc)
+                        - parsed.astimezone(timezone.utc)
+                    ).total_seconds()
+                ),
+            )
+            freshness = (
+                "fresh"
+                if age_seconds <= max(0, ttl_seconds)
+                else "stale"
+            )
+        except ValueError:
+            freshness = "invalid"
+    snapshot["freshness"] = {
+        "status": freshness,
+        "age_seconds": age_seconds,
+        "ttl_seconds": ttl_seconds,
+    }
+    if freshness in {"stale", "invalid"}:
+        snapshot["observed_status"] = snapshot.get("status")
+        snapshot["observed_connected"] = snapshot.get("connected")
+        snapshot["status"] = "snapshot_stale"
+        snapshot["connected"] = False
+    snapshot["snapshot_source"] = "executor_state"
+    snapshot["snapshot_updated_at"] = state.get("updated_at")
+    return snapshot
+
+
 def _task_context_for_callback(loop: Any, task_id: str) -> tuple[dict[str, Any], bool]:
     getter = getattr(loop.task_tracker, "get_context", None)
     if callable(getter):
@@ -138,6 +275,26 @@ def _is_case_context(
         context_found
         and str(task_context.get("case_id") or "").strip()
     )
+
+
+def _require_task_owner(
+    task_context: dict[str, Any],
+    context_found: bool,
+    *,
+    user_id: str,
+    session_id: str,
+) -> tuple[str, str]:
+    user_scope = _required_memory_identifier(user_id, "user_id")
+    session_scope = _required_memory_identifier(session_id, "session_id")
+    if (
+        not context_found
+        or str(task_context.get("user_id") or "").strip() != user_scope
+        or str(task_context.get("session_id") or "").strip()
+        != session_scope
+    ):
+        # Do not disclose whether an unowned task id exists.
+        raise HTTPException(status_code=404, detail="Agent task not found")
+    return user_scope, session_scope
 
 
 def _adapter_for_context(loop: Any, task_context: dict[str, Any]) -> Any:
@@ -234,11 +391,102 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
     router = APIRouter()
 
     @router.get("/agent/tasks/{task_id}")
-    async def agent_task_status(task_id: str) -> dict[str, Any]:
+    async def agent_task_status(
+        task_id: str,
+        *,
+        user_id: str = Query(min_length=1, max_length=240),
+        session_id: str = Query(min_length=1, max_length=240),
+    ) -> dict[str, Any]:
+        loop = deps["awareness_loop"]
+        task_context, context_found = _task_context_for_callback(
+            loop, task_id
+        )
+        _require_task_owner(
+            task_context,
+            context_found,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        task_state = deps["state_store"].read_json("task_state.json")
+        pending = (
+            task_state.get("pending_agent_tasks")
+            if isinstance(task_state.get("pending_agent_tasks"), list)
+            else []
+        )
+        runtime_task_id = str(
+            task_context.get("runtime_task_id") or task_id
+        )
+        pending_item = next(
+            (
+                item
+                for item in pending
+                if isinstance(item, dict)
+                and str(item.get("task_id") or "") == runtime_task_id
+                and str(item.get("user_id") or "") == user_id.strip()
+                and str(item.get("session_id") or "")
+                == session_id.strip()
+            ),
+            None,
+        )
+        task_status = str(
+            (pending_item or {}).get("status")
+            or task_context.get("final_status")
+            or "not_observed"
+        )
+        verification_status = str(
+            (pending_item or {}).get("verification_status")
+            or task_context.get("verification_status")
+            or "unverified"
+        )
+        durable_case = None
+        if _is_case_context(task_context, context_found):
+            case = loop.durable_case_store.get_case(
+                case_id=str(task_context["case_id"]),
+                user_id=str(task_context["user_id"]),
+                workspace_id=str(task_context["case_workspace_id"]),
+            )
+            durable_case = (
+                loop.bounded_negotiation.public_case_summary(case)
+            )
+        return {
+            "status": "cached",
+            "task": {
+                "status": task_status,
+                "verification_status": verification_status,
+                "next_action": (
+                    (pending_item or {}).get("next_action")
+                    or (
+                        "POST /agent/tasks/{task_id}/refresh"
+                        if pending_item
+                        else None
+                    )
+                ),
+                "updated_at": (
+                    (pending_item or {}).get("last_polled_at")
+                    or task_context.get("updated_at")
+                ),
+            },
+            "durable_case": durable_case,
+            "snapshot_source": "task_state",
+        }
+
+    @router.post("/agent/tasks/{task_id}/refresh")
+    async def agent_task_refresh(
+        task_id: str,
+        *,
+        user_id: str = Query(min_length=1, max_length=240),
+        session_id: str = Query(min_length=1, max_length=240),
+    ) -> dict[str, Any]:
         loop = deps["awareness_loop"]
         state_store = deps["state_store"]
         task_context, context_found = _task_context_for_callback(
             loop, task_id
+        )
+        user_scope, session_scope = _require_task_owner(
+            task_context,
+            context_found,
+            user_id=user_id,
+            session_id=session_id,
         )
         adapter = _adapter_for_context(loop, task_context)
         runtime_task_id = str(
@@ -289,7 +537,18 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
                 "verification": verified,
             }
         )
-        state_store.patch_json("task_state.json", {"current_task": {"task_id": task_id, "route": "agent", "status": verified["status"]}})
+        state_store.patch_json(
+            "task_state.json",
+            {
+                "current_task": {
+                    "task_id": task_id,
+                    "user_id": user_scope,
+                    "session_id": session_scope,
+                    "route": "agent",
+                    "status": verified["status"],
+                }
+            },
+        )
         loop.task_tracker.apply_result(execution=execution, verification=verified, event_id=f"poll_{task_id}")
         return {
             "execution_result": (
@@ -558,11 +817,22 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
         }
 
     @router.post("/agent/tasks/{task_id}/stop")
-    async def agent_task_stop(task_id: str) -> dict[str, Any]:
+    async def agent_task_stop(
+        task_id: str,
+        *,
+        user_id: str = Query(min_length=1, max_length=240),
+        session_id: str = Query(min_length=1, max_length=240),
+    ) -> dict[str, Any]:
         loop = deps["awareness_loop"]
         state_store = deps["state_store"]
         task_context, context_found = _task_context_for_callback(
             loop, task_id
+        )
+        _require_task_owner(
+            task_context,
+            context_found,
+            user_id=user_id,
+            session_id=session_id,
         )
         if _is_case_context(task_context, context_found):
             case = await run_in_threadpool(
@@ -599,9 +869,12 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
             adapter = _adapter_for_context(
                 loop, task_context
             )
+            runtime_task_id = str(
+                task_context.get("runtime_task_id") or task_id
+            )
             cancellation = await run_in_threadpool(
                 adapter.cancel_task_authority,
-                task_id,
+                runtime_task_id,
                 reason="explicit_agent_task_stop",
             )
             result = {
@@ -642,12 +915,7 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
 
     @router.get("/agent/status")
     async def agent_status() -> dict[str, Any]:
-        loop = deps["awareness_loop"]
-        state_store = deps["state_store"]
-        adapter = loop.agent_registry.selected()
-        status = adapter.connection_status()
-        state_store.patch_json("executor_state.json", {"selected_agent": loop.agent_registry.selected_name(), **status})
-        return status
+        return _agent_status_snapshot(deps)
 
     @router.get("/agent/contract")
     async def agent_contract() -> dict[str, Any]:
@@ -655,11 +923,24 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
 
     @router.get("/agents")
     async def agents() -> dict[str, Any]:
-        loop = deps["awareness_loop"]
-        state_store = deps["state_store"]
-        status = loop.agent_registry.list_status()
-        state_store.patch_json("executor_state.json", status)
-        return status
+        state = deps["state_store"].read_json("executor_state.json")
+        state = state if isinstance(state, dict) else {}
+        agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
+        selected_status = _agent_status_snapshot(deps)
+        selected = str(
+            state.get("selected_agent")
+            or selected_status.get("name")
+            or "openclaw"
+        )
+        if selected not in agents:
+            agents = {**agents, selected: selected_status}
+        return {
+            "selected_agent": selected,
+            "selected_status": selected_status,
+            "agents": agents,
+            "snapshot_source": "executor_state",
+            "snapshot_updated_at": state.get("updated_at"),
+        }
 
     @router.get("/agents/certification")
     async def agents_certification_status() -> dict[str, Any]:
@@ -716,27 +997,148 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
         return status
 
     @router.get("/memory/summary")
-    async def memory_summary(session_id: str = "console-session", provider: str = "selected") -> dict[str, Any]:
-        return deps["awareness_loop"].memory_bridge.read_summary(session_id, provider=provider)
+    async def memory_summary(
+        *,
+        user_id: str = Query(min_length=1, max_length=240),
+        session_id: str = Query(min_length=1, max_length=240),
+        provider: str = Query(default="selected", min_length=1, max_length=120),
+    ) -> dict[str, Any]:
+        bridge = deps["awareness_loop"].memory_bridge
+        user_scope = _required_memory_identifier(user_id, "user_id")
+        session_scope = _required_memory_identifier(
+            session_id,
+            "session_id",
+        )
+        provider_name = _memory_provider(bridge, provider)
+        return bridge.read_summary(
+            session_scope,
+            provider=provider_name,
+            user_id=user_scope,
+            model_assist=False,
+            external_read=False,
+        )
+
+    @router.post("/memory/summary/resolve")
+    async def memory_summary_resolve(
+        request: MemorySummaryRequest,
+    ) -> dict[str, Any]:
+        bridge = deps["awareness_loop"].memory_bridge
+        provider = _memory_provider(bridge, request.provider)
+        user_scope = _required_memory_identifier(
+            request.user_id,
+            "user_id",
+        )
+        session_scope = _required_memory_identifier(
+            request.session_id,
+            "session_id",
+        )
+        focus = [
+            value
+            for value in (
+                str(item or "").strip()[:240]
+                for item in request.focus
+            )
+            if value
+        ]
+        return await run_in_threadpool(
+            bridge.read_summary,
+            session_scope,
+            focus,
+            provider,
+            user_id=user_scope,
+            model_assist=True,
+            external_read=True,
+        )
 
     @router.get("/memory/providers")
     async def memory_providers() -> dict[str, Any]:
-        return deps["awareness_loop"].memory_bridge.provider_status()
+        return deps["awareness_loop"].memory_bridge.provider_status(
+            probe=False
+        )
 
     @router.get("/memory/providers/diagnostics")
-    async def memory_provider_diagnostics(provider: str = "all", session_id: str = "memory-diagnostics") -> dict[str, Any]:
-        return deps["awareness_loop"].memory_bridge.provider_diagnostics(provider=provider, session_id=session_id, write_probe=False)
+    async def memory_provider_diagnostics(
+        provider: str = Query(default="all", min_length=1, max_length=120),
+        user_id: str = Query(default="local-user", min_length=1, max_length=240),
+        session_id: str = Query(
+            default="memory-diagnostics",
+            min_length=1,
+            max_length=240,
+        ),
+    ) -> dict[str, Any]:
+        bridge = deps["awareness_loop"].memory_bridge
+        return bridge.provider_diagnostics(
+            provider=_memory_provider(bridge, provider),
+            user_id=_required_memory_identifier(user_id, "user_id"),
+            session_id=_required_memory_identifier(
+                session_id,
+                "session_id",
+            ),
+            write_probe=False,
+            record=False,
+            persist=False,
+            active_probe=False,
+        )
 
     @router.post("/memory/providers/diagnostics")
     async def memory_provider_diagnostics_write(request: MemoryDiagnosticsRequest) -> dict[str, Any]:
-        return deps["awareness_loop"].memory_bridge.provider_diagnostics(
-            provider=request.provider,
-            session_id=request.session_id,
+        bridge = deps["awareness_loop"].memory_bridge
+        return bridge.provider_diagnostics(
+            provider=_memory_provider(bridge, request.provider),
+            user_id=_required_memory_identifier(
+                request.user_id,
+                "user_id",
+            ),
+            session_id=_required_memory_identifier(
+                request.session_id,
+                "session_id",
+            ),
             write_probe=request.write_probe,
+            record=True,
+            persist=True,
+            active_probe=True,
         )
 
     @router.post("/memory/patch")
     async def memory_patch(request: MemoryPatchRequest) -> dict[str, Any]:
-        return deps["awareness_loop"].memory_bridge.write_patch(request.patch, provider=request.provider)
+        bridge = deps["awareness_loop"].memory_bridge
+        provider = _memory_provider(bridge, request.provider)
+        user_scope = _required_memory_identifier(
+            request.user_id,
+            "user_id",
+        )
+        session_scope = _required_memory_identifier(
+            request.session_id,
+            "session_id",
+        )
+        supplied_patch = dict(request.patch)
+        for field, expected in (
+            ("user_id", user_scope),
+            ("session_id", session_scope),
+        ):
+            supplied = str(supplied_patch.get(field) or "").strip()
+            if supplied and supplied != expected:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"memory patch {field} conflicts with request scope",
+                )
+        patch = {
+            field: supplied_patch[field]
+            for field in PUBLIC_MEMORY_CONTENT_FIELDS
+            if field in supplied_patch
+        }
+        if not patch:
+            raise HTTPException(
+                status_code=422,
+                detail="memory patch contains no supported caller content",
+            )
+        patch["user_id"] = user_scope
+        patch["session_id"] = session_scope
+        patch["trust"] = "caller_attested"
+        patch["freshness"] = "fresh"
+        return bridge.write_patch(
+            patch,
+            provider=provider,
+        )
 
     return router

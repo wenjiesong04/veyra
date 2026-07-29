@@ -690,9 +690,12 @@ class IsolatedMemoryBridge:
         session_id: str,
         focus: list[str] | None = None,
         provider: str = "selected",
+        *,
+        user_id: str,
     ) -> dict[str, Any]:
         self.read_attempts.append(
             {
+                "user_id": user_id,
                 "session_id": session_id,
                 "focus": list(focus or []),
                 "provider": provider,

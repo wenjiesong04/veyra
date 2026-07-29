@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from core.commitment_core import CommitmentCore
+from core.context_scope import exact_owner_visible, owner_scope, visible_probe_map
 from core.definitions import RiskLevel
 from core.foresight_engine import ForesightEngine
 from core.guardian_controller import GuardianController
@@ -214,14 +215,14 @@ class CommitmentPushRuntime:
         if kind == "learning_digest":
             topic = str(payload.get("topic") or "学习")
             phase = str(payload.get("phase") or "进行中")
-            candidate = self._next_push_candidate(str(commitment.get("commitment_id") or ""))
+            candidate = self._next_push_candidate(commitment)
             if candidate:
                 title_text = str(candidate.get("title") or topic)
                 url = str(candidate.get("url") or "")
                 snippet = str(candidate.get("snippet") or "")
                 link_line = f"\n链接：{url}" if url else ""
                 message = f"【学习资料·{topic}】{title_text}\n{snippet[:220]}{link_line}\n如需调整计划或推送频率，直接告诉我即可。"
-                return message, {"kind": "external_candidate", "candidate_id": candidate.get("candidate_id")}
+                return message, self._push_candidate_context(candidate)
             tips = [
                 "回顾上一轮笔记并列出 3 个不懂的概念",
                 "完成一小节练习并记录错题",
@@ -231,19 +232,28 @@ class CommitmentPushRuntime:
             return f"【学习辅导·{topic}】当前阶段：{phase}。今日建议：{tip}。如需调整计划或推送频率，直接告诉我即可。", None
         if kind == "external_digest":
             topic = str(payload.get("topic") or title)
-            candidate = self._next_push_candidate(str(commitment.get("commitment_id") or ""))
+            candidate = self._next_push_candidate(commitment)
             if candidate:
                 title_text = str(candidate.get("title") or topic)
                 url = str(candidate.get("url") or "")
                 snippet = str(candidate.get("snippet") or "")
                 link_line = f"\n链接：{url}" if url else ""
                 message = f"【外部追踪·{topic}】{title_text}\n{snippet[:220]}{link_line}\n如需暂停、取消或调整范围，直接告诉我即可。"
-                return message, {"kind": "external_candidate", "candidate_id": candidate.get("candidate_id")}
+                return message, self._push_candidate_context(candidate)
             return f"【外部追踪·{topic}】当前没有新的高价值更新。我会继续按授权观察；如需暂停或取消，直接告诉我即可。", None
         if kind == "local_probe_monitor":
             topic = str(payload.get("topic") or title)
             local = self.state_store.read_json("local_world.json")
-            probes = local.get("probes") if isinstance(local.get("probes"), dict) else {}
+            owner_state, user_id, session_id = owner_scope(commitment)
+            probes = (
+                visible_probe_map(
+                    local,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+                if owner_state == "exact"
+                else {}
+            )
             status = "unknown"
             if probes:
                 latest = list(probes.values())[-1]
@@ -312,13 +322,43 @@ class CommitmentPushRuntime:
             return str(message_context.get("candidate_id") or "")
         return None
 
-    def _next_push_candidate(self, commitment_id: str) -> dict[str, Any] | None:
+    @staticmethod
+    def _push_candidate_context(candidate: dict[str, Any]) -> dict[str, Any]:
+        owner_state, user_id, session_id = owner_scope(candidate)
+        if owner_state != "exact":
+            return {}
+        return {
+            "kind": "external_candidate",
+            "candidate_id": candidate.get("candidate_id"),
+            "scope_kind": "tenant",
+            "tenant_derived": True,
+            "user_id": user_id,
+            "session_id": session_id,
+        }
+
+    def _next_push_candidate(
+        self,
+        commitment: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        owner_state, user_id, session_id = owner_scope(commitment)
+        commitment_id = str(commitment.get("commitment_id") or "")
+        if owner_state != "exact" or not commitment_id:
+            return None
         external = self.state_store.read_json("external_world.json")
         candidates = external.get("push_candidates") if isinstance(external.get("push_candidates"), list) else []
         eligible = [
             item
             for item in candidates
-            if isinstance(item, dict) and item.get("commitment_id") == commitment_id and item.get("status") in {"new", "queued", "failed"}
+            if (
+                isinstance(item, dict)
+                and item.get("commitment_id") == commitment_id
+                and item.get("status") in {"new", "queued", "failed"}
+                and exact_owner_visible(
+                    item,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+            )
         ]
         if not eligible:
             return None
@@ -326,13 +366,22 @@ class CommitmentPushRuntime:
 
     def _mark_push_candidate(self, message_context: dict[str, Any] | None, status: str) -> None:
         candidate_id = self._candidate_id(message_context)
-        if not candidate_id:
+        owner_state, user_id, session_id = owner_scope(message_context)
+        if not candidate_id or owner_state != "exact":
             return
 
         def mark(external: dict[str, Any]) -> dict[str, Any]:
             candidates = external.get("push_candidates") if isinstance(external.get("push_candidates"), list) else []
             for item in candidates:
-                if not isinstance(item, dict) or item.get("candidate_id") != candidate_id:
+                if (
+                    not isinstance(item, dict)
+                    or item.get("candidate_id") != candidate_id
+                    or not exact_owner_visible(
+                        item,
+                        user_id=user_id,
+                        session_id=session_id,
+                    )
+                ):
                     continue
                 item["status"] = status
                 item["updated_at"] = utc_now_iso()

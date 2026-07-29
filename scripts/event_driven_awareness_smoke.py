@@ -2870,6 +2870,7 @@ def test_scoped_debug_api(base: Path) -> None:
         and public_state.status_code == 200
         and "event_inbox" not in public_state.json()
         and "situation_state" not in public_state.json()
+        and "agent_memory" not in public_state.json()
         and "phase6_collaboration_state" not in public_state.json()
         and mode_status.json().get("mode") == "shadow"
         and invalid_mode.status_code == 422

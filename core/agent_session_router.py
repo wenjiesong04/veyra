@@ -5,6 +5,7 @@ import time
 from typing import Any
 
 from core.world_state import WorldStateStore
+from memory_bridge.scope import framed_sha256, normalize_scope_component
 
 # Markers that signal the user explicitly wants to continue the previous agent task,
 # i.e. reuse the previous agent execution session instead of opening a fresh one.
@@ -59,7 +60,13 @@ class AgentSessionRouter:
         self.state_store = state_store
         self.reuse_ttl_seconds = reuse_ttl_seconds
 
-    def resolve(self, *, dialogue_session_id: str, text: str) -> dict[str, Any]:
+    def resolve(
+        self,
+        *,
+        user_id: str,
+        dialogue_session_id: str,
+        text: str,
+    ) -> dict[str, Any]:
         """Return the agent session plan for this turn.
 
         Returns a dict with ``policy``, ``reuse_session_id`` (or ``None``) and a
@@ -73,7 +80,24 @@ class AgentSessionRouter:
                 "reuse_session_id": None,
                 "trace": {"requested_continue": False, "reason": "default_isolated_session"},
             }
-        previous = self._previous_for(dialogue_session_id)
+        try:
+            user_scope, dialogue_scope = self._required_scope(
+                user_id=user_id,
+                dialogue_session_id=dialogue_session_id,
+            )
+        except ValueError:
+            return {
+                "policy": "ephemeral_per_task",
+                "reuse_session_id": None,
+                "trace": {
+                    "requested_continue": True,
+                    "reason": "invalid_owner_scope",
+                },
+            }
+        previous = self._previous_for(
+            user_id=user_scope,
+            dialogue_session_id=dialogue_scope,
+        )
         if not previous:
             return {
                 "policy": "ephemeral_per_task",
@@ -86,33 +110,63 @@ class AgentSessionRouter:
                 "reuse_session_id": None,
                 "trace": {"requested_continue": True, "reason": "previous_session_expired"},
             }
+        try:
+            reuse_session_id = normalize_scope_component(
+                previous.get("agent_execution_session_id"),
+                "agent_execution_session_id",
+            )
+        except ValueError:
+            return {
+                "policy": "ephemeral_per_task",
+                "reuse_session_id": None,
+                "trace": {
+                    "requested_continue": True,
+                    "reason": "invalid_previous_session",
+                },
+            }
         return {
             "policy": "continue_previous_task",
-            "reuse_session_id": str(previous.get("agent_execution_session_id") or "") or None,
+            "reuse_session_id": reuse_session_id,
             "trace": {
                 "requested_continue": True,
                 "reason": "reusing_previous_session",
                 "previous_task_id": previous.get("task_id"),
-                "previous_user_goal": previous.get("user_goal"),
             },
         }
 
     def record(
         self,
         *,
+        user_id: str,
         dialogue_session_id: str,
         agent_execution_session_id: str,
         task_id: str,
         user_goal: str,
     ) -> None:
-        if not dialogue_session_id or not agent_execution_session_id:
+        try:
+            user_scope, dialogue_scope = self._required_scope(
+                user_id=user_id,
+                dialogue_session_id=dialogue_session_id,
+            )
+        except ValueError:
             return
+        try:
+            execution_scope = normalize_scope_component(
+                agent_execution_session_id,
+                "agent_execution_session_id",
+            )
+        except ValueError:
+            return
+        scope_key = self._scope_key(user_scope, dialogue_scope)
 
         def update(index: dict[str, Any]) -> dict[str, Any]:
             sessions = index.get("sessions") if isinstance(index.get("sessions"), dict) else {}
             sessions = dict(sessions)
-            sessions[dialogue_session_id] = {
-                "agent_execution_session_id": agent_execution_session_id,
+            sessions[scope_key] = {
+                "scope_version": "veyra-agent-session-scope-v2",
+                "user_id": user_scope,
+                "dialogue_session_id": dialogue_scope,
+                "agent_execution_session_id": execution_scope,
                 "task_id": task_id,
                 "user_goal": (user_goal or "")[:200],
                 "recorded_at": time.time(),
@@ -132,16 +186,63 @@ class AgentSessionRouter:
         lowered = raw.lower()
         return any(marker in lowered for marker in CONTINUE_MARKERS_EN)
 
-    def _previous_for(self, dialogue_session_id: str) -> dict[str, Any] | None:
+    def _previous_for(
+        self,
+        *,
+        user_id: str,
+        dialogue_session_id: str,
+    ) -> dict[str, Any] | None:
         index = self._read_index()
         sessions = index.get("sessions") if isinstance(index.get("sessions"), dict) else {}
-        entry = sessions.get(dialogue_session_id)
-        return entry if isinstance(entry, dict) else None
+        entry = sessions.get(
+            self._scope_key(user_id, dialogue_session_id)
+        )
+        if not isinstance(entry, dict):
+            return None
+        try:
+            entry_user, entry_session = self._required_scope(
+                user_id=entry.get("user_id"),
+                dialogue_session_id=entry.get(
+                    "dialogue_session_id"
+                ),
+            )
+        except ValueError:
+            return None
+        if (
+            entry.get("scope_version")
+            != "veyra-agent-session-scope-v2"
+            or entry_user != user_id
+            or entry_session != dialogue_session_id
+        ):
+            return None
+        return entry
+
+    @staticmethod
+    def _required_scope(
+        *,
+        user_id: Any,
+        dialogue_session_id: Any,
+    ) -> tuple[str, str]:
+        return (
+            normalize_scope_component(user_id, "user_id"),
+            normalize_scope_component(
+                dialogue_session_id,
+                "dialogue_session_id",
+            ),
+        )
+
+    @staticmethod
+    def _scope_key(user_id: str, dialogue_session_id: str) -> str:
+        return "scope-" + framed_sha256(
+            "veyra-agent-session-index-v2",
+            user_id,
+            dialogue_session_id,
+        )[:32]
 
     def _is_expired(self, entry: dict[str, Any]) -> bool:
         recorded_at = entry.get("recorded_at")
         if not isinstance(recorded_at, (int, float)):
-            return False
+            return True
         return (time.time() - float(recorded_at)) > self.reuse_ttl_seconds
 
     def _read_index(self) -> dict[str, Any]:

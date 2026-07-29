@@ -111,6 +111,10 @@ def test_awareness_assembler_fresh_claim_match() -> None:
                         "confidence": 0.88,
                         "ttl_seconds": 3600,
                         "observed_at": now,
+                        "scope_kind": "tenant",
+                        "tenant_derived": True,
+                        "user_id": "user-a",
+                        "session_id": "session-a",
                     }
                 ],
                 "summary": {"fresh": 1, "stale": 0},
@@ -125,12 +129,22 @@ def test_awareness_assembler_fresh_claim_match() -> None:
                         "status": "ok",
                         "summary": "贵阳: 多云, 18°C",
                         "target": "贵阳",
+                        "scope_kind": "tenant",
+                        "tenant_derived": True,
+                        "user_id": "user-a",
+                        "session_id": "session-a",
                     }
                 }
             },
         )
         assembler = AwarenessContextAssembler(store)
-        snap = assembler.snapshot(user_message="贵阳天气", attention_focus=["天气", "贵阳"], evidence_kind="weather")
+        snap = assembler.snapshot(
+            user_message="贵阳天气",
+            attention_focus=["天气", "贵阳"],
+            evidence_kind="weather",
+            user_id="user-a",
+            session_id="session-a",
+        )
         assert snap["relevant_fresh_claims"]
         suff = assembler.evidence_sufficient(
             understanding_entities={"location": "贵阳"},

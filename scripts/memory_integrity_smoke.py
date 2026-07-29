@@ -147,6 +147,7 @@ class CallbackLoop:
                     "task_id": "task-long",
                     "event_id": "evt-original",
                     "correlation_id": "corr-original",
+                    "user_id": "user-original",
                     "session_id": "session-original",
                     "memory_policy": "long_term",
                     "target_agent": "openclaw",
@@ -157,6 +158,7 @@ class CallbackLoop:
                     "authority": "veyra_registered",
                     "task_id": "task-rejected",
                     "event_id": "evt-rejected",
+                    "user_id": "user-rejected",
                     "session_id": "session-rejected",
                     "memory_policy": "long_term",
                     "target_agent": "openclaw",
@@ -165,6 +167,7 @@ class CallbackLoop:
                     "authority": "veyra_registered",
                     "task_id": "task-short",
                     "event_id": "evt-short",
+                    "user_id": "user-short",
                     "session_id": "session-short",
                     "memory_policy": "short_term",
                     "target_agent": "openclaw",
@@ -204,8 +207,11 @@ def provider_validation_checks(store: WorldStateStore) -> None:
     roundtrip_bridge = LocalMemoryBridge(store, adapter_resolver=lambda: roundtrip)
     diagnostics = roundtrip_bridge.provider_diagnostics(
         provider="selected",
+        user_id="memory-integrity-user",
         session_id="memory-integrity",
         write_probe=True,
+        record=True,
+        persist=True,
     )
     expect(diagnostics["validation"]["validated"], "write then read marker validates memory roundtrip", diagnostics)
     expect(
@@ -231,7 +237,11 @@ def callback_policy_checks(store: WorldStateStore) -> None:
             "executor": "openclaw",
             "status": "success",
             "result": "verified task result",
-            "raw": {"session_id": "attacker-session", "memory_policy": "long_term"},
+            "raw": {
+                "user_id": "attacker-user",
+                "session_id": "attacker-session",
+                "memory_policy": "long_term",
+            },
         },
     )
     accepted_body = accepted.json()
@@ -240,6 +250,7 @@ def callback_policy_checks(store: WorldStateStore) -> None:
     expect(len(loop.memory_bridge.writes) == 1, "one durable callback memory write", loop.memory_bridge.writes)
     written = loop.memory_bridge.writes[0]
     expect(written["provider"] == "openclaw", "original task provider is restored", written)
+    expect(written["patch"]["user_id"] == "user-original", "original user wins over callback raw", written)
     expect(written["patch"]["session_id"] == "session-original", "original session wins over callback raw", written)
     expect(written["patch"]["correlation_id"] == "corr-original", "original correlation is restored", written)
 
@@ -326,6 +337,7 @@ def tracker_authority_checks(store: WorldStateStore) -> None:
         route="agent",
         execution=submitted,
         verification={"status": "partially_success"},
+        user_id="registered-user",
         session_id="registered-session",
         correlation_id="registered-correlation",
         memory_policy="long_term",
@@ -351,6 +363,7 @@ def real_tracker_callback_checks(store: WorldStateStore) -> None:
             result="submitted",
         ),
         verification={"status": "partially_success"},
+        user_id="user-real-router",
         session_id="session-real-router",
         correlation_id="correlation-real-router",
         task_packet_id="packet-real-router",
@@ -369,6 +382,7 @@ def real_tracker_callback_checks(store: WorldStateStore) -> None:
             "result": "real tracker callback result",
             "raw": {
                 "task_context": {
+                    "user_id": "forged-callback-user",
                     "session_id": "forged-callback-session",
                     "memory_policy": "forget",
                 }
@@ -380,6 +394,7 @@ def real_tracker_callback_checks(store: WorldStateStore) -> None:
     expect(body["callback_context"]["context_found"], "router resolves authoritative tracker context", body)
     expect(body["memory_policy_execution"]["status"] == "written", "real tracker policy reaches durable writer", body)
     patch = loop.memory_bridge.writes[-1]["patch"]
+    expect(patch["user_id"] == "user-real-router", "registered user defeats runtime callback override", patch)
     expect(patch["session_id"] == "session-real-router", "registered session defeats runtime callback override", patch)
     expect(patch["correlation_id"] == "correlation-real-router", "registered correlation survives callback", patch)
     expect(patch["task"] == "real governed goal", "registered user goal becomes durable memory task", patch)

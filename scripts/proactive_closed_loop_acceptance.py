@@ -105,7 +105,14 @@ def main() -> int:
             json={"text": "好的", "channel": "acceptance", "user_id": "closed-loop-user", "session_id": "learn"},
         )
         expect(confirm.status_code == 200 and (confirm.json().get("artifacts") or {}).get("commitment", {}).get("status") == "confirmed", "learning push confirmed", confirm.text)
-        active_learning = client.get("/commitments", params={"session_id": pending["session_id"], "status": "active"}).json()["commitments"][0]
+        active_learning = client.get(
+            "/commitments",
+            params={
+                "user_id": "closed-loop-user",
+                "session_id": pending["session_id"],
+                "status": "active",
+            },
+        ).json()["commitments"][0]
 
         external = client.post("/external/refresh", params={"limit": 5})
         expect(external.status_code == 200 and external.json().get("refreshed"), "authorized external search refreshed", external.text)

@@ -60,7 +60,6 @@ type VeyraState = {
   attention_state: { focus?: string[]; ignored_noise?: string[] };
   review_queue?: { items?: Array<Record<string, JsonValue>> };
   rollback_state?: Record<string, JsonValue>;
-  agent_memory?: Record<string, JsonValue>;
 };
 
 type MessageResult = {
@@ -198,6 +197,7 @@ function App() {
   const [toolProxyStatus, setToolProxyStatus] = useState<Record<string, JsonValue> | null>(null);
   const [executionLogs, setExecutionLogs] = useState<LogResponse>({ items: [] });
   const [memoryLogs, setMemoryLogs] = useState<LogResponse>({ items: [] });
+  const [memorySummary, setMemorySummary] = useState<Record<string, JsonValue> | null>(null);
   const [memoryDiagnostics, setMemoryDiagnostics] = useState<Record<string, JsonValue> | null>(null);
   const [coreModelLogs, setCoreModelLogs] = useState<LogResponse>({ items: [] });
   const [alertLogs, setAlertLogs] = useState<LogResponse>({ items: [] });
@@ -267,6 +267,7 @@ function App() {
       toolProxyData,
       executionData,
       memoryData,
+      memorySummaryData,
       memoryDiagnosticsData,
       coreModelLogData,
       alertLogData,
@@ -305,8 +306,15 @@ function App() {
       fetchJson<LogResponse>("/logs/policy?limit=20"),
       fetchJson<Record<string, JsonValue>>("/tool-proxy/status"),
       fetchJson<LogResponse>("/logs/execution?limit=20"),
-      fetchJson<LogResponse>("/logs/memory?limit=20"),
-      fetchJson<Record<string, JsonValue>>("/memory/providers/diagnostics?provider=all&session_id=console"),
+      fetchJson<LogResponse>(
+        "/logs/memory?limit=20&user_id=console-user&session_id=console-session"
+      ),
+      fetchJson<Record<string, JsonValue>>(
+        "/memory/summary?provider=local&user_id=console-user&session_id=console-session"
+      ),
+      fetchJson<Record<string, JsonValue>>(
+        "/memory/providers/diagnostics?provider=all&user_id=console-user&session_id=console-session"
+      ),
       fetchJson<LogResponse>("/logs/core-model?limit=20"),
       fetchJson<LogResponse>("/logs/alerts?limit=20"),
       fetchJson<Record<string, JsonValue>>("/audit/journal?limit=40"),
@@ -345,6 +353,7 @@ function App() {
     setToolProxyStatus(toolProxyData);
     setExecutionLogs(executionData);
     setMemoryLogs(memoryData);
+    setMemorySummary(memorySummaryData);
     setMemoryDiagnostics(memoryDiagnosticsData);
     setCoreModelLogs(coreModelLogData);
     setAlertLogs(alertLogData);
@@ -640,7 +649,13 @@ function App() {
       await fetchJson("/external/watchlist", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ target: watchTarget, reason: "console_watch", enabled: true })
+        body: JSON.stringify({
+          user_id: "console-user",
+          session_id: "console-session",
+          target: watchTarget,
+          reason: "console_watch",
+          enabled: true
+        })
       });
       await refresh();
     } catch (caught) {
@@ -749,7 +764,12 @@ function App() {
     try {
       const response = await fetchJson<Record<string, JsonValue>>("/memory/providers/diagnostics", {
         method: "POST",
-        body: JSON.stringify({ provider: "all", session_id: "console", write_probe: false })
+        body: JSON.stringify({
+          provider: "all",
+          user_id: "console-user",
+          session_id: "console-session",
+          write_probe: false
+        })
       });
       setMemoryDiagnostics(response);
       setResult(response as MessageResult);
@@ -796,7 +816,7 @@ function App() {
   const currentRisk = String(state?.risk_state.current_risk ?? "R0");
   const connected = agentStatus?.connected === true ? "connected" : String(agentStatus?.status ?? "unconfigured");
   const snapshots = Array.isArray(state?.rollback_state?.snapshots) ? (state.rollback_state.snapshots as Array<Record<string, JsonValue>>) : [];
-  const memoryItems = Array.isArray(state?.agent_memory?.items) ? (state.agent_memory.items as Array<Record<string, JsonValue>>) : [];
+  const memoryItems = Array.isArray(memorySummary?.summary) ? (memorySummary.summary as Array<Record<string, JsonValue>>) : [];
   const agents = asRecord(agentRegistry?.agents);
   const selectedAgent = String(agentRegistry?.selected_agent ?? runtime?.identity.selected_agent ?? "openclaw");
   const coreModules = architecture?.core_modules ?? [];

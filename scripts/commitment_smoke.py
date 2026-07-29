@@ -31,6 +31,7 @@ TEST_AGENCY_ROOT.mkdir(parents=True, exist_ok=True)
 import scripts.semantic_generalization_smoke as semantic_smoke  # noqa: E402
 from main import app, awareness_loop, commitment_core  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
+from interface.session_mapper import SessionMapper  # noqa: E402
 
 
 LEARNING_TEXT = "请建立深度学习学习辅导，开启前先让我确认。"
@@ -185,7 +186,14 @@ def main() -> int:
         "commitment confirmation follows semantic authority without Agent execution",
         confirm_learning.json(),
     )
-    learning_list = client.get("/commitments", params={"session_id": learn_session, "status": "active"})
+    learning_list = client.get(
+        "/commitments",
+        params={
+            "user_id": "cmt-user",
+            "session_id": learn_session,
+            "status": "active",
+        },
+    )
     expect(learning_list.status_code == 200 and learning_list.json().get("count", 0) >= 1, "active learning commitment exists", learning_list.json())
     learn_id = learning_list.json()["commitments"][0]["commitment_id"]
     recall_learning = client.post(
@@ -227,7 +235,13 @@ def main() -> int:
     weather_outbox = [
         item
         for item in store.read_json("channel_state.json").get("outbox", [])
-        if isinstance(item, dict) and item.get("session_id") == "self-test:cmt-user:cmt-weather"
+        if isinstance(item, dict)
+        and item.get("session_id")
+        == SessionMapper().map(
+            "self-test",
+            "cmt-user",
+            "cmt-weather",
+        )
     ][-1:]
     message_types = [(item.get("metadata") or {}).get("message_type") for item in weather_outbox]
     expect(message_types == ["primary"], "weather turn sends active confirmation once", weather_outbox)
@@ -252,7 +266,14 @@ def main() -> int:
         weather_offer.get("session_id")
         or "self-test:cmt-user:cmt-weather"
     )
-    listed = client.get("/commitments", params={"session_id": mapped_session, "status": "active"})
+    listed = client.get(
+        "/commitments",
+        params={
+            "user_id": "cmt-user",
+            "session_id": mapped_session,
+            "status": "active",
+        },
+    )
     expect(listed.status_code == 200 and listed.json().get("count", 0) >= 1, "active commitment exists", listed.json())
 
     commitment_id = listed.json()["commitments"][0]["commitment_id"]

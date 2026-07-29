@@ -3,7 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from awareness.claim_schema import detect_conflicts, make_claim, refresh_claim_status
+from awareness.claim_schema import (
+    claim_identity_key,
+    detect_conflicts,
+    make_claim,
+    refresh_claim_status,
+)
+from core.context_scope import item_visible_to_scope
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent
 
@@ -13,15 +19,29 @@ class BeliefCore:
         self.state_store = state_store
 
     def update_from_event(self, event: VeyraEvent) -> None:
+        claim = make_claim(
+            key=f"event:{event.event_id}",
+            claim=f"received {event.type.value} from {event.source.channel}",
+            confidence=1.0,
+            source="event",
+            ttl_seconds=300,
+            evidence={
+                "event_id": event.event_id,
+                "channel": event.source.channel,
+                "user_id": event.source.user_id,
+                "session_id": event.source.session_id,
+            },
+        )
+        claim.update(
+            {
+                "scope_kind": "tenant",
+                "tenant_derived": True,
+                "user_id": event.source.user_id,
+                "session_id": event.source.session_id,
+            }
+        )
         self.upsert_claim(
-            make_claim(
-                key=f"event:{event.event_id}",
-                claim=f"received {event.type.value} from {event.source.channel}",
-                confidence=1.0,
-                source="event",
-                ttl_seconds=300,
-                evidence={"event_id": event.event_id, "channel": event.source.channel},
-            )
+            claim
         )
 
     def upsert_claim(self, claim: dict[str, Any]) -> dict[str, Any]:
@@ -31,9 +51,13 @@ class BeliefCore:
             claims = belief.setdefault("claims", [])
             if not isinstance(claims, list):
                 claims = []
-            key = str(claim.get("key") or claim.get("claim"))
+            identity = claim_identity_key(claim)
             for index, current in enumerate(claims):
-                if not isinstance(current, dict) or str(current.get("key") or current.get("claim")) != key:
+                if (
+                    identity is None
+                    or not isinstance(current, dict)
+                    or claim_identity_key(current) != identity
+                ):
                     continue
                 history = current.get("history") if isinstance(current.get("history"), list) else []
                 history.append(
@@ -65,25 +89,42 @@ class BeliefCore:
     def upsert_claims(self, claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [self.upsert_claim(claim) for claim in claims]
 
-    def refresh(self, *, expire_after_seconds: int | None = 3600, prune_expired_after_seconds: int | None = None) -> dict[str, Any]:
-        def refresh_belief(belief: dict[str, Any]) -> dict[str, Any]:
-            raw_claims = belief.get("claims") if isinstance(belief.get("claims"), list) else []
-            claims = [
-                refresh_claim_status(item, expire_after_seconds=expire_after_seconds)
-                for item in raw_claims
-                if isinstance(item, dict)
-            ]
-            belief["claims"] = detect_conflicts(claims)
-            if prune_expired_after_seconds is not None:
-                belief["claims"] = self._prune_expired(belief["claims"], prune_expired_after_seconds)
-            belief["summary"] = self.summary_from_claims(belief["claims"])
-            return belief
+    def refresh(
+        self,
+        *,
+        expire_after_seconds: int | None = 3600,
+        prune_expired_after_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        return self.state_store.mutate_json(
+            "belief_state.json",
+            lambda belief: self._evaluated_state(
+                belief,
+                expire_after_seconds=expire_after_seconds,
+                prune_expired_after_seconds=prune_expired_after_seconds,
+            ),
+        )
 
-        return self.state_store.mutate_json("belief_state.json", refresh_belief)
-
-    def relevant_claims(self, focus: list[str], limit: int = 30, *, include_stale: bool = True) -> list[dict[str, Any]]:
-        belief = self.refresh()
+    def relevant_claims(
+        self,
+        focus: list[str],
+        limit: int = 30,
+        *,
+        include_stale: bool = True,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        belief = self._snapshot()
         claims = belief.get("claims", [])
+        if user_id is not None or session_id is not None:
+            claims = [
+                claim
+                for claim in claims
+                if item_visible_to_scope(
+                    claim,
+                    user_id=str(user_id or "").strip(),
+                    session_id=str(session_id or "").strip(),
+                )
+            ]
         if not include_stale:
             claims = [claim for claim in claims if str(claim.get("status") or "fresh") in {"fresh", "conflict"}]
         if not focus:
@@ -103,7 +144,7 @@ class BeliefCore:
         return ranked[-limit:]
 
     def ttl_report(self, limit: int = 50) -> dict[str, Any]:
-        belief = self.refresh()
+        belief = self._snapshot()
         claims = self._rank_claims(belief.get("claims", []))
         refreshable = [claim for claim in claims if claim.get("next_action") == "refresh_probe"]
         return {
@@ -115,7 +156,7 @@ class BeliefCore:
         }
 
     def stale_report(self, limit: int = 50) -> dict[str, Any]:
-        belief = self.refresh()
+        belief = self._snapshot()
         stale = [
             claim
             for claim in self._rank_claims(belief.get("claims", []))
@@ -127,6 +168,46 @@ class BeliefCore:
             "items": stale[-limit:],
             "next_action": "refresh_probe" if stale else None,
         }
+
+    def _snapshot(
+        self,
+        *,
+        expire_after_seconds: int | None = 3600,
+        prune_expired_after_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        return self._evaluated_state(
+            self.state_store.read_json("belief_state.json"),
+            expire_after_seconds=expire_after_seconds,
+            prune_expired_after_seconds=prune_expired_after_seconds,
+        )
+
+    def _evaluated_state(
+        self,
+        belief: dict[str, Any],
+        *,
+        expire_after_seconds: int | None,
+        prune_expired_after_seconds: int | None,
+    ) -> dict[str, Any]:
+        evaluated = dict(belief)
+        raw_claims = belief.get("claims") if isinstance(belief.get("claims"), list) else []
+        now = datetime.now(timezone.utc)
+        claims = [
+            refresh_claim_status(
+                item,
+                now=now,
+                expire_after_seconds=expire_after_seconds,
+            )
+            for item in raw_claims
+            if isinstance(item, dict)
+        ]
+        evaluated["claims"] = detect_conflicts(claims)
+        if prune_expired_after_seconds is not None:
+            evaluated["claims"] = self._prune_expired(
+                evaluated["claims"],
+                prune_expired_after_seconds,
+            )
+        evaluated["summary"] = self.summary_from_claims(evaluated["claims"])
+        return evaluated
 
     def summary_from_claims(self, claims: list[dict[str, Any]]) -> dict[str, Any]:
         summary: dict[str, Any] = {

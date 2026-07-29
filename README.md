@@ -131,7 +131,10 @@ User/Event
 python3 -B -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Endpoints:
+Selected operational endpoints are listed below. The mechanically checked
+206-product-route inventory, including Project Guardian, Cases, Tool
+Governance, Phase 5, and Phase 6 control planes, is maintained in
+[`docs/main_route_inventory.md`](docs/main_route_inventory.md).
 
 - `GET /` runtime identity and status
 - `POST /events/message` normalize a message and run the Awareness Loop
@@ -193,25 +196,33 @@ Endpoints:
 - `POST /audit/replay/runtime/config` configure guarded replay auto-execution gates
 - `POST /audit/replay/runtime/execute` explicitly auto-approve and execute allowed snapshot restore jobs
 - `GET /audit/time-travel` inspect last-known state from append-only audit logs
-- `GET /agent/status` inspect selected Agent adapter connection status
+- `GET /agent/status` inspect the cached selected Agent status without probing the runtime
 - `GET /agents/certification` inspect multi-runtime certification matrix
 - `POST /agents/certification/run` certify OpenClaw/Hermes/Custom runtime surfaces
 - `POST /agents/invoke` invoke one or more validated configured Agent runtimes
-- `GET /agent/tasks/{task_id}` poll selected Agent task status
+- `GET /agent/tasks/{task_id}?user_id=...&session_id=...` read the cached exact-owner Agent task status
+- `POST /agent/tasks/{task_id}/refresh?user_id=...&session_id=...` explicitly poll one exact-owner Agent task
 - `POST /agent/tasks/refresh` refresh all pending selected Agent tasks
-- `POST /agent/tasks/{task_id}/stop` request selected Agent task stop
+- `POST /agent/tasks/{task_id}/stop?user_id=...&session_id=...` request an exact-owner Agent task stop
 - `POST /agent/results` receive an Agent result callback and update verification state
 - `GET /agent/contract` inspect the AgentAdapter v2 contract
-- `GET /memory/summary` read local Memory Bridge summary
+- `GET /commitments?user_id=...&session_id=...` list one user's commitments, optionally narrowed to an exact session
+- `POST /commitments` create a commitment with explicit `user_id` and `session_id` in the request body
+- `GET /commitments/{commitment_id}?user_id=...&session_id=...` read one exact-owner commitment
+- `POST /commitments/{commitment_id}/{confirm|pause|cancel}?user_id=...&session_id=...` mutate one exact-owner commitment
+- `POST /commitments/run-due` run the explicitly operator-wide local commitment scheduler
+- `GET /memory/summary?user_id=...&session_id=...` read a deterministic owner-scoped local Memory projection without model or external provider I/O
+- `POST /memory/summary/resolve` explicitly run model-assisted and external-provider Memory resolution
 - `GET /memory/providers` list available MemoryBridge providers
-- `GET /memory/providers/diagnostics` run read-only MemoryBridge provider diagnostics
-- `POST /memory/providers/diagnostics` optionally run provider diagnostics with a write probe
+- `GET /memory/providers/diagnostics` read cached no-probe MemoryBridge diagnostics
+- `POST /memory/providers/diagnostics` explicitly run active provider diagnostics with an optional write probe
+- `POST /memory/patch` write owner/session-scoped caller-attested content; trust, verification, authority, quality, freshness, and storage provenance are server-owned
 - `GET /belief/status` inspect claim TTL, freshness, conflicts, and source trust
 - `POST /belief/refresh` refresh and optionally prune stale/expired claims
 - `GET /agency/intentions` read proactive Agency intention queue
 - `GET /personas/status` inspect current persona/channel/Agent binding state
 - `POST /state/refresh-stale` refresh stale belief claims with read-only probes
-- `POST /external/watchlist` add or update an ExternalWorld watch target
+- `POST /external/watchlist` add or update an exact owner/session ExternalWorld watch target
 - `POST /external/refresh` refresh ExternalWorld watchlist targets with read-only probes
 - `GET /ops/safety/red-team` run non-destructive safety validation cases
 - `GET /ops/retention` inspect append-only log retention status
@@ -281,7 +292,7 @@ Run the current gate smoke suite:
 
 ```bash
 python3 scripts/run_smokes.py --group gate --timeout 90
-python3 -m compileall core interface runtime execution tool_proxy routers main.py scripts
+python3 -m compileall awareness core decision execution foresight guardian interface memory_bridge probes rollback_audit routers runtime skills tool_proxy main.py cli.py desktop_backend.py scripts
 ```
 
 Run the broader core governance loop, review approval, Tool Proxy, rollback, Memory Bridge, proactive check, and readiness checks in one command:
@@ -448,6 +459,8 @@ Runtime observability now records each message route into `runtime_trace.jsonl` 
 
 MemoryBridge supports `local`, `selected`, explicit runtime names such as `openclaw` / `hermes` / `custom`, and `all` provider fan-out. Writes still pass the sensitive-memory filter before local storage or external adapter submission.
 
+The Memory boundary is internal logical isolation for the loopback local runtime, not authenticated multi-tenancy. Agent bridge/task/history/tail/slot/ExternalWorld data requires exact `user_id + session_id`; profile/project/location/goal/commitment continuity is user-scoped. Belief/probe context, proactive planning, Agent continuation, commitment controls/watchlists/push, and intake dedupe use the same explicit owner boundary. API identity is still caller-declared, `/state` and several diagnostics remain operator-wide, and native OpenClaw Memory stays disabled until its scope contract is directly certified. Until then, the supported path is a Veyra-private owner/session-scoped mirror outside every OpenClaw workspace or configured memory index; an unsafe mirror path fails closed.
+
 OpenClaw uses the same WebSocket Gateway protocol as the local OpenClaw Control UI. Veyra converts `http://127.0.0.1:18789` to `ws://127.0.0.1:18789`, sends `connect`, checks `health` / `status`, and submits Agent work with `chat.send`. If OpenClaw is reachable but requires device pairing or a gateway token, `/agent/status` reports that explicitly instead of treating the control UI HTML as a working Agent API.
 
 For OpenClaw deployments with Control UI auth enabled, set `OPENCLAW_GATEWAY_TOKEN` to the dashboard token. If that environment variable is not set, Veyra can read the local dashboard token from `~/.openclaw/openclaw.json` at runtime; set `VEYRA_OPENCLAW_USE_LOCAL_CONFIG=0` to disable that fallback. Veyra stores its generated OpenClaw device identity in `state/local/openclaw_device.json` and ignores that file in git because it contains local signing material. The adapter writes this credential atomically with file mode `0600`; its standard `state/local` parent is restricted to `0700`, and an existing legacy file is tightened before it is read.
@@ -473,7 +486,7 @@ Without a configured base URL, Veyra still builds the task packet but returns `a
 - `probes`: system, git, port, process, file, log, network, web, MCP, OpenClaw, and Hermes read-only probe envelopes
 - `tool_proxy`: SafeShell, SafeFile, SafeBrowser, and SafeAPI policy gates with trace logging and optional executor hooks
 - `rollback_audit`: snapshot, diff, ActionJournal timeline, replay plan, automatic replay runtime, compensation review jobs, guarded auto-execute, traces
-- `routers`: first-stage FastAPI route split for runtime observability, debug/audit/state, ops/runtime, agent, memory, commitments, and local setup surfaces; `main.py` remains runtime wiring only
+- `routers`: FastAPI route split for runtime observability, debug/audit/state, ops/runtime, agent/memory, Cases, commitments, Tool Governance, local setup, Phase 5, and Phase 6 surfaces; `main.py` retains runtime wiring plus 28 high-coupling product routes for intake/channel/Feishu, local Tool Proxy, rollback, health, MVP, and runtime entrypoints
 - `memory_bridge`: local/selected/runtime/all provider routing, sensitive-memory filtering, provider diagnostics, and external adapter hooks
 - `skills`: built-in skill registry/runtime for fixed low-risk workflows
 - `personas`: Minimalist, Operator, Engineer, Guardian, Steward

@@ -206,8 +206,9 @@ def main() -> int:
     memory = post_json(
         "/memory/patch",
         {
+            "user_id": "mvp-self-test",
+            "session_id": "mvp-self-test",
             "patch": {
-                "session_id": "mvp-self-test",
                 "task": "MVP self-test memory write",
                 "executor": "self-test",
                 "status": "success",

@@ -140,7 +140,11 @@ class CognitionPipeline:
         ctx = turn_context if isinstance(turn_context, dict) else self._build_turn_context(
             text=text, attention_focus=attention_focus, event=event
         )
-        awareness = self._awareness_snapshot(text=text, attention_focus=attention_focus)
+        awareness = self._awareness_snapshot(
+            text=text,
+            attention_focus=attention_focus,
+            event=event,
+        )
         understanding = self._normalize_understanding(turn_understanding)
         if understanding is None:
             understanding = self._orient_turn(
@@ -156,6 +160,7 @@ class CognitionPipeline:
             text=text,
             attention_focus=attention_focus,
             evidence_kind=understanding.evidence_kind,
+            event=event,
         )
         expanded = self._retrieve_context(
             understanding=understanding,
@@ -188,13 +193,26 @@ class CognitionPipeline:
             sufficiency=sufficiency,
         )
 
-    def _awareness_snapshot(self, *, text: str, attention_focus: list[str], evidence_kind: str = "") -> dict[str, Any]:
+    def _awareness_snapshot(
+        self,
+        *,
+        text: str,
+        attention_focus: list[str],
+        evidence_kind: str = "",
+        event: VeyraEvent | None = None,
+    ) -> dict[str, Any]:
         if not self.assembler:
             return {"status": "unavailable"}
         return self.assembler.snapshot(
             user_message=text,
             attention_focus=attention_focus,
             evidence_kind=evidence_kind,
+            user_id=str(event.source.user_id or "").strip() if event else "",
+            session_id=(
+                str(event.source.session_id or "").strip()
+                if event
+                else ""
+            ),
         )
 
     def _orient_turn(

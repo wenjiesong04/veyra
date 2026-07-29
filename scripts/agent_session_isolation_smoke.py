@@ -29,6 +29,7 @@ from core.world_state import WorldStateStore  # noqa: E402
 from interface.agent_adapter import AgentAdapter, ExecutionResult  # noqa: E402
 from interface.intake_gateway import IntakeGateway  # noqa: E402
 from interface.event_schema import Decision, EventSource, EventType, Route, VeyraEvent, VeyraTaskPacket  # noqa: E402
+from interface.session_mapper import SessionMapper  # noqa: E402
 from runtime.bounded_agent_negotiation import BoundedNegotiationError  # noqa: E402
 
 
@@ -118,10 +119,20 @@ def build_loop(tmp: Path) -> tuple[AwarenessLoop, FakeOpenClawAdapter]:
     return loop, fake
 
 
-def make_event(text: str, *, session_id: str, idx: int) -> VeyraEvent:
+def make_event(
+    text: str,
+    *,
+    session_id: str,
+    idx: int,
+    user_id: str = "ou_test",
+) -> VeyraEvent:
     return VeyraEvent(
         type=EventType.USER_MESSAGE,
-        source=EventSource(channel="feishu", user_id="ou_test", session_id=session_id),
+        source=EventSource(
+            channel="feishu",
+            user_id=user_id,
+            session_id=session_id,
+        ),
         payload={"text": text, "message_id": f"iso-{idx}"},
     )
 
@@ -199,6 +210,57 @@ def run() -> None:
             other.agent_execution_session_id not in session_ids,
             "different dialogue session gets its own isolated agent session",
             other.agent_execution_session_id,
+        )
+        mapper = SessionMapper()
+        expect(
+            mapper.map("api", "alice:private", "shared")
+            != mapper.map("api", "alice_private", "shared"),
+            "dialogue session mapper uses collision-safe framed identity",
+        )
+        owner_loop, owner_fake = build_loop(
+            tmp / "owner-bound-agent-session"
+        )
+        shared_dialogue = "shared-owner-dialogue"
+        owner_loop.handle_event(
+            make_event(
+                "为 Veyra 分析 SECRET_A_GOAL 并给出方案",
+                session_id=shared_dialogue,
+                idx=500,
+                user_id="user-a",
+            )
+        )
+        owner_loop.handle_event(
+            make_event(
+                "基于刚才结果继续这个任务",
+                session_id=shared_dialogue,
+                idx=501,
+                user_id="user-b",
+            )
+        )
+        expect(
+            len(owner_fake.sent) == 2
+            and owner_fake.sent[1].agent_session_policy
+            == "ephemeral_per_task"
+            and owner_fake.sent[1].agent_execution_session_id
+            != owner_fake.sent[0].agent_execution_session_id,
+            "same dialogue id cannot reuse another user's Agent session",
+            [
+                {
+                    "policy": packet.agent_session_policy,
+                    "session": packet.agent_execution_session_id,
+                }
+                for packet in owner_fake.sent
+            ],
+        )
+        expect(
+            "SECRET_A_GOAL"
+            not in __import__("json").dumps(
+                owner_fake.sent[1].to_dict(),
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            "cross-user continuation packet contains no previous user goal",
+            owner_fake.sent[1].to_dict(),
         )
 
         target_loop, target_fake = build_loop(

@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 
 from core.awareness_loop import AwarenessLoop  # noqa: E402
 from core.commitment_core import CommitmentCore  # noqa: E402
+from core.definitions import RiskLevel  # noqa: E402
 from core.decision_core import DecisionCore  # noqa: E402
 from core.perception_layer import PerceptionLayer  # noqa: E402
 from core.runtime_entity import RuntimeEntity  # noqa: E402
@@ -27,8 +28,10 @@ from core.world_state import (  # noqa: E402
     StateRevisionConflictError,
     WorldStateStore,
 )
+from interface.event_schema import LoopResult, Route  # noqa: E402
 from interface.event_normalizer import EventNormalizer  # noqa: E402
 from interface.intake_gateway import IntakeGateway  # noqa: E402
+from interface.session_mapper import SessionMapper  # noqa: E402
 from memory_bridge.local_memory_bridge import LocalMemoryBridge  # noqa: E402
 from runtime.retention_policy import RetentionPolicy  # noqa: E402
 
@@ -158,10 +161,135 @@ def test_failed_intake_can_retry(root: Path) -> None:
             pass
     state = store.read_json("channel_state.json")
     expect(
-        "retryable-message" not in state.get("seen_message_ids", {})
-        and len(state.get("intake_failures", [])) == 2,
+        not state.get("seen_message_ids")
+        and len(state.get("intake_failures", [])) == 2
+        and all(
+            item.get("message_id") == "retryable-message"
+            for item in state.get("intake_failures", [])
+            if isinstance(item, dict)
+        ),
         "failed intake releases dedupe reservation for retry",
         state,
+    )
+
+
+def test_intake_dedupe_scope_isolation(root: Path) -> None:
+    store = WorldStateStore(root, exclusive_writer=True, writer_owner="intake-dedupe-scope-smoke")
+
+    class SuccessfulLoop:
+        runtime_trace = None
+
+        def __init__(self) -> None:
+            self.events: list[Any] = []
+
+        def handle_event(self, inbound_event: Any) -> LoopResult:
+            self.events.append(inbound_event)
+            return LoopResult(
+                event_id=inbound_event.event_id,
+                route=Route.DIRECT_ANSWER,
+                status="success",
+                response="scope-isolated reply",
+                risk_level=RiskLevel.R0,
+            )
+
+    raw_message_id = "provider-shared-message-id"
+    legacy_event_id = "evt_legacy_other_owner"
+    legacy_session_id = "legacy-other-owner-session"
+    store.patch_json(
+        "channel_state.json",
+        {
+            "seen_message_ids": {
+                raw_message_id: {
+                    "event_id": legacy_event_id,
+                    "session_id": legacy_session_id,
+                    "status": "success",
+                }
+            }
+        },
+    )
+    loop = SuccessfulLoop()
+    gateway = IntakeGateway(loop, state_store=store)  # type: ignore[arg-type]
+    request_a = {
+        "text": "tenant A",
+        "channel": "api",
+        "user_id": "tenant:a",
+        "session_id": "dialogue",
+        "message_id": raw_message_id,
+    }
+    request_b = {
+        "text": "tenant B",
+        "channel": "api",
+        "user_id": "tenant",
+        "session_id": "a:dialogue",
+        "message_id": raw_message_id,
+    }
+    mapped_a = SessionMapper().map("api", "tenant:a", "dialogue")
+    mapped_b = SessionMapper().map("api", "tenant", "a:dialogue")
+    first_a = gateway.receive_message(**request_a)
+    first_b = gateway.receive_message(**request_b)
+    replay_b = gateway.receive_message(**request_b)
+    replay_text = json.dumps(replay_b, ensure_ascii=False, sort_keys=True)
+
+    expect(
+        mapped_a != mapped_b
+        and first_a.get("status") == "delivered"
+        and first_b.get("status") == "delivered"
+        and len(loop.events) == 2,
+        "framed session and intake scopes keep delimiter-collision identities independent",
+        {
+            "mapped_a": mapped_a,
+            "mapped_b": mapped_b,
+            "first_a": first_a,
+            "first_b": first_b,
+            "handled_count": len(loop.events),
+        },
+    )
+    expect(
+        replay_b.get("status") == "duplicate"
+        and replay_b.get("message_id") == raw_message_id
+        and replay_b.get("session_id") == mapped_b
+        and replay_b.get("previous", {}).get("event_id")
+        == first_b.get("event", {}).get("event_id")
+        and replay_b.get("previous", {}).get("session_id") == mapped_b
+        and len(loop.events) == 2,
+        "same exact owner replay is deduplicated while preserving the raw public message id",
+        replay_b,
+    )
+    expect(
+        first_a.get("event", {}).get("event_id") not in replay_text
+        and mapped_a not in replay_text
+        and legacy_event_id not in replay_text
+        and legacy_session_id not in replay_text,
+        "duplicate response cannot disclose another owner or legacy reservation",
+        replay_b,
+    )
+
+    state = store.read_json("channel_state.json")
+    seen = state.get("seen_message_ids", {})
+    scoped_entries = {
+        key: value
+        for key, value in seen.items()
+        if isinstance(key, str) and key.startswith("intake-dedupe-v2-")
+    }
+    scoped_owners = {
+        (
+            str((value.get("owner") or {}).get("user_id") or ""),
+            str((value.get("owner") or {}).get("session_id") or ""),
+        )
+        for value in scoped_entries.values()
+        if isinstance(value, dict)
+    }
+    expect(
+        raw_message_id in seen
+        and len(scoped_entries) == 2
+        and scoped_owners == {("tenant:a", mapped_a), ("tenant", mapped_b)}
+        and all(
+            value.get("scope_version") == "veyra-intake-dedupe-v2"
+            for value in scoped_entries.values()
+            if isinstance(value, dict)
+        ),
+        "legacy raw keys are ignored and new reservations persist exact versioned owner envelopes",
+        seen,
     )
 
 
@@ -220,6 +348,7 @@ def test_fact_and_memory_boundaries(root: Path) -> None:
     bridge = LocalMemoryBridge(store)
     bridge.write_patch(
         {
+            "user_id": "memory-boundary-user",
             "session_id": "memory-boundary",
             "memory_type": "user_preference",
             "preference": {"scope": "response_style", "source_text": "回答直接一点"},
@@ -241,10 +370,22 @@ def test_fact_and_memory_boundaries(root: Path) -> None:
     summary = TurnContextBuilder(store)._task_summary(
         {
             "short_term_memory": [
-                {"summary": "expired", "expires_at": expired},
-                {"summary": "active", "expires_at": active},
+                {
+                    "user_id": "memory-boundary-user",
+                    "session_id": "memory-boundary",
+                    "summary": "expired",
+                    "expires_at": expired,
+                },
+                {
+                    "user_id": "memory-boundary-user",
+                    "session_id": "memory-boundary",
+                    "summary": "active",
+                    "expires_at": active,
+                },
             ]
-        }
+        },
+        user_id="memory-boundary-user",
+        session_id="memory-boundary",
     )
     summaries = [item.get("summary") for item in summary.get("short_term_memory", []) if isinstance(item, dict)]
     expect(summaries == ["active"], "expired short-term memory is excluded from turn context", summary)
@@ -359,6 +500,8 @@ def main() -> int:
         test_corrupt_state_health(Path(tmp) / "state")
     with TemporaryDirectory(prefix="veyra-intake-retry-") as tmp:
         test_failed_intake_can_retry(Path(tmp) / "state")
+    with TemporaryDirectory(prefix="veyra-intake-dedupe-scope-") as tmp:
+        test_intake_dedupe_scope_isolation(Path(tmp) / "state")
     with TemporaryDirectory(prefix="veyra-boundaries-") as tmp:
         test_fact_and_memory_boundaries(Path(tmp) / "state")
     with TemporaryDirectory(prefix="veyra-retention-") as tmp:

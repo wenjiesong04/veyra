@@ -32,6 +32,7 @@ from interface.agent_contract import (
     normalize_execution_payload,
     validate_task_packet_payload,
 )
+from memory_bridge.scope import framed_sha256, normalize_scope_component
 from interface.event_schema import VeyraTaskPacket
 from interface.provider_certification import certify_agent_provider
 
@@ -87,6 +88,7 @@ class OpenClawAdapter(AgentAdapter):
         governance_dispatch_canceller: Callable[..., Any] | None = None,
         governance_run_evidence_resolver: Callable[..., Any] | None = None,
         governance_status_resolver: Callable[..., Any] | None = None,
+        native_memory_scope_verified: bool = False,
         **_: Any,
     ) -> None:
         raw_url = base_url or os.getenv("OPENCLAW_GATEWAY_URL") or os.getenv("OPENCLAW_BASE_URL", "")
@@ -108,9 +110,24 @@ class OpenClawAdapter(AgentAdapter):
         self.memory_scopes = self._scopes(os.getenv("OPENCLAW_MEMORY_SCOPES", ",".join([*self.scopes, "operator.admin"])))
         self.device_store = Path(os.getenv("OPENCLAW_DEVICE_STORE", "state/local/openclaw_device.json"))
         self.workspace_memory_fallback_enabled = os.getenv("VEYRA_OPENCLAW_WORKSPACE_MEMORY_FALLBACK", "1").strip().lower() not in {"0", "false", "no"}
+        # OpenClaw's native memory method currently has no verified contract
+        # proving whether sessionId or sessionKey is the authoritative tenant
+        # boundary. Production therefore fails closed to a Veyra-private
+        # scoped fallback that is outside the OpenClaw workspace index. Tests
+        # or a future certified adapter revision may enable native Memory
+        # this only with a derived owner/session scope for both fields.
+        self.native_memory_scope_verified = bool(
+            native_memory_scope_verified
+        )
         self.openclaw_workspace = Path(os.getenv("OPENCLAW_WORKSPACE_DIR", str(Path.home() / ".openclaw" / "workspace"))).expanduser()
         self.openclaw_workspace_memory_dir = Path(
             os.getenv("OPENCLAW_WORKSPACE_MEMORY_DIR", str(self.openclaw_workspace / "memory"))
+        ).expanduser()
+        self.openclaw_config_path = Path(
+            os.getenv(
+                "OPENCLAW_CONFIG_PATH",
+                str(Path.home() / ".openclaw" / "openclaw.json"),
+            )
         ).expanduser()
         self.veyra_memory_mirror_dir = Path(os.getenv("VEYRA_OPENCLAW_MEMORY_MIRROR_DIR", "state/local/openclaw_memory_mirror")).expanduser()
         self.protocol_min = protocol_min if protocol_min is not None else self._int_env("OPENCLAW_PROTOCOL_MIN", DEFAULT_OPENCLAW_PROTOCOL_MIN)
@@ -551,8 +568,26 @@ class OpenClawAdapter(AgentAdapter):
     def fetch_memory_summary(self, session_id: str) -> dict[str, Any]:
         if not self.gateway_url:
             return {"session_id": session_id, "summary": "", "runtime": "openclaw", "status": "not_configured"}
+        if not self.native_memory_scope_verified:
+            return self._workspace_memory_summary(
+                session_id,
+                gateway_error={
+                    "status": "native_scope_unverified",
+                    "message": (
+                        "OpenClaw native memory scope contract is not "
+                        "certified; using Veyra scoped fallback"
+                    ),
+                },
+            )
         try:
-            response = self._gateway_request("memory.summary", {"sessionId": session_id, "sessionKey": self.session_key}, scopes=self.memory_scopes)
+            response = self._gateway_request(
+                "memory.summary",
+                {
+                    "sessionId": session_id,
+                    "sessionKey": session_id,
+                },
+                scopes=self.memory_scopes,
+            )
         except OpenClawGatewayError as exc:
             return self._workspace_memory_summary(session_id, gateway_error={"status": exc.status, "message": exc.message})
         summary = response.get("summary") or response.get("text") or response.get("memory") or ""
@@ -569,8 +604,38 @@ class OpenClawAdapter(AgentAdapter):
     def write_memory_patch(self, memory_patch: dict[str, Any]) -> dict[str, Any]:
         if not self.gateway_url:
             return {"status": "not_configured", "runtime": "openclaw"}
+        if not self.native_memory_scope_verified:
+            return self._workspace_memory_patch(
+                memory_patch,
+                gateway_error={
+                    "status": "native_scope_unverified",
+                    "message": (
+                        "OpenClaw native memory scope contract is not "
+                        "certified; using Veyra scoped fallback"
+                    ),
+                },
+            )
+        scoped_session_id = str(
+            (memory_patch if isinstance(memory_patch, dict) else {}).get(
+                "session_id"
+            )
+            or ""
+        ).strip()
+        if not scoped_session_id:
+            return {
+                "status": "blocked",
+                "runtime": "openclaw",
+                "reason": "memory_scope_required",
+            }
         try:
-            response = self._gateway_request("memory.patch", {"sessionKey": self.session_key, "patch": memory_patch}, scopes=self.memory_scopes)
+            response = self._gateway_request(
+                "memory.patch",
+                {
+                    "sessionKey": scoped_session_id,
+                    "patch": memory_patch,
+                },
+                scopes=self.memory_scopes,
+            )
         except OpenClawGatewayError as exc:
             return self._workspace_memory_patch(memory_patch, gateway_error={"status": exc.status, "message": exc.message})
         if str(response.get("status") or "") in {"method_unavailable", "unknown_method", "unsupported"}:
@@ -587,7 +652,35 @@ class OpenClawAdapter(AgentAdapter):
                 "error": str(gateway_error.get("message") or "OpenClaw memory RPC unavailable"),
                 "fallback": {"enabled": False},
             }
-        files = self._workspace_memory_files()
+        try:
+            scoped_session_id = normalize_scope_component(
+                session_id,
+                "session_id",
+            )
+        except ValueError as exc:
+            return {
+                "session_id": "",
+                "summary": "",
+                "runtime": "openclaw",
+                "status": "invalid_memory_scope",
+                "error": str(exc),
+                "fallback": {"enabled": True},
+            }
+        mirror_safety_error = self._memory_mirror_safety_error()
+        if mirror_safety_error:
+            return {
+                "session_id": session_id,
+                "summary": "",
+                "runtime": "openclaw",
+                "status": "blocked",
+                "reason": mirror_safety_error,
+                "freshness": "stale",
+                "trust": "untrusted",
+                "source": "veyra_private_scoped_files",
+                "sync_status": "not_read",
+                "gateway_error": self._redact_payload(gateway_error),
+            }
+        files = self._workspace_memory_files(scoped_session_id)
         chunks: list[str] = []
         for path in files:
             text = self._read_workspace_memory_file(path)
@@ -605,12 +698,11 @@ class OpenClawAdapter(AgentAdapter):
             "status": status,
             "freshness": "fresh" if summary else "stale",
             "trust": "workspace_file_fallback" if summary else "untrusted",
-            "source": "openclaw_workspace_files",
+            "source": "veyra_private_scoped_files",
             "sync_status": "pending_gateway_support",
             "files": [self._display_path(path) for path in files],
             "gateway_error": self._redact_payload(gateway_error),
         }
-        self._audit_workspace_memory("summary", status, result)
         return result
 
     def _workspace_memory_patch(self, memory_patch: dict[str, Any], *, gateway_error: dict[str, Any]) -> dict[str, Any]:
@@ -621,35 +713,64 @@ class OpenClawAdapter(AgentAdapter):
                 "error": str(gateway_error.get("message") or "OpenClaw memory RPC unavailable"),
                 "fallback": {"enabled": False},
             }
-        sanitized = self._redact_payload(memory_patch if isinstance(memory_patch, dict) else {"patch": memory_patch})
+        raw_patch = memory_patch if isinstance(memory_patch, dict) else {}
+        try:
+            scoped_session_id = normalize_scope_component(
+                raw_patch.get("session_id"),
+                "session_id",
+            )
+        except ValueError as exc:
+            result = {
+                "status": "blocked",
+                "runtime": "openclaw",
+                "reason": "invalid_memory_scope",
+                "error": str(exc),
+                "sync_status": "not_written",
+                "gateway_error": self._redact_payload(gateway_error),
+            }
+            self._audit_workspace_memory("patch", "blocked", result)
+            return result
+        mirror_safety_error = self._memory_mirror_safety_error()
+        if mirror_safety_error:
+            result = {
+                "status": "blocked",
+                "runtime": "openclaw",
+                "reason": mirror_safety_error,
+                "sync_status": "not_written",
+                "gateway_error": self._redact_payload(gateway_error),
+            }
+            self._audit_workspace_memory("patch", "blocked", result)
+            return result
+        sanitized = self._redact_payload(raw_patch)
         now = self._utc_now()
         note = self._memory_patch_note(sanitized, now=now)
-        target = self.openclaw_workspace_memory_dir / f"{now[:10]}-veyra.md"
-        write_target = target
-        mode = "workspace_file"
+        scope_dir = self._workspace_memory_scope_dir(
+            self.veyra_memory_mirror_dir,
+            scoped_session_id,
+        )
+        target = scope_dir / f"{now[:10]}-veyra.md"
+        mode = "veyra_private_mirror"
         try:
-            self._append_text(write_target, note)
+            self._append_text(target, note)
         except OSError as exc:
-            mode = "local_mirror"
-            write_target = self.veyra_memory_mirror_dir / f"{now[:10]}-veyra.md"
-            try:
-                self._append_text(write_target, note + f"\n\nfallback_error: {type(exc).__name__}: {str(exc)[:300]}\n")
-            except OSError as mirror_exc:
-                result = {
-                    "status": "error",
-                    "runtime": "openclaw",
-                    "error": f"workspace and local mirror memory fallback failed: {mirror_exc}",
-                    "sync_status": "pending_gateway_support",
-                    "gateway_error": self._redact_payload(gateway_error),
-                }
-                self._audit_workspace_memory("patch", "error", result)
-                return result
+            result = {
+                "status": "error",
+                "runtime": "openclaw",
+                "error": (
+                    "Veyra private scoped memory fallback failed: "
+                    f"{type(exc).__name__}: {str(exc)[:300]}"
+                ),
+                "sync_status": "pending_gateway_support",
+                "gateway_error": self._redact_payload(gateway_error),
+            }
+            self._audit_workspace_memory("patch", "error", result)
+            return result
         memory_id = "owm_" + hashlib.sha256(json.dumps(sanitized, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
         result = {
             "status": "workspace_file_fallback",
             "runtime": "openclaw",
             "memory_id": memory_id,
-            "path": str(write_target),
+            "path": str(target),
             "fallback_mode": mode,
             "sync_status": "pending_gateway_support",
             "gateway_error": self._redact_payload(gateway_error),
@@ -657,36 +778,124 @@ class OpenClawAdapter(AgentAdapter):
         self._audit_workspace_memory("patch", "workspace_file_fallback", result)
         return result
 
-    def _workspace_memory_files(self) -> list[Path]:
-        explicit = os.getenv("OPENCLAW_WORKSPACE_MEMORY_FILES", "")
-        files: list[Path] = []
-        if explicit:
-            for item in explicit.split(","):
-                path = Path(item.strip()).expanduser()
-                if path.is_file():
-                    files.append(path)
-        memory_md = self.openclaw_workspace / "MEMORY.md"
-        if memory_md.is_file():
-            files.append(memory_md)
-        if self.openclaw_workspace_memory_dir.is_dir():
-            dated = sorted(
-                [
-                    path
-                    for path in self.openclaw_workspace_memory_dir.glob("*.md")
-                    if path.is_file() and self._looks_like_memory_note(path.name)
-                ],
-                key=lambda path: path.stat().st_mtime,
+    def _workspace_memory_files(self, scoped_session_id: str) -> list[Path]:
+        dated: list[Path] = []
+        scope_dir = self._workspace_memory_scope_dir(
+            self.veyra_memory_mirror_dir,
+            scoped_session_id,
+        )
+        if scope_dir.is_dir():
+            dated.extend(
+                path
+                for path in scope_dir.glob("*.md")
+                if path.is_file()
+                and self._looks_like_memory_note(path.name)
             )
-            files.extend(dated[-20:])
-        deduped: list[Path] = []
-        seen: set[str] = set()
-        for path in files:
-            key = str(path.resolve()) if path.exists() else str(path)
-            if key in seen:
+        return sorted(
+            dated,
+            key=lambda path: path.stat().st_mtime,
+        )[-20:]
+
+    def _workspace_memory_scope_dir(self, root: Path, scoped_session_id: str) -> Path:
+        digest = framed_sha256(
+            "openclaw-private-memory-scope-v2",
+            normalize_scope_component(
+                scoped_session_id,
+                "session_id",
+            ),
+        )
+        return root / "veyra-scoped" / f"scope-{digest[:32]}"
+
+    def _memory_mirror_safety_error(self) -> str | None:
+        """Reject mirrors that OpenClaw can recursively index as native memory."""
+
+        try:
+            mirror = self.veyra_memory_mirror_dir.expanduser().resolve()
+            indexed_roots = {
+                self.openclaw_workspace.expanduser().resolve(),
+                self.openclaw_workspace_memory_dir.expanduser().resolve(),
+            }
+        except OSError:
+            return "memory_mirror_path_unresolvable"
+        configured_roots, config_error = (
+            self._configured_memory_index_roots()
+        )
+        if config_error:
+            return config_error
+        indexed_roots.update(configured_roots)
+        if any(
+            mirror == indexed_root
+            or indexed_root in mirror.parents
+            or mirror in indexed_root.parents
+            for indexed_root in indexed_roots
+        ):
+            return "memory_mirror_inside_openclaw_index"
+        return None
+
+    def _configured_memory_index_roots(
+        self,
+    ) -> tuple[set[Path], str | None]:
+        path = self.openclaw_config_path
+        if not path.exists():
+            return set(), None
+        try:
+            config = json.loads(path.read_text(encoding="utf-8") or "{}")
+        except (OSError, json.JSONDecodeError):
+            return set(), "openclaw_memory_index_config_unreadable"
+        if not isinstance(config, dict):
+            return set(), "openclaw_memory_index_config_invalid"
+        agents = (
+            config.get("agents")
+            if isinstance(config.get("agents"), dict)
+            else {}
+        )
+        defaults = (
+            agents.get("defaults")
+            if isinstance(agents.get("defaults"), dict)
+            else {}
+        )
+        memory_search = (
+            defaults.get("memorySearch")
+            if isinstance(defaults.get("memorySearch"), dict)
+            else {}
+        )
+        memory = (
+            config.get("memory")
+            if isinstance(config.get("memory"), dict)
+            else {}
+        )
+        qmd = (
+            memory.get("qmd")
+            if isinstance(memory.get("qmd"), dict)
+            else {}
+        )
+        roots: set[Path] = set()
+        for raw_paths in (
+            memory_search.get("extraPaths"),
+            qmd.get("paths"),
+        ):
+            if raw_paths is None:
                 continue
-            seen.add(key)
-            deduped.append(path)
-        return deduped
+            if not isinstance(raw_paths, list):
+                return set(), "openclaw_memory_index_config_invalid"
+            for raw in raw_paths:
+                value = (
+                    raw
+                    if isinstance(raw, str)
+                    else raw.get("path")
+                    if isinstance(raw, dict)
+                    else None
+                )
+                if not isinstance(value, str) or not value.strip():
+                    return set(), "openclaw_memory_index_config_invalid"
+                candidate = Path(value).expanduser()
+                if not candidate.is_absolute():
+                    candidate = self.openclaw_workspace / candidate
+                try:
+                    roots.add(candidate.resolve())
+                except OSError:
+                    return set(), "openclaw_memory_index_config_unreadable"
+        return roots, None
 
     def _looks_like_memory_note(self, name: str) -> bool:
         if name == "MEMORY.md":
@@ -711,7 +920,7 @@ class OpenClawAdapter(AgentAdapter):
         return (
             f"\n\n## Veyra memory patch - {now}\n\n"
             "sync_status: pending_gateway_support\n"
-            "source: veyra_workspace_file_fallback\n"
+            "source: veyra_private_scoped_fallback\n"
             f"session_id: {session_id[:180]}\n"
             f"topic: {topic[:180]}\n"
             f"summary: {summary[:500]}\n\n"
@@ -1331,8 +1540,17 @@ class OpenClawAdapter(AgentAdapter):
                 **self._phase4_capability_features(),
                 "structured_task_packet": True,
                 "rendered_prompt_fallback": True,
-                "memory_summary": bool(optional_methods.get("memory.summary")),
-                "memory_patch": bool(optional_methods.get("memory.patch")),
+                "memory_summary": bool(
+                    optional_methods.get("memory.summary")
+                    and self.native_memory_scope_verified
+                ),
+                "memory_patch": bool(
+                    optional_methods.get("memory.patch")
+                    and self.native_memory_scope_verified
+                ),
+                "memory_native_scope_verified": (
+                    self.native_memory_scope_verified
+                ),
                 "task_status": True,
                 "task_poll": "agent.wait+chat.history",
                 "stop_task": True,
@@ -2903,7 +3121,12 @@ class OpenClawAdapter(AgentAdapter):
     def _local_gateway_token(self) -> str:
         if os.getenv("VEYRA_OPENCLAW_USE_LOCAL_CONFIG", "1").strip().lower() in {"0", "false", "no"}:
             return ""
-        path = Path.home() / ".openclaw" / "openclaw.json"
+        path = Path(
+            os.getenv(
+                "OPENCLAW_CONFIG_PATH",
+                str(Path.home() / ".openclaw" / "openclaw.json"),
+            )
+        ).expanduser()
         if not path.exists():
             return ""
         try:

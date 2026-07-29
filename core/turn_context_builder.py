@@ -35,7 +35,12 @@ class TurnContextBuilder:
         persona_hint: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         state = self._scoped_state()
-        relevant_claims = self.belief.relevant_claims(attention_focus, limit=4)
+        relevant_claims = self.belief.relevant_claims(
+            attention_focus,
+            limit=4,
+            user_id=event.source.user_id if event else "",
+            session_id=event.source.session_id if event else "",
+        )
         fresh_claims = [
             self._claim_summary(claim)
             for claim in relevant_claims
@@ -68,6 +73,7 @@ class TurnContextBuilder:
                     "conversation_tail": self._conversation_tail(event, limit=6),
                     "conversation_slots": self._conversation_slots(
                         state.get("task_state", {}),
+                        user_id=event.source.user_id if event else None,
                         session_id=event.source.session_id if event else None,
                     ),
                     "user": self._user_world_summary(
@@ -76,6 +82,7 @@ class TurnContextBuilder:
                     ),
                     "task": self._task_summary(
                         state.get("task_state", {}),
+                        user_id=event.source.user_id if event else None,
                         session_id=event.source.session_id if event else None,
                     ),
                 },
@@ -183,10 +190,27 @@ class TurnContextBuilder:
         state = self.state_store.read_json("channel_state.json")
         inbox = state.get("inbox") if isinstance(state.get("inbox"), list) else []
         outbox = state.get("outbox") if isinstance(state.get("outbox"), list) else []
+        user_id = str(event.source.user_id or "").strip()
         session_id = event.source.session_id
+        if not user_id or not session_id:
+            return []
+        owned_event_ids = {
+            str(item.get("event_id"))
+            for item in inbox
+            if self._owned_session_item(
+                item,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            and item.get("event_id")
+        }
         tail: list[dict[str, Any]] = []
         for item in inbox:
-            if not isinstance(item, dict) or item.get("session_id") != session_id:
+            if not self._owned_session_item(
+                item,
+                user_id=user_id,
+                session_id=session_id,
+            ):
                 continue
             metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
             feishu = metadata.get("feishu") if isinstance(metadata.get("feishu"), dict) else {}
@@ -200,9 +224,32 @@ class TurnContextBuilder:
                 }
             )
         for item in outbox:
-            if not isinstance(item, dict) or item.get("session_id") != session_id:
+            if not isinstance(item, dict) or str(item.get("session_id") or "") != session_id:
                 continue
             metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            direct_user = str(item.get("user_id") or "").strip()
+            metadata_user = str(metadata.get("user_id") or "").strip()
+            direct_event_id = str(item.get("event_id") or "").strip()
+            metadata_event_id = str(metadata.get("event_id") or "").strip()
+            if direct_user and metadata_user and direct_user != metadata_user:
+                continue
+            if (
+                direct_event_id
+                and metadata_event_id
+                and direct_event_id != metadata_event_id
+            ):
+                continue
+            item_user = direct_user or metadata_user
+            event_id = direct_event_id or metadata_event_id
+            if item_user:
+                if item_user != user_id:
+                    continue
+                if event_id and event_id not in owned_event_ids:
+                    continue
+            elif not event_id or event_id not in owned_event_ids:
+                # Historical outbox records have no owner. They are visible
+                # only when an exact owned inbound event proves the linkage.
+                continue
             tail.append(
                 {
                     "direction": "outbound",
@@ -215,12 +262,22 @@ class TurnContextBuilder:
         tail.sort(key=lambda item: str(item.get("received_at") or ""))
         return tail[-limit:]
 
-    def _conversation_slots(self, task_state: dict[str, Any], session_id: str | None) -> dict[str, Any]:
-        if not session_id or not isinstance(task_state, dict):
+    def _conversation_slots(
+        self,
+        task_state: dict[str, Any],
+        *,
+        user_id: str | None,
+        session_id: str | None,
+    ) -> dict[str, Any]:
+        if not user_id or not session_id or not isinstance(task_state, dict):
             return {}
         slots_by_session = task_state.get("conversation_slots") if isinstance(task_state.get("conversation_slots"), dict) else {}
         slots = slots_by_session.get(session_id) if isinstance(slots_by_session, dict) else {}
-        if not isinstance(slots, dict):
+        if not self._owned_session_item(
+            slots,
+            user_id=user_id,
+            session_id=session_id,
+        ):
             return {}
         tool = slots.get("last_tool_result") if isinstance(slots.get("last_tool_result"), dict) else {}
         compact_tool: dict[str, Any] = {
@@ -287,53 +344,111 @@ class TurnContextBuilder:
         ]
 
     def _user_world_summary(self, value: Any, *, user_id: str | None = None) -> dict[str, Any]:
-        if not isinstance(value, dict):
+        if not isinstance(value, dict) or not user_id:
             return {}
         scoped: dict[str, Any] = {}
         profiles = value.get("profiles_by_user") if isinstance(value.get("profiles_by_user"), dict) else {}
         if user_id and isinstance(profiles.get(user_id), dict):
             scoped = profiles.get(user_id) or {}
-        preferences = value.get("preferences", {}) if isinstance(value.get("preferences"), dict) else {}
+        if not scoped:
+            return {}
         scoped_preferences = scoped.get("preferences") if isinstance(scoped.get("preferences"), dict) else {}
-        profile = scoped.get("profile") if isinstance(scoped.get("profile"), dict) else value.get("profile", {})
-        focus = scoped.get("focus") if isinstance(scoped.get("focus"), list) else value.get("focus", [])
+        profile = scoped.get("profile") if isinstance(scoped.get("profile"), dict) else {}
+        focus = scoped.get("focus") if isinstance(scoped.get("focus"), list) else []
         return {
-            "preferences": self._limit_mapping({**preferences, **scoped_preferences}, 6),
+            "preferences": self._limit_mapping(scoped_preferences, 6),
             "profile": self._limit_mapping(profile, 6),
-            "current_goal": self._clip(scoped.get("current_goal") or value.get("current_goal", ""), 180),
-            "current_project": self._clip(scoped.get("current_project") or value.get("current_project", ""), 120),
+            "current_goal": self._clip(scoped.get("current_goal") or "", 180),
+            "current_project": self._clip(scoped.get("current_project") or "", 120),
             "focus": focus,
         }
 
-    def _task_summary(self, value: Any, *, session_id: str | None = None) -> dict[str, Any]:
+    def _task_summary(
+        self,
+        value: Any,
+        *,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
         if not isinstance(value, dict):
             return {}
         history = value.get("history") if isinstance(value.get("history"), list) else []
         short_term = value.get("short_term_memory") if isinstance(value.get("short_term_memory"), list) else []
         pending = value.get("pending_agent_tasks") if isinstance(value.get("pending_agent_tasks"), list) else []
-        short_term = [item for item in short_term if not isinstance(item, dict) or not self._memory_expired(item)]
-        if session_id:
-            history = [
-                item
-                for item in history
-                if not isinstance(item, dict) or not item.get("session_id") or str(item.get("session_id")) == session_id
-            ]
-            short_term = [
-                item
-                for item in short_term
-                if not isinstance(item, dict) or not item.get("session_id") or str(item.get("session_id")) == session_id
-            ]
-            pending = [
-                item
-                for item in pending
-                if not isinstance(item, dict) or not item.get("session_id") or str(item.get("session_id")) == session_id
-            ]
+        if not user_id or not session_id:
+            return {
+                "current_task": None,
+                "recent_history": [],
+                "short_term_memory": [],
+                "pending_agent_tasks": [],
+            }
+        history = [
+            item
+            for item in history
+            if self._owned_session_item(
+                item,
+                user_id=user_id,
+                session_id=session_id,
+            )
+        ]
+        short_term = [
+            item
+            for item in short_term
+            if self._owned_session_item(
+                item,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            and not self._memory_expired(item)
+        ]
+        pending = [
+            item
+            for item in pending
+            if self._owned_session_item(
+                item,
+                user_id=user_id,
+                session_id=session_id,
+            )
+        ]
+        current_task = value.get("current_task")
+        if not self._owned_session_item(
+            current_task,
+            user_id=user_id,
+            session_id=session_id,
+        ):
+            current_task = None
         return {
-            "current_task": self._compact_task_item(value.get("current_task")),
+            "current_task": self._compact_task_item(current_task),
             "recent_history": [self._compact_task_item(item) for item in history[-2:]],
             "short_term_memory": [self._compact_task_item(item) for item in short_term[-3:]],
             "pending_agent_tasks": [self._compact_task_item(item) for item in pending[-2:]],
         }
+
+    @staticmethod
+    def _owned_session_item(
+        item: Any,
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> bool:
+        if not isinstance(item, dict):
+            return False
+        context = (
+            item.get("task_context")
+            if isinstance(item.get("task_context"), dict)
+            else {}
+        )
+        direct_user = str(item.get("user_id") or "").strip()
+        context_user = str(context.get("user_id") or "").strip()
+        direct_session = str(item.get("session_id") or "").strip()
+        context_session = str(context.get("session_id") or "").strip()
+        if direct_user and context_user and direct_user != context_user:
+            return False
+        if direct_session and context_session and direct_session != context_session:
+            return False
+        item_user = direct_user or context_user
+        item_session = direct_session or context_session
+        return item_user == user_id and item_session == session_id
 
     def _memory_expired(self, item: dict[str, Any]) -> bool:
         value = str(item.get("expires_at") or "")

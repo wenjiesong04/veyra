@@ -84,7 +84,8 @@ curl -s -X POST http://127.0.0.1:8000/commitments \
 **API 确认：**
 
 ```bash
-curl -s -X POST http://127.0.0.1:8000/commitments/<commitment_id>/confirm
+curl -s -X POST \
+  'http://127.0.0.1:8000/commitments/<commitment_id>/confirm?user_id=demo-user&session_id=demo-session'
 ```
 
 **对话确认：** 先问天气，在 Veyra 询问是否订阅后回复「好的」。
@@ -100,6 +101,8 @@ curl -s -X POST http://127.0.0.1:8000/commitments/run-due \
   -H 'Content-Type: application/json' \
   -d '{"limit": 5, "reason": "manual_acceptance"}'
 ```
+
+`run-due` 是 loopback 管理面的 operator-wide 调度动作；它不是 tenant-scoped 读取接口。
 
 **Cron job：**
 
@@ -133,7 +136,8 @@ curl -s 'http://127.0.0.1:8000/channels/outbox?limit=20'
 ## 7. 查看 push_history 与 next_run_at
 
 ```bash
-curl -s http://127.0.0.1:8000/commitments/<commitment_id>
+curl -s \
+  'http://127.0.0.1:8000/commitments/<commitment_id>?user_id=demo-user&session_id=demo-session'
 ```
 
 检查：
@@ -176,7 +180,7 @@ state/logs/action_record.jsonl
 - **可推送**必须同时满足：`status=active` **且** `confirmed_at` 非空。
 - `confirmed_at` 表示用户或运维方**已明确授权**出站推送（对话回复「好的」或 `POST .../confirm`）。
 - `POST /commitments` 若直接创建 `status=active`，服务端会**自动写入** `confirmed_at=now`，语义为：该 API 调用本身视为显式授权（适合运维/验收脚本）。
-- 若需“先创建、后确认”流程，请创建 `status=pending_confirmation`，再调用 `POST /commitments/{id}/confirm`。
+- 若需“先创建、后确认”流程，请创建 `status=pending_confirmation`，再以 exact `user_id + session_id` 调用 `POST /commitments/{id}/confirm`。
 
 ### 冷却与 `next_run_at`
 
@@ -204,7 +208,8 @@ python scripts/commitment_runtime_acceptance.py http://127.0.0.1:8000
 验收脚本使用独立临时目录（`--embedded`）或你指定的运行 `state/`。不需要的测试 commitment 可：
 
 ```bash
-curl -s -X POST http://127.0.0.1:8000/commitments/<id>/cancel
+curl -s -X POST \
+  'http://127.0.0.1:8000/commitments/<id>/cancel?user_id=demo-user&session_id=demo-session'
 ```
 
 验收脚本可在不再需要时删除：`scripts/commitment_runtime_acceptance.py`。

@@ -58,6 +58,8 @@ class LearningPlanTemplate(ProactiveIntentTemplate):
             ),
             commitment=commitment,
             goal=goal,
+            user_id=event.source.user_id,
+            session_id=event.source.session_id,
         )
         result["intent"] = intent.to_dict()
         result["goal_draft"] = GoalDraft(
@@ -124,7 +126,9 @@ class ExternalTrackingTemplate(ProactiveIntentTemplate):
                 ttl=1800,
                 status="pending_confirmation",
                 source_intent_id=intent.intent_id,
-            )
+            ),
+            user_id=event.source.user_id,
+            session_id=event.source.session_id,
         )
         commitment = core.create_commitment(
             {
