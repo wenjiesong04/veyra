@@ -690,6 +690,126 @@ class ExtensionArtifactQuarantine:
         self._require_owner(record, selected_user, selected_workspace)
         return self._public_artifact(record)
 
+    def source_check_subject(
+        self,
+        *,
+        artifact_id: str,
+        user_id: str,
+        workspace_id: str,
+        expected_artifact_revision: int,
+        expected_artifact_sha256: str,
+    ) -> dict[str, Any]:
+        """Return exact private bytes for the non-executing source gate.
+
+        This in-process boundary is deliberately unavailable over HTTP.  It
+        revalidates the owner, current Spec gate, artifact lifecycle, expiry,
+        immutable blob identity, and caller CAS before returning bytes.  It
+        grants no parser, test, execution, signing, or promotion authority.
+        """
+
+        selected_user, selected_workspace, state = (
+            self._read_owner_state(user_id, workspace_id)
+        )
+        selected_artifact = self._required_artifact_id(artifact_id)
+        selected_revision = self._required_revision(
+            expected_artifact_revision
+        )
+        selected_digest = str(expected_artifact_sha256 or "")
+        if not _DIGEST.fullmatch(selected_digest):
+            raise ValueError(
+                "expected_artifact_sha256 must be a SHA-256 digest"
+            )
+        record = self._record_by_id(state, selected_artifact)
+        self._require_owner(record, selected_user, selected_workspace)
+        if (
+            record["revision"] != selected_revision
+            or record["artifact_sha256"] != selected_digest
+        ):
+            raise ExtensionArtifactConflictError(
+                "artifact source-check CAS or digest changed"
+            )
+        if record["stage"] != "ARTIFACT_QUARANTINED":
+            raise ExtensionArtifactConflictError(
+                "source check requires a quarantined artifact"
+            )
+        if self._is_expired(record):
+            raise ExtensionArtifactConflictError(
+                "source check requires a fresh artifact"
+            )
+        try:
+            spec_subject = self.spec_quarantine.artifact_subject(
+                candidate_id=str(record["candidate_id"]),
+                user_id=selected_user,
+                workspace_id=selected_workspace,
+                require_gate_passed=True,
+            )
+        except ExtensionSpecQuarantineError:
+            raise
+        except Exception as exc:
+            raise ExtensionArtifactStorageError(
+                "source-check Spec binding is unavailable"
+            ) from exc
+        if self._binding_status_from_subject(
+            record,
+            spec_subject,
+        ) != "validated":
+            raise ExtensionArtifactConflictError(
+                "source check requires the exact gated candidate"
+            )
+        contract = spec_subject.get("source_check_contract")
+        source_check_spec = spec_subject.get("source_check_spec")
+        if (
+            not isinstance(contract, dict)
+            or not isinstance(source_check_spec, dict)
+        ):
+            raise ExtensionArtifactStorageError(
+                "source-check contract is unavailable"
+            )
+        try:
+            content = self.blob_store.read(
+                selected_artifact,
+                expected_metadata=BlobMetadata.from_dict(record["blob"]),
+            )
+        except Exception as exc:
+            raise ExtensionArtifactStorageError(
+                "source-check artifact bytes are unavailable"
+            ) from exc
+        if (
+            len(content) != record["size_bytes"]
+            or hashlib.sha256(content).hexdigest() != selected_digest
+        ):
+            raise ExtensionArtifactStorageError(
+                "source-check artifact identity changed"
+            )
+        return {
+            "schema_version": (
+                "veyra.phase6.extension_source_check_subject.v1"
+            ),
+            "artifact_id": record["artifact_id"],
+            "artifact_revision": record["revision"],
+            "artifact_sha256": record["artifact_sha256"],
+            "artifact_size_bytes": record["size_bytes"],
+            "artifact_envelope_digest": record["envelope_digest"],
+            "artifact_policy_revision": record[
+                "artifact_policy_revision"
+            ],
+            "candidate_id": record["candidate_id"],
+            "candidate_revision": record["candidate_revision"],
+            "spec_digest": record["spec_digest"],
+            "extension_policy_revision": record[
+                "extension_policy_revision"
+            ],
+            "extension_id": record["extension_id"],
+            "extension_version": record["extension_version"],
+            "owner_scope_digest": record["owner_scope_digest"],
+            "user_id": selected_user,
+            "workspace_id": selected_workspace,
+            "source_check_contract": dict(contract),
+            "source_check_spec": dict(source_check_spec),
+            "source_bytes": content,
+            "authority": self._authority(),
+        }
+
     def list(
         self,
         *,

@@ -49,6 +49,9 @@ from routers.phase6_extensions import (
 from routers.phase6_extension_artifacts import (
     build_phase6_extension_artifacts_router,
 )
+from routers.phase6_extension_source_checks import (
+    build_phase6_extension_source_checks_router,
+)
 from routers.runtime_observability import build_runtime_observability_router
 from routers.tool_governance import build_tool_governance_router
 from runtime.active_loop import ActiveRuntimeLoop
@@ -84,6 +87,9 @@ from runtime.extension_spec_quarantine import (
 )
 from runtime.extension_artifact_quarantine import (
     ExtensionArtifactQuarantine,
+)
+from runtime.extension_source_policy_gate import (
+    ExtensionSourcePolicyGate,
 )
 from runtime.soak_runner import SoakRunner
 from runtime.state_refresh import StateRefresh
@@ -376,6 +382,10 @@ phase6_extension_specs = ExtensionSpecQuarantine(
 phase6_extension_artifacts = ExtensionArtifactQuarantine(
     state_store=state_store,
     spec_quarantine=phase6_extension_specs,
+)
+phase6_extension_source_checks = ExtensionSourcePolicyGate(
+    state_store=state_store,
+    artifact_quarantine=phase6_extension_artifacts,
 )
 
 
@@ -739,11 +749,18 @@ app.include_router(
     build_phase6_extensions_router(
         quarantine=phase6_extension_specs,
         artifact_quarantine=phase6_extension_artifacts,
+        source_check_gate=phase6_extension_source_checks,
     )
 )
 app.include_router(
     build_phase6_extension_artifacts_router(
         quarantine=phase6_extension_artifacts,
+        source_check_gate=phase6_extension_source_checks,
+    )
+)
+app.include_router(
+    build_phase6_extension_source_checks_router(
+        gate=phase6_extension_source_checks,
     )
 )
 app.include_router(

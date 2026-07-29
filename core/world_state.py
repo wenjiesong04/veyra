@@ -93,6 +93,7 @@ STATE_FILE_LAYOUT: dict[str, str] = {
     "phase6_collaboration_state.json": f"{STATE_RUNTIME}/phase6_collaboration_state.json",
     "phase6_extension_spec_state.json": f"{STATE_RUNTIME}/phase6_extension_spec_state.json",
     "phase6_extension_artifact_state.json": f"{STATE_RUNTIME}/phase6_extension_artifact_state.json",
+    "phase6_extension_source_check_state.json": f"{STATE_RUNTIME}/phase6_extension_source_check_state.json",
     "rollback_state.json": f"{STATE_RUNTIME}/rollback_state.json",
     "replay_runtime_state.json": f"{STATE_RUNTIME}/replay_runtime_state.json",
     "ops_soak_state.json": f"{STATE_RUNTIME}/ops_soak_state.json",
@@ -148,6 +149,7 @@ STATE_METADATA: dict[str, dict[str, Any]] = {
     "phase6_collaboration_state.json": {"source": "read_only_agent_collaboration", "ttl_seconds": 0, "confidence": 1.0},
     "phase6_extension_spec_state.json": {"source": "extension_spec_quarantine", "ttl_seconds": 0, "confidence": 1.0},
     "phase6_extension_artifact_state.json": {"source": "extension_artifact_quarantine", "ttl_seconds": 0, "confidence": 1.0},
+    "phase6_extension_source_check_state.json": {"source": "extension_source_policy_gate", "ttl_seconds": 0, "confidence": 1.0},
     "feishu_ws_state.json": {"source": "feishu_ws_runner", "ttl_seconds": 600, "confidence": 0.65},
     "ops_runtime_matrix.json": {"source": "runtime_matrix", "ttl_seconds": 1800, "confidence": 0.74},
     "ops_config.json": {"source": "ops_config", "ttl_seconds": 0, "confidence": 0.8},
@@ -174,6 +176,7 @@ DURABLE_STATE_FILES = CONFIG_STATE_FILES | {
     "phase6_collaboration_state.json",
     "phase6_extension_spec_state.json",
     "phase6_extension_artifact_state.json",
+    "phase6_extension_source_check_state.json",
 }
 
 _ROOT_LOCKS_GUARD = threading.Lock()
@@ -729,6 +732,14 @@ class WorldStateStore:
                 "candidate_index": {},
                 "operation_index": {},
                 "artifact_count": 0,
+                "updated_at": None,
+            },
+            "phase6_extension_source_check_state.json": {
+                "schema_version": "veyra.phase6.extension_source_check_state.v1",
+                "checks": {},
+                "artifact_index": {},
+                "operation_index": {},
+                "check_count": 0,
                 "updated_at": None,
             },
             "feishu_ws_state.json": {"status": "stopped", "last_event_at": None},

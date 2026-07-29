@@ -29,6 +29,9 @@ from runtime.extension_artifact_quarantine import (  # noqa: E402
 from runtime.extension_spec_quarantine import (  # noqa: E402
     ExtensionSpecQuarantine,
 )
+from runtime.extension_source_policy_gate import (  # noqa: E402
+    ExtensionSourcePolicyGate,
+)
 from scripts.event_driven_awareness_smoke import (  # noqa: E402
     OFFLINE_ROUTE_CASES,
     build_offline_route_loop,
@@ -47,6 +50,8 @@ SCENARIOS = (
     "extension_corrupt",
     "extension_artifact_populated",
     "extension_artifact_corrupt",
+    "extension_source_check_populated",
+    "extension_source_check_corrupt",
 )
 
 
@@ -66,6 +71,9 @@ def seed_phase6(loop: Any, scenario: str) -> None:
     artifact_path = loop.state_store.path_for(
         "phase6_extension_artifact_state.json"
     )
+    source_check_path = loop.state_store.path_for(
+        "phase6_extension_source_check_state.json"
+    )
     if scenario == "collaboration_corrupt":
         collaboration_path.write_text(
             "{invalid-phase6-collaboration-state",
@@ -81,6 +89,12 @@ def seed_phase6(loop: Any, scenario: str) -> None:
     if scenario == "extension_artifact_corrupt":
         artifact_path.write_text(
             "{invalid-phase6-extension-artifact-state",
+            encoding="utf-8",
+        )
+        return
+    if scenario == "extension_source_check_corrupt":
+        source_check_path.write_text(
+            "{invalid-phase6-extension-source-check-state",
             encoding="utf-8",
         )
         return
@@ -306,6 +320,108 @@ def seed_phase6(loop: Any, scenario: str) -> None:
                 f"invalid artifact route fixture: {status!r}"
             )
         return
+    if scenario == "extension_source_check_populated":
+        now = datetime.now(timezone.utc)
+        user_id = "private-source-check-user"
+        workspace_id = str(
+            loop.state_store.read_json("local_world.json").get(
+                "current_project"
+            )
+            or ""
+        )
+        payload = valid_spec(now=now)
+        payload["extension_id"] = "example.route_source_check"
+        payload["dependencies"] = []
+        spec = parse_extension_spec(payload)
+        spec_quarantine = ExtensionSpecQuarantine(
+            state_store=loop.state_store
+        )
+        candidate = spec_quarantine.quarantine(
+            spec=spec,
+            expected_spec_digest=spec.digest(),
+            user_id=user_id,
+            workspace_id=workspace_id,
+            operation_id="route-source-check-spec",
+        )
+        candidate = spec_quarantine.review(
+            candidate_id=candidate["candidate_id"],
+            user_id=user_id,
+            workspace_id=workspace_id,
+            expected_revision=candidate["candidate_revision"],
+            operation_id="route-source-check-review",
+            decision="accept_for_future_isolated_generation",
+            reason="route isolation source-check fixture only",
+        )
+        source = (
+            b"def run_extension(payload):\n"
+            b'    return {"label": payload["name"]}\n'
+        )
+        source_sha256 = hashlib.sha256(source).hexdigest()
+        artifact_quarantine = ExtensionArtifactQuarantine(
+            state_store=loop.state_store,
+            spec_quarantine=spec_quarantine,
+        )
+        artifact = artifact_quarantine.submit(
+            envelope={
+                "schema_version": EXTENSION_ARTIFACT_SCHEMA_VERSION,
+                "artifact_kind": "python_source_utf8",
+                "candidate_id": candidate["candidate_id"],
+                "candidate_revision": candidate["candidate_revision"],
+                "owner_scope_digest": artifact_owner_scope_digest(
+                    user_id,
+                    workspace_id,
+                ),
+                "extension_id": candidate["extension_id"],
+                "extension_version": candidate["extension_version"],
+                "spec_digest": candidate["spec_digest"],
+                "extension_policy_revision": (
+                    spec.tcb_policy.policy_revision
+                ),
+                "artifact_policy_revision": (
+                    EXTENSION_ARTIFACT_POLICY_REVISION
+                ),
+                "artifact_sha256": source_sha256,
+                "size_bytes": len(source),
+                "content_b64url": encode_artifact_content(source),
+                "expires_at": (
+                    now + timedelta(days=3)
+                ).isoformat(timespec="microseconds").replace(
+                    "+00:00",
+                    "Z",
+                ),
+            },
+            expected_artifact_sha256=source_sha256,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            operation_id="route-source-check-artifact",
+        )
+        gate = ExtensionSourcePolicyGate(
+            state_store=loop.state_store,
+            artifact_quarantine=artifact_quarantine,
+        )
+        result = gate.start(
+            artifact_id=artifact["artifact_id"],
+            user_id=user_id,
+            workspace_id=workspace_id,
+            expected_artifact_revision=artifact[
+                "artifact_revision"
+            ],
+            expected_artifact_sha256=artifact[
+                "artifact_sha256"
+            ],
+            operation_id="route-source-check-start",
+        )
+        status = gate.status()
+        if (
+            result["source_check_status"] != "passed"
+            or status["operational_health"] != "available"
+            or status["storage"]["check_count"] != 1
+        ):
+            raise AssertionError(
+                "invalid source-check route fixture: "
+                f"{result!r} {status!r}"
+            )
+        return
     raise ValueError(f"unknown Phase 6 scenario: {scenario}")
 
 
@@ -353,12 +469,22 @@ def main() -> int:
                     }
                 }
             },
+            "phase6_extension_source_check_state": {
+                "checks": {
+                    "private-source-check": {
+                        "source_sha256": "private-source-digest",
+                        "user_id": "private-user",
+                        "workspace_id": "private-workspace",
+                    }
+                }
+            },
         }
     )
     expect(
         "phase6_collaboration_state" not in public_state
         and "phase6_extension_spec_state" not in public_state
         and "phase6_extension_artifact_state" not in public_state
+        and "phase6_extension_source_check_state" not in public_state
         and public_state.get("local_world", {}).get(
             "current_project"
         )
@@ -435,12 +561,13 @@ def main() -> int:
                             "candidate": candidate.to_dict(),
                         }
     expect(
-        comparisons == 9 * len(MODES) * len(SCENARIOS)
+        len(SCENARIOS) == 8
+        and comparisons == 9 * len(MODES) * len(SCENARIOS) == 216
         and not failures,
         (
-            "isolated populated or corrupt collaboration/extension state "
-            "cannot weaken complete "
-            "disabled, record-only, or shadow Route output/status/risk"
+            "216 isolated populated or corrupt collaboration/extension/"
+            "source-check states cannot weaken complete disabled, "
+            "record-only, or shadow Route output/status/risk"
         ),
         failures,
     )

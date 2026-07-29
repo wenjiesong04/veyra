@@ -829,6 +829,7 @@ def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
     public.pop("phase6_collaboration_state", None)
     public.pop("phase6_extension_spec_state", None)
     public.pop("phase6_extension_artifact_state", None)
+    public.pop("phase6_extension_source_check_state", None)
     public.pop("project_guardian_state", None)
     public.pop("project_guardian_signal_state", None)
     public.pop("project_guardian_producer_state", None)

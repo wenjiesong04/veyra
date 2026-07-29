@@ -19,6 +19,10 @@ from runtime.extension_artifact_quarantine import (
     ExtensionArtifactError,
     ExtensionArtifactQuarantine,
 )
+from runtime.extension_source_policy_gate import (
+    ExtensionSourceCheckError,
+    ExtensionSourcePolicyGate,
+)
 
 
 _ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
@@ -32,6 +36,26 @@ _ARTIFACT_PROJECTION_FIELDS = (
     "behavior_verification_status",
     "signature_status",
     "execution_status",
+    "activation_status",
+    "capability_registry_visible",
+    "promotion_authorized",
+)
+_SOURCE_CHECK_PROJECTION_FIELDS = (
+    "source_check_id",
+    "source_check_status",
+    "source_check_effective_status",
+    "source_syntax_status",
+    "static_checks_status",
+    "static_security_policy_status",
+    "isolated_generation_status",
+    "unit_checks_status",
+    "contract_checks_status",
+    "security_runtime_checks_status",
+    "fuzz_checks_status",
+    "test_execution_status",
+    "behavior_verification_status",
+    "execution_status",
+    "signature_status",
     "activation_status",
     "capability_registry_visible",
     "promotion_authorized",
@@ -58,13 +82,49 @@ def _unavailable_artifact_projection() -> dict[str, Any]:
 def _merge_artifact_projection(
     candidate: dict[str, Any],
     projection: dict[str, Any],
+    source_check_projection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     public = dict(candidate)
     for field in _ARTIFACT_PROJECTION_FIELDS:
         if field in projection:
             public[field] = projection[field]
     public["artifact_projection"] = dict(projection)
+    if source_check_projection is not None:
+        for field in _SOURCE_CHECK_PROJECTION_FIELDS:
+            if field in source_check_projection:
+                public[field] = source_check_projection[field]
+        public["source_check_operational_health"] = (
+            source_check_projection.get(
+                "operational_health",
+                "fail_closed",
+            )
+        )
+        public["source_check_projection"] = dict(
+            source_check_projection
+        )
     return public
+
+
+def _source_check_projection(
+    artifact_projection: dict[str, Any],
+    *,
+    user_id: str,
+    workspace_id: str,
+    source_check_gate: ExtensionSourcePolicyGate,
+) -> dict[str, Any]:
+    artifact_id = artifact_projection.get("artifact_id")
+    if not isinstance(artifact_id, str):
+        if artifact_projection.get("artifact_status") == "not_submitted":
+            return source_check_gate.empty_projection()
+        return source_check_gate.unavailable_projection()
+    try:
+        return source_check_gate.projection_for_artifact(
+            artifact_id=artifact_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+    except ExtensionSourceCheckError:
+        return source_check_gate.unavailable_projection()
 
 
 def _with_artifact_projection(
@@ -73,6 +133,7 @@ def _with_artifact_projection(
     user_id: str,
     workspace_id: str,
     artifact_quarantine: ExtensionArtifactQuarantine | None,
+    source_check_gate: ExtensionSourcePolicyGate | None,
 ) -> dict[str, Any]:
     if artifact_quarantine is None:
         return candidate
@@ -84,7 +145,21 @@ def _with_artifact_projection(
         )
     except ExtensionArtifactError:
         projection = _unavailable_artifact_projection()
-    return _merge_artifact_projection(candidate, projection)
+    source_projection = (
+        _source_check_projection(
+            projection,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            source_check_gate=source_check_gate,
+        )
+        if source_check_gate is not None
+        else None
+    )
+    return _merge_artifact_projection(
+        candidate,
+        projection,
+        source_projection,
+    )
 
 
 def _with_artifact_projections(
@@ -93,6 +168,7 @@ def _with_artifact_projections(
     user_id: str,
     workspace_id: str,
     artifact_quarantine: ExtensionArtifactQuarantine,
+    source_check_gate: ExtensionSourcePolicyGate | None,
 ) -> list[dict[str, Any]]:
     candidate_ids = [
         str(candidate["candidate_id"]) for candidate in candidates
@@ -108,10 +184,45 @@ def _with_artifact_projections(
             candidate_id: _unavailable_artifact_projection()
             for candidate_id in candidate_ids
         }
+    source_projections: dict[str, dict[str, Any]] = {}
+    if source_check_gate is not None:
+        artifact_ids = sorted(
+            {
+                str(projection["artifact_id"])
+                for projection in projections.values()
+                if isinstance(projection.get("artifact_id"), str)
+            }
+        )
+        try:
+            by_artifact = source_check_gate.projections_for_artifacts(
+                artifact_ids=artifact_ids,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
+        except ExtensionSourceCheckError:
+            by_artifact = {
+                artifact_id: source_check_gate.unavailable_projection()
+                for artifact_id in artifact_ids
+            }
+        for candidate_id, projection in projections.items():
+            artifact_id = projection.get("artifact_id")
+            if isinstance(artifact_id, str):
+                source_projections[candidate_id] = by_artifact[
+                    artifact_id
+                ]
+            elif projection.get("artifact_status") == "not_submitted":
+                source_projections[candidate_id] = (
+                    source_check_gate.empty_projection()
+                )
+            else:
+                source_projections[candidate_id] = (
+                    source_check_gate.unavailable_projection()
+                )
     return [
         _merge_artifact_projection(
             candidate,
             projections[str(candidate["candidate_id"])],
+            source_projections.get(str(candidate["candidate_id"])),
         )
         for candidate in candidates
     ]
@@ -205,6 +316,7 @@ def build_phase6_extensions_router(
     *,
     quarantine: ExtensionSpecQuarantine,
     artifact_quarantine: ExtensionArtifactQuarantine | None = None,
+    source_check_gate: ExtensionSourcePolicyGate | None = None,
 ) -> APIRouter:
     router = APIRouter(
         prefix="/phase6/extensions",
@@ -220,6 +332,13 @@ def build_phase6_extensions_router(
                 **status,
                 "artifact_quarantine": await run_in_threadpool(
                     artifact_quarantine.status
+                ),
+            }
+        if source_check_gate is not None:
+            status = {
+                **status,
+                "source_check_gate": await run_in_threadpool(
+                    source_check_gate.status
                 ),
             }
         return status
@@ -245,6 +364,7 @@ def build_phase6_extensions_router(
                 user_id=user_id,
                 workspace_id=workspace_id,
                 artifact_quarantine=artifact_quarantine,
+                source_check_gate=source_check_gate,
             )
             return {
                 **result,
@@ -273,6 +393,7 @@ def build_phase6_extensions_router(
                 user_id=user_id,
                 workspace_id=workspace_id,
                 artifact_quarantine=artifact_quarantine,
+                source_check_gate=source_check_gate,
             )
         except Exception as exc:
             _raise_extension_error(exc)
@@ -297,6 +418,7 @@ def build_phase6_extensions_router(
                 user_id=user_id,
                 workspace_id=workspace_id,
                 artifact_quarantine=artifact_quarantine,
+                source_check_gate=source_check_gate,
             )
         except Exception as exc:
             _raise_extension_error(exc)
@@ -321,6 +443,7 @@ def build_phase6_extensions_router(
                 user_id=request.user_id,
                 workspace_id=request.workspace_id,
                 artifact_quarantine=artifact_quarantine,
+                source_check_gate=source_check_gate,
             )
         except Exception as exc:
             _raise_extension_error(exc)
@@ -348,6 +471,7 @@ def build_phase6_extensions_router(
                 user_id=request.user_id,
                 workspace_id=request.workspace_id,
                 artifact_quarantine=artifact_quarantine,
+                source_check_gate=source_check_gate,
             )
         except Exception as exc:
             _raise_extension_error(exc)
@@ -374,6 +498,7 @@ def build_phase6_extensions_router(
                 user_id=request.user_id,
                 workspace_id=request.workspace_id,
                 artifact_quarantine=artifact_quarantine,
+                source_check_gate=source_check_gate,
             )
         except Exception as exc:
             _raise_extension_error(exc)

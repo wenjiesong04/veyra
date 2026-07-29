@@ -982,6 +982,26 @@ class ExtensionSpecQuarantine:
             "artifact_declaration": parsed.artifact.model_dump(
                 mode="json",
             ),
+            "source_check_contract": {
+                "schema_version": (
+                    "veyra.phase6.extension_source_check_contract.v1"
+                ),
+                "entrypoint": "run_extension",
+                "signature": "one_unannotated_payload_argument",
+                "input_schema": parsed.input_schema.model_dump(
+                    mode="json",
+                    by_alias=True,
+                ),
+                "output_schema": parsed.output_schema.model_dump(
+                    mode="json",
+                    by_alias=True,
+                ),
+                "dependencies": [
+                    dependency.model_dump(mode="json")
+                    for dependency in parsed.dependencies
+                ],
+            },
+            "source_check_spec": parsed.canonical_dict(),
             "authority": self._authority(),
         }
 
