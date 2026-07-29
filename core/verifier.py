@@ -59,6 +59,7 @@ class Verifier:
         self,
         agent_response: Any,
         *,
+        expected_message_id: str | None = None,
         expected_case_id: str,
         expected_case_revision: int,
         expected_turn_index: int,
@@ -66,12 +67,14 @@ class Verifier:
         expected_task_packet_id: str,
         expected_operation_id: str,
         expected_scope_digest: str,
+        expected_collaboration_binding: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Validate a proposal envelope without promoting it to evidence."""
 
         try:
             message = extract_agent_dialogue(
                 agent_response,
+                expected_message_id=expected_message_id,
                 expected_case_id=expected_case_id,
                 expected_case_revision=expected_case_revision,
                 expected_turn_index=expected_turn_index,
@@ -79,6 +82,9 @@ class Verifier:
                 expected_task_packet_id=expected_task_packet_id,
                 expected_operation_id=expected_operation_id,
                 expected_scope_digest=expected_scope_digest,
+                expected_collaboration_binding=(
+                    expected_collaboration_binding
+                ),
             )
         except DialogueContractError as exc:
             return {
@@ -390,7 +396,11 @@ class Verifier:
 
         execution = raw.get("execution_result")
         if self._has_observed_execution_payload(execution):
-            outcome_sources.append("raw.execution_result")
+            # This nested projection comes from the caller and remains useful
+            # for diagnostics, but it is not an authoritative observation.
+            # Durable probe and tool-receipt evidence are classified above.
+            reported_sources.append("raw.execution_result")
+            reported_outcome_sources.append("raw.execution_result")
 
         agent_response = raw.get("agent_response")
         if isinstance(agent_response, dict):

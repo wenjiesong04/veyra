@@ -21,6 +21,7 @@ from interface.agent_dialogue_contract import (
     DialogueContractError,
     DialogueType,
     build_task_request,
+    expected_agent_reply_message_id,
     extract_agent_dialogue,
     scope_digest,
 )
@@ -293,17 +294,44 @@ class BoundedNegotiationRuntime:
             user_id=str(binding["user_id"]),
             workspace_id=str(binding["workspace_id"]),
         )
+        collaboration_effect_reported = (
+            self._collaboration_effect_reported(binding, execution)
+        )
         terminal_closure: dict[str, Any] = {}
         if execution.status not in NON_TERMINAL_STATUSES:
             if not self._has_exact_run_observation(execution):
+                failure_code = self._run_observation_failure_code(
+                    execution
+                )
                 raise BoundedNegotiationError(
                     "terminal Agent run was not observed exactly; "
-                    "Durable Case remains evaluable"
+                    "Durable Case remains evaluable "
+                    f"(reason={failure_code})"
                 )
-            terminal_closure = self._confirm_terminal_authority_closed(
+            try:
+                terminal_closure = (
+                    self._confirm_terminal_authority_closed(
+                        binding=binding,
+                        case=case,
+                        execution=execution,
+                    )
+                )
+            except Exception as exc:
+                if not collaboration_effect_reported:
+                    raise
+                terminal_closure = {
+                    "status": "unconfirmed",
+                    "reason": (
+                        str(exc).strip()[:600]
+                        or exc.__class__.__name__
+                    ),
+                }
+        if collaboration_effect_reported:
+            return self._fence_collaboration_effect(
                 binding=binding,
                 case=case,
                 execution=execution,
+                terminal_closure=terminal_closure,
             )
         actual_session_key = self._execution_session_key(
             execution,
@@ -388,8 +416,18 @@ class BoundedNegotiationRuntime:
         )
         dialogue: dict[str, Any] | None = None
         if execution.status == "success":
+            expected_reply_message_id = (
+                expected_agent_reply_message_id(
+                    prepared["request"]
+                )
+                if isinstance(
+                    binding.get("collaboration_binding"), dict
+                )
+                else None
+            )
             verification = self.verifier.verify_agent_dialogue(
                 agent_response,
+                expected_message_id=expected_reply_message_id,
                 expected_case_id=str(binding["case_id"]),
                 expected_case_revision=int(binding["case_revision"]),
                 expected_turn_index=int(binding["turn_index"]),
@@ -397,10 +435,18 @@ class BoundedNegotiationRuntime:
                 expected_task_packet_id=str(binding["task_packet_id"]),
                 expected_operation_id=str(binding["operation_id"]),
                 expected_scope_digest=str(binding["scope_digest"]),
+                expected_collaboration_binding=(
+                    binding.get("collaboration_binding")
+                    if isinstance(
+                        binding.get("collaboration_binding"), dict
+                    )
+                    else None
+                ),
             )
             if verification.get("status") == "partially_success":
                 dialogue = extract_agent_dialogue(
                     agent_response,
+                    expected_message_id=expected_reply_message_id,
                     expected_case_id=str(binding["case_id"]),
                     expected_case_revision=int(binding["case_revision"]),
                     expected_turn_index=int(binding["turn_index"]),
@@ -408,6 +454,13 @@ class BoundedNegotiationRuntime:
                     expected_task_packet_id=str(binding["task_packet_id"]),
                     expected_operation_id=str(binding["operation_id"]),
                     expected_scope_digest=str(binding["scope_digest"]),
+                    expected_collaboration_binding=(
+                        binding.get("collaboration_binding")
+                        if isinstance(
+                            binding.get("collaboration_binding"), dict
+                        )
+                        else None
+                    ),
                 )
         else:
             verification = self._failed_execution_verification(
@@ -677,6 +730,198 @@ class BoundedNegotiationRuntime:
                 "bound Agent run was not observed exactly"
             )
         return execution
+
+    def _fence_collaboration_effect(
+        self,
+        *,
+        binding: dict[str, Any],
+        case: dict[str, Any],
+        execution: ExecutionResult,
+        terminal_closure: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Stop a bound read-only collaboration before dialogue acceptance."""
+
+        if execution.status in NON_TERMINAL_STATUSES:
+            adapter = self._adapter_for(str(binding["target_agent"]))
+            try:
+                cancellation = adapter.cancel_task_authority(
+                    execution.task_id,
+                    reason="phase6_read_only_effect_boundary_violation",
+                    identity={
+                        "run_id": str(binding["runtime_run_id"]),
+                    },
+                    abort_agent=True,
+                )
+            except Exception as exc:  # pragma: no cover - diagnostic only
+                cancellation = {
+                    "status": "unconfirmed",
+                    "error": type(exc).__name__,
+                }
+        else:
+            cancellation = terminal_closure
+        checkpoint_id = f"{binding['checkpoint_id']}:effect_fence"
+        existing = self._find_checkpoint(case, checkpoint_id)
+        if existing:
+            current = self.case_store.get_case(
+                case_id=str(binding["case_id"]),
+                user_id=str(binding["user_id"]),
+                workspace_id=str(binding["workspace_id"]),
+            )
+            return self._outcome(
+                case=current,
+                execution=execution,
+                dialogue=None,
+                verification=self._collaboration_effect_verification(),
+                response=(
+                    "只读协作报告了工具或文件效果；Case 已保持不确定并停止"
+                    "继续协商，等待人工核对。"
+                ),
+            )
+        current = self.case_store.get_case(
+            case_id=str(binding["case_id"]),
+            user_id=str(binding["user_id"]),
+            workspace_id=str(binding["workspace_id"]),
+        )
+        if str(current.get("status") or "") in {
+            CaseStatus.CANCELLED.value,
+            CaseStatus.FAILED.value,
+            CaseStatus.INDETERMINATE.value,
+            CaseStatus.CLOSED.value,
+        }:
+            return self._outcome(
+                case=current,
+                execution=execution,
+                dialogue=None,
+                verification=self._collaboration_effect_verification(),
+                response=(
+                    "只读协作报告了工具或文件效果；终态 Case 未被迟到结果"
+                    "推进。"
+                ),
+            )
+        fenced = self.case_store.transition(
+            case_id=str(binding["case_id"]),
+            user_id=str(binding["user_id"]),
+            workspace_id=str(binding["workspace_id"]),
+            operation_id=f"{binding['operation_id']}:effect_fence",
+            expected_revision=int(current["revision"]),
+            to_status=CaseStatus.INDETERMINATE,
+            reason=(
+                "read-only collaboration reported or produced an effect; "
+                "dialogue was not accepted"
+            ),
+            checkpoint=self._checkpoint(
+                checkpoint_id=checkpoint_id,
+                phase="phase6_effect_violation",
+                operation_id=str(binding["operation_id"]),
+                step_id=str(binding["step_id"]),
+                task_id=str(binding["task_packet_id"]),
+                run_id=str(execution.task_id),
+                session_key=str(binding["session_key"]),
+                executor=str(execution.executor),
+                target_agent=str(binding["target_agent"]),
+                dialogue_message_id=str(binding["message_id"]),
+                result_status="indeterminate",
+                effect_state=CheckpointEffectState.UNKNOWN,
+                evidence_refs=[
+                    "phase6_effect_boundary_violation",
+                    "authority_closure:"
+                    f"{self._digest(cancellation)[:32]}",
+                ],
+            ),
+        )
+        self._retire_case_tasks(
+            case_id=str(binding["case_id"]),
+            case_status=CaseStatus.INDETERMINATE.value,
+        )
+        return self._outcome(
+            case=fenced,
+            execution=execution,
+            dialogue=None,
+            verification=self._collaboration_effect_verification(),
+            response=(
+                "只读协作报告了工具或文件效果；Case 已保持不确定并停止"
+                "继续协商，等待人工核对。"
+            ),
+        )
+
+    @staticmethod
+    def _collaboration_effect_reported(
+        binding: dict[str, Any],
+        execution: ExecutionResult,
+    ) -> bool:
+        collaboration = binding.get("collaboration_binding")
+        if not isinstance(collaboration, dict):
+            return False
+        if execution.tool_calls or execution.changed_files:
+            return True
+        raw = execution.raw if isinstance(execution.raw, dict) else {}
+        reported_evidence = raw.get("agent_reported_tool_evidence")
+        if reported_evidence is not None:
+            if not isinstance(reported_evidence, dict):
+                return True
+            for flag_name in (
+                "tool_calls_reported",
+                "changed_files_reported",
+            ):
+                flag = reported_evidence.get(flag_name)
+                if not isinstance(flag, bool) or flag:
+                    return True
+            for count_name in (
+                "tool_call_count",
+                "changed_file_count",
+            ):
+                count = reported_evidence.get(count_name)
+                if (
+                    isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or count != 0
+                ):
+                    return True
+        if execution.status not in NON_TERMINAL_STATUSES:
+            governed_evidence = raw.get("governed_tool_evidence")
+            if not isinstance(governed_evidence, dict):
+                return True
+            if (
+                str(governed_evidence.get("status") or "").strip().lower()
+                != "resolved"
+            ):
+                return True
+            for count_name in (
+                "observed_call_count",
+                "effect_count",
+            ):
+                count = governed_evidence.get(count_name)
+                if (
+                    isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or count != 0
+                ):
+                    return True
+        return any(
+            (
+                isinstance(raw.get(key), list)
+                and bool(raw.get(key))
+            )
+            or (
+                isinstance(raw.get(key), dict)
+                and bool(raw.get(key))
+            )
+            for key in (
+                "authoritative_tool_receipts",
+                "verified_tool_effects",
+                "authoritative_effects",
+            )
+        )
+
+    @staticmethod
+    def _collaboration_effect_verification() -> dict[str, Any]:
+        return {
+            "status": "indeterminate",
+            "verdict": "read_only_effect_boundary_violation",
+            "next_action": "human_reconcile_effect_before_any_continuation",
+            "evidence_status": "unknown",
+            "verified": False,
+        }
 
     def _prepared_for_registered_context(
         self,
@@ -1264,11 +1509,16 @@ class BoundedNegotiationRuntime:
             item
             for item in case.get("dialogue", [])
             if isinstance(item, dict)
-            and item.get("message_type") == DialogueType.TASK_REQUEST.value
+            and item.get("sender") == "veyra"
+            and item.get("message_type")
+            in {
+                DialogueType.TASK_REQUEST.value,
+                DialogueType.CONTEXT_PATCH.value,
+            }
         ]
         if not requests:
             raise BoundedNegotiationError(
-                "durable case has no persisted TASK_REQUEST"
+                "durable case has no persisted dispatch request"
             )
         record = requests[-1]
         request = (
@@ -1296,6 +1546,13 @@ class BoundedNegotiationRuntime:
             "target_agent": (
                 checkpoint.get("target_agent")
                 or checkpoint.get("executor")
+            ),
+            "collaboration_binding": (
+                dict(request["collaboration_binding"])
+                if isinstance(
+                    request.get("collaboration_binding"), dict
+                )
+                else None
             ),
         }
         self._require_binding(binding)
@@ -1794,25 +2051,46 @@ class BoundedNegotiationRuntime:
         raw = execution.raw if isinstance(execution.raw, dict) else {}
         if raw.get("exact_run_observed") is True:
             return True
-        agent_wait = (
-            raw.get("agent_wait")
-            if isinstance(raw.get("agent_wait"), dict)
+        chat_send = (
+            raw.get("chat_send")
+            if isinstance(raw.get("chat_send"), dict)
             else {}
         )
-        wait_run_id = str(
-            agent_wait.get("runId")
-            or agent_wait.get("run_id")
-            or ""
+        final_event = (
+            raw.get("final_event")
+            if isinstance(raw.get("final_event"), dict)
+            else {}
         )
-        if wait_run_id == execution.task_id:
-            if agent_wait.get("providerStarted") is False:
-                return False
-            if (
-                str(agent_wait.get("status") or "").lower() == "timeout"
-                and str(agent_wait.get("timeoutPhase") or "").lower()
-                == "queue"
-            ):
-                return False
+        top_level_run_id = str(raw.get("run_id") or "").strip()
+        chat_run_id = str(
+            chat_send.get("runId")
+            or chat_send.get("run_id")
+            or ""
+        ).strip()
+        final_run_id = str(
+            final_event.get("runId")
+            or final_event.get("run_id")
+            or ""
+        ).strip()
+        if (
+            top_level_run_id == execution.task_id
+            and chat_run_id == execution.task_id
+            and (not final_run_id or final_run_id == execution.task_id)
+            and str(final_event.get("state") or "").strip().lower()
+            in {"final", "error"}
+        ):
+            for payload in (chat_send, final_event):
+                if payload.get("providerStarted") is False:
+                    return False
+                if (
+                    str(payload.get("status") or "").strip().lower()
+                    == "timeout"
+                    and str(
+                        payload.get("timeoutPhase") or ""
+                    ).strip().lower()
+                    == "queue"
+                ):
+                    return False
             return True
         for key in ("agent_wait", "final_event", "task"):
             payload = raw.get(key)
@@ -1825,10 +2103,54 @@ class BoundedNegotiationRuntime:
                 or payload.get("task_id")
                 or payload.get("id")
                 or ""
-            )
+            ).strip()
+            if observed_id != execution.task_id:
+                continue
+            if payload.get("providerStarted") is False:
+                return False
+            if (
+                str(payload.get("status") or "").strip().lower()
+                == "timeout"
+                and str(
+                    payload.get("timeoutPhase") or ""
+                ).strip().lower()
+                == "queue"
+            ):
+                return False
             if observed_id == execution.task_id:
                 return True
         return False
+
+    @staticmethod
+    def _run_observation_failure_code(
+        execution: ExecutionResult,
+    ) -> str:
+        raw = execution.raw if isinstance(execution.raw, dict) else {}
+        governance = (
+            raw.get("governance")
+            if isinstance(raw.get("governance"), dict)
+            else {}
+        )
+        failure_code = str(
+            governance.get("failure_code") or ""
+        ).strip()
+        if (
+            governance.get("status") == "registration_failed"
+            and failure_code
+        ):
+            return failure_code
+        if (
+            governance.get("status")
+            == "registration_identity_invalid"
+        ):
+            return "governance_registration_identity_invalid"
+        if raw.get("reason") == "openclaw_governed_dispatch_not_verified":
+            return "governance_preflight_blocked"
+        if isinstance(raw.get("error"), dict):
+            return "gateway_submission_failed"
+        if execution.status in NON_TERMINAL_STATUSES:
+            return "provider_run_not_terminal"
+        return "provider_run_provenance_missing"
 
     def _adapter_for(self, executor: str) -> AgentAdapter:
         names = getattr(self.registry, "names", None)

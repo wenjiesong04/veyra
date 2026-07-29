@@ -42,6 +42,7 @@ from routers.debug_audit import build_debug_audit_router
 from routers.local_setup import build_local_setup_router
 from routers.ops_runtime import build_ops_runtime_router
 from routers.phase5 import build_phase5_router
+from routers.phase6 import build_phase6_router
 from routers.runtime_observability import build_runtime_observability_router
 from routers.tool_governance import build_tool_governance_router
 from runtime.active_loop import ActiveRuntimeLoop
@@ -68,6 +69,10 @@ from runtime.project_guardian_github_ci import GitHubActionsCIProvider
 from runtime.retention_policy import RetentionPolicy
 from runtime.routing_metrics import RoutingMetrics
 from runtime.runtime_matrix import RuntimeMatrix
+from runtime.agent_capability_directory import AgentCapabilityDirectory
+from runtime.read_only_agent_collaboration import (
+    ReadOnlyAgentCollaborationRuntime,
+)
 from runtime.soak_runner import SoakRunner
 from runtime.state_refresh import StateRefresh
 from runtime.openclaw_tool_broker import (
@@ -340,6 +345,18 @@ agent_orchestrator = AgentOrchestrator(
     task_tracker=awareness_loop.task_tracker,
     execution_trace=awareness_loop.execution_trace,
     verifier=awareness_loop.verifier,
+)
+phase6_capability_directory = AgentCapabilityDirectory(
+    state_store=state_store,
+    registry=awareness_loop.agent_registry,
+)
+phase6_collaboration = ReadOnlyAgentCollaborationRuntime(
+    state_store=state_store,
+    case_store=awareness_loop.durable_case_store,
+    task_packet_builder=awareness_loop.task_packet_builder,
+    bounded_negotiation=awareness_loop.bounded_negotiation,
+    capability_directory=phase6_capability_directory,
+    task_tracker=awareness_loop.task_tracker,
 )
 
 
@@ -695,6 +712,11 @@ app.include_router(
     )
 )
 app.include_router(
+    build_phase6_router(
+        collaboration=phase6_collaboration,
+    )
+)
+app.include_router(
     build_tool_governance_router(
         tool_governance,
         openclaw_tool_broker,
@@ -714,6 +736,9 @@ app.include_router(
                 "runtime_entity": lambda: runtime_entity,
                 "runtime_matrix": lambda: runtime_matrix,
                 "agent_orchestrator": lambda: agent_orchestrator,
+                "phase6_collaboration": (
+                    lambda: phase6_collaboration
+                ),
             }
         )
     )

@@ -101,6 +101,14 @@ def expect_authoritative(
         result.to_dict(),
     )
     expect(
+        diagnostic.get("tool_call_count") == 1
+        and diagnostic.get("changed_file_count") == 1
+        and diagnostic.get("tool_calls_reported") is True
+        and diagnostic.get("changed_files_reported") is True,
+        f"{source} labels authority and Agent diagnostics honestly",
+        result.to_dict(),
+    )
+    expect(
         "untrusted.shell" not in result.tool_calls
         and "/etc/passwd" not in result.changed_files,
         f"{source} overrides forged Agent JSON",
@@ -159,6 +167,22 @@ def main() -> int:
         immediate_result,
         run_id="run-immediate",
         source="immediate final",
+    )
+    expect(
+        immediate._execution_observed_exact_run(immediate_result) is True,
+        "immediate final preserves the exact chat.send run chain",
+        immediate_result.to_dict(),
+    )
+
+    mismatched_final = immediate_result.to_dict()
+    mismatched_final["raw"]["final_event"]["runId"] = "run-other"
+    expect(
+        immediate._execution_observed_exact_run(
+            type(immediate_result)(**mismatched_final)
+        )
+        is False,
+        "mismatched final run cannot satisfy exact observation",
+        mismatched_final,
     )
 
     cached_immediate = immediate.fetch_task_status("run-immediate")

@@ -9,7 +9,18 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from core.task_packet_builder import (
+    PHASE3_SANDBOX_EXECUTION_PROFILE,
+    PHASE6_READ_ONLY_COLLABORATION_PROFILE,
+)
 from core.world_state import WorldStateStore
+from interface.agent_dialogue_contract import (
+    DialogueContractError,
+    DialogueType,
+    collaboration_turn_transport_identity,
+    parse_dialogue_message,
+    scope_digest,
+)
 from interface.event_schema import VeyraTaskPacket
 from runtime.tool_governance_runtime import (
     ToolGovernanceConflict,
@@ -40,7 +51,7 @@ HOOK_REGISTRY_REVISION = "veyra.openclaw.tool_registry.v1"
 HOOK_EXECUTOR_ID = "veyra.openclaw.scoped_executor.v1"
 HOOK_PLUGIN_PROTOCOL = "veyra.openclaw.governance.v1"
 HOOK_PLUGIN_IMPLEMENTATION_REVISION = (
-    "veyra.openclaw.governance.phase3.v2"
+    "veyra.openclaw.governance.phase6.v1"
 )
 
 CUSTOM_TOOL_REGISTRY: dict[str, tuple[str, str, str]] = {
@@ -255,33 +266,169 @@ class OpenClawToolBroker:
             )
             else {}
         )
-        user_id = self._identifier(
-            context.get("user_id") or "local_user",
-            "user_id",
+        execution_profile = self._execution_profile(context)
+        dialogue_payload = (
+            task_packet.dialogue_message
+            if isinstance(task_packet.dialogue_message, dict)
+            else {}
         )
-        workspace_id = self._identifier(
-            context.get("workspace_id") or str(Path.cwd().resolve()),
-            "workspace_id",
-        )
-        channel_id = self._identifier(
-            context.get("channel_id") or "api",
-            "channel_id",
-        )
-        case_id = self._identifier(
-            context.get("case_id") or task_packet.task_id,
-            "case_id",
-        )
-        step_id = self._identifier(
-            context.get("step_id") or task_packet.task_id,
-            "step_id",
-        )
+        if (
+            isinstance(
+                dialogue_payload.get("collaboration_binding"),
+                dict,
+            )
+            and execution_profile
+            != PHASE6_READ_ONLY_COLLABORATION_PROFILE
+        ):
+            raise OpenClawHookDenied(
+                "bound collaboration requires the Phase 6 read-only "
+                "execution profile"
+            )
+        collaboration_expires_at: datetime | None = None
+        if execution_profile == PHASE6_READ_ONLY_COLLABORATION_PROFILE:
+            try:
+                dialogue = parse_dialogue_message(
+                    task_packet.dialogue_message,
+                    expected_sender="veyra",
+                    allowed_types={
+                        DialogueType.TASK_REQUEST,
+                        DialogueType.CONTEXT_PATCH,
+                        DialogueType.PLAN_SELECTION,
+                    },
+                )
+                transport_identity = (
+                    collaboration_turn_transport_identity(
+                        task_packet.dialogue_message
+                    )
+                )
+            except (DialogueContractError, TypeError, ValueError) as exc:
+                raise OpenClawHookDenied(
+                    "Phase 6 dispatch requires an exact collaboration "
+                    "dialogue"
+                ) from exc
+            collaboration_binding = dialogue.collaboration_binding
+            if collaboration_binding is None:
+                raise OpenClawHookDenied(
+                    "Phase 6 dispatch requires an exact collaboration "
+                    "binding"
+                )
+            now = self._now()
+            if collaboration_binding.issued_at > now:
+                raise OpenClawHookDenied(
+                    "Phase 6 collaboration binding is not active yet"
+                )
+            if collaboration_binding.expires_at <= now:
+                raise OpenClawHookDenied(
+                    "Phase 6 collaboration binding has expired"
+                )
+            collaboration_expires_at = (
+                collaboration_binding.expires_at
+            )
+            self._identifier(task_packet.task_id, "task_id")
+            agent_id = self._identifier(
+                task_packet.target_agent,
+                "agent_id",
+            )
+            user_id = self._identifier(context.get("user_id"), "user_id")
+            workspace_id = self._identifier(
+                context.get("workspace_id"),
+                "workspace_id",
+            )
+            channel_id = self._identifier(
+                context.get("channel_id"),
+                "channel_id",
+            )
+            case_id = self._identifier(context.get("case_id"), "case_id")
+            step_id = self._identifier(context.get("step_id"), "step_id")
+            if case_id != dialogue.case_id:
+                raise OpenClawHookDenied(
+                    "Phase 6 private case does not match dialogue case"
+                )
+            if task_packet.task_id != dialogue.task_packet_id:
+                raise OpenClawHookDenied(
+                    "Phase 6 task_id does not match dialogue task"
+                )
+            if (
+                task_packet.target_agent
+                != collaboration_binding.provider.runtime
+            ):
+                raise OpenClawHookDenied(
+                    "Phase 6 target_agent does not match bound provider"
+                )
+            if dialogue.scope_digest != scope_digest(
+                user_id=user_id,
+                workspace_id=workspace_id,
+            ):
+                raise OpenClawHookDenied(
+                    "Phase 6 private owner scope does not match dialogue"
+                )
+            packet_run_id = self._identifier(
+                getattr(task_packet, "runtime_run_id", ""),
+                "runtime_run_id",
+            )
+            packet_session_key = self._identifier(
+                getattr(
+                    task_packet,
+                    "agent_execution_session_id",
+                    "",
+                ),
+                "agent_execution_session_id",
+            )
+            if packet_run_id != run:
+                raise OpenClawHookDenied(
+                    "Phase 6 runtime_run_id does not match dispatch run_id"
+                )
+            if not self._phase6_runtime_session_matches(
+                contract_session_key=packet_session_key,
+                runtime_session_key=session,
+            ):
+                raise OpenClawHookDenied(
+                    "Phase 6 Agent session does not match dispatch session"
+                )
+            if (
+                task_packet.session_id
+                != transport_identity["packet_session_id"]
+                or packet_session_key
+                != transport_identity["agent_execution_session_id"]
+                or task_packet.agent_session_policy
+                != "ephemeral_per_task"
+            ):
+                raise OpenClawHookDenied(
+                    "Phase 6 transport session is not the exact bound "
+                    "ephemeral turn"
+                )
+            allowed_tools: tuple[str, ...] = ()
+        else:
+            agent_id = self._identifier(
+                task_packet.target_agent or "openclaw",
+                "agent_id",
+            )
+            user_id = self._identifier(
+                context.get("user_id") or "local_user",
+                "user_id",
+            )
+            workspace_id = self._identifier(
+                context.get("workspace_id")
+                or str(Path.cwd().resolve()),
+                "workspace_id",
+            )
+            channel_id = self._identifier(
+                context.get("channel_id") or "api",
+                "channel_id",
+            )
+            case_id = self._identifier(
+                context.get("case_id") or task_packet.task_id,
+                "case_id",
+            )
+            step_id = self._identifier(
+                context.get("step_id") or task_packet.task_id,
+                "step_id",
+            )
+            allowed_tools = tuple(sorted(CUSTOM_TOOL_REGISTRY))
         binding = GovernedSessionBinding.create(
             user_id=user_id,
             workspace_id=workspace_id,
-            agent_id=self._identifier(
-                task_packet.target_agent or "openclaw",
-                "agent_id",
-            ),
+            agent_id=agent_id,
             session_id=session,
             channel_id=channel_id,
             case_id=case_id,
@@ -296,6 +443,9 @@ class OpenClawToolBroker:
                 existing.get("binding")
                 != binding.model_dump(mode="json")
                 or existing.get("session_key") != session
+                or self._dispatch_execution_profile(existing)
+                != execution_profile
+                or self._dispatch_allowed_tools(existing) != allowed_tools
             ):
                 raise OpenClawHookConflict(
                     "run_id is already registered to another dispatch"
@@ -343,6 +493,8 @@ class OpenClawToolBroker:
         token_digest = secret_sha256(dispatch_token)
         now = self._now()
         expires_at = now + self.dispatch_ttl
+        if collaboration_expires_at is not None:
+            expires_at = min(expires_at, collaboration_expires_at)
         dispatch_payload = {
             "run_id": run,
             "session_key": session,
@@ -350,7 +502,8 @@ class OpenClawToolBroker:
             "dispatch_token_digest": token_digest,
             "sandbox_root": str(scope.root),
             "scope_digest": scope.scope_digest,
-            "allowed_tools": sorted(CUSTOM_TOOL_REGISTRY),
+            "execution_profile": execution_profile,
+            "allowed_tools": list(allowed_tools),
             "status": "active",
             "registered_at": now.isoformat(),
             "expires_at": expires_at.isoformat(),
@@ -387,7 +540,8 @@ class OpenClawToolBroker:
                 "run_id": run,
                 "binding_digest": binding.binding_digest,
                 "scope_digest": scope.scope_digest,
-                "allowed_tools": sorted(CUSTOM_TOOL_REGISTRY),
+                "execution_profile": execution_profile,
+                "allowed_tools": list(allowed_tools),
             },
         )
         return HookDispatchRegistration(
@@ -397,7 +551,7 @@ class OpenClawToolBroker:
             expires_at=expires_at,
             binding_digest=binding.binding_digest,
             sandbox_root=str(scope.root),
-            allowed_tools=tuple(sorted(CUSTOM_TOOL_REGISTRY)),
+            allowed_tools=allowed_tools,
         )
 
     def cancel_dispatch(
@@ -612,6 +766,11 @@ class OpenClawToolBroker:
         try:
             if dispatch.get("session_key") != session_key:
                 raise OpenClawHookDenied("OpenClaw session key mismatch")
+            allowed_tools = self._dispatch_allowed_tools(dispatch)
+            if host_tool not in allowed_tools:
+                raise OpenClawHookDenied(
+                    "tool is not allowed for this governed dispatch"
+                )
             if host_tool not in CUSTOM_TOOL_REGISTRY:
                 raise OpenClawHookDenied(
                     "tool is not in the governed OpenClaw registry"
@@ -1052,8 +1211,15 @@ class OpenClawToolBroker:
             "observed_at": self._now().isoformat(),
             "authoritative": False,
         }
+        observation_semantics = {
+            key: value
+            for key, value in observation.items()
+            if key != "observed_at"
+        }
+        replayed = False
 
         def persist(document: dict[str, Any]) -> None:
+            nonlocal replayed
             self._validate_document(document)
             attempt_id = self._mapping(document, "call_index").get(
                 self._call_key(run, call_id)
@@ -1065,10 +1231,18 @@ class OpenClawToolBroker:
                         "hook call index points to a missing attempt"
                     )
                 existing = attempt.get("plugin_observation")
-                if isinstance(existing, dict) and existing != observation:
-                    raise OpenClawHookConflict(
-                        "contradictory plugin observation"
-                    )
+                if isinstance(existing, dict):
+                    existing_semantics = {
+                        key: value
+                        for key, value in existing.items()
+                        if key != "observed_at"
+                    }
+                    if existing_semantics != observation_semantics:
+                        raise OpenClawHookConflict(
+                            "contradictory plugin observation"
+                        )
+                    replayed = True
+                    return
                 attempt["plugin_observation"] = observation
             elif outcome == "blocked":
                 diagnostic_id = f"plugin_block_{canonical_sha256({'run': run, 'call': call_id})[:24]}"
@@ -1095,12 +1269,14 @@ class OpenClawToolBroker:
             "authoritative": False,
             "runId": run,
             "toolCallId": call_id,
+            "replayed": replayed,
         }
 
     def status(self) -> dict[str, Any]:
         try:
             document = self.state_store.read_json(HOOK_STATE_FILE)
             self._validate_document(document)
+            self._validate_dispatch_security_fields(document)
         except (OpenClawToolBrokerError, ToolGovernanceStorageError) as exc:
             return {
                 "status": "degraded",
@@ -1166,6 +1342,29 @@ class OpenClawToolBroker:
                 "attempts": len(self._mapping(document, "attempts")),
             },
         }
+
+    @classmethod
+    def _validate_dispatch_security_fields(
+        cls,
+        document: Mapping[str, Any],
+    ) -> None:
+        dispatches = document.get("dispatches")
+        if not isinstance(dispatches, dict):
+            raise OpenClawToolBrokerError(
+                "hook state field dispatches must be an object"
+            )
+        for run_id, dispatch in dispatches.items():
+            if not isinstance(dispatch, dict):
+                raise OpenClawToolBrokerError(
+                    f"governed dispatch {run_id} must be an object"
+                )
+            try:
+                cls._dispatch_execution_profile(dispatch)
+                cls._dispatch_allowed_tools(dispatch)
+            except (OpenClawToolBrokerError, ValueError) as exc:
+                raise OpenClawToolBrokerError(
+                    f"governed dispatch {run_id} is invalid: {exc}"
+                ) from exc
 
     def mark_canary_validated(
         self,
@@ -1951,6 +2150,98 @@ class OpenClawToolBroker:
         ):
             raise ValueError(f"{field_name} must be a normalized identifier")
         return normalized
+
+    @staticmethod
+    def _phase6_runtime_session_matches(
+        *,
+        contract_session_key: str,
+        runtime_session_key: str,
+    ) -> bool:
+        """Bind a neutral turn id to OpenClaw's canonical session key.
+
+        The collaboration contract deliberately does not encode an OpenClaw
+        agent id.  The trusted adapter maps its immutable ``p6session_*`` turn
+        id to ``agent:<configured-agent>:<turn-id>`` before the Gateway call.
+        The broker validates that exact one-way mapping and stores the actual
+        runtime key in the governed binding.
+        """
+
+        parts = runtime_session_key.split(":", 2)
+        return bool(
+            contract_session_key
+            and len(parts) == 3
+            and parts[0] == "agent"
+            and parts[1]
+            and parts[2] == contract_session_key
+        )
+
+    @classmethod
+    def _execution_profile(cls, context: Mapping[str, Any]) -> str:
+        if "execution_profile" not in context:
+            # Compatibility for packets created before the trusted private
+            # execution-profile field existed.
+            return PHASE3_SANDBOX_EXECUTION_PROFILE
+        profile = cls._identifier(
+            context.get("execution_profile"),
+            "execution_profile",
+        )
+        if profile not in {
+            PHASE3_SANDBOX_EXECUTION_PROFILE,
+            PHASE6_READ_ONLY_COLLABORATION_PROFILE,
+        }:
+            raise OpenClawHookDenied(
+                "Agent execution profile is not supported"
+            )
+        return profile
+
+    @classmethod
+    def _dispatch_execution_profile(
+        cls,
+        dispatch: Mapping[str, Any],
+    ) -> str:
+        if "execution_profile" not in dispatch:
+            return PHASE3_SANDBOX_EXECUTION_PROFILE
+        profile = cls._identifier(
+            dispatch.get("execution_profile"),
+            "execution_profile",
+        )
+        if profile not in {
+            PHASE3_SANDBOX_EXECUTION_PROFILE,
+            PHASE6_READ_ONLY_COLLABORATION_PROFILE,
+        }:
+            raise OpenClawHookDenied(
+                "governed dispatch execution profile is unsupported"
+            )
+        return profile
+
+    @classmethod
+    def _dispatch_allowed_tools(
+        cls,
+        dispatch: Mapping[str, Any],
+    ) -> tuple[str, ...]:
+        raw = dispatch.get("allowed_tools")
+        if (
+            not isinstance(raw, list)
+            or any(
+                not isinstance(item, str)
+                or item not in CUSTOM_TOOL_REGISTRY
+                for item in raw
+            )
+            or len(raw) != len(set(raw))
+        ):
+            raise OpenClawHookDenied(
+                "governed dispatch tool allowlist is invalid"
+            )
+        allowed_tools = tuple(sorted(raw))
+        if (
+            cls._dispatch_execution_profile(dispatch)
+            == PHASE6_READ_ONLY_COLLABORATION_PROFILE
+            and allowed_tools
+        ):
+            raise OpenClawHookDenied(
+                "Phase 6 read-only collaboration cannot allow tools"
+            )
+        return allowed_tools
 
     @staticmethod
     def _call_key(run_id: str, tool_call_id: str) -> str:

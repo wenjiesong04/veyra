@@ -473,6 +473,67 @@ def test_capability_gate() -> None:
     )
 
 
+def test_exact_run_observation() -> None:
+    immediate = ExecutionResult(
+        task_id="run-immediate",
+        executor=AGENT_NAME,
+        status="success",
+        result="done",
+        raw={
+            "run_id": "run-immediate",
+            "chat_send": {"runId": "run-immediate"},
+            "final_event": {"state": "final"},
+        },
+    )
+    expect(
+        BoundedNegotiationRuntime._has_exact_run_observation(immediate),
+        "exact chat.send and terminal event prove the immediate run",
+    )
+    for label, raw_patch in (
+        (
+            "mismatched chat.send run",
+            {"chat_send": {"runId": "run-other"}},
+        ),
+        (
+            "mismatched terminal run",
+            {"final_event": {"state": "final", "runId": "run-other"}},
+        ),
+        (
+            "non-terminal chat event",
+            {"final_event": {"state": "submitted"}},
+        ),
+        (
+            "provider did not start",
+            {
+                "final_event": {
+                    "state": "final",
+                    "providerStarted": False,
+                }
+            },
+        ),
+    ):
+        raw = {
+            "run_id": "run-immediate",
+            "chat_send": {"runId": "run-immediate"},
+            "final_event": {"state": "final"},
+            **raw_patch,
+        }
+        candidate = ExecutionResult(
+            task_id="run-immediate",
+            executor=AGENT_NAME,
+            status="success",
+            result="done",
+            raw=raw,
+        )
+        expect(
+            not BoundedNegotiationRuntime._has_exact_run_observation(
+                candidate
+            ),
+            f"{label} cannot prove an exact run",
+            raw,
+        )
+
+
 def test_success_transitions(root: Path) -> None:
     expected = {
         "OPTION_SET": "PROPOSED",
@@ -1141,6 +1202,7 @@ def test_recovery_round_robin_survives_restart(root: Path) -> None:
 
 def main() -> None:
     test_capability_gate()
+    test_exact_run_observation()
     with tempfile.TemporaryDirectory(
         prefix="veyra-bounded-negotiation-"
     ) as temp_dir:

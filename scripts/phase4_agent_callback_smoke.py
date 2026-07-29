@@ -482,6 +482,128 @@ def terminal_execution(
     )
 
 
+def phase6_callback_namespace_checks(root: Path) -> None:
+    unknown = LoopFixture(root / "phase6-unknown")
+    rejected_responses = [
+        unknown.client.post(
+            "/agent/results",
+            json={
+                "task_id": task_id,
+                "executor": TARGET_AGENT,
+                "status": "success",
+                "result": "caller-forged Phase 6 result",
+                "raw": {
+                    "execution_result": {"stdout": "fabricated"},
+                    "probe_result": {
+                        "observed": True,
+                        "status": "success",
+                    },
+                },
+            },
+        )
+        for task_id in (
+            "p6task_unknown",
+            "veyra-p6-unknown-runtime",
+        )
+    ]
+    expect(
+        all(
+            response.status_code == 409
+            and "Veyra-registered Durable Case binding"
+            in response.text
+            for response in rejected_responses
+        ),
+        (
+            "unknown Phase 6 task-packet and runtime callback IDs fail "
+            "closed before the legacy branch"
+        ),
+        [response.text for response in rejected_responses],
+    )
+    expect(
+        unknown.verifier.generic_calls == 0
+        and unknown.memory_policy_runtime.calls == 0,
+        "rejected Phase 6 callback reaches no generic verifier or memory writer",
+        {
+            "generic_calls": unknown.verifier.generic_calls,
+            "memory_calls": unknown.memory_policy_runtime.calls,
+        },
+    )
+
+    legacy = LoopFixture(root / "legacy-compatible")
+    accepted_legacy = legacy.client.post(
+        "/agent/results",
+        json={
+            "task_id": "legacy_callback_1",
+            "executor": "legacy-agent",
+            "status": "failed",
+            "result": "legacy callback result",
+        },
+    )
+    expect(
+        accepted_legacy.status_code == 200
+        and accepted_legacy.json()["execution_result"]["task_id"]
+        == "legacy_callback_1"
+        and legacy.verifier.generic_calls == 1,
+        "ordinary legacy callback remains compatible",
+        accepted_legacy.text,
+    )
+
+    registered = LoopFixture(root / "phase6-registered")
+    original_identity = registered.bounded_negotiation._turn_identity
+
+    def phase6_identity(**kwargs: Any) -> dict[str, str]:
+        identity = original_identity(**kwargs)
+        return {
+            **identity,
+            "runtime_run_id": "veyra-p6-registered-case",
+        }
+
+    registered.bounded_negotiation._turn_identity = phase6_identity
+    prepared = registered.prepare_registered_case(
+        "event-phase6-registered"
+    )
+    run_id = prepared["binding"]["runtime_run_id"]
+    registered.target_adapter.fetch_results[run_id] = terminal_execution(
+        prepared,
+        "phase6_authoritative_fetch",
+    )
+    accepted_registered = registered.client.post(
+        "/agent/results",
+        json={
+            **result_payload(
+                prepared,
+                suffix="phase6_caller_forged",
+            ),
+            "result": "caller-forged registered result",
+        },
+    )
+    registered_body = accepted_registered.json()
+    expect(
+        accepted_registered.status_code == 200,
+        "Veyra-registered Phase 6 Case callback is accepted",
+        registered_body,
+    )
+    expect(
+        len(registered.target_adapter.bound_fetch_calls) == 1
+        and registered_body["agent_dialogue"]["message_id"]
+        == "agent_options_phase6_authoritative_fetch",
+        "registered Phase 6 callback is only a wake-up hint with exact re-fetch",
+        {
+            "fetches": registered.target_adapter.bound_fetch_calls,
+            "dialogue": registered_body.get("agent_dialogue"),
+        },
+    )
+    expect(
+        registered.verifier.generic_calls == 0
+        and registered.memory_policy_runtime.calls == 0,
+        "registered Phase 6 callback cannot enter legacy verification or memory",
+        {
+            "generic_calls": registered.verifier.generic_calls,
+            "memory_calls": registered.memory_policy_runtime.calls,
+        },
+    )
+
+
 def callback_contract_checks(root: Path) -> None:
     loop = LoopFixture(root / "callback")
     prepared = loop.prepare_registered_case("event-callback")
@@ -941,6 +1063,7 @@ def main() -> int:
         prefix="veyra-phase4-callback-"
     ) as temp_dir:
         root = Path(temp_dir)
+        phase6_callback_namespace_checks(root)
         callback_contract_checks(root)
         wrong_binding_checks(root)
         poll_binding_checks(root)

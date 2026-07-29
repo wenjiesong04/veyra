@@ -42,7 +42,7 @@ OPENCLAW_REQUIRED_METHODS = ("chat.send",)
 OPENCLAW_OPTIONAL_METHODS = ("health", "status", "tools.catalog", "skills.status", "agent.wait", "chat.history", "memory.summary", "memory.patch")
 OPENCLAW_GOVERNANCE_PROTOCOL = "veyra.openclaw.governance.v1"
 OPENCLAW_GOVERNANCE_IMPLEMENTATION_REVISION = (
-    "veyra.openclaw.governance.phase3.v2"
+    "veyra.openclaw.governance.phase6.v1"
 )
 
 
@@ -131,6 +131,68 @@ class OpenClawAdapter(AgentAdapter):
         self._governance_status_resolver = governance_status_resolver
 
     def send_task(self, task_packet: VeyraTaskPacket) -> ExecutionResult:
+        return self._send_task(
+            task_packet,
+            allow_governance_canary_bootstrap=False,
+        )
+
+    def send_governance_canary(
+        self,
+        task_packet: VeyraTaskPacket,
+    ) -> ExecutionResult:
+        """Run one fixed local canary when only fresh attestation is missing."""
+
+        context = (
+            task_packet.governance_context
+            if isinstance(task_packet.governance_context, dict)
+            else {}
+        )
+        marker = context.get("governance_canary")
+        suffix = (
+            str(marker.get("suffix") or "")
+            if isinstance(marker, dict)
+            else ""
+        )
+        callbacks = (
+            self._governance_dispatch_preparer,
+            self._governance_dispatch_canceller,
+            self._governance_run_evidence_resolver,
+            self._governance_status_resolver,
+        )
+        if (
+            not isinstance(marker, dict)
+            or marker.get("schema_version")
+            != "veyra.openclaw_governance_canary.v1"
+            or re.fullmatch(r"[0-9a-f]{12}", suffix) is None
+            or task_packet.target_agent != "openclaw"
+            or context.get("execution_profile")
+            != "phase3_sandbox_proposal"
+            or context.get("user_id")
+            != f"phase3-live-canary-{suffix}"
+            or not all(callable(callback) for callback in callbacks)
+        ):
+            return ExecutionResult(
+                task_id=task_packet.task_id,
+                executor="openclaw",
+                status="blocked",
+                result="Invalid Veyra governance canary bootstrap.",
+                raw={
+                    "configured": bool(self.gateway_url),
+                    "dispatch_allowed": False,
+                    "reason": "invalid_governance_canary_bootstrap",
+                },
+            )
+        return self._send_task(
+            task_packet,
+            allow_governance_canary_bootstrap=True,
+        )
+
+    def _send_task(
+        self,
+        task_packet: VeyraTaskPacket,
+        *,
+        allow_governance_canary_bootstrap: bool,
+    ) -> ExecutionResult:
         validation_errors = validate_task_packet_payload(task_packet.to_dict())
         if validation_errors:
             return ExecutionResult(
@@ -143,7 +205,16 @@ class OpenClawAdapter(AgentAdapter):
         if not self.gateway_url:
             return self._unconfigured_result(task_packet)
         dispatch_preflight = self._governed_dispatch_preflight()
-        if dispatch_preflight.get("allowed") is not True:
+        canary_bootstrap = bool(
+            allow_governance_canary_bootstrap
+            and self._can_bootstrap_governance_canary(
+                dispatch_preflight
+            )
+        )
+        if (
+            dispatch_preflight.get("allowed") is not True
+            and not canary_bootstrap
+        ):
             return ExecutionResult(
                 task_id=task_packet.task_id,
                 executor="openclaw",
@@ -195,6 +266,11 @@ class OpenClawAdapter(AgentAdapter):
                         "governance dispatch preparer returned an invalid registration"
                     )
             except Exception as exc:
+                failure_code = (
+                    self._governance_registration_failure_code(
+                        exc
+                    )
+                )
                 self._remember_chat_run(
                     run_id,
                     status="blocked",
@@ -220,6 +296,7 @@ class OpenClawAdapter(AgentAdapter):
                             "task_context": task_context,
                             "governance": {
                                 "status": "registration_failed",
+                                "failure_code": failure_code,
                                 "reason": str(exc)[:600],
                             },
                             "governance_cleanup": cleanup,
@@ -465,6 +542,10 @@ class OpenClawAdapter(AgentAdapter):
             "idempotent_submit": True,
             "exact_stop": True,
             "enforced_execution_profile": "phase3_sandbox_proposal",
+            "enforced_execution_profiles": [
+                "phase3_sandbox_proposal",
+                "phase6_read_only_collaboration.v1",
+            ],
         }
 
     def fetch_memory_summary(self, session_id: str) -> dict[str, Any]:
@@ -1047,6 +1128,26 @@ class OpenClawAdapter(AgentAdapter):
             "policy_effect": "none",
         }
 
+    @staticmethod
+    def _can_bootstrap_governance_canary(
+        preflight: dict[str, Any],
+    ) -> bool:
+        """Allow only the single missing-attestation state to run a canary."""
+
+        return bool(
+            preflight.get("allowed") is False
+            and preflight.get("reasons")
+            == ["tool_proxy_enforcement_not_verified"]
+            and preflight.get("provider_certification_status")
+            == "validated"
+            and preflight.get("tool_proxy_enforced") is False
+            and preflight.get("tool_proxy_identity_match") is True
+            and preflight.get("tool_proxy_enforcement_scope")
+            == "veyra_governed_openclaw_sessions"
+            and preflight.get("governance_callbacks_complete") is True
+            and preflight.get("policy_effect") == "none"
+        )
+
     def _cached_capabilities(self) -> dict[str, Any]:
         if self._capabilities_cache_ttl <= 0:
             return {}
@@ -1119,6 +1220,12 @@ class OpenClawAdapter(AgentAdapter):
                     },
                 )
             final_event = self._wait_for_chat_final(ws, run_id, events)
+            final_event = self._hydrate_chat_final_message(
+                ws,
+                final_event=final_event,
+                session_key=active_session_key,
+                events=events,
+            )
         return self._redact_payload(
             {
                 "hello": self._hello_summary(hello),
@@ -1389,6 +1496,47 @@ class OpenClawAdapter(AgentAdapter):
             if payload.get("state") in {"final", "error"}:
                 return payload
         return {"state": "submitted", "reason": "timeout_waiting_for_final_event"}
+
+    def _hydrate_chat_final_message(
+        self,
+        ws: Any,
+        *,
+        final_event: dict[str, Any],
+        session_key: str,
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Resolve a text-less final event from its exact isolated history."""
+
+        if (
+            final_event.get("state") != "final"
+            or self._message_text(final_event.get("message"))
+        ):
+            return final_event
+        for attempt in range(3):
+            try:
+                history = self._request_on_socket(
+                    ws,
+                    "chat.history",
+                    {
+                        "sessionKey": session_key,
+                        "limit": 12,
+                    },
+                    events,
+                )
+            except OpenClawGatewayError:
+                return final_event
+            if str(history.get("sessionKey") or "") != session_key:
+                return final_event
+            text = self._latest_assistant_text(history)
+            if text:
+                return {
+                    **final_event,
+                    "message": {"text": text},
+                    "messageSource": "chat.history",
+                }
+            if attempt < 2:
+                time.sleep(0.05 * (attempt + 1))
+        return final_event
 
     def _resolve_chat_run(self, task_id: str, *, wait_timeout_ms: int) -> ExecutionResult:
         cached = self._cached_execution(task_id)
@@ -1749,6 +1897,53 @@ class OpenClawAdapter(AgentAdapter):
         raw = execution.raw if isinstance(execution.raw, dict) else {}
         if raw.get("exact_run_observed") is True:
             return True
+        # ``chat.send`` is an authoritative provider acknowledgement: the
+        # adapter rejects a response whose runId differs from the governed
+        # idempotency key, and ``_wait_for_chat_final`` only returns a terminal
+        # chat event for that same run.  Some OpenClaw releases omit runId from
+        # the returned event payload, so preserve the complete acknowledgement
+        # chain instead of requiring the final event to repeat the identifier.
+        chat_send = (
+            raw.get("chat_send")
+            if isinstance(raw.get("chat_send"), dict)
+            else {}
+        )
+        final_event = (
+            raw.get("final_event")
+            if isinstance(raw.get("final_event"), dict)
+            else {}
+        )
+        top_level_run_id = str(raw.get("run_id") or "").strip()
+        chat_run_id = str(
+            chat_send.get("runId")
+            or chat_send.get("run_id")
+            or ""
+        ).strip()
+        final_run_id = str(
+            final_event.get("runId")
+            or final_event.get("run_id")
+            or ""
+        ).strip()
+        if (
+            top_level_run_id == execution.task_id
+            and chat_run_id == execution.task_id
+            and (not final_run_id or final_run_id == execution.task_id)
+            and str(final_event.get("state") or "").strip().lower()
+            in {"final", "error"}
+        ):
+            for payload in (chat_send, final_event):
+                if payload.get("providerStarted") is False:
+                    return False
+                if (
+                    str(payload.get("status") or "").strip().lower()
+                    == "timeout"
+                    and str(
+                        payload.get("timeoutPhase") or ""
+                    ).strip().lower()
+                    == "queue"
+                ):
+                    return False
+            return True
         for key in ("agent_wait", "final_event", "task"):
             payload = raw.get(key)
             if not isinstance(payload, dict):
@@ -1774,6 +1969,76 @@ class OpenClawAdapter(AgentAdapter):
                 return False
             return True
         return False
+
+    @staticmethod
+    def _governance_registration_failure_code(
+        exc: Exception,
+    ) -> str:
+        """Project local registration failures to stable public-safe codes."""
+
+        exception_name = type(exc).__name__
+        if exception_name == "OpenClawHookDenied":
+            exact_policy_codes = {
+                (
+                    "bound collaboration requires the Phase 6 read-only "
+                    "execution profile"
+                ): "phase6_execution_profile_mismatch",
+                (
+                    "Phase 6 dispatch requires an exact collaboration "
+                    "dialogue"
+                ): "phase6_dialogue_invalid",
+                (
+                    "Phase 6 dispatch requires an exact collaboration "
+                    "binding"
+                ): "phase6_binding_missing",
+                (
+                    "Phase 6 collaboration binding is not active yet"
+                ): "phase6_binding_not_active",
+                (
+                    "Phase 6 collaboration binding has expired"
+                ): "phase6_binding_expired",
+                (
+                    "Phase 6 private case does not match dialogue case"
+                ): "phase6_case_binding_mismatch",
+                (
+                    "Phase 6 task_id does not match dialogue task"
+                ): "phase6_task_binding_mismatch",
+                (
+                    "Phase 6 target_agent does not match bound provider"
+                ): "phase6_provider_binding_mismatch",
+                (
+                    "Phase 6 private owner scope does not match dialogue"
+                ): "phase6_owner_scope_mismatch",
+                (
+                    "Phase 6 runtime_run_id does not match dispatch run_id"
+                ): "phase6_run_binding_mismatch",
+                (
+                    "Phase 6 Agent session does not match dispatch session"
+                ): "phase6_agent_session_mismatch",
+                (
+                    "Phase 6 transport session is not the exact bound "
+                    "ephemeral turn"
+                ): "phase6_transport_identity_mismatch",
+            }
+            return exact_policy_codes.get(
+                str(exc),
+                "governance_policy_denied",
+            )
+        return {
+            "OpenClawHookConflict": (
+                "governance_registration_conflict"
+            ),
+            "ToolGovernanceConflict": (
+                "governance_session_conflict"
+            ),
+            "ToolGovernanceStorageError": (
+                "governance_state_invalid"
+            ),
+            "ValueError": "governance_identity_invalid",
+        }.get(
+            exception_name,
+            "governance_registration_error",
+        )
 
     def _execution_raw_for_run(
         self,
@@ -2336,11 +2601,20 @@ class OpenClawAdapter(AgentAdapter):
         reported_changed_files = self._string_items(
             agent_response.get("changed_files")
         ) or self._string_items(execution.changed_files)
+        tool_calls_reported = bool(
+            agent_response.get("tool_calls") or execution.tool_calls
+        )
+        changed_files_reported = bool(
+            agent_response.get("changed_files")
+            or execution.changed_files
+        )
         raw["agent_reported_tool_evidence"] = {
             "status": "diagnostic_only",
             "authoritative": False,
             "tool_call_count": len(reported_tool_calls),
             "changed_file_count": len(reported_changed_files),
+            "tool_calls_reported": tool_calls_reported,
+            "changed_files_reported": changed_files_reported,
         }
         raw["governed_tool_evidence"] = {
             "status": projection["status"],

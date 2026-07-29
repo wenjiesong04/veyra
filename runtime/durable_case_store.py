@@ -27,6 +27,14 @@ from core.durable_case import (
     sha256_digest,
 )
 from core.world_state import WorldStateStore
+from interface.agent_dialogue_contract import (
+    DialogueContractError,
+    DialogueType as AgentDialogueType,
+    parse_collaboration_binding,
+    parse_dialogue_message,
+    scope_digest as agent_scope_digest,
+    validate_collaboration_child,
+)
 
 
 STATE_FILE = "durable_case_state.json"
@@ -641,6 +649,30 @@ class DurableCaseStore:
                             "outbound dialogue case_revision must match the "
                             "current case"
                         )
+                    self._validate_veyra_dialogue_parent(
+                        existing,
+                        dialogue,
+                    )
+                    if (
+                        dialogue.content.get("collaboration_binding")
+                        is not None
+                    ):
+                        required_status = {
+                            DialogueMessageType.TASK_REQUEST: (
+                                CaseStatus.DELIBERATING
+                            ),
+                            DialogueMessageType.CONTEXT_PATCH: (
+                                CaseStatus.DELIBERATING
+                            ),
+                            DialogueMessageType.PLAN_SELECTION: (
+                                CaseStatus.CLOSED
+                            ),
+                        }[dialogue.message_type]
+                        if next_status != required_status:
+                            raise CaseOperationConflictError(
+                                f"bound {dialogue.message_type.value} requires "
+                                f"resulting Case status {required_status.value}"
+                            )
                 else:
                     parent = next(
                         (
@@ -649,14 +681,17 @@ class DurableCaseStore:
                             if item.message_id == dialogue.in_reply_to
                             and item.sender == "veyra"
                             and item.message_type
-                            == DialogueMessageType.TASK_REQUEST
+                            in {
+                                DialogueMessageType.TASK_REQUEST,
+                                DialogueMessageType.CONTEXT_PATCH,
+                            }
                         ),
                         None,
                     )
                     if parent is None:
                         raise CaseOperationConflictError(
                             "Agent dialogue in_reply_to does not identify a "
-                            "recorded Veyra TASK_REQUEST"
+                            "recorded Veyra request turn"
                         )
                     if dialogue.case_revision != parent.case_revision:
                         raise CaseRevisionConflictError(
@@ -666,8 +701,48 @@ class DurableCaseStore:
                     if dialogue.turn_index != parent.turn_index:
                         raise CaseOperationConflictError(
                             "Agent dialogue turn_index must echo the parent "
-                            "TASK_REQUEST turn"
+                            "Veyra request turn"
                         )
+                    if (
+                        parent.content.get("collaboration_binding")
+                        is not None
+                        and existing.status != CaseStatus.DELIBERATING
+                    ):
+                        raise CaseOperationConflictError(
+                            "bound Agent reply requires a DELIBERATING Case"
+                        )
+                    if (
+                        parent.content.get("collaboration_binding")
+                        is not None
+                        and any(
+                            item.sender == "agent"
+                            and item.in_reply_to == parent.message_id
+                            for item in existing.dialogue
+                        )
+                    ):
+                        raise CaseOperationConflictError(
+                            "bound Veyra request already has an Agent reply"
+                        )
+                    self._validate_agent_reply_binding(
+                        parent,
+                        dialogue,
+                    )
+                    if (
+                        parent.content.get("collaboration_binding")
+                        is not None
+                    ):
+                        required_status = {
+                            DialogueMessageType.EVIDENCE_REQUEST: (
+                                CaseStatus.AWAITING_EVIDENCE
+                            ),
+                            DialogueMessageType.CHALLENGE: CaseStatus.PAUSED,
+                            DialogueMessageType.OPTION_SET: CaseStatus.PROPOSED,
+                        }[dialogue.message_type]
+                        if next_status != required_status:
+                            raise CaseOperationConflictError(
+                                f"bound {dialogue.message_type.value} requires "
+                                f"resulting Case status {required_status.value}"
+                            )
                 if any(
                     item.message_id == dialogue.message_id
                     for item in existing.dialogue
@@ -832,6 +907,420 @@ class DurableCaseStore:
         value = dialogue.model_dump(mode="json")
         value.pop("recorded_at", None)
         return value
+
+    def _validate_veyra_dialogue_parent(
+        self,
+        case: DurableCase,
+        dialogue: DialogueRecord,
+    ) -> None:
+        """Enforce Phase 6 Veyra-child lineage without weakening legacy v1."""
+
+        message_type = AgentDialogueType(dialogue.message_type.value)
+        raw_binding = dialogue.content.get("collaboration_binding")
+        phase6_message = (
+            message_type
+            in {
+                AgentDialogueType.CONTEXT_PATCH,
+                AgentDialogueType.PLAN_SELECTION,
+            }
+            or dialogue.in_reply_to is not None
+            or raw_binding is not None
+        )
+        if not phase6_message:
+            # Phase 4 TASK_REQUEST records predate the collaboration binding
+            # and intentionally retain their exact stored shape.
+            return
+
+        try:
+            parsed = parse_dialogue_message(
+                dialogue.content,
+                expected_case_id=case.case_id,
+                expected_case_revision=dialogue.case_revision,
+                expected_turn_index=dialogue.turn_index,
+                expected_sender="veyra",
+                allowed_types={message_type},
+            )
+        except (DialogueContractError, ValueError) as exc:
+            raise CaseOperationConflictError(
+                f"invalid Veyra collaboration dialogue: {exc}"
+            ) from exc
+        if parsed.scope_digest != agent_scope_digest(
+            user_id=case.scope.user_id,
+            workspace_id=case.scope.workspace_id,
+        ):
+            raise CaseOperationConflictError(
+                "dialogue scope_digest does not match the Durable Case scope"
+            )
+        child_binding = parsed.collaboration_binding
+        if child_binding is None:
+            raise CaseOperationConflictError(
+                "Veyra collaboration dialogue requires collaboration_binding"
+            )
+        self._validate_active_collaboration_binding(child_binding)
+        if (
+            message_type
+            in {
+                AgentDialogueType.TASK_REQUEST,
+                AgentDialogueType.CONTEXT_PATCH,
+            }
+            and self._strict_json_size(parsed.payload.context)
+            > child_binding.budget.max_context_bytes
+        ):
+            raise CaseOperationConflictError(
+                "dialogue context exceeds collaboration context budget"
+            )
+        if (
+            message_type == AgentDialogueType.TASK_REQUEST
+            and not set(parsed.payload.evidence_refs).issubset(
+                set(child_binding.evidence_scope)
+            )
+        ):
+            raise CaseOperationConflictError(
+                "TASK_REQUEST evidence exceeds collaboration evidence scope"
+            )
+
+        if dialogue.in_reply_to is None:
+            if case.status != CaseStatus.QUALIFIED:
+                raise CaseOperationConflictError(
+                    "initial collaboration TASK_REQUEST requires a QUALIFIED "
+                    "Case"
+                )
+            if message_type != AgentDialogueType.TASK_REQUEST:
+                raise CaseOperationConflictError(
+                    "only an initial TASK_REQUEST may omit its parent"
+                )
+            if (
+                child_binding.handoff_index != 0
+                or child_binding.parent_participant_id is not None
+            ):
+                raise CaseOperationConflictError(
+                    "initial TASK_REQUEST must bind the root participant"
+                )
+            if child_binding.budget.remaining_agent_calls < 1:
+                raise CaseOperationConflictError(
+                    "initial TASK_REQUEST requires remaining Agent-call budget"
+                )
+            if any(
+                item.sender == "veyra"
+                and item.message_type == DialogueMessageType.TASK_REQUEST
+                and item.content.get("collaboration_binding") is not None
+                for item in case.dialogue
+            ):
+                raise CaseOperationConflictError(
+                    "Case already has a collaboration root TASK_REQUEST"
+                )
+            return
+
+        expected_parent_types: set[DialogueMessageType]
+        if message_type == AgentDialogueType.CONTEXT_PATCH:
+            if case.status != CaseStatus.AWAITING_EVIDENCE:
+                raise CaseOperationConflictError(
+                    "CONTEXT_PATCH requires an AWAITING_EVIDENCE Case"
+                )
+            expected_parent_types = {
+                DialogueMessageType.EVIDENCE_REQUEST,
+            }
+        elif message_type in {
+            AgentDialogueType.TASK_REQUEST,
+            AgentDialogueType.PLAN_SELECTION,
+        }:
+            if case.status != CaseStatus.PROPOSED:
+                raise CaseOperationConflictError(
+                    f"{message_type.value} requires a PROPOSED Case"
+                )
+            expected_parent_types = {
+                DialogueMessageType.OPTION_SET,
+            }
+        else:
+            raise CaseOperationConflictError(
+                "unsupported Veyra collaboration dialogue type"
+            )
+        parent = next(
+            (
+                item
+                for item in case.dialogue
+                if item.message_id == dialogue.in_reply_to
+                and item.sender == "agent"
+                and item.message_type in expected_parent_types
+            ),
+            None,
+        )
+        if parent is None:
+            expected = ", ".join(
+                sorted(item.value for item in expected_parent_types)
+            )
+            raise CaseOperationConflictError(
+                "Veyra dialogue in_reply_to does not identify the required "
+                f"Agent parent ({expected})"
+            )
+        if any(
+            item.sender == "veyra"
+            and item.in_reply_to == parent.message_id
+            for item in case.dialogue
+        ):
+            raise CaseOperationConflictError(
+                "bound Agent parent already has a Veyra child"
+            )
+        if dialogue.turn_index != parent.turn_index + 1:
+            raise CaseOperationConflictError(
+                "Veyra child turn_index must immediately follow its Agent "
+                "parent"
+            )
+
+        parent_binding = self._record_collaboration_binding(
+            parent,
+            required=True,
+        )
+        if message_type == AgentDialogueType.CONTEXT_PATCH:
+            parent_payload = parent.content.get("payload")
+            raw_requests = (
+                parent_payload.get("requested_evidence")
+                if isinstance(parent_payload, dict)
+                else None
+            )
+            if not isinstance(raw_requests, list):
+                raise CaseOperationConflictError(
+                    "EVIDENCE_REQUEST parent request set is unavailable"
+                )
+            request_ids = {
+                item.get("request_id")
+                for item in raw_requests
+                if isinstance(item, dict)
+                and isinstance(item.get("request_id"), str)
+            }
+            if len(request_ids) != len(raw_requests):
+                raise CaseOperationConflictError(
+                    "bound EVIDENCE_REQUEST requires one unique request_id "
+                    "per evidence need"
+                )
+            resolved = set(parsed.payload.resolved_request_ids)
+            unresolved = set(parsed.payload.unresolved_request_ids)
+            if resolved.union(unresolved) != request_ids:
+                raise CaseOperationConflictError(
+                    "CONTEXT_PATCH must partition the exact parent request set"
+                )
+        relationship_errors = validate_collaboration_child(
+            parent=parent_binding,
+            child=child_binding,
+            outbound_type=message_type,
+            provided_evidence_refs=(
+                list(parsed.payload.evidence_refs)
+                if message_type == AgentDialogueType.CONTEXT_PATCH
+                else None
+            ),
+        )
+        if relationship_errors:
+            raise CaseOperationConflictError(
+                "collaboration child scope is invalid: "
+                + "; ".join(relationship_errors)
+            )
+
+        if message_type == AgentDialogueType.PLAN_SELECTION:
+            parent_payload = parent.content.get("payload")
+            if not isinstance(parent_payload, dict):
+                raise CaseOperationConflictError(
+                    "OPTION_SET parent payload is unavailable"
+                )
+            raw_options = parent_payload.get("options")
+            if not isinstance(raw_options, list):
+                raise CaseOperationConflictError(
+                    "OPTION_SET parent options are unavailable"
+                )
+            option_ids = {
+                option.get("option_id")
+                for option in raw_options
+                if isinstance(option, dict)
+                and isinstance(option.get("option_id"), str)
+            }
+            if parsed.payload.option_set_message_id != parent.message_id:
+                raise CaseOperationConflictError(
+                    "PLAN_SELECTION option_set_message_id must identify its "
+                    "exact OPTION_SET parent"
+                )
+            if parsed.payload.selected_option_id not in option_ids:
+                raise CaseOperationConflictError(
+                    "PLAN_SELECTION selected_option_id is absent from its "
+                    "OPTION_SET parent"
+                )
+            if not set(parsed.payload.rejected_option_ids).issubset(
+                option_ids
+            ):
+                raise CaseOperationConflictError(
+                    "PLAN_SELECTION rejected_option_ids are absent from its "
+                    "OPTION_SET parent"
+                )
+            if not set(parsed.payload.decision_evidence_refs).issubset(
+                set(child_binding.evidence_scope)
+            ):
+                raise CaseOperationConflictError(
+                    "PLAN_SELECTION decision evidence exceeds the bound "
+                    "evidence scope"
+                )
+
+    def _validate_agent_reply_binding(
+        self,
+        parent: DialogueRecord,
+        dialogue: DialogueRecord,
+    ) -> None:
+        """Require a bound Agent reply to echo its Veyra parent exactly."""
+
+        parent_binding = self._record_collaboration_binding(
+            parent,
+            required=False,
+        )
+        reply_binding = self._record_collaboration_binding(
+            dialogue,
+            required=False,
+        )
+        if parent_binding is None:
+            if reply_binding is not None:
+                raise CaseOperationConflictError(
+                    "legacy Agent reply cannot introduce collaboration_binding"
+                )
+            return
+        if reply_binding is None:
+            raise CaseOperationConflictError(
+                "Agent reply omitted its parent collaboration_binding"
+            )
+        if dialogue.content.get(
+            "collaboration_binding"
+        ) != parent.content.get("collaboration_binding"):
+            raise CaseOperationConflictError(
+                "Agent reply collaboration_binding envelope must exactly "
+                "match its Veyra parent"
+            )
+        if reply_binding.model_dump(
+            mode="json"
+        ) != parent_binding.model_dump(mode="json"):
+            raise CaseOperationConflictError(
+                "Agent reply collaboration_binding must exactly echo its "
+                "Veyra parent"
+            )
+        self._validate_active_collaboration_binding(parent_binding)
+
+        try:
+            parsed = parse_dialogue_message(
+                dialogue.content,
+                expected_case_id=str(parent.content["case_id"]),
+                expected_case_revision=parent.case_revision,
+                expected_turn_index=parent.turn_index,
+                expected_in_reply_to=parent.message_id,
+                expected_sender="agent",
+                expected_task_packet_id=str(
+                    parent.content["task_packet_id"]
+                ),
+                expected_operation_id=str(
+                    parent.content["operation_id"]
+                ),
+                expected_scope_digest=str(
+                    parent.content["scope_digest"]
+                ),
+                expected_collaboration_binding=parent_binding,
+                require_collaboration_binding=True,
+                allowed_types={
+                    AgentDialogueType.EVIDENCE_REQUEST,
+                    AgentDialogueType.CHALLENGE,
+                    AgentDialogueType.OPTION_SET,
+                },
+            )
+        except (DialogueContractError, KeyError, ValueError) as exc:
+            raise CaseOperationConflictError(
+                f"invalid bound Agent reply: {exc}"
+            ) from exc
+        if (
+            self._strict_json_size(dialogue.content)
+            > parent_binding.budget.max_output_bytes
+        ):
+            raise CaseOperationConflictError(
+                "Agent reply exceeds collaboration output budget"
+            )
+
+        capability_scope = set(parent_binding.capability_scope)
+        evidence_scope = set(parent_binding.evidence_scope)
+        requested_capabilities: set[str] = set()
+        referenced_evidence: set[str] = set()
+        if parsed.message_type == AgentDialogueType.EVIDENCE_REQUEST.value:
+            requested_capabilities.update(
+                parsed.payload.requested_capabilities
+            )
+            if any(
+                item.request_id is None
+                for item in parsed.payload.requested_evidence
+            ):
+                raise CaseOperationConflictError(
+                    "bound EVIDENCE_REQUEST requires request_id for every "
+                    "evidence need"
+                )
+            referenced_evidence.update(
+                item.claim_ref
+                for item in parsed.payload.requested_evidence
+                if item.claim_ref is not None
+            )
+        elif parsed.message_type == AgentDialogueType.CHALLENGE.value:
+            requested_capabilities.update(
+                parsed.payload.requested_capabilities
+            )
+            referenced_evidence.update(
+                parsed.payload.challenged_claim_refs
+            )
+            referenced_evidence.update(parsed.payload.evidence_refs)
+        elif parsed.message_type == AgentDialogueType.OPTION_SET.value:
+            for option in parsed.payload.options:
+                requested_capabilities.update(
+                    option.required_capabilities
+                )
+                referenced_evidence.update(option.evidence_refs)
+        if not requested_capabilities.issubset(capability_scope):
+            raise CaseOperationConflictError(
+                "Agent reply capability request exceeds its exact parent scope"
+            )
+        if not referenced_evidence.issubset(evidence_scope):
+            raise CaseOperationConflictError(
+                "Agent reply evidence reference exceeds its exact parent scope"
+            )
+
+    def _record_collaboration_binding(
+        self,
+        dialogue: DialogueRecord,
+        *,
+        required: bool,
+    ) -> Any:
+        raw = dialogue.content.get("collaboration_binding")
+        if raw is None:
+            if required:
+                raise CaseOperationConflictError(
+                    "collaboration parent is missing collaboration_binding"
+                )
+            return None
+        try:
+            return parse_collaboration_binding(raw)
+        except (ValidationError, ValueError) as exc:
+            raise CaseOperationConflictError(
+                f"invalid collaboration_binding: {exc}"
+            ) from exc
+
+    def _validate_active_collaboration_binding(self, binding: Any) -> None:
+        now = self._now()
+        if binding.issued_at > now:
+            raise CaseOperationConflictError(
+                "collaboration_binding is not active yet"
+            )
+        if binding.expires_at <= now:
+            raise CaseOperationConflictError(
+                "collaboration_binding has expired"
+            )
+
+    @staticmethod
+    def _strict_json_size(value: Any) -> int:
+        return len(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
 
     def _enqueue_trace(
         self,

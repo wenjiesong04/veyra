@@ -49,9 +49,11 @@ class CasePriority(str, Enum):
 
 class DialogueMessageType(str, Enum):
     TASK_REQUEST = "TASK_REQUEST"
+    CONTEXT_PATCH = "CONTEXT_PATCH"
     EVIDENCE_REQUEST = "EVIDENCE_REQUEST"
     CHALLENGE = "CHALLENGE"
     OPTION_SET = "OPTION_SET"
+    PLAN_SELECTION = "PLAN_SELECTION"
 
 
 class CheckpointEffectState(str, Enum):
@@ -355,11 +357,27 @@ class DialogueRecord(StrictCaseModel):
         )
         if self.direction != expected:
             raise ValueError("dialogue direction does not match sender")
-        if self.message_type == DialogueMessageType.TASK_REQUEST:
+        veyra_message_types = {
+            DialogueMessageType.TASK_REQUEST,
+            DialogueMessageType.CONTEXT_PATCH,
+            DialogueMessageType.PLAN_SELECTION,
+        }
+        if self.message_type in veyra_message_types:
             if self.sender != "veyra":
-                raise ValueError("TASK_REQUEST must be sent by Veyra")
-            if self.in_reply_to is not None:
-                raise ValueError("TASK_REQUEST cannot be a reply")
+                raise ValueError(
+                    f"{self.message_type.value} must be sent by Veyra"
+                )
+            if (
+                self.message_type
+                in {
+                    DialogueMessageType.CONTEXT_PATCH,
+                    DialogueMessageType.PLAN_SELECTION,
+                }
+                and self.in_reply_to is None
+            ):
+                raise ValueError(
+                    f"{self.message_type.value} must identify its parent"
+                )
         else:
             if self.sender != "agent":
                 raise ValueError(

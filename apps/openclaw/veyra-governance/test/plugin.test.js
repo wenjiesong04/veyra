@@ -277,6 +277,127 @@ function assertSecretsErased(runtime, secrets) {
   }
 }
 
+test("registration accepts unique governed tool subsets including an empty set", async () => {
+  const fake = setupPlugin("http://127.0.0.1:9");
+  try {
+    const empty = await invokeGateway(
+      fake,
+      "veyra.governance.registerSession",
+      {
+        sessionKey: "agent-exec:no-tools",
+        runId: "run-no-tools",
+        dispatchToken: "dispatch-no-tools",
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        bindingDigest: BINDING_DIGEST,
+        allowedTools: [],
+      },
+    );
+    assert.equal(empty.ok, true);
+
+    const subset = await invokeGateway(
+      fake,
+      "veyra.governance.registerSession",
+      {
+        sessionKey: "agent-exec:read-only",
+        runId: "run-read-only",
+        dispatchToken: "dispatch-read-only",
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        bindingDigest: "e".repeat(64),
+        allowedTools: ["veyra_file_read"],
+      },
+    );
+    assert.equal(subset.ok, true);
+
+    for (const allowedTools of [
+      ["veyra_file_read", "veyra_file_read"],
+      ["veyra_file_read", "openclaw_native_read"],
+    ]) {
+      const rejected = await invokeGateway(
+        fake,
+        "veyra.governance.registerSession",
+        {
+          sessionKey: `agent-exec:invalid-${allowedTools.length}`,
+          runId: `run-invalid-${allowedTools.join("-")}`,
+          dispatchToken: "dispatch-invalid",
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          bindingDigest: "f".repeat(64),
+          allowedTools,
+        },
+      );
+      assert.equal(rejected.ok, false);
+      assert.equal(rejected.error.code, "invalid_registration");
+    }
+  } finally {
+    cleanupPlugin(fake);
+  }
+});
+
+test("an empty governed allowlist blocks every tool before preflight and direct execution", async () => {
+  const mock = await createMockVeyra((request, response) => {
+    assert.equal(request.path, "/tool-governance/hook/observe");
+    assert.equal(request.body.outcome, "blocked");
+    jsonResponse(response, 200, {
+      status: "recorded",
+      authoritative: false,
+    });
+  });
+  const fake = setupPlugin(mock.baseUrl);
+  try {
+    await registerSession(fake, { allowedTools: [] });
+
+    const custom = beforeEvent({
+      toolName: "veyra_file_read",
+      params: { path: "must-not-read.txt" },
+      toolCallId: "no-tool-custom",
+    });
+    const customDecision = await fake.hooks.get("before_tool_call")(
+      custom.event,
+      custom.ctx,
+    );
+    assert.equal(customDecision.block, true);
+    assert.match(customDecision.blockReason, /not allowed/);
+
+    const native = beforeEvent({
+      toolName: "read",
+      params: { path: "must-not-read.txt" },
+      toolCallId: "no-tool-native",
+    });
+    const nativeDecision = await fake.hooks.get("before_tool_call")(
+      native.event,
+      native.ctx,
+    );
+    assert.equal(nativeDecision.block, true);
+    assert.match(nativeDecision.blockReason, /disabled/);
+
+    await assert.rejects(
+      toolsForSession(fake)
+        .get("veyra_file_read")
+        .execute("no-tool-direct", { path: "must-not-read.txt" }),
+      (error) => error?.code === "tool_not_allowed",
+    );
+
+    assert.deepEqual(
+      mock.requests.map((request) => request.path),
+      [
+        "/tool-governance/hook/observe",
+        "/tool-governance/hook/observe",
+      ],
+    );
+    const status = await invokeGateway(
+      fake,
+      "veyra.governance.status",
+    );
+    assert.equal(status.payload.metrics.allowlist_blocks, 2);
+    assert.equal(status.payload.metrics.disallowed_custom_blocks, 1);
+    assert.equal(status.payload.metrics.native_blocks, 1);
+    assert.equal(status.payload.metrics.preflight_allows, 0);
+    assert.equal(status.payload.metrics.executions, 0);
+  } finally {
+    cleanupPlugin(fake);
+    await mock.close();
+  }
+});
+
 test("governance unavailability fails closed and erases the dispatch token", async () => {
   const unavailable = await createMockVeyra((_request, response) => {
     response.destroy();
@@ -573,6 +694,271 @@ test("an active governed run cannot be registered to another session", async () 
     );
     assert.equal(status.payload.active_sessions, 1);
     assert.equal(status.payload.metrics.replacements, 0);
+  } finally {
+    cleanupPlugin(fake);
+  }
+});
+
+test("an exact active registration is idempotent without replacing the session or clearing reservations", async () => {
+  const mock = await createMockVeyra((request, response) => {
+    assert.equal(request.path, "/tool-governance/hook/preflight");
+    jsonResponse(response, 200, {
+      allow: true,
+      canonicalToolName: "file.read",
+      invocationDigest: INVOCATION_DIGEST,
+      reservationId: "reservation-idempotent-registration",
+      reservationToken: "reservation-token-idempotent-registration",
+      executionToken: "execution-token-idempotent-registration",
+      expiresAt: new Date(Date.now() + 30_000).toISOString(),
+    });
+  });
+  const fake = setupPlugin(mock.baseUrl);
+  const expiresAt = new Date(Date.now() + 60_000).toISOString();
+  const registration = {
+    sessionKey: "agent-exec:idempotent-registration",
+    runId: "run-idempotent-registration",
+    dispatchToken: "dispatch-idempotent-registration",
+    expiresAt,
+    bindingDigest: "e".repeat(64),
+    allowedTools: ["veyra_shell_probe", "veyra_file_read"],
+  };
+  try {
+    const first = await invokeGateway(
+      fake,
+      "veyra.governance.registerSession",
+      registration,
+    );
+    assert.equal(first.ok, true);
+    assert.equal(first.payload.idempotent, false);
+
+    const input = beforeEvent({
+      toolName: "veyra_file_read",
+      params: { path: "note.txt" },
+      sessionKey: registration.sessionKey,
+      runId: registration.runId,
+      toolCallId: "idempotent-registration-call",
+    });
+    assert.equal(
+      await fake.hooks.get("before_tool_call")(
+        input.event,
+        input.ctx,
+      ),
+      undefined,
+    );
+
+    const before = await invokeGateway(
+      fake,
+      "veyra.governance.status",
+    );
+    assert.equal(before.payload.metrics.registrations, 1);
+    assert.equal(before.payload.metrics.replacements, 0);
+    assert.equal(before.payload.pending_reservations, 1);
+
+    const repeated = await invokeGateway(
+      fake,
+      "veyra.governance.registerSession",
+      {
+        ...registration,
+        allowedTools: [...registration.allowedTools].reverse(),
+      },
+    );
+    assert.equal(repeated.ok, true);
+    assert.equal(repeated.payload.idempotent, true);
+
+    const after = await invokeGateway(
+      fake,
+      "veyra.governance.status",
+    );
+    assert.equal(after.payload.metrics.registrations, 1);
+    assert.equal(after.payload.metrics.replacements, 0);
+    assert.equal(after.payload.pending_reservations, 1);
+
+    for (const mismatch of [
+      { bindingDigest: "f".repeat(64) },
+      { dispatchToken: "different-dispatch-token" },
+      { expiresAt: new Date(Date.now() + 90_000).toISOString() },
+      { allowedTools: ["veyra_file_read"] },
+    ]) {
+      const rejected = await invokeGateway(
+        fake,
+        "veyra.governance.registerSession",
+        {
+          ...registration,
+          ...mismatch,
+        },
+      );
+      assert.equal(rejected.ok, false);
+      assert.equal(rejected.error.code, "run_binding_mismatch");
+    }
+
+    const finalStatus = await invokeGateway(
+      fake,
+      "veyra.governance.status",
+    );
+    assert.equal(finalStatus.payload.metrics.registrations, 1);
+    assert.equal(finalStatus.payload.metrics.replacements, 0);
+    assert.equal(finalStatus.payload.pending_reservations, 1);
+  } finally {
+    cleanupPlugin(fake);
+    await mock.close();
+  }
+});
+
+test("a cancelled session cannot be re-registered locally or from a shared tombstone", async () => {
+  const sharedHostRuntime = {};
+  const first = setupPlugin(
+    "http://127.0.0.1:9",
+    {},
+    sharedHostRuntime,
+  );
+  const expiresAt = new Date(Date.now() + 60_000).toISOString();
+  const registration = {
+    sessionKey: "agent-exec:cancelled-registration",
+    runId: "run-cancelled-registration",
+    dispatchToken: "dispatch-cancelled-registration",
+    expiresAt,
+    bindingDigest: "f".repeat(64),
+    allowedTools: [],
+  };
+  let restarted;
+  try {
+    const registered = await invokeGateway(
+      first,
+      "veyra.governance.registerSession",
+      registration,
+    );
+    assert.equal(registered.ok, true);
+    assert.equal(registered.payload.idempotent, false);
+
+    const cancelled = await invokeGateway(
+      first,
+      "veyra.governance.cancelSession",
+      {
+        sessionKey: registration.sessionKey,
+        runId: registration.runId,
+        bindingDigest: registration.bindingDigest,
+      },
+    );
+    assert.equal(cancelled.ok, true);
+
+    const localReplay = await invokeGateway(
+      first,
+      "veyra.governance.registerSession",
+      registration,
+    );
+    assert.equal(localReplay.ok, false);
+    assert.equal(localReplay.error.code, "session_retired");
+
+    const localStatus = await invokeGateway(
+      first,
+      "veyra.governance.status",
+    );
+    assert.equal(localStatus.payload.active_sessions, 0);
+    assert.equal(localStatus.payload.metrics.registrations, 1);
+    assert.equal(localStatus.payload.metrics.cancellations, 1);
+
+    restarted = setupPlugin(
+      "http://127.0.0.1:9",
+      {},
+      {
+        runContexts: sharedHostRuntime.runContexts,
+        processContextStore: new Map(),
+      },
+    );
+    const sharedReplay = await invokeGateway(
+      restarted,
+      "veyra.governance.registerSession",
+      registration,
+    );
+    assert.equal(sharedReplay.ok, false);
+    assert.equal(sharedReplay.error.code, "session_retired");
+
+    const restartedStatus = await invokeGateway(
+      restarted,
+      "veyra.governance.status",
+    );
+    assert.equal(restartedStatus.payload.active_sessions, 0);
+  } finally {
+    if (restarted) {
+      cleanupPlugin(restarted);
+    }
+    cleanupPlugin(first);
+  }
+});
+
+test("a delayed old registration cannot resurrect its run over a replacement", async () => {
+  const fake = setupPlugin("http://127.0.0.1:9");
+  const expiresAt = new Date(Date.now() + 60_000).toISOString();
+  const oldRegistration = {
+    sessionKey: "agent-exec:delayed-old-registration",
+    runId: "run-delayed-old",
+    dispatchToken: "dispatch-delayed-old",
+    expiresAt,
+    bindingDigest: "d".repeat(64),
+    allowedTools: [],
+  };
+  const replacementRegistration = {
+    ...oldRegistration,
+    runId: "run-current-replacement",
+    dispatchToken: "dispatch-current-replacement",
+    bindingDigest: "e".repeat(64),
+  };
+  try {
+    const old = await invokeGateway(
+      fake,
+      "veyra.governance.registerSession",
+      oldRegistration,
+    );
+    assert.equal(old.ok, true);
+    assert.equal(old.payload.idempotent, false);
+
+    const replacement = await invokeGateway(
+      fake,
+      "veyra.governance.registerSession",
+      replacementRegistration,
+    );
+    assert.equal(replacement.ok, true);
+    assert.equal(replacement.payload.idempotent, false);
+
+    const beforeReplay = await invokeGateway(
+      fake,
+      "veyra.governance.status",
+    );
+    assert.equal(beforeReplay.payload.active_sessions, 1);
+    assert.equal(beforeReplay.payload.metrics.registrations, 2);
+    assert.equal(beforeReplay.payload.metrics.replacements, 1);
+
+    const delayedOld = await invokeGateway(
+      fake,
+      "veyra.governance.registerSession",
+      oldRegistration,
+    );
+    assert.equal(delayedOld.ok, false);
+    assert.equal(delayedOld.error.code, "session_retired");
+
+    const afterReplay = await invokeGateway(
+      fake,
+      "veyra.governance.status",
+    );
+    assert.equal(afterReplay.payload.active_sessions, 1);
+    assert.equal(afterReplay.payload.metrics.registrations, 2);
+    assert.equal(afterReplay.payload.metrics.replacements, 1);
+
+    const current = await invokeGateway(
+      fake,
+      "veyra.governance.registerSession",
+      replacementRegistration,
+    );
+    assert.equal(current.ok, true);
+    assert.equal(current.payload.idempotent, true);
+
+    const finalStatus = await invokeGateway(
+      fake,
+      "veyra.governance.status",
+    );
+    assert.equal(finalStatus.payload.active_sessions, 1);
+    assert.equal(finalStatus.payload.metrics.registrations, 2);
+    assert.equal(finalStatus.payload.metrics.replacements, 1);
   } finally {
     cleanupPlugin(fake);
   }
@@ -1633,7 +2019,7 @@ test("gateway canary attestation uses the active session token without exposing 
       nativeBlockContent: "must-not-be-written",
       pluginProtocol: "veyra.openclaw.governance.v1",
       pluginImplementationRevision:
-        "veyra.openclaw.governance.phase3.v2",
+        "veyra.openclaw.governance.phase6.v1",
     });
     jsonResponse(response, 200, {
       status: "validated",
@@ -1641,7 +2027,7 @@ test("gateway canary attestation uses the active session token without exposing 
       implementation: {
         plugin_protocol: "veyra.openclaw.governance.v1",
         plugin_implementation_revision:
-          "veyra.openclaw.governance.phase3.v2",
+          "veyra.openclaw.governance.phase6.v1",
       },
       dispatchToken: "server-response-token-must-be-ignored",
     });

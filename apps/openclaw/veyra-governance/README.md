@@ -1,18 +1,19 @@
 # Veyra OpenClaw governance plugin
 
-This plugin narrows an explicitly registered OpenClaw dispatch to three
-Veyra-backed tools:
+This plugin narrows an explicitly registered OpenClaw dispatch to an exact
+subset of three Veyra-backed tools:
 
 - `veyra_file_read`
 - `veyra_file_write`
 - `veyra_shell_probe`
 
-The plugin never reads, writes, or starts a process itself. While an exact
-governed registration or its token-free tombstone is present, every other tool
-is blocked and every allowed call must obtain a single-use reservation from
-Veyra before its tool body can run. Sessions not registered by Veyra keep
-OpenClaw's normal native-tool behavior, while the three `veyra_*` tools always
-fail closed without registration.
+The subset may be empty; Phase 6 read-only collaboration deliberately uses an
+empty allowlist. The plugin never reads, writes, or starts a process itself.
+While an exact governed registration or its token-free tombstone is present,
+every other tool is blocked and every allowed call must obtain a single-use
+reservation from Veyra before its tool body can run. Sessions not registered by
+Veyra keep OpenClaw's normal native-tool behavior, while the three `veyra_*`
+tools always fail closed without registration.
 
 ## Install
 
@@ -55,8 +56,7 @@ identityless ordinary call until the governed run reaches a terminal event.
 }
 ```
 
-`expiresAt` must be no more than 15 minutes in the future. The allowed tool set
-must exactly match the plugin's three Veyra-backed tools.
+`expiresAt` must be no more than 15 minutes in the future.
 
 The plugin calls:
 
@@ -69,6 +69,10 @@ The plugin calls:
   optional `effectEvidenceDigest`.
 - `POST /tool-governance/hook/observe`, which must return
   `{"status": "recorded", "authoritative": false}`.
+
+`allowedTools` must be a duplicate-free subset of the three registered custom
+tools. The Veyra broker binds the exact subset to the private execution profile;
+the plugin can only preserve or restrict that set and never widens it.
 
 The dispatch token is sent only in `X-Veyra-Dispatch-Token`; hook request bodies
 do not contain it. Observation payloads contain bounded digests, and an

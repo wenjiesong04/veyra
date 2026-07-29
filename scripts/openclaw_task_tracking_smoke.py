@@ -45,6 +45,59 @@ def main() -> None:
         "overlapping structured JSON blocks fail closed",
         ambiguous_response,
     )
+    adapter._request_on_socket = (  # type: ignore[method-assign]
+        lambda _ws, method, params, _events: {
+            "sessionKey": params["sessionKey"],
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                '{"dialogue_message":'
+                                '{"message_type":"CHALLENGE"}}'
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+        if method == "chat.history"
+        else {}
+    )
+    hydrated = adapter._hydrate_chat_final_message(
+        object(),
+        final_event={"state": "final"},
+        session_key="agent:main:phase6-hydration",
+        events=[],
+    )
+    expect(
+        hydrated.get("messageSource") == "chat.history"
+        and adapter._message_text(hydrated.get("message"))
+        == '{"dialogue_message":{"message_type":"CHALLENGE"}}',
+        "text-less final resolves from exact isolated history",
+        hydrated,
+    )
+    adapter._request_on_socket = (  # type: ignore[method-assign]
+        lambda _ws, _method, _params, _events: {
+            "sessionKey": "agent:main:other-session",
+            "messages": [
+                {"role": "assistant", "text": "cross-session text"}
+            ],
+        }
+    )
+    mismatched_history = adapter._hydrate_chat_final_message(
+        object(),
+        final_event={"state": "final"},
+        session_key="agent:main:phase6-hydration",
+        events=[],
+    )
+    expect(
+        mismatched_history == {"state": "final"},
+        "history hydration rejects a mismatched session",
+        mismatched_history,
+    )
 
     def gateway_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == "agent.wait":

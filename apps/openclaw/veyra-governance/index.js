@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 const PLUGIN_ID = "veyra-governance";
 const PROTOCOL_VERSION = "veyra.openclaw.governance.v1";
-const IMPLEMENTATION_REVISION = "veyra.openclaw.governance.phase3.v2";
+const IMPLEMENTATION_REVISION = "veyra.openclaw.governance.phase6.v1";
 const RUN_CONTEXT_NAMESPACE = "session-v1";
 const SESSION_INDEX_NAMESPACE = "session-index-v1";
 const RESERVATION_INDEX_NAMESPACE = "reservation-index-v1";
@@ -132,6 +132,8 @@ function newMetrics() {
     native_blocks: 0,
     unknown_blocks: 0,
     unregistered_custom_blocks: 0,
+    disallowed_custom_blocks: 0,
+    allowlist_blocks: 0,
     malformed_blocks: 0,
     preflight_allows: 0,
     preflight_denials: 0,
@@ -894,8 +896,7 @@ export function createVeyraGovernancePlugin(runtimeOptions = {}) {
           !Number.isSafeInteger(generation) ||
           generation < 1 ||
           !Array.isArray(allowedTools) ||
-          allowedTools.length !== CUSTOM_TOOLS.size ||
-          new Set(allowedTools).size !== CUSTOM_TOOLS.size ||
+          new Set(allowedTools).size !== allowedTools.length ||
           allowedTools.some(
             (toolName) =>
               typeof toolName !== "string" || !CUSTOM_TOOLS.has(toolName),
@@ -1932,10 +1933,12 @@ export function createVeyraGovernancePlugin(runtimeOptions = {}) {
           };
         }
 
-        if (!CUSTOM_TOOLS.has(toolName)) {
+        if (!session.allowedTools.includes(toolName)) {
           const reason = NATIVE_SIDE_EFFECT_TOOLS.has(toolName)
             ? "Native OpenClaw tool is disabled for this Veyra-governed run"
-            : "Unknown tool is disabled for this Veyra-governed run";
+            : CUSTOM_TOOLS.has(toolName)
+              ? "Tool is not allowed for this Veyra-governed run"
+              : "Unknown tool is disabled for this Veyra-governed run";
           try {
             const paramsDigest = exactDigest(
               event.params,
@@ -1957,8 +1960,16 @@ export function createVeyraGovernancePlugin(runtimeOptions = {}) {
               blockReason: `Veyra governance blocked tool and failed closed (${error.code ?? "observation_failed"})`,
             };
           }
+          metrics.allowlist_blocks += 1;
           if (NATIVE_SIDE_EFFECT_TOOLS.has(toolName)) {
             metrics.native_blocks += 1;
+            return {
+              block: true,
+              blockReason: reason,
+            };
+          }
+          if (CUSTOM_TOOLS.has(toolName)) {
+            metrics.disallowed_custom_blocks += 1;
             return {
               block: true,
               blockReason: reason,
@@ -1968,6 +1979,14 @@ export function createVeyraGovernancePlugin(runtimeOptions = {}) {
           return {
             block: true,
             blockReason: reason,
+          };
+        }
+        if (!CUSTOM_TOOLS.has(toolName)) {
+          metrics.malformed_blocks += 1;
+          return {
+            block: true,
+            blockReason:
+              "Veyra governance rejected an invalid tool allowlist",
           };
         }
 
@@ -2169,6 +2188,25 @@ export function createVeyraGovernancePlugin(runtimeOptions = {}) {
         signal,
       }) {
         requireBoundedString(toolCallId, "tool_call_id");
+        const governedSession =
+          hydrateSharedSessionForKey(sessionKey) ??
+          activeSession(sessionKey);
+        if (
+          !governedSession ||
+          governedSession.state !== "active" ||
+          !governedSession.dispatchToken
+        ) {
+          throw new GovernanceError(
+            "session_unavailable",
+            "Veyra governed session is unavailable",
+          );
+        }
+        if (!governedSession.allowedTools.includes(toolName)) {
+          throw new GovernanceError(
+            "tool_not_allowed",
+            "tool is not allowed for this Veyra-governed run",
+          );
+        }
         const hydrated = hydrateSharedReservation(
           sessionKey,
           toolCallId,
@@ -2475,8 +2513,7 @@ export function createVeyraGovernancePlugin(runtimeOptions = {}) {
         const allowedTools = params.allowed_tools ?? params.allowedTools;
         if (
           !Array.isArray(allowedTools) ||
-          allowedTools.length !== CUSTOM_TOOLS.size ||
-          new Set(allowedTools).size !== CUSTOM_TOOLS.size ||
+          new Set(allowedTools).size !== allowedTools.length ||
           allowedTools.some(
             (toolName) =>
               typeof toolName !== "string" || !CUSTOM_TOOLS.has(toolName),
@@ -2484,9 +2521,10 @@ export function createVeyraGovernancePlugin(runtimeOptions = {}) {
         ) {
           throw new GovernanceError(
             "invalid_registration",
-            "allowed_tools must exactly match the Veyra plugin tools",
+            "allowed_tools must be a unique subset of the Veyra plugin tools",
           );
         }
+        const normalizedAllowedTools = [...allowedTools].sort();
         const expiresAt = parseExpiry(
           params.expires_at ?? params.expiresAt,
           "expires_at",
@@ -2519,18 +2557,28 @@ export function createVeyraGovernancePlugin(runtimeOptions = {}) {
           runId,
           RUN_CONTEXT_NAMESPACE,
         );
+        let sharedSessionForRun;
         if (sharedForRun !== undefined) {
-          const sharedSession = parseSharedSession(
+          sharedSessionForRun = parseSharedSession(
             sharedForRun,
             runId,
           );
           if (
-            sharedSession.state === "active" &&
-            sharedSession.sessionKey !== sessionKey
+            sharedSessionForRun.state === "active" &&
+            sharedSessionForRun.sessionKey !== sessionKey
           ) {
             throw new GovernanceError(
               "run_binding_mismatch",
               "run_id is already bound in OpenClaw run context",
+            );
+          }
+          if (
+            sharedSessionForRun.state !== "active" &&
+            sharedSessionForRun.sessionKey === sessionKey
+          ) {
+            throw new GovernanceError(
+              "session_retired",
+              `governed session cannot be re-registered from state ${sharedSessionForRun.state}`,
             );
           }
         }
@@ -2549,12 +2597,57 @@ export function createVeyraGovernancePlugin(runtimeOptions = {}) {
             "governed session belongs to another Veyra authority",
           );
         }
+        if (sharedIndex !== undefined) {
+          existing = hydrateSharedSessionForKey(sessionKey);
+        }
         if (
           !existing &&
-          isRecord(sharedIndex) &&
-          sharedIndex.state === "active"
+          sharedSessionForRun?.sessionKey === sessionKey
         ) {
-          existing = hydrateSharedSessionForKey(sessionKey);
+          existing = hydrateSharedSession(runId);
+        }
+        if (
+          existing &&
+          existing.runId === runId &&
+          existing.state !== "active"
+        ) {
+          throw new GovernanceError(
+            "session_retired",
+            `governed session cannot be re-registered from state ${existing.state}`,
+          );
+        }
+        if (existing?.state === "active" && existing.runId === runId) {
+          const exactAllowedTools =
+            existing.allowedTools.length ===
+              normalizedAllowedTools.length &&
+            existing.allowedTools.every(
+              (toolName, index) =>
+                toolName === normalizedAllowedTools[index],
+            );
+          if (
+            existing.sessionKey !== sessionKey ||
+            existing.bindingDigest !== bindingDigest ||
+            existing.authorityFingerprint !==
+              configuredAuthorityFingerprint ||
+            !exactAllowedTools ||
+            existing.dispatchToken !== dispatchToken ||
+            existing.expiresAt !== expiresAt
+          ) {
+            throw new GovernanceError(
+              "run_binding_mismatch",
+              "active governed session registration does not exactly match its binding",
+            );
+          }
+          return {
+            status: "registered",
+            registered: true,
+            idempotent: true,
+            sessionKey,
+            runId,
+            bindingDigest,
+            expiresAt: new Date(expiresAt).toISOString(),
+            runBound: true,
+          };
         }
         if (existing?.state === "active" && existing.runId !== runId) {
           if (existing.timer) {
@@ -2574,7 +2667,7 @@ export function createVeyraGovernancePlugin(runtimeOptions = {}) {
           runId,
           bindingDigest,
           authorityFingerprint: configuredAuthorityFingerprint,
-          allowedTools: [...allowedTools].sort(),
+          allowedTools: normalizedAllowedTools,
           generation: (existing?.generation ?? 0) + 1,
           state: "active",
           timer: undefined,
@@ -2596,6 +2689,7 @@ export function createVeyraGovernancePlugin(runtimeOptions = {}) {
         return {
           status: "registered",
           registered: true,
+          idempotent: false,
           sessionKey,
           runId,
           bindingDigest,

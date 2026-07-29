@@ -90,6 +90,7 @@ STATE_FILE_LAYOUT: dict[str, str] = {
     "foresight_runtime_state.json": f"{STATE_RUNTIME}/foresight_runtime_state.json",
     "self_heal_state.json": f"{STATE_RUNTIME}/self_heal_state.json",
     "sandbox_repair_state.json": f"{STATE_RUNTIME}/sandbox_repair_state.json",
+    "phase6_collaboration_state.json": f"{STATE_RUNTIME}/phase6_collaboration_state.json",
     "rollback_state.json": f"{STATE_RUNTIME}/rollback_state.json",
     "replay_runtime_state.json": f"{STATE_RUNTIME}/replay_runtime_state.json",
     "ops_soak_state.json": f"{STATE_RUNTIME}/ops_soak_state.json",
@@ -142,6 +143,7 @@ STATE_METADATA: dict[str, dict[str, Any]] = {
     "foresight_runtime_state.json": {"source": "foresight_runtime", "ttl_seconds": 0, "confidence": 1.0},
     "self_heal_state.json": {"source": "self_heal_playbook", "ttl_seconds": 0, "confidence": 1.0},
     "sandbox_repair_state.json": {"source": "sandbox_repair_playbook", "ttl_seconds": 0, "confidence": 1.0},
+    "phase6_collaboration_state.json": {"source": "read_only_agent_collaboration", "ttl_seconds": 0, "confidence": 1.0},
     "feishu_ws_state.json": {"source": "feishu_ws_runner", "ttl_seconds": 600, "confidence": 0.65},
     "ops_runtime_matrix.json": {"source": "runtime_matrix", "ttl_seconds": 1800, "confidence": 0.74},
     "ops_config.json": {"source": "ops_config", "ttl_seconds": 0, "confidence": 0.8},
@@ -165,6 +167,7 @@ DURABLE_STATE_FILES = CONFIG_STATE_FILES | {
     "foresight_runtime_state.json",
     "self_heal_state.json",
     "sandbox_repair_state.json",
+    "phase6_collaboration_state.json",
 }
 
 _ROOT_LOCKS_GUARD = threading.Lock()
@@ -699,6 +702,13 @@ class WorldStateStore:
                 "last_operation_id": None,
                 "updated_at": None,
             },
+            "phase6_collaboration_state.json": {
+                "schema_version": "veyra.phase6.collaboration_state.v1",
+                "collaborations": {},
+                "event_index": {},
+                "collaboration_count": 0,
+                "updated_at": None,
+            },
             "feishu_ws_state.json": {"status": "stopped", "last_event_at": None},
             "ops_runtime_matrix.json": {"status": "not_run", "runtimes": []},
             "ops_config.json": {
@@ -1179,6 +1189,7 @@ class WorldStateStore:
             "project_guardian_state": self.read_json("project_guardian_state.json"),
             "project_guardian_signal_state": self.read_json("project_guardian_signal_state.json"),
             "self_heal_state": self.read_json("self_heal_state.json"),
+            "phase6_collaboration_state": self.read_json("phase6_collaboration_state.json"),
             "feishu_ws_state": self.read_json("feishu_ws_state.json"),
             "ops_config": self.read_json("ops_config.json"),
         }

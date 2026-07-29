@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
 from interface.agent_adapter import ExecutionResult
@@ -58,6 +58,19 @@ class AgentInvokeRequest(BaseModel):
     channel: str = "api"
     user_id: str = "local-user"
     session_id: str = "multi-agent"
+
+
+class GovernanceCanaryRunRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    schema_version: Literal[
+        "veyra.openclaw_governance_canary_run.v1"
+    ]
+    suffix: str = Field(
+        min_length=12,
+        max_length=12,
+        pattern=r"^[0-9a-f]{12}$",
+    )
 
 
 class AgentResultRequest(BaseModel):
@@ -162,6 +175,41 @@ def _accept_case_execution(
         ) from exc
 
 
+def _sync_phase6_case_projection(
+    deps: dict[str, Any],
+    *,
+    task_context: dict[str, Any],
+) -> None:
+    runtime_task_id = str(
+        task_context.get("runtime_task_id") or ""
+    )
+    task_packet_id = str(
+        task_context.get("task_packet_id") or ""
+    )
+    if not (
+        runtime_task_id.startswith("veyra-p6-")
+        or task_packet_id.startswith("p6task_")
+    ):
+        return
+    collaboration = deps.get("phase6_collaboration")
+    if collaboration is None:
+        return
+    try:
+        collaboration.reconcile_case_projection(
+            case_id=str(task_context["case_id"]),
+            user_id=str(task_context["user_id"]),
+            workspace_id=str(task_context["case_workspace_id"]),
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Phase 6 Case advanced but its public projection could "
+                f"not be reconciled: {str(exc)[:400]}"
+            ),
+        ) from exc
+
+
 def _fetch_registered_case_execution(
     loop: Any,
     *,
@@ -214,6 +262,11 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
             if case_bound
             else None
         )
+        if isinstance(negotiation, dict):
+            _sync_phase6_case_projection(
+                deps,
+                task_context=task_context,
+            )
         verified = (
             negotiation["verification"]
             if isinstance(negotiation, dict)
@@ -306,6 +359,21 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
         loop = deps["awareness_loop"]
         task_context, context_found = _task_context_for_callback(loop, request.task_id)
         case_bound = _is_case_context(task_context, context_found)
+        if (
+            request.task_id.startswith(("p6task_", "veyra-p6-"))
+            and (
+                not case_bound
+                or str(task_context.get("authority") or "")
+                != "veyra_registered"
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Phase 6 callback requires a Veyra-registered "
+                    "Durable Case binding"
+                ),
+            )
         if case_bound:
             registered_run_id = str(
                 task_context.get("runtime_task_id") or ""
@@ -359,6 +427,11 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
             if case_bound
             else None
         )
+        if isinstance(negotiation, dict):
+            _sync_phase6_case_projection(
+                deps,
+                task_context=task_context,
+            )
         verified = (
             negotiation["verification"]
             if isinstance(negotiation, dict)
@@ -607,6 +680,20 @@ def build_agent_memory_router(deps: dict[str, Any]) -> APIRouter:
             user_id=request.user_id,
             session_id=request.session_id,
         )
+
+    @router.post("/agents/governance-canary")
+    async def run_governance_canary(
+        request: GovernanceCanaryRunRequest,
+    ) -> dict[str, Any]:
+        try:
+            return await run_in_threadpool(
+                deps["agent_orchestrator"].invoke_governance_canary,
+                suffix=request.suffix,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail=str(exc)[:400]
+            ) from exc
 
     @router.post("/agents/select")
     async def select_agent(request: AgentSelectRequest) -> dict[str, Any]:
