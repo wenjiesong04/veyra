@@ -15,15 +15,27 @@ if str(ROOT) not in sys.path:
 from interface.event_normalizer import EventNormalizer  # noqa: E402
 from interface.event_schema import Route  # noqa: E402
 from routers.debug_audit import _public_state  # noqa: E402
+from interface.extension_spec import parse_extension_spec  # noqa: E402
+from runtime.extension_spec_quarantine import (  # noqa: E402
+    ExtensionSpecQuarantine,
+)
 from scripts.event_driven_awareness_smoke import (  # noqa: E402
     OFFLINE_ROUTE_CASES,
     build_offline_route_loop,
     offline_public_outputs_equivalent,
 )
+from scripts.phase6_extension_spec_contract_smoke import (  # noqa: E402
+    valid_spec,
+)
 
 
 MODES = ("disabled", "record_only", "shadow")
-SCENARIOS = ("populated", "corrupt")
+SCENARIOS = (
+    "collaboration_populated",
+    "collaboration_corrupt",
+    "extension_populated",
+    "extension_corrupt",
+)
 
 
 def expect(condition: bool, label: str, detail: Any = None) -> None:
@@ -33,11 +45,23 @@ def expect(condition: bool, label: str, detail: Any = None) -> None:
 
 
 def seed_phase6(loop: Any, scenario: str) -> None:
-    path = loop.state_store.path_for(
+    collaboration_path = loop.state_store.path_for(
         "phase6_collaboration_state.json"
     )
-    if scenario == "corrupt":
-        path.write_text("{invalid-phase6-state", encoding="utf-8")
+    extension_path = loop.state_store.path_for(
+        "phase6_extension_spec_state.json"
+    )
+    if scenario == "collaboration_corrupt":
+        collaboration_path.write_text(
+            "{invalid-phase6-collaboration-state",
+            encoding="utf-8",
+        )
+        return
+    if scenario == "extension_corrupt":
+        extension_path.write_text(
+            "{invalid-phase6-extension-state",
+            encoding="utf-8",
+        )
         return
 
     def mutate(state: dict[str, Any]) -> None:
@@ -79,9 +103,110 @@ def seed_phase6(loop: Any, scenario: str) -> None:
             }
         )
 
-    loop.state_store.mutate_json(
-        "phase6_collaboration_state.json", mutate
-    )
+    if scenario == "collaboration_populated":
+        loop.state_store.mutate_json(
+            "phase6_collaboration_state.json", mutate
+        )
+        return
+
+    def mutate_extension(state: dict[str, Any]) -> None:
+        created = datetime.now(timezone.utc)
+        payload = valid_spec(now=created)
+        payload["extension_id"] = "example.route_non_regression"
+        spec = parse_extension_spec(payload)
+        user_id = "private-user"
+        workspace_id = "private-workspace"
+        identity_key = ExtensionSpecQuarantine._identity_key(
+            user_id,
+            workspace_id,
+            spec.extension_id,
+            spec.version,
+        )
+        candidate_id = ExtensionSpecQuarantine._candidate_id(
+            identity_key,
+            spec.digest(),
+        )
+        operation_key = ExtensionSpecQuarantine._operation_key(
+            user_id,
+            workspace_id,
+            "private-route-fixture",
+        )
+        recorded_at = created.isoformat()
+        state.update(
+            {
+                "schema_version": (
+                    "veyra.phase6.extension_spec_state.v1"
+                ),
+                "candidates": {
+                    candidate_id: {
+                        "schema_version": (
+                            "veyra.phase6.extension_spec_record.v1"
+                        ),
+                        "candidate_id": candidate_id,
+                        "spec": spec.canonical_dict(),
+                        "spec_digest": spec.digest(),
+                        "user_id": user_id,
+                        "workspace_id": workspace_id,
+                        "extension_id": spec.extension_id,
+                        "extension_version": spec.version,
+                        "stage": "SPEC_QUARANTINED",
+                        "revision": 1,
+                        "expires_at": spec.expires_at,
+                        "review": None,
+                        "revocation": None,
+                        "history": [
+                            {
+                                "revision": 1,
+                                "transition": "spec_quarantined",
+                                "recorded_at": recorded_at,
+                            }
+                        ],
+                        "created_at": recorded_at,
+                        "updated_at": recorded_at,
+                    }
+                },
+                "identity_index": {
+                    identity_key: candidate_id,
+                },
+                "operation_index": {
+                    operation_key: {
+                        "request_digest": (
+                            ExtensionSpecQuarantine._digest(
+                                {"fixture": "route"}
+                            )
+                        ),
+                        "kind": "quarantine",
+                        "candidate_id": candidate_id,
+                        "result_revision": 1,
+                        "result_stage": "SPEC_QUARANTINED",
+                        "owner_scope_digest": (
+                            ExtensionSpecQuarantine._owner_scope_digest(
+                                user_id,
+                                workspace_id,
+                            )
+                        ),
+                        "terminal_control": False,
+                        "recorded_at": recorded_at,
+                    }
+                },
+                "candidate_count": 1,
+            }
+        )
+
+    if scenario == "extension_populated":
+        loop.state_store.mutate_json(
+            "phase6_extension_spec_state.json",
+            mutate_extension,
+        )
+        status = ExtensionSpecQuarantine(
+            state_store=loop.state_store
+        ).status()
+        if status["operational_health"] != "available":
+            raise AssertionError(
+                f"invalid extension route fixture: {status!r}"
+            )
+        return
+    raise ValueError(f"unknown Phase 6 scenario: {scenario}")
 
 
 def route_event(case: Any, mode: str, scenario: str) -> Any:
@@ -110,10 +235,20 @@ def main() -> int:
                     }
                 }
             },
+            "phase6_extension_spec_state": {
+                "candidates": {
+                    "private-extension": {
+                        "purpose": "private extension purpose",
+                        "user_id": "private-user",
+                        "workspace_id": "private-workspace",
+                    }
+                }
+            },
         }
     )
     expect(
         "phase6_collaboration_state" not in public_state
+        and "phase6_extension_spec_state" not in public_state
         and public_state.get("local_world", {}).get(
             "current_project"
         )
@@ -193,7 +328,8 @@ def main() -> int:
         comparisons == 9 * len(MODES) * len(SCENARIOS)
         and not failures,
         (
-            "populated or corrupt Phase 6 state cannot weaken complete "
+            "isolated populated or corrupt collaboration/extension state "
+            "cannot weaken complete "
             "disabled, record-only, or shadow Route output/status/risk"
         ),
         failures,

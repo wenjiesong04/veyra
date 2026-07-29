@@ -43,6 +43,9 @@ from routers.local_setup import build_local_setup_router
 from routers.ops_runtime import build_ops_runtime_router
 from routers.phase5 import build_phase5_router
 from routers.phase6 import build_phase6_router
+from routers.phase6_extensions import (
+    build_phase6_extensions_router,
+)
 from routers.runtime_observability import build_runtime_observability_router
 from routers.tool_governance import build_tool_governance_router
 from runtime.active_loop import ActiveRuntimeLoop
@@ -72,6 +75,9 @@ from runtime.runtime_matrix import RuntimeMatrix
 from runtime.agent_capability_directory import AgentCapabilityDirectory
 from runtime.read_only_agent_collaboration import (
     ReadOnlyAgentCollaborationRuntime,
+)
+from runtime.extension_spec_quarantine import (
+    ExtensionSpecQuarantine,
 )
 from runtime.soak_runner import SoakRunner
 from runtime.state_refresh import StateRefresh
@@ -357,6 +363,9 @@ phase6_collaboration = ReadOnlyAgentCollaborationRuntime(
     bounded_negotiation=awareness_loop.bounded_negotiation,
     capability_directory=phase6_capability_directory,
     task_tracker=awareness_loop.task_tracker,
+)
+phase6_extension_specs = ExtensionSpecQuarantine(
+    state_store=state_store,
 )
 
 
@@ -714,6 +723,11 @@ app.include_router(
 app.include_router(
     build_phase6_router(
         collaboration=phase6_collaboration,
+    )
+)
+app.include_router(
+    build_phase6_extensions_router(
+        quarantine=phase6_extension_specs,
     )
 )
 app.include_router(

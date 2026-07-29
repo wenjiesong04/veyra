@@ -816,16 +816,18 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
 
 def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
     public = redact_sensitive(payload)
-    # Event, situation, Durable Case, Guardian, and Phase 6 collaboration
-    # projections are tenant-scoped. Durable Case and collaboration documents
-    # also carry private Agent run bindings, so they must only be exposed
-    # through their owner-scoped projections.
+    # Event, situation, Durable Case, Guardian, Phase 6 collaboration, and
+    # ExtensionSpec quarantine projections are tenant-scoped. Durable Case,
+    # collaboration, and extension documents also carry private bindings or
+    # manifest content, so they must only be exposed through owner-scoped
+    # projections.
     # The generic state endpoint has no authenticated tenant identity, so it
     # must not expose any of these collections.
     public.pop("event_inbox", None)
     public.pop("situation_state", None)
     public.pop("durable_case_state", None)
     public.pop("phase6_collaboration_state", None)
+    public.pop("phase6_extension_spec_state", None)
     public.pop("project_guardian_state", None)
     public.pop("project_guardian_signal_state", None)
     public.pop("project_guardian_producer_state", None)
