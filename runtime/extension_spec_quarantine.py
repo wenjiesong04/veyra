@@ -784,6 +784,207 @@ class ExtensionSpecQuarantine:
             "authority": self._authority(),
         }
 
+    def artifact_subject(
+        self,
+        *,
+        candidate_id: str,
+        user_id: str,
+        workspace_id: str,
+        require_gate_passed: bool = True,
+    ) -> dict[str, Any]:
+        """Return one strict private subject for the artifact quarantine.
+
+        This is an in-process governance boundary, not a public projection.
+        It performs the same owner/workspace/state validation as the control
+        plane and reparses the immutable manifest.  It never creates an
+        artifact or grants generation, execution, signing, or promotion.
+        """
+
+        if type(require_gate_passed) is not bool:
+            raise TypeError("require_gate_passed must be a boolean")
+        selected_user, selected_workspace, state = (
+            self._read_owner_state(user_id, workspace_id)
+        )
+        record = self._record_by_id(
+            state,
+            self._required_id(candidate_id, "candidate_id"),
+        )
+        self._require_owner(
+            record,
+            selected_user,
+            selected_workspace,
+        )
+        return self._artifact_subject_from_record(
+            record,
+            selected_user=selected_user,
+            selected_workspace=selected_workspace,
+            require_gate_passed=require_gate_passed,
+        )
+
+    def artifact_subjects(
+        self,
+        *,
+        candidate_ids: list[str],
+        user_id: str,
+        workspace_id: str,
+        require_gate_passed: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        """Resolve bounded artifact bindings from one validated state snapshot."""
+
+        if (
+            not isinstance(candidate_ids, list)
+            or len(candidate_ids) > 100
+            or any(not isinstance(item, str) for item in candidate_ids)
+        ):
+            raise ValueError("candidate_ids must be a bounded string list")
+        if len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("candidate_ids must be unique")
+        if type(require_gate_passed) is not bool:
+            raise TypeError("require_gate_passed must be a boolean")
+        selected_user, selected_workspace, state = (
+            self._read_owner_state(user_id, workspace_id)
+        )
+        subjects: dict[str, dict[str, Any]] = {}
+        for candidate_id in candidate_ids:
+            selected_candidate = self._required_id(
+                candidate_id,
+                "candidate_id",
+            )
+            record = self._record_by_id(state, selected_candidate)
+            self._require_owner(
+                record,
+                selected_user,
+                selected_workspace,
+            )
+            subjects[selected_candidate] = (
+                self._artifact_subject_from_record(
+                    record,
+                    selected_user=selected_user,
+                    selected_workspace=selected_workspace,
+                    require_gate_passed=require_gate_passed,
+                )
+            )
+        return subjects
+
+    def artifact_subjects_for_bindings(
+        self,
+        *,
+        bindings: list[tuple[str, str, str]],
+    ) -> list[dict[str, Any] | None]:
+        """Resolve private owner bindings from one validated state snapshot."""
+
+        if (
+            not isinstance(bindings, list)
+            or len(bindings) > 200
+            or any(
+                not isinstance(binding, tuple)
+                or len(binding) != 3
+                or any(not isinstance(item, str) for item in binding)
+                for binding in bindings
+            )
+        ):
+            raise ValueError(
+                "artifact subject bindings must be a bounded tuple list"
+            )
+        try:
+            snapshot = self.state_store.read_snapshot(
+                ["local_world.json", STATE_FILE]
+            )
+            local_world = snapshot["local_world.json"]
+            state = snapshot[STATE_FILE]
+            if not isinstance(local_world, dict):
+                raise ExtensionSpecStorageError(
+                    "ExtensionSpec workspace state is invalid"
+                )
+            self._validate_state(state)
+        except ExtensionSpecQuarantineError:
+            raise
+        except Exception as exc:
+            raise ExtensionSpecStorageError(
+                "ExtensionSpec artifact binding state is unavailable"
+            ) from exc
+        current_workspace = str(
+            local_world.get("current_project") or ""
+        ).strip()
+        subjects: list[dict[str, Any] | None] = []
+        for user_id, workspace_id, candidate_id in bindings:
+            selected_user = self._required_text(
+                user_id,
+                "user_id",
+                240,
+            )
+            selected_workspace = self._required_text(
+                workspace_id,
+                "workspace_id",
+                240,
+            )
+            selected_candidate = self._required_id(
+                candidate_id,
+                "candidate_id",
+            )
+            record = state["candidates"].get(selected_candidate)
+            if (
+                current_workspace != selected_workspace
+                or not isinstance(record, dict)
+                or record.get("user_id") != selected_user
+                or record.get("workspace_id") != selected_workspace
+            ):
+                subjects.append(None)
+                continue
+            subjects.append(
+                self._artifact_subject_from_record(
+                    record,
+                    selected_user=selected_user,
+                    selected_workspace=selected_workspace,
+                    require_gate_passed=False,
+                )
+            )
+        return subjects
+
+    def _artifact_subject_from_record(
+        self,
+        record: dict[str, Any],
+        *,
+        selected_user: str,
+        selected_workspace: str,
+        require_gate_passed: bool,
+    ) -> dict[str, Any]:
+        parsed = parse_extension_spec(record["spec"])
+        if parsed.digest() != record["spec_digest"]:
+            raise ExtensionSpecStorageError(
+                "ExtensionSpec artifact subject digest is invalid"
+            )
+        stage = self._effective_stage(record)
+        if require_gate_passed and stage != "SPEC_GATE_PASSED":
+            raise ExtensionSpecConflictError(
+                "artifact admission requires a fresh SPEC_GATE_PASSED candidate"
+            )
+        return {
+            "schema_version": (
+                "veyra.phase6.extension_artifact_subject.v1"
+            ),
+            "candidate_id": record["candidate_id"],
+            "candidate_revision": record["revision"],
+            "user_id": selected_user,
+            "workspace_id": selected_workspace,
+            "owner_scope_digest": self._owner_scope_digest(
+                selected_user,
+                selected_workspace,
+            ),
+            "extension_id": record["extension_id"],
+            "extension_version": record["extension_version"],
+            "extension_kind": parsed.extension_kind,
+            "risk_floor": parsed.risk_floor,
+            "spec_digest": record["spec_digest"],
+            "extension_policy_revision": EXTENSION_POLICY_REVISION,
+            "candidate_stage": stage,
+            "candidate_expires_at": record["expires_at"],
+            "artifact_declaration": parsed.artifact.model_dump(
+                mode="json",
+            ),
+            "authority": self._authority(),
+        }
+
     def _read_valid_state(self) -> dict[str, Any]:
         try:
             state = self.state_store.read_json(STATE_FILE)

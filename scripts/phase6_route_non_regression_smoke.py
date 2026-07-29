@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import hashlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -16,6 +17,15 @@ from interface.event_normalizer import EventNormalizer  # noqa: E402
 from interface.event_schema import Route  # noqa: E402
 from routers.debug_audit import _public_state  # noqa: E402
 from interface.extension_spec import parse_extension_spec  # noqa: E402
+from interface.extension_artifact import (  # noqa: E402
+    EXTENSION_ARTIFACT_POLICY_REVISION,
+    EXTENSION_ARTIFACT_SCHEMA_VERSION,
+    artifact_owner_scope_digest,
+    encode_artifact_content,
+)
+from runtime.extension_artifact_quarantine import (  # noqa: E402
+    ExtensionArtifactQuarantine,
+)
 from runtime.extension_spec_quarantine import (  # noqa: E402
     ExtensionSpecQuarantine,
 )
@@ -35,6 +45,8 @@ SCENARIOS = (
     "collaboration_corrupt",
     "extension_populated",
     "extension_corrupt",
+    "extension_artifact_populated",
+    "extension_artifact_corrupt",
 )
 
 
@@ -51,6 +63,9 @@ def seed_phase6(loop: Any, scenario: str) -> None:
     extension_path = loop.state_store.path_for(
         "phase6_extension_spec_state.json"
     )
+    artifact_path = loop.state_store.path_for(
+        "phase6_extension_artifact_state.json"
+    )
     if scenario == "collaboration_corrupt":
         collaboration_path.write_text(
             "{invalid-phase6-collaboration-state",
@@ -60,6 +75,12 @@ def seed_phase6(loop: Any, scenario: str) -> None:
     if scenario == "extension_corrupt":
         extension_path.write_text(
             "{invalid-phase6-extension-state",
+            encoding="utf-8",
+        )
+        return
+    if scenario == "extension_artifact_corrupt":
+        artifact_path.write_text(
+            "{invalid-phase6-extension-artifact-state",
             encoding="utf-8",
         )
         return
@@ -206,6 +227,85 @@ def seed_phase6(loop: Any, scenario: str) -> None:
                 f"invalid extension route fixture: {status!r}"
             )
         return
+    if scenario == "extension_artifact_populated":
+        now = datetime.now(timezone.utc)
+        user_id = "private-artifact-user"
+        workspace_id = str(
+            loop.state_store.read_json("local_world.json").get(
+                "current_project"
+            )
+            or ""
+        )
+        payload = valid_spec(now=now)
+        payload["extension_id"] = "example.route_artifact"
+        spec = parse_extension_spec(payload)
+        spec_quarantine = ExtensionSpecQuarantine(
+            state_store=loop.state_store
+        )
+        candidate = spec_quarantine.quarantine(
+            spec=spec,
+            expected_spec_digest=spec.digest(),
+            user_id=user_id,
+            workspace_id=workspace_id,
+            operation_id="route-artifact-spec",
+        )
+        candidate = spec_quarantine.review(
+            candidate_id=candidate["candidate_id"],
+            user_id=user_id,
+            workspace_id=workspace_id,
+            expected_revision=candidate["candidate_revision"],
+            operation_id="route-artifact-review",
+            decision="accept_for_future_isolated_generation",
+            reason="route isolation fixture only",
+        )
+        source = (
+            b"def route_isolation_fixture(value: str) -> str:\n"
+            b"    return value\n"
+        )
+        artifact = ExtensionArtifactQuarantine(
+            state_store=loop.state_store,
+            spec_quarantine=spec_quarantine,
+        )
+        artifact.submit(
+            envelope={
+                "schema_version": EXTENSION_ARTIFACT_SCHEMA_VERSION,
+                "artifact_kind": "python_source_utf8",
+                "candidate_id": candidate["candidate_id"],
+                "candidate_revision": candidate["candidate_revision"],
+                "owner_scope_digest": artifact_owner_scope_digest(
+                    user_id,
+                    workspace_id,
+                ),
+                "extension_id": candidate["extension_id"],
+                "extension_version": candidate["extension_version"],
+                "spec_digest": candidate["spec_digest"],
+                "extension_policy_revision": (
+                    spec.tcb_policy.policy_revision
+                ),
+                "artifact_policy_revision": (
+                    EXTENSION_ARTIFACT_POLICY_REVISION
+                ),
+                "artifact_sha256": hashlib.sha256(source).hexdigest(),
+                "size_bytes": len(source),
+                "content_b64url": encode_artifact_content(source),
+                "expires_at": (
+                    now + timedelta(days=3)
+                ).isoformat(timespec="microseconds").replace(
+                    "+00:00",
+                    "Z",
+                ),
+            },
+            expected_artifact_sha256=hashlib.sha256(source).hexdigest(),
+            user_id=user_id,
+            workspace_id=workspace_id,
+            operation_id="route-artifact-submit",
+        )
+        status = artifact.status()
+        if status["operational_health"] != "available":
+            raise AssertionError(
+                f"invalid artifact route fixture: {status!r}"
+            )
+        return
     raise ValueError(f"unknown Phase 6 scenario: {scenario}")
 
 
@@ -244,11 +344,21 @@ def main() -> int:
                     }
                 }
             },
+            "phase6_extension_artifact_state": {
+                "artifacts": {
+                    "private-artifact": {
+                        "content_b64url": "private-bytes",
+                        "user_id": "private-user",
+                        "workspace_id": "private-workspace",
+                    }
+                }
+            },
         }
     )
     expect(
         "phase6_collaboration_state" not in public_state
         and "phase6_extension_spec_state" not in public_state
+        and "phase6_extension_artifact_state" not in public_state
         and public_state.get("local_world", {}).get(
             "current_project"
         )

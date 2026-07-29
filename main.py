@@ -46,6 +46,9 @@ from routers.phase6 import build_phase6_router
 from routers.phase6_extensions import (
     build_phase6_extensions_router,
 )
+from routers.phase6_extension_artifacts import (
+    build_phase6_extension_artifacts_router,
+)
 from routers.runtime_observability import build_runtime_observability_router
 from routers.tool_governance import build_tool_governance_router
 from runtime.active_loop import ActiveRuntimeLoop
@@ -78,6 +81,9 @@ from runtime.read_only_agent_collaboration import (
 )
 from runtime.extension_spec_quarantine import (
     ExtensionSpecQuarantine,
+)
+from runtime.extension_artifact_quarantine import (
+    ExtensionArtifactQuarantine,
 )
 from runtime.soak_runner import SoakRunner
 from runtime.state_refresh import StateRefresh
@@ -366,6 +372,10 @@ phase6_collaboration = ReadOnlyAgentCollaborationRuntime(
 )
 phase6_extension_specs = ExtensionSpecQuarantine(
     state_store=state_store,
+)
+phase6_extension_artifacts = ExtensionArtifactQuarantine(
+    state_store=state_store,
+    spec_quarantine=phase6_extension_specs,
 )
 
 
@@ -728,6 +738,12 @@ app.include_router(
 app.include_router(
     build_phase6_extensions_router(
         quarantine=phase6_extension_specs,
+        artifact_quarantine=phase6_extension_artifacts,
+    )
+)
+app.include_router(
+    build_phase6_extension_artifacts_router(
+        quarantine=phase6_extension_artifacts,
     )
 )
 app.include_router(
