@@ -101,7 +101,7 @@ Veyra 更新世界状态、承诺、经验和下一次主动行为
 - Agent adapter 合同保持 provider-neutral。当前真实验证使用 Kimi/Moonshot 配置的 OpenClaw：一个明确实现请求进入 `route=agent`，Kimi 返回严格 `EVIDENCE_REQUEST`，Case 到达 `AWAITING_EVIDENCE`，checkpoint 的 effect state 保持 `not_started`，治理 session 归零；同一 `message_id` 重放只返回 duplicate，工作区 Git diff 不变。Kimi 将普通结构化回答与 dialogue envelope 放在相邻 JSON block 时，adapter 只按有界 JSON 结构组合互不重叠的顶层字段；字段重叠或结构歧义仍 fail closed；
 - 进程重启后的恢复、错绑 callback、terminal cache provenance、取消竞态、prepared-before-broker crash、同进程重复 submit、跨 provider 并发隔离、公开隐私边界、Phase 1 三个不变量与全部 9 Route 非弱化均进入 gate。
 
-这不是通用工作流引擎或无限多轮 Agent 会话。Phase 4 基线路径本身仍是一轮 bounded Agent reply；Phase 6.1 已在独立的 `phase6_read_only_agent_collaboration` Case 上增加最多一次 unresolved `CONTEXT_PATCH`、一个 critic handoff 和显式、非授权的 `PLAN_SELECTION` 记录。Phase 6.2a 又增加了完全独立、不可执行的 ExtensionSpec 规范隔离门；它不进入 Case、Agent、Tool Proxy 或 capability 路由。上述路径都没有开放 capability negotiation、候选代码生成/执行、验证、通用 DAG 或长期 wakeup。状态继续使用现有有界 JSON 原子存储，没有 SQLite 迁移，也没有引入 HMAC 归档、密钥轮换、旧索引迁移或压缩预算。其他模型/provider 需要分别完成 capability、严格输出质量和 live compatibility 验证，不能由 Kimi 的成功自动继承。
+这不是通用工作流引擎或无限多轮 Agent 会话。Phase 4 基线路径本身仍是一轮 bounded Agent reply；Phase 6.1 已在独立的 `phase6_read_only_agent_collaboration` Case 上增加最多一次 unresolved `CONTEXT_PATCH`、一个 critic handoff 和显式、非授权的 `PLAN_SELECTION` 记录。Phase 6.2a 增加了完全独立、不可执行的 ExtensionSpec 规范隔离门，Phase 6.2b 又允许本地控制面把一个与 fresh gate 精确绑定的有界 source blob 写入私有、不可执行的 artifact quarantine；两者都不进入 Case、Agent、Tool Proxy 或 capability 路由。上述路径仍没有开放 capability negotiation、候选代码生成、语法/行为验证、执行、签名、晋级、通用 DAG 或长期 wakeup。状态继续使用现有有界 JSON 原子存储，没有 SQLite 迁移，也没有引入 HMAC 归档、密钥轮换、旧索引迁移或压缩预算。其他模型/provider 需要分别完成 capability、严格输出质量和 live compatibility 验证，不能由 Kimi 的成功自动继承。
 
 ### 1.4 当前已经落地的 Phase 5 technical complete / shadow calibration
 
@@ -145,7 +145,7 @@ Veyra 更新世界状态、承诺、经验和下一次主动行为
 
 本次 changeset 的 Python gate 为 `73/73`，OpenClaw governance plugin 为 `32/32`，Python compileall、Web browser build 和 desktop build 均通过。Veyra API 重启加载新实现时 OpenClaw Gateway PID 和启动时间保持不变；`/phase6/status=technical_complete_read_only`，当前 capability directory 只有 OpenClaw eligible。
 
-因此 Phase 6.1 可以记为 `technical_complete_read_only + local_live_validated`；完整 Phase 6 仍是 `PARTIAL`。跨 provider/runtime 协作、其他模型独立认证、自动专家选择和并行 Agent 尚未实现；ExtensionSpec 的当前窄切片见下一节，隔离生成、artifact quarantine、固定代码测试、签名 registry、extension shadow/read-only execution canary/scoped canary、晋级和监控仍未实现。
+因此 Phase 6.1 可以记为 `technical_complete_read_only + local_live_validated`；完整 Phase 6 仍是 `PARTIAL`。跨 provider/runtime 协作、其他模型独立认证、自动专家选择和并行 Agent 尚未实现；ExtensionSpec 与 artifact quarantine 的当前窄切片见后两节，隔离生成、固定代码测试、签名 registry、extension shadow/read-only execution canary/scoped canary、晋级和监控仍未实现。
 
 ### 1.6 当前已经落地的 Phase 6.2a ExtensionSpec 规范隔离门
 
@@ -164,6 +164,24 @@ Veyra 更新世界状态、承诺、经验和下一次主动行为
 最终自动化为 Python gate `76/76`、OpenClaw governance plugin `32/32`、Python compileall、Web build 和 desktop build 全部通过；Extension/Phase 6 非回归矩阵单独覆盖 9 Route × 3 Event modes × collaboration/extension 各自 populated/corrupt，共 108 组完整 response/status/risk 对照。`/health=critical` 仍来自既有 Feishu self-signed TLS `SSLCertVerificationError`，同时还有 model stale、memory fallback、历史 pending review/stale belief；OpenClaw 保持 connected/available 且 provider certification validated。Feishu `last_event_after_start=false`，因此没有把本轮 websocket 当作 fresh channel acceptance。
 
 所以 Phase 6.2a 可以记为 `technical_complete_specification_only + local_live_validated`，完整 Phase 6 仍是 `PARTIAL`。这里的 quarantine 是 manifest specification quarantine，不是 worktree/container artifact quarantine；revocation 只是 manifest tombstone，不是已安装工具的 rollback。
+
+### 1.7 当前已经落地的 Phase 6.2b 私有非执行 Artifact Quarantine
+
+当前完成的是 `technical_complete_artifact_quarantine_only`，不是 isolated generation、代码验证或扩展执行。它只允许本地控制面为一个 fresh、精确的 `SPEC_GATE_PASSED` 候选提交一次有界 UTF-8 Python source blob，并把 bytes 与治理身份固定在私有 quarantine：
+
+- `interface/extension_artifact.py` 冻结 strict `veyra.phase6.extension_artifact_envelope.v1`，把 candidate ID/revision、owner scope digest、extension ID/version、`spec_digest`、两层 policy revision、artifact SHA-256、byte size 和 expiry 绑定到同一个 canonical envelope。source 上限 64 KiB，必须是 canonical base64url、strict UTF-8、NFC、LF-only，拒绝 BOM/NUL；合同没有 caller path、filename、entrypoint、command、environment、dependency、permission、signature、install、activate 或 promote 字段；
+- `runtime/private_artifact_blob_store.py` 只持久化 immutable bytes，不 parse AST、不 import、不 compile、不 eval、不执行。私有目录固定 `0700`，blob 固定 `0600`，使用 descriptor-relative `openat`、`O_NOFOLLOW / O_EXCL`、regular-file 与 single-link 检查、文件/目录 `fsync`，并持久绑定 hash、size、device、inode、mode 与 link count；内容替换、inode 替换、symlink、hardlink、mode 变化、缺失或读中变化全部 fail closed；
+- 私有 `phase6_extension_artifact_state.json` 精确绑定 owner/workspace/candidate/spec/revision/policy/artifact identity，单个 candidate 只能有一个 artifact；lifecycle 只允许 `ARTIFACT_QUARANTINED → ARTIFACT_REJECTED | ARTIFACT_REVOKED`。artifact 自身到期、Spec 撤销/到期/漂移或依赖状态不可用会形成互斥的 `EXPIRED / BLOCKED_CANDIDATE / CANDIDATE_UNAVAILABLE` 公开 effective status，不能继续当作可用；
+- submit 的新 operation 必须在 state-writer 边界重新取得 fresh `SPEC_GATE_PASSED` subject；原 operation 的 exact replay 可以在 Spec 后续撤销后返回历史结果和当前 blocked/terminal 状态，但不新增 artifact state 或 audit。新 operation 不能借 replay 绕过已撤销或已过期的 Spec；
+- `/phase6/extensions/artifacts` 只提供 status、owner-scoped list/detail、submit、bytes `integrity`、reject 和 revoke。`integrity` 只安全重开、验证 exact bytes/envelope，不做语法、静态、unit/contract/security/fuzz、行为、签名或执行验证；generate、test、sign、install、execute、activate 和 promote endpoint 不存在；
+- Spec list/detail/mutation 会合并 artifact 的真实 `not_submitted / quarantined / rejected / revoked / blocked / unavailable` 投影；批量投影只读取和验证一次有界状态快照。artifact state、raw source、base64、owner、blob path/inode 和完整 envelope 不进入 `WorldStateStore.read_all()`、通用 `/state`、专用公开响应或全局 audit；Phase 6 私有控制面的 `422` 也使用固定脱敏错误，不能回显无效 source 或 owner 输入；
+- authority projection 明确关闭 code generation、quarantine 外 artifact write、workspace/state/environment/network/secret/tool access、Agent dispatch、signing、installation、activation、capability registration、execution、behavior verification、promotion 和 provider switch。这里的 private blob persistence 只是隔离存储机制，不是候选获得的写入或执行权限。
+
+2026-07-29 的真实主进程验收中，候选 `extspec_1727a916ddca642f084b7672` 与 artifact `extart_ed25bec3251aa6ee581fb05b` 依次经过 `SPEC_QUARANTINED → SPEC_GATE_PASSED → ARTIFACT_QUARANTINED → BLOCKED_CANDIDATE → ARTIFACT_REVOKED`。artifact source 包含一条如果被 import 就会写 `/tmp` sentinel 的顶层语句；提交、integrity、两次 Veyra 重启、submit replay、Spec revoke、artifact revoke 和 terminal replay 全程都没有创建 sentinel。真实私有目录/blob 权限为 `0700/0600`，通用 `/state` 不含 private artifact；submit/revoke 精确重放均是 state 与 audit no-op。
+
+验收前后，8 个 capability/Memory/Review/Task/Tool Governance/Phase 6 collaboration/self-improvement/state-proposal 核心文件 SHA-256 与 Git status 逐字节不变。Veyra API 两次重启后的 PID 分别为 `35406 / 35651`，OpenClaw PID 始终为 `58174`，provider certification 保持 validated；`dispatch_registered=31 / execution_started=88 / execution_completed=88 / execution_failed=0 / started_without_reservation=0` 全部不变。自动化最终为 Python gate `79/79`、OpenClaw governance plugin `32/32`、Python compileall、Web build 和 desktop build 全部通过；Phase 6 非回归矩阵扩展为 9 Route × 3 Event modes × collaboration/spec/artifact 各自 populated/corrupt，共 162 组完整 response/status/risk 对照。最终真实 `/events/message` 仍为 `direct_answer / success / R0` 且没有 execution artifact；`/health=critical` 来自既有 Feishu TLS/connect error、memory fallback、历史 pending review 与 stale belief，model/agent/safety 均为 ok，因此不是 Phase 6.2b 回归。
+
+所以 Phase 6.2b 可以记为 `technical_complete_artifact_quarantine_only + local_live_validated`，完整 Phase 6 仍是 `PARTIAL`。下一条安全切片应从 isolated generation 和固定 static/unit/contract/security/fuzz checks 开始；只有 artifact/build identity 已固定且这些检查完成后，才进入签名 trust root、shadow/read-only canary、scoped canary、人工/治理 promotion、monitoring 和已安装版本 rollback。当前 SHA-256 只是完整性 identity，不是签名或来源 attestation。
 
 ## 2. “像贾维斯”在本项目中的可实现含义
 
@@ -237,7 +255,7 @@ Guardian、授权系统、Tool Proxy、Verifier、审计、密钥管理、签名
 - `PARTIAL`：只覆盖目标的一部分，不能按完整能力宣传；
 - `TARGET`：设计目标，尚未实现。
 
-Phase 4 已实现分析/提案限定的 `Durable Case` 子集；Phase 6.1 在独立 Case 类型上增加了同一受信 OpenClaw runtime 内的 primary/critic 顺序协作、一次 unresolved context patch 和非授权 plan selection。带授权、执行、验证、补偿和长期 wakeup 的完整 Case 仍是 `TARGET`。Phase 6 当前为 `PARTIAL`：Phase 6.1 已实现并真实验证 proposal-only 协作；Phase 6.2a 已实现并真实验证 specification-only ExtensionSpec 隔离门；跨 provider/runtime 协作，以及从 isolated generation、artifact quarantine、代码测试、签名到 canary/promotion 的安全扩展执行生命周期仍是 `TARGET`。覆盖任意工具/环境的完整 `CapabilityGrant`、全局 100% pre-tool enforcement、多事件 Situation Engine 和通用生产自治仍不是当前安全不变量。Phase 5 已完成冻结的技术范围：不可变内建 playbook registry、固定 OpenClaw A2、Veyra 私有 JSON sandbox A3、exact-effect Foresight residual、Attention 分类反馈、只读 performance portfolio 与 fail-closed provider certification；A4/A5 继续 `not_certified`，当前状态为 technical complete / shadow calibration，本地 live acceptance 已完成但长期与故障演练证据仍待积累。Phase 3 曾从 contract-only ledger 推进到一个**经真实 Kimi/OpenClaw governed run 验证的窄范围执行切片**：只有预注册的 Veyra → OpenClaw governed session、三个固定自定义工具和 Veyra 管理的逐 run sandbox 可以进入 server-side broker。2026-07-29 又在 plugin revision `phase6.v1` 上完成 fresh scoped canary；它只验证当前治理实现，仍不能等同于任意 OpenClaw session、原生工具、真实 workspace 或生产环境已经获得受治理执行权。累计 reservation coverage 也不是所有 OpenClaw tool call 的全局覆盖率。
+Phase 4 已实现分析/提案限定的 `Durable Case` 子集；Phase 6.1 在独立 Case 类型上增加了同一受信 OpenClaw runtime 内的 primary/critic 顺序协作、一次 unresolved context patch 和非授权 plan selection。带授权、执行、验证、补偿和长期 wakeup 的完整 Case 仍是 `TARGET`。Phase 6 当前为 `PARTIAL`：Phase 6.1 已实现并真实验证 proposal-only 协作；Phase 6.2a 已实现并真实验证 specification-only ExtensionSpec 隔离门；Phase 6.2b 已实现并真实验证 private non-executing artifact quarantine。跨 provider/runtime 协作，以及从 isolated generation、固定代码测试、签名到 canary/promotion 的后续安全扩展执行生命周期仍是 `TARGET`。覆盖任意工具/环境的完整 `CapabilityGrant`、全局 100% pre-tool enforcement、多事件 Situation Engine 和通用生产自治仍不是当前安全不变量。Phase 5 已完成冻结的技术范围：不可变内建 playbook registry、固定 OpenClaw A2、Veyra 私有 JSON sandbox A3、exact-effect Foresight residual、Attention 分类反馈、只读 performance portfolio 与 fail-closed provider certification；A4/A5 继续 `not_certified`，当前状态为 technical complete / shadow calibration，本地 live acceptance 已完成但长期与故障演练证据仍待积累。Phase 3 曾从 contract-only ledger 推进到一个**经真实 Kimi/OpenClaw governed run 验证的窄范围执行切片**：只有预注册的 Veyra → OpenClaw governed session、三个固定自定义工具和 Veyra 管理的逐 run sandbox 可以进入 server-side broker。2026-07-29 又在 plugin revision `phase6.v1` 上完成 fresh scoped canary；它只验证当前治理实现，仍不能等同于任意 OpenClaw session、原生工具、真实 workspace 或生产环境已经获得受治理执行权。累计 reservation coverage 也不是所有 OpenClaw tool call 的全局覆盖率。
 
 | 能力 | 当前代码 | 已有价值 | 主要差距 |
 |---|---|---|---|
@@ -251,7 +269,7 @@ Phase 4 已实现分析/提案限定的 `Durable Case` 子集；Phase 6.1 在独
 | 理解和决策 | `understanding_core.py`、`cognition_pipeline.py`、`decision_core.py` | 模型优先理解、证据路由和多种执行路径已存在 | 普通请求会出现重复认知；部分后续策略仍依赖开放词表；长期情境与一次性 turn 没有统一 |
 | Foresight | `core/foresight_engine.py`、`core/foresight_contract.py`、`runtime/foresight_runtime.py` | `CURRENT / SHADOW CALIBRATION`：固定 capability 的 exact invocation/target/effect graph、权威 receipt/effect reconciliation 与 `exact/mismatch/indeterminate` residual 已接通；promotion 只读报告 eligibility | 尚不是任意工具的通用模拟器；未覆盖真实 workspace/生产预演，也不会自动晋级、签发 Grant 或改变 autonomy |
 | Agent 委托 | `task_packet_builder.py`、`delegation_policy.py`、`openclaw_adapter.py`、`interface/agent_dialogue_contract.py`、`interface/provider_certification.py`、`runtime/agent_capability_directory.py`、`runtime/read_only_agent_collaboration.py`、`routers/phase6.py` | `VERIFIED / SCOPED SAME-RUNTIME COLLABORATION`：当前 Kimi/Moonshot + OpenClaw fresh exact certification、Phase 6.1 primary `OPTION_SET` + critic `CHALLENGE` 真实链和 scoped governance canary 已通过；无持久执行证据的模型成功仍保持未验证 | 当前只有 operator-selected 的单一 OpenClaw/Kimi 路径，没有自动选择、fallback、provider switch、并行团队、工具或执行权；其他模型/provider 必须独立 live 验证。generic provider 即使协议认证通过也只有 diagnostics |
-| 安全扩展 | `interface/extension_spec.py`、`runtime/extension_spec_quarantine.py`、`routers/phase6_extensions.py` | `VERIFIED / SPECIFICATION ONLY`：strict pure-function manifest、private specification quarantine、CAS/replay、integrity、gate decision、expiry 和 revocation tombstone 已实现并完成本地 live 验收；全部 authority 为 false | 没有自动 CapabilityGap 接线、isolated generation、artifact quarantine、行为测试、签名 trust root、execution canary、CapabilityRegistry 注册、晋级或已安装版本 rollback |
+| 安全扩展 | `interface/extension_spec.py`、`interface/extension_artifact.py`、`runtime/extension_spec_quarantine.py`、`runtime/extension_artifact_quarantine.py`、`runtime/private_artifact_blob_store.py`、`routers/phase6_extensions.py`、`routers/phase6_extension_artifacts.py` | `VERIFIED / SPEC + PRIVATE INERT ARTIFACT`：strict pure-function manifest、private specification gate、exact-bound 64 KiB source envelope、0700/0600 immutable blob quarantine、CAS/replay、integrity、expiry 与 revocation 已完成本地 live 验收；无解析、测试、签名、执行或晋级 authority | 没有自动 CapabilityGap 接线、isolated generation、static/unit/contract/security/fuzz 与行为测试、签名 trust root、execution canary、CapabilityRegistry 注册、晋级或已安装版本 rollback |
 | 持久任务 | `core/durable_case.py`、`runtime/durable_case_store.py`、`runtime/bounded_agent_negotiation.py`、`runtime/read_only_agent_collaboration.py`、`runtime/agent_task_tracker.py` | `VERIFIED / SCOPED`：已有 owner scope、revision CAS、幂等 operation、checkpoint/dialogue、取消、trace outbox、round-robin crash recovery，以及 Phase 6 collaboration graph、两参与者 lineage、handoff/patch/call budgets 和 replay | 仍只承载 foreground analysis/proposal Case；尚未把 Goal、Commitment、Situation、授权执行和长期 wakeup 统一成完整事务 |
 | 执行治理 | `guardian/`、`tool_proxy/`、`execution/`、`runtime/openclaw_tool_broker.py`、`apps/openclaw/veyra-governance/` | `VERIFIED / SCOPED`：已有严格 Grant/receipt/effect 合同、server-side broker、OpenClaw pre/execute/observe bridge；真实 canary 直接覆盖授权 Veyra write、同 run native write block 和 traversal block | 当前只覆盖注册的 Veyra session 和逐 run sandbox；live run 没有逐项覆盖所有原生/自定义工具，不能声称所有 OpenClaw/Agent tool call 必经 Veyra |
 | 验证/恢复 | `core/verifier.py`、`rollback_audit/` | 有结构化验证、权威 receipt/effect 投影、精确 snapshot/trace/restore；canonical review 文件写入执行前必须先生成同 scope snapshot；scoped live hook write/effect canary 已通过 | 更广工具的独立 effect verifier 和通用 rollback 仍未实现；本次 canary 不是未来版本永久有效证明 |
@@ -1305,7 +1323,7 @@ CapabilityGap
 
 现有 `runtime/self_improvement.py` 默认只记录 proposal、不改源码，这个安全边界已经保留；当前 proposal 尚未自动创建或推进 ExtensionSpec。
 
-Phase 6.2a 目前只实现 strict ExtensionSpec manifest、private specification quarantine、非授权 gate decision、manifest integrity 和 revocation tombstone。它没有 artifact，因此 specification quarantine 不能写成 worktree/container artifact quarantine；integrity 不能写成 canary；SHA-256 digest 不能写成签名或 attestation；`SPEC_GATE_PASSED` 不能写成生成、安装、执行或晋级授权。从 isolated generation 开始的 artifact/static/unit/contract/security/fuzz checks、外部签名和 trust-root registry、shadow/read-only execution canary/scoped canary、人工/治理 promotion、monitoring 与真实 rollback 仍全部是 `TARGET`。
+Phase 6.2a 已实现 strict ExtensionSpec manifest、private specification quarantine、非授权 gate decision、manifest integrity 和 revocation tombstone；Phase 6.2b 又实现一个与 exact gate/owner/revision/spec/policy/hash/expiry 绑定的私有非执行 source artifact quarantine。它仍不是 worktree/container generation sandbox：source bytes 不 parse、不 compile、不 import、不执行，artifact `integrity` 也不能写成 static check、行为验证或 canary；SHA-256 不能写成签名或 attestation；`SPEC_GATE_PASSED / ARTIFACT_QUARANTINED` 都不能写成生成、安装、执行或晋级授权。isolated generation、static/unit/contract/security/fuzz checks、外部签名和 trust-root registry、shadow/read-only execution canary/scoped canary、人工/治理 promotion、monitoring 与真实 rollback 仍全部是 `TARGET`。
 
 ## 21. 人为可控的产品界面
 
@@ -1450,6 +1468,11 @@ routers/phase6.py                            # Phase 6.1 控制面
 interface/extension_spec.py                  # Phase 6.2a strict non-executing manifest
 runtime/extension_spec_quarantine.py         # Phase 6.2a private specification gate
 routers/phase6_extensions.py                 # Phase 6.2a owner-scoped control plane
+interface/extension_artifact.py              # Phase 6.2b strict inert source envelope
+runtime/private_artifact_blob_store.py       # Phase 6.2b private immutable bytes
+runtime/extension_artifact_quarantine.py     # Phase 6.2b lifecycle and bindings
+routers/phase6_extension_artifacts.py        # Phase 6.2b owner-scoped control plane
+routers/private_control_plane.py             # Phase 6 private validation redaction
 
 runtime/event_fabric.py
 runtime/runtime_db.py
@@ -1485,7 +1508,7 @@ routers/phase5.py                             # Phase 5 控制面
 apps/openclaw/veyra-governance/
 ```
 
-列入该图不代表一次全部实现；未标注“Phase 4/5/6.1/6.2a 已实现”的项目仍是建议名称或目标职责，必须按垂直闭环逐步落地。尤其不要为了名称对齐而把当前有界 JSON Case 迁移到数据库或重写 `AwarenessLoop`。
+列入该图不代表一次全部实现；未标注“Phase 4/5/6.1/6.2a/6.2b 已实现”的项目仍是建议名称或目标职责，必须按垂直闭环逐步落地。尤其不要为了名称对齐而把当前有界 JSON Case 迁移到数据库或重写 `AwarenessLoop`。
 
 ### 23.3 逐步拆分超大中心文件
 
@@ -1704,9 +1727,11 @@ Foresight residual、Attention 分类 feedback、performance portfolio 与 provi
 - `VALIDATED / REAL SCENARIO`：真实 primary `OPTION_SET` 与 critic `CHALLENGE` 被严格接受，Case 安全停在 `PAUSED`；replay 无新增 dispatch，Tool execution 计数不变；
 - `IMPLEMENTED / LIVE VALIDATED / PHASE 6.2a`：strict `pure_function` ExtensionSpec、private specification quarantine、CAS/replay、manifest integrity、非授权 gate decision、expiry、严格 history 和 revocation tombstone 已接入；无 generation、artifact、Agent、Tool、signing、execution、CapabilityRegistry 或 promotion authority；
 - `VALIDATED / REAL SPEC SCENARIO`：真实主进程候选完成 `SPEC_QUARANTINED → SPEC_GATE_PASSED → REVOKED`，两次 Veyra restart 后 tombstone/replay 保持；CapabilityRegistry 投影、memory/review/task/Tool Governance/broker 和 OpenClaw 进程均未变化；
-- `VALIDATED / AUTOMATED`：Python gate `76/76`、OpenClaw governance plugin `32/32`、compileall 及 Web browser/desktop builds 通过；全部 9 个公开 Route 在 3 个 Event modes 与 collaboration/extension 各自 populated/corrupt 下完成 108 组完整 response/status/risk 非弱化对照；
+- `IMPLEMENTED / LIVE VALIDATED / PHASE 6.2b`：strict 64 KiB source envelope、exact Spec/owner/revision/policy/hash/expiry binding、0700/0600 immutable private blob store、artifact CAS/replay/integrity/expiry/reject/revoke 与 honest Spec projection 已接入；不 parse、不测试、不签名、不执行、不安装、不注册、不激活、不晋级；
+- `VALIDATED / REAL ARTIFACT SCENARIO`：真实主进程候选/artifact 完成 `SPEC_QUARANTINED → SPEC_GATE_PASSED → ARTIFACT_QUARANTINED → BLOCKED_CANDIDATE → ARTIFACT_REVOKED`；危险 import-time sentinel 未执行，两次 Veyra restart 后 submit/revoke replay 均为 state/audit no-op，核心状态/Git/OpenClaw PID 与 execution 计数不变；
+- `VALIDATED / AUTOMATED`：Python gate `79/79`、OpenClaw governance plugin `32/32`、compileall 及 Web browser/desktop builds 通过；全部 9 个公开 Route 在 3 个 Event modes 与 collaboration/spec/artifact 各自 populated/corrupt 下完成 162 组完整 response/status/risk 非弱化对照；
 - `PARTIAL`：provider-neutral 合同已存在，但跨 provider/runtime 协作、其他模型独立 live compatibility、自动专家选择和并行 Agent 尚未实现；
-- `TARGET`：CapabilityGap 自动接线、isolated generation、artifact quarantine、固定代码测试、签名 trust-root registry、extension shadow/read-only execution canary/scoped canary、监控、真实 rollback 与人工/治理晋级；
+- `TARGET`：CapabilityGap 自动接线、isolated generation、固定 static/unit/contract/security/fuzz 与行为测试、签名 trust-root registry、extension shadow/read-only execution canary/scoped canary、监控、真实 rollback 与人工/治理晋级；
 - 任何生产晋级继续受人和治理策略控制。
 
 ## 26. 非弱化验收
