@@ -105,7 +105,38 @@ const workbenchSections: Array<{ id: WorkbenchSection; label: string; icon: Reac
 ];
 
 function StatusPill({ value }: { value: string }) {
-  const tone = value === "R5" || value === "blocked" ? "danger" : value === "R1" || value === "success" ? "good" : "neutral";
+  const normalized = value.trim().toLowerCase();
+  const dangerStates = [
+    "blocked",
+    "critical",
+    "configuration_missing",
+    "degraded",
+    "denied",
+    "error",
+    "fail_closed",
+    "failed",
+    "indeterminate",
+    "not_certified",
+    "not_configured",
+    "not_ready",
+    "rejected",
+    "timeout",
+    "timed_out",
+    "unconfigured",
+    "unavailable"
+  ];
+  const goodStates = [
+    "active",
+    "available",
+    "certified",
+    "configured",
+    "connected",
+    "passed",
+    "ready",
+    "success"
+  ];
+  const matchesDanger = dangerStates.some((state) => normalized === state || normalized.includes(state));
+  const tone = normalized === "r5" || matchesDanger ? "danger" : normalized === "r1" || goodStates.includes(normalized) ? "good" : "neutral";
   return <span className={`pill ${tone}`}>{value}</span>;
 }
 
@@ -227,6 +258,8 @@ function App() {
   const [rollbackLogs, setRollbackLogs] = useState<LogResponse>({ items: [] });
   const [diffStatus, setDiffStatus] = useState<Record<string, JsonValue> | null>(null);
   const [rollbackDiff, setRollbackDiff] = useState<Record<string, JsonValue> | null>(null);
+  const [isolatedRunnerStatus, setIsolatedRunnerStatus] = useState<Record<string, JsonValue> | null>(null);
+  const [isolatedRunnerStatusError, setIsolatedRunnerStatusError] = useState<string | null>(null);
   const [message, setMessage] = useState(initialMessage);
   const [snapshotPath, setSnapshotPath] = useState("README.md");
   const [agentBaseUrl, setAgentBaseUrl] = useState("");
@@ -255,7 +288,21 @@ function App() {
     }
   };
 
+  const refreshExtensionIsolation = async () => {
+    try {
+      const status = await fetchJson<Record<string, JsonValue>>("/phase6/extensions/isolated-runs/status");
+      setIsolatedRunnerStatus(status);
+      setIsolatedRunnerStatusError(null);
+    } catch (caught) {
+      setIsolatedRunnerStatus(null);
+      setIsolatedRunnerStatusError(caught instanceof Error ? caught.message : "Status endpoint unavailable");
+    }
+  };
+
   const refresh = async () => {
+    // Phase 6 is an additive, fail-closed surface. Its absence must not make the
+    // established Console refresh fail or mask the rest of Veyra's state.
+    void refreshExtensionIsolation();
     const [
       runtimeData,
       stateData,
@@ -845,6 +892,41 @@ function App() {
   const setupPaths = asRecord(setupStatus?.paths);
   const setupAgent = asRecord(setupStatus?.agent);
   const setupFeishu = asRecord(setupStatus?.feishu_setup);
+  const isolatedRunnerBackend = asRecord(isolatedRunnerStatus?.backend);
+  const isolatedRunnerAdmission = asRecord(isolatedRunnerStatus?.admission);
+  const isolatedRunnerContract = asRecord(isolatedRunnerStatus?.isolation_contract);
+  const isolatedRunnerLimits = asRecord(isolatedRunnerContract.limits);
+  const isolatedRunnerAuthority = asRecord(isolatedRunnerStatus?.authority ?? isolatedRunnerBackend.authority);
+  const isolatedRunnerUnavailable = isolatedRunnerStatusError !== null;
+  const isolationStatus = isolatedRunnerUnavailable ? "unavailable" : String(isolatedRunnerStatus?.status ?? "loading");
+  const isolationHealth = isolatedRunnerUnavailable ? "fail_closed" : String(isolatedRunnerStatus?.operational_health ?? "loading");
+  const backendAvailability = isolatedRunnerUnavailable ? "unavailable" : String(isolatedRunnerBackend.availability ?? "loading");
+  const backendCertification = isolatedRunnerUnavailable
+    ? "not_certified"
+    : isolatedRunnerBackend.conformance_certified === true
+      ? "certified"
+      : isolatedRunnerBackend.conformance_certified === false
+        ? "not_certified"
+        : "loading";
+  const admissionEnabled = isolatedRunnerUnavailable
+    ? "fail_closed"
+    : isolatedRunnerAdmission.enabled === true
+      ? "enabled"
+      : isolatedRunnerAdmission.enabled === false
+        ? "disabled"
+        : "unknown";
+  const admissionToken = isolatedRunnerAdmission.token_configured === true
+    ? "configured"
+    : isolatedRunnerAdmission.token_configured === false
+      ? "not_configured"
+      : "unknown";
+  const admissionReady = isolatedRunnerUnavailable
+    ? "fail_closed"
+    : isolatedRunnerAdmission.start_ready === true
+      ? "ready"
+      : isolatedRunnerAdmission.start_ready === false
+        ? "not_ready"
+        : "unknown";
   const feishuReadiness = String(setupFeishu.readiness ?? "not_configured");
   const feishuReadinessLabels: Record<string, string> = {
     receiving: "receiving",
@@ -1107,6 +1189,85 @@ function App() {
       </section>
 
       <section className={`workspaceGrid workbenchPane ${activeSection === "governance" ? "active" : ""}`}>
+        <Section title="Extension Isolation" icon={<Shield size={18} />}>
+          <div className="isolationPanel">
+            {isolatedRunnerStatusError ? (
+              <div className="isolationNotice">
+                <AlertTriangle size={16} />
+                <span>Status unavailable; isolated-run admission remains fail closed.</span>
+              </div>
+            ) : null}
+
+            <div className="isolationSummary">
+              <Metric label="Phase" value={String(isolatedRunnerStatus?.phase ?? "6.2d")} />
+              <Metric label="Status" value={<StatusPill value={isolationStatus} />} />
+              <Metric label="Operational health" value={<StatusPill value={isolationHealth} />} />
+              <Metric label="Completion scope" value={String(isolatedRunnerStatus?.completion_scope ?? "isolated runner only")} />
+            </div>
+
+            <div className="isolationGroup">
+              <div className="isolationGroupTitle">Trusted backend</div>
+              <div className="isolationStatusRows">
+                <div><span>Backend</span><strong>{String(isolatedRunnerBackend.backend_kind ?? "unknown")}</strong></div>
+                <div><span>Availability</span><StatusPill value={backendAvailability} /></div>
+                <div><span>Conformance</span><StatusPill value={backendCertification} /></div>
+                <div><span>Reason</span><StatusPill value={String(isolatedRunnerBackend.reason_code ?? "unknown")} /></div>
+              </div>
+            </div>
+
+            <div className="isolationGroup">
+              <div className="isolationGroupTitle">Control admission</div>
+              <div className="isolationStatusRows">
+                <div><span>Admission</span><StatusPill value={admissionEnabled} /></div>
+                <div><span>Control token</span><StatusPill value={admissionToken} /></div>
+                <div><span>Start readiness</span><StatusPill value={admissionReady} /></div>
+                <div><span>Loopback bypass</span><StatusPill value={isolatedRunnerAdmission.loopback_bypass_allowed === false ? "false" : "critical"} /></div>
+              </div>
+            </div>
+
+            <div className="isolationGroup">
+              <div className="isolationGroupTitle">Fixed isolation contract</div>
+              <div className="isolationStatusRows isolationContractRows">
+                <div><span>Network</span><strong>{String(isolatedRunnerContract.network ?? "unknown")}</strong></div>
+                <div><span>Root filesystem</span><strong>{String(isolatedRunnerContract.rootfs ?? "unknown")}</strong></div>
+                <div><span>Candidate mount</span><strong>{String(isolatedRunnerContract.candidate_mount ?? "unknown")}</strong></div>
+                <div><span>Fixed harness</span><strong>{String(isolatedRunnerContract.fixed_harness ?? "unknown")}</strong></div>
+                <div><span>Host workspace</span><strong>{String(isolatedRunnerContract.host_workspace ?? "unknown")}</strong></div>
+                <div><span>Host state</span><strong>{String(isolatedRunnerContract.host_state ?? "unknown")}</strong></div>
+                <div><span>Host secrets</span><strong>{String(isolatedRunnerContract.host_secrets ?? "unknown")}</strong></div>
+                <div><span>Candidate executed</span><strong>{String(isolatedRunnerContract.candidate_executed ?? "unknown")}</strong></div>
+              </div>
+              <div className="isolationIdentityRow">
+                <span>Limits</span>
+                <code>{Object.keys(isolatedRunnerLimits).length ? compactJson(isolatedRunnerLimits) : "unknown"}</code>
+              </div>
+            </div>
+
+            <div className="isolationGroup isolationIdentity">
+              <div className="isolationGroupTitle">Pinned trust identity</div>
+              <div className="isolationIdentityRow"><span>Image</span><code>{String(isolatedRunnerBackend.image_id ?? "unavailable")}</code></div>
+              <div className="isolationIdentityRow"><span>Image conformance</span><code>{String(isolatedRunnerBackend.image_conformance_digest ?? "unavailable")}</code></div>
+              <div className="isolationIdentityRow"><span>Engine identity</span><code>{String(isolatedRunnerBackend.engine_identity_digest ?? "unavailable")}</code></div>
+              <div className="isolationIdentityRow"><span>Harness</span><code>{String(isolatedRunnerBackend.harness_revision ?? "unknown")}</code></div>
+              <div className="isolationIdentityRow"><span>Harness digest</span><code>{String(isolatedRunnerBackend.harness_digest ?? "unknown")}</code></div>
+              <div className="isolationIdentityRow"><span>Policy</span><code>{String(isolatedRunnerBackend.runner_policy_revision ?? "unknown")}</code></div>
+              <div className="isolationIdentityRow"><span>Policy digest</span><code>{String(isolatedRunnerBackend.runner_policy_digest ?? "unknown")}</code></div>
+            </div>
+
+            <div className="isolationGroup">
+              <div className="isolationGroupTitle">Authority locks</div>
+              <div className="authorityGrid">
+                {Object.keys(isolatedRunnerAuthority).length ? Object.entries(isolatedRunnerAuthority).map(([name, value]) => (
+                  <div key={name}>
+                    <span>{name.replaceAll("_", " ")}</span>
+                    <StatusPill value={value === false ? "false" : "critical"} />
+                  </div>
+                )) : <div className="emptyState"><Shield size={16} />Authority status unavailable.</div>}
+              </div>
+            </div>
+          </div>
+        </Section>
+
         <Section title="Action Review" icon={<Shield size={18} />}>
           <div className="reviewList">
             {reviews.items.length ? (

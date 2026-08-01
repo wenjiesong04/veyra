@@ -52,6 +52,9 @@ from routers.phase6_extension_artifacts import (
 from routers.phase6_extension_source_checks import (
     build_phase6_extension_source_checks_router,
 )
+from routers.phase6_extension_isolated_runner import (
+    build_phase6_extension_isolated_runner_router,
+)
 from routers.runtime_observability import build_runtime_observability_router
 from routers.tool_governance import build_tool_governance_router
 from runtime.active_loop import ActiveRuntimeLoop
@@ -90,6 +93,12 @@ from runtime.extension_artifact_quarantine import (
 )
 from runtime.extension_source_policy_gate import (
     ExtensionSourcePolicyGate,
+)
+from runtime.extension_isolated_runner_gate import (
+    ExtensionIsolatedRunnerGate,
+)
+from runtime.trusted_isolated_runner import (
+    TrustedIsolatedRunnerBackend,
 )
 from runtime.soak_runner import SoakRunner
 from runtime.state_refresh import StateRefresh
@@ -386,6 +395,31 @@ phase6_extension_artifacts = ExtensionArtifactQuarantine(
 phase6_extension_source_checks = ExtensionSourcePolicyGate(
     state_store=state_store,
     artifact_quarantine=phase6_extension_artifacts,
+)
+phase6_extension_isolated_backend = TrustedIsolatedRunnerBackend(
+    docker_binary=(
+        os.getenv("VEYRA_ISOLATED_RUNNER_DOCKER_BINARY") or None
+    ),
+    expected_image_id=(
+        os.getenv("VEYRA_ISOLATED_RUNNER_EXPECTED_IMAGE_ID") or None
+    ),
+    expected_engine_identity_digest=(
+        os.getenv("VEYRA_ISOLATED_RUNNER_EXPECTED_ENGINE_DIGEST") or None
+    ),
+    image_conformance_digest=(
+        os.getenv("VEYRA_ISOLATED_RUNNER_CONFORMANCE_DIGEST") or None
+    ),
+    conformance_certified=(
+        _env_bool("VEYRA_ISOLATED_RUNNER_CONFORMANCE_CERTIFIED") is True
+    ),
+)
+phase6_extension_isolated_runner = ExtensionIsolatedRunnerGate(
+    state_store=state_store,
+    source_check_gate=phase6_extension_source_checks,
+    backend=phase6_extension_isolated_backend,
+)
+phase6_extension_source_checks.bind_isolated_runner_projection(
+    phase6_extension_isolated_runner.projection_for_source_check
 )
 
 
@@ -761,6 +795,11 @@ app.include_router(
 app.include_router(
     build_phase6_extension_source_checks_router(
         gate=phase6_extension_source_checks,
+    )
+)
+app.include_router(
+    build_phase6_extension_isolated_runner_router(
+        gate=phase6_extension_isolated_runner,
     )
 )
 app.include_router(

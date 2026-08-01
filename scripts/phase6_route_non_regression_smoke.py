@@ -52,6 +52,8 @@ SCENARIOS = (
     "extension_artifact_corrupt",
     "extension_source_check_populated",
     "extension_source_check_corrupt",
+    "extension_isolated_runner_populated",
+    "extension_isolated_runner_corrupt",
 )
 
 
@@ -74,6 +76,9 @@ def seed_phase6(loop: Any, scenario: str) -> None:
     source_check_path = loop.state_store.path_for(
         "phase6_extension_source_check_state.json"
     )
+    isolated_runner_path = loop.state_store.path_for(
+        "phase6_extension_isolated_runner_state.json"
+    )
     if scenario == "collaboration_corrupt":
         collaboration_path.write_text(
             "{invalid-phase6-collaboration-state",
@@ -95,6 +100,12 @@ def seed_phase6(loop: Any, scenario: str) -> None:
     if scenario == "extension_source_check_corrupt":
         source_check_path.write_text(
             "{invalid-phase6-extension-source-check-state",
+            encoding="utf-8",
+        )
+        return
+    if scenario == "extension_isolated_runner_corrupt":
+        isolated_runner_path.write_text(
+            "{invalid-phase6-extension-isolated-runner-state",
             encoding="utf-8",
         )
         return
@@ -422,6 +433,74 @@ def seed_phase6(loop: Any, scenario: str) -> None:
                 f"{result!r} {status!r}"
             )
         return
+    if scenario == "extension_isolated_runner_populated":
+        recorded_at = datetime.now(timezone.utc).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+        run_id = "extrun_0123456789abcdef01234567"
+        check_id = "extcheck_0123456789abcdef01234567"
+        binding_digest = hashlib.sha256(
+            b"private-isolated-runner-binding"
+        ).hexdigest()
+        report_digest = hashlib.sha256(
+            b"private-isolated-runner-report"
+        ).hexdigest()
+        operation_key = hashlib.sha256(
+            b"private-user\0private-workspace\0route-isolated-runner"
+        ).hexdigest()
+
+        def mutate_isolated_runner(state: dict[str, Any]) -> None:
+            state.update(
+                {
+                    "schema_version": (
+                        "veyra.phase6.extension_isolated_runner_state.v1"
+                    ),
+                    "runs": {
+                        run_id: {
+                            "schema_version": (
+                                "veyra.phase6.extension_isolated_runner_record.v1"
+                            ),
+                            "run_id": run_id,
+                            "check_id": check_id,
+                            "user_id": "private-user",
+                            "workspace_id": "private-workspace",
+                            "stage": "ISOLATED_RUN_PASSED",
+                            "revision": 2,
+                            "binding_digest": binding_digest,
+                            "report_digest": report_digest,
+                            "candidate_execution_status": "not_started",
+                            "behavior_verification_status": "not_started",
+                            "promotion_authorized": False,
+                            "created_at": recorded_at,
+                            "updated_at": recorded_at,
+                        }
+                    },
+                    "binding_index": {binding_digest: run_id},
+                    "operation_index": {
+                        operation_key: {
+                            "request_digest": hashlib.sha256(
+                                b"private-isolated-runner-request"
+                            ).hexdigest(),
+                            "kind": "start_isolated_run",
+                            "run_id": run_id,
+                            "result_revision": 2,
+                            "result_stage": "ISOLATED_RUN_PASSED",
+                            "owner_scope_digest": hashlib.sha256(
+                                b"private-user\0private-workspace"
+                            ).hexdigest(),
+                            "recorded_at": recorded_at,
+                        }
+                    },
+                    "run_count": 1,
+                    "updated_at": recorded_at,
+                }
+            )
+
+        loop.state_store.mutate_json(
+            "phase6_extension_isolated_runner_state.json",
+            mutate_isolated_runner,
+        )
+        return
     raise ValueError(f"unknown Phase 6 scenario: {scenario}")
 
 
@@ -478,6 +557,16 @@ def main() -> int:
                     }
                 }
             },
+            "phase6_extension_isolated_runner_state": {
+                "runs": {
+                    "private-isolated-run": {
+                        "binding_digest": "private-binding-digest",
+                        "report_digest": "private-report-digest",
+                        "user_id": "private-user",
+                        "workspace_id": "private-workspace",
+                    }
+                }
+            },
         }
     )
     expect(
@@ -485,6 +574,7 @@ def main() -> int:
         and "phase6_extension_spec_state" not in public_state
         and "phase6_extension_artifact_state" not in public_state
         and "phase6_extension_source_check_state" not in public_state
+        and "phase6_extension_isolated_runner_state" not in public_state
         and public_state.get("local_world", {}).get(
             "current_project"
         )
@@ -561,12 +651,12 @@ def main() -> int:
                             "candidate": candidate.to_dict(),
                         }
     expect(
-        len(SCENARIOS) == 8
-        and comparisons == 9 * len(MODES) * len(SCENARIOS) == 216
+        len(SCENARIOS) == 10
+        and comparisons == 9 * len(MODES) * len(SCENARIOS) == 270
         and not failures,
         (
-            "216 isolated populated or corrupt collaboration/extension/"
-            "source-check states cannot weaken complete disabled, "
+            "270 isolated populated or corrupt collaboration/extension/"
+            "source-check/runner states cannot weaken complete disabled, "
             "record-only, or shadow Route output/status/risk"
         ),
         failures,

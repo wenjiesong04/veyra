@@ -1009,9 +1009,12 @@ def real_main_assembly() -> None:
             "paths = main.app.openapi()['paths']\n"
             f"expected = {SOURCE_CHECK_PATHS!r}\n"
             "source_paths = {path for path in paths "
-            "if 'source-check' in path}\n"
+            "if 'source-check' in path "
+            "and not path.endswith('/isolated-run')}\n"
             "assert source_paths == expected, "
             "(source_paths, expected)\n"
+            "assert '/phase6/extensions/source-checks/"
+            "{check_id}/isolated-run' in paths, paths\n"
             f"for action in {FORBIDDEN_ACTIONS!r}:\n"
             "    assert all("
             "path.rsplit('/', 1)[-1] != action "
@@ -1041,8 +1044,8 @@ def real_main_assembly() -> None:
         expect(
             assembly.returncode == 0,
             (
-                "real main assembles exactly five source-check routes "
-                "and no dynamic extension endpoint"
+                "real main preserves five source-check routes, adds only "
+                "the fixed isolated-run admission, and no future endpoint"
             ),
             {
                 "stdout": assembly.stdout[-2_000:],

@@ -158,6 +158,19 @@ class ExtensionSourcePolicyGate:
         self.artifact_quarantine = artifact_quarantine
         self.checker = checker or check_extension_source
         self._now = now or (lambda: datetime.now(timezone.utc))
+        self._isolated_runner_projection: Callable[..., dict[str, Any]] | None = (
+            None
+        )
+
+    def bind_isolated_runner_projection(
+        self,
+        resolver: Callable[..., dict[str, Any]],
+    ) -> None:
+        """Attach a fault-contained read projection after runtime assembly."""
+
+        if not callable(resolver):
+            raise TypeError("isolated runner projection must be callable")
+        self._isolated_runner_projection = resolver
 
     def status(self) -> dict[str, Any]:
         try:
@@ -590,6 +603,114 @@ class ExtensionSourcePolicyGate:
             "state_mutated": False,
         }
 
+    def isolated_runner_subject(
+        self,
+        *,
+        check_id: str,
+        user_id: str,
+        workspace_id: str,
+        expected_artifact_revision: int,
+        expected_artifact_sha256: str,
+        expected_source_check_report_digest: str,
+    ) -> dict[str, Any]:
+        """Return one exact passed-check subject to the isolated runner gate.
+
+        This is an in-process-only boundary.  It revalidates the logical
+        owner, current workspace, terminal source-check report, immutable
+        report digest, artifact CAS, artifact bytes, Spec gate, lifecycle and
+        expiry before returning the private bytes.  It grants no HTTP access
+        to source, paths, commands, environments, images, tests, signing or
+        production execution.
+        """
+
+        selected_revision = self._required_revision(
+            expected_artifact_revision
+        )
+        selected_artifact_digest = self._required_digest(
+            expected_artifact_sha256,
+            "expected_artifact_sha256",
+        )
+        selected_report_digest = self._required_digest(
+            expected_source_check_report_digest,
+            "expected_source_check_report_digest",
+        )
+        selected_user, selected_workspace, owner_scope, state = (
+            self._read_owner_state(user_id, workspace_id)
+        )
+        record = self._record_by_id(
+            state,
+            self._required_check_id(check_id),
+        )
+        self._require_owner(record, owner_scope)
+        if (
+            record["stage"] != "SOURCE_CHECK_PASSED"
+            or record.get("report_digest") != selected_report_digest
+            or not isinstance(record.get("report"), dict)
+        ):
+            raise ExtensionSourceCheckConflictError(
+                "isolated runner requires the exact passed source check"
+            )
+        binding = parse_extension_source_check_binding(record["binding"])
+        report = parse_extension_source_check_report(record["report"])
+        self._validate_report_binding(report, binding)
+        if (
+            binding.artifact_revision != selected_revision
+            or binding.artifact_sha256 != selected_artifact_digest
+            or report.report_digest() != selected_report_digest
+        ):
+            raise ExtensionSourceCheckConflictError(
+                "isolated runner prerequisite CAS changed"
+            )
+        subject = self._source_subject(
+            artifact_id=binding.artifact_id,
+            user_id=selected_user,
+            workspace_id=selected_workspace,
+            expected_artifact_revision=selected_revision,
+            expected_artifact_sha256=selected_artifact_digest,
+        )
+        rebound = self._binding_from_subject(subject)
+        if rebound.binding_digest() != record["binding_digest"]:
+            raise ExtensionSourceCheckConflictError(
+                "isolated runner source-check binding changed"
+            )
+        return {
+            "schema_version": (
+                "veyra.phase6.extension_isolated_runner_subject.v1"
+            ),
+            "check_id": record["check_id"],
+            "source_check_binding": binding.canonical_dict(),
+            "source_check_binding_digest": record["binding_digest"],
+            "source_check_report": report.canonical_dict(),
+            "source_check_report_digest": selected_report_digest,
+            "candidate_id": binding.candidate_id,
+            "candidate_revision": binding.candidate_revision,
+            "artifact_id": binding.artifact_id,
+            "artifact_revision": binding.artifact_revision,
+            "artifact_sha256": binding.artifact_sha256,
+            "artifact_size_bytes": binding.source_size_bytes,
+            "artifact_envelope_digest": subject[
+                "artifact_envelope_digest"
+            ],
+            "owner_scope_digest": binding.owner_scope_digest,
+            "extension_id": binding.extension_id,
+            "extension_version": binding.extension_version,
+            "spec_digest": binding.spec_digest,
+            "extension_policy_revision": (
+                binding.extension_policy_revision
+            ),
+            "artifact_policy_revision": binding.artifact_policy_revision,
+            "source_check_policy_revision": (
+                binding.source_check_policy_revision
+            ),
+            "checker_revision": report.checker_revision,
+            "parser_identity": binding.parser_identity,
+            "ruleset_digest": binding.ruleset_digest,
+            "source_bytes": subject["source_bytes"],
+            "user_id": selected_user,
+            "workspace_id": selected_workspace,
+            "authority": self._authority(),
+        }
+
     def projection_for_artifact(
         self,
         *,
@@ -818,6 +939,7 @@ class ExtensionSourcePolicyGate:
             ),
             "parser_identity": EXTENSION_SOURCE_PARSER_IDENTITY,
             "ruleset_digest": EXTENSION_SOURCE_RULESET_DIGEST,
+            "source_check_report_digest": record["report_digest"],
             "report_integrity_status": (
                 "validated" if report is not None else "unavailable"
             ),
@@ -878,6 +1000,26 @@ class ExtensionSourcePolicyGate:
         except Exception:
             public["effective_status"] = "PREREQUISITE_UNAVAILABLE"
             public["operational_health"] = "degraded"
+        if self._isolated_runner_projection is not None:
+            try:
+                projection = self._isolated_runner_projection(
+                    check_id=record["check_id"],
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                )
+                if not isinstance(projection, dict):
+                    raise TypeError("runner projection is invalid")
+                public["trusted_isolated_runner_status"] = str(
+                    projection["trusted_isolated_runner_status"]
+                )
+                public["isolated_test_execution_status"] = str(
+                    projection["isolated_test_execution_status"]
+                )
+            except Exception:
+                # A corrupt or unavailable later-stage store must never make
+                # the already-established source-check result less truthful.
+                public["trusted_isolated_runner_status"] = "indeterminate"
+                public["isolated_test_execution_status"] = "not_started"
         return public
 
     @staticmethod
@@ -902,6 +1044,8 @@ class ExtensionSourcePolicyGate:
     def _dynamic_statuses() -> dict[str, Any]:
         return {
             "isolated_generation_status": "not_started",
+            "trusted_isolated_runner_status": "not_started",
+            "isolated_test_execution_status": "not_started",
             "unit_checks_status": "not_started",
             "contract_checks_status": "not_started",
             "security_runtime_checks_status": "not_started",

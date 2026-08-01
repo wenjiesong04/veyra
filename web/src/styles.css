@@ -511,6 +511,97 @@ h2 {
   overflow-wrap: anywhere;
 }
 
+.isolationPanel {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.isolationNotice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #ebc6cc;
+  border-radius: 8px;
+  padding: 9px 10px;
+  color: #7b1f2a;
+  background: #fff4f5;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.isolationSummary,
+.isolationStatusRows,
+.authorityGrid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.isolationSummary .metric {
+  min-height: 68px;
+  box-shadow: none;
+}
+
+.isolationGroup {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #e3e7e3;
+  border-radius: 8px;
+  padding: 10px;
+  background: #fbfcfb;
+}
+
+.isolationGroupTitle {
+  color: #43505e;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.isolationStatusRows > div,
+.authorityGrid > div {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+  border-radius: 7px;
+  padding: 8px;
+  background: #ffffff;
+}
+
+.isolationStatusRows span,
+.authorityGrid span,
+.isolationIdentityRow > span {
+  color: #68727d;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.isolationStatusRows strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.isolationIdentityRow {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.28fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.isolationIdentityRow code {
+  min-width: 0;
+  color: #27313f;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.authorityGrid .emptyState {
+  grid-column: 1 / -1;
+}
+
 .executionResult {
   display: grid;
   gap: 6px;
@@ -971,7 +1062,10 @@ code {
   .personaGrid,
   .stateDefinitionGrid,
   .readinessGrid,
-  .traceSummary {
+  .traceSummary,
+  .isolationSummary,
+  .isolationStatusRows,
+  .authorityGrid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -1031,6 +1125,9 @@ code {
     .stateDefinitionGrid,
     .readinessGrid,
     .traceSummary,
+    .isolationSummary,
+    .isolationStatusRows,
+    .authorityGrid,
     .phaseItem {
     grid-template-columns: 1fr;
   }
@@ -1050,6 +1147,7 @@ code {
 
   .segmentedControl,
   .agentUrlRow,
+  .isolationIdentityRow,
   .configSummary,
   .configGrid {
     grid-template-columns: 1fr;
