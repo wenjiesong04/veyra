@@ -126,7 +126,11 @@ OFFLINE_ROUTE_CASES = (
         route=Route.AGENT,
         risk_level=RiskLevel.R1,
         expected_status="partially_success",
-        response="Offline Agent returned a bounded plan.",
+        response=(
+            "offline-agent 报告称：Offline Agent returned a bounded plan. "
+            "该内容仍是 Agent 报告，尚未验证为持久执行效果，"
+            "不能据此标记完成。"
+        ),
     ),
     OfflineRouteCase(
         case_id="ask_user",
@@ -293,6 +297,11 @@ class OfflineAgentAdapter(AgentAdapter):
 
 _RUNTIME_TRACE_ID_PATH = ("artifacts", "runtime_trace", "trace_id")
 _EXECUTION_TRACE_ID_PATH = ("artifacts", "execution_trace", "trace_id")
+_RESPONSE_EXECUTION_RECEIPT_PREFIX = (
+    "artifacts",
+    "response_authority",
+    "execution_receipt_refs",
+)
 _REVIEW_ID_PATH = ("artifacts", "review", "review_id")
 _LATENCY_PATH = ("artifacts", "runtime_trace", "latency_ms")
 _AGENT_TASK_ID_PATHS = {
@@ -395,6 +404,13 @@ def _generated_id_rule(
     if path == _RUNTIME_TRACE_ID_PATH:
         return ("runtime_trace_id", "rt_")
     if path == _EXECUTION_TRACE_ID_PATH:
+        return ("execution_trace_id", "exec_")
+    if (
+        len(path) == len(_RESPONSE_EXECUTION_RECEIPT_PREFIX) + 1
+        and path[: len(_RESPONSE_EXECUTION_RECEIPT_PREFIX)]
+        == _RESPONSE_EXECUTION_RECEIPT_PREFIX
+        and path[-1].isdigit()
+    ):
         return ("execution_trace_id", "exec_")
     if path == _REVIEW_ID_PATH:
         return ("review_id", "rev_")

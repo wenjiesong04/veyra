@@ -27,6 +27,7 @@ GATE_SMOKES = [
     "general_situation_suggestion_smoke.py",
     "structured_observation_control_plane_smoke.py",
     "strategic_discussion_boundary_smoke.py",
+    "final_route_projection_smoke.py",
     "commitment_smoke.py",
     "commitment_scope_smoke.py",
     "cognition_pipeline_smoke.py",

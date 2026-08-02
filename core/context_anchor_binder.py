@@ -287,6 +287,11 @@ class ContextAnchorBinder:
         threads: list[dict[str, Any]] = []
         used_keys: set[str] = set()
         unresolved_acts: list[dict[str, str]] = []
+        history_links = {
+            item
+            for item in list(getattr(understanding, "history_links", []) or [])
+            if isinstance(item, str) and item
+        }
         for act in list(getattr(frame, "acts", []) or []):
             if len(bindings) >= self.MAX_BINDINGS:
                 break
@@ -295,6 +300,14 @@ class ContextAnchorBinder:
             if score is None:
                 continue
             selected = self._selected_candidate(act, private_candidates)
+            selection_source = "owner_scoped_candidate_selection"
+            if selected is None:
+                selected = self._selected_context_continuation(
+                    act,
+                    private_candidates,
+                    history_links=history_links,
+                )
+                selection_source = "owner_session_context_token_continuation"
             if selected is not None:
                 anchor = StructuredAnchor(selected["kind"], selected["ref_id"])
                 if anchor.key not in used_keys:
@@ -305,7 +318,7 @@ class ContextAnchorBinder:
                             act=act,
                             anchor=anchor,
                             score=score,
-                            source="owner_scoped_candidate_selection",
+                            source=selection_source,
                             candidate=selected,
                             snapshot_digest=str(candidate_index.get("snapshot_digest") or ""),
                         )
@@ -555,6 +568,44 @@ class ContextAnchorBinder:
             quote_text = cls._canonical(getattr(quote, "text", ""), 800)
             if not selected_label or selected_label not in quote_text:
                 return None
+        return copy.deepcopy(selected)
+
+    @classmethod
+    def _selected_context_continuation(
+        cls,
+        act: Any,
+        candidates: dict[str, dict[str, Any]],
+        *,
+        history_links: set[str],
+    ) -> dict[str, Any] | None:
+        """Resolve only a non-authoritative exact-session Context continuation.
+
+        The token must be expressed independently in both the semantic target
+        and the turn-level history links.  Unlike durable-object selection,
+        this path may survive a paraphrased or translated label because its
+        result remains a same-session hypothesis with no factual, causal,
+        routing, risk, execution, or delivery authority.
+        """
+
+        target = getattr(act, "target", None)
+        attributes = getattr(target, "attributes", None)
+        if not isinstance(attributes, dict):
+            return None
+        raw = attributes.get("anchor_candidate_token")
+        if not isinstance(raw, str) or not raw or raw not in history_links:
+            return None
+        selected = candidates.get(raw)
+        if not isinstance(selected, dict):
+            return None
+        if (
+            cls._canonical(selected.get("kind"), 120) != "context"
+            or selected.get("durable") is not False
+            or str(selected.get("source_file") or "")
+            != "context_binding_state.json"
+            or str(selected.get("status") or "")
+            not in {"provisional", "corroborated"}
+        ):
+            return None
         return copy.deepcopy(selected)
 
     @staticmethod

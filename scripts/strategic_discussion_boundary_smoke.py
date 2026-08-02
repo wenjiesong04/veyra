@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 from core.cognition_pipeline import CognitionPipeline  # noqa: E402
 from core.decision_core import DecisionCore  # noqa: E402
 from core.definitions import RiskLevel  # noqa: E402
+from core.semantic_policy import SemanticPolicyCompiler  # noqa: E402
 from core.understanding_core import TurnUnderstanding  # noqa: E402
 from interface.event_schema import Decision, Route  # noqa: E402
 
@@ -30,10 +31,20 @@ def understanding(
     operation: str,
     target_type: str,
     suggested_mode: str,
+    condition: dict[str, Any] | None = None,
 ) -> TurnUnderstanding:
     # Deliberately mark both examples as implementation/code_task.  The exact
     # semantic act must still distinguish discussion-about-implementation from
     # an instruction to implement.  This guards against a lexical route flip.
+    condition_payload = dict(condition) if isinstance(condition, dict) else None
+    if condition_payload is not None and isinstance(condition_payload.get("source_quote"), str):
+        quote_text = str(condition_payload["source_quote"])
+        quote_start = text.index(quote_text)
+        condition_payload["source_quote"] = {
+            "text": quote_text,
+            "start": quote_start,
+            "end": quote_start + len(quote_text),
+        }
     return TurnUnderstanding.from_payload(
         {
             "status": "model_assisted",
@@ -79,7 +90,7 @@ def understanding(
                             "status": "resolved",
                             "candidates": [],
                         },
-                        "condition": None,
+                        "condition": condition_payload,
                         "modality": "asserted",
                         "arguments": {},
                     }
@@ -124,6 +135,30 @@ def main() -> int:
         target_type="component",
         suggested_mode="strategic_discussion",
     )
+    constrained_discussion = understanding(
+        "在不扩大执行权的前提下，分析下一步最值得补的认知闭环。",
+        kind="information_request",
+        operation="analyze_cognitive_loop",
+        target_type="architecture_topic",
+        suggested_mode="strategic_discussion",
+        condition={
+            "kind": "governance_constraint",
+            "expression": "do not expand execution authority",
+            "source_quote": "在不扩大执行权的前提下",
+        },
+    )
+    conditional_execution = understanding(
+        "如果隔离 runner 可用，请实现候选扩展。",
+        kind="implementation",
+        operation="build",
+        target_type="component",
+        suggested_mode="governed_execution",
+        condition={
+            "kind": "runtime_precondition",
+            "expression": "isolated runner is available",
+            "source_quote": "如果隔离 runner 可用",
+        },
+    )
 
     expect(
         not discussion.requests_governed_effect_or_runtime(),
@@ -132,6 +167,34 @@ def main() -> int:
     expect(
         execution.requests_governed_effect_or_runtime(),
         "explicit implementation act preserves governed execution intent",
+    )
+    expect(
+        not constrained_discussion.requests_governed_effect_or_runtime(),
+        "read-only discussion constraint grants no governed effect",
+    )
+    expect(
+        conditional_execution.requests_governed_effect_or_runtime(),
+        "conditional implementation remains a governed effect request",
+    )
+
+    compiler = SemanticPolicyCompiler()
+    discussion_policy = compiler.compile(constrained_discussion.semantic_frame)
+    execution_policy = compiler.compile(conditional_execution.semantic_frame)
+    expect(
+        discussion_policy.preferred_route == Route.DIRECT_ANSWER.value
+        and not discussion_policy.requires_clarification
+        and "semantic_policy:read_only_condition_non_authorizing"
+        in discussion_policy.policy_signals,
+        "read-only condition stays a non-authorizing answer constraint",
+        discussion_policy.to_dict(),
+    )
+    expect(
+        execution_policy.preferred_route == Route.ASK_USER.value
+        and execution_policy.requires_clarification
+        and "semantic_policy:conditional_effect_unresolved"
+        in execution_policy.policy_signals,
+        "unresolved execution precondition still fails closed",
+        execution_policy.to_dict(),
     )
 
     cognition = CognitionPipeline.__new__(CognitionPipeline)
@@ -161,6 +224,15 @@ def main() -> int:
         agent_candidate(),
         execution,
     )
+    guarded_constrained_discussion = decisions._apply_understanding_guardrails(
+        constrained_discussion.explicit_request,
+        agent_candidate(),
+        constrained_discussion,
+    )
+    governed_conditional_execution = decisions._enforce_semantic_policy(
+        agent_candidate(),
+        conditional_execution,
+    )
     expect(
         guarded_discussion.route == Route.DIRECT_ANSWER
         and not guarded_discussion.needs_agent,
@@ -173,8 +245,20 @@ def main() -> int:
         "decision guard does not erase an explicit implementation command",
         guarded_execution.to_dict(),
     )
+    expect(
+        guarded_constrained_discussion.route == Route.DIRECT_ANSWER
+        and not guarded_constrained_discussion.needs_agent,
+        "decision guard keeps constrained architecture discussion read-only",
+        guarded_constrained_discussion.to_dict(),
+    )
+    expect(
+        governed_conditional_execution.route == Route.ASK_USER
+        and not governed_conditional_execution.needs_agent,
+        "semantic enforcement blocks conditional execution pending trigger evidence",
+        governed_conditional_execution.to_dict(),
+    )
 
-    print("Strategic discussion boundary smoke passed: 6/6")
+    print("Strategic discussion boundary smoke passed: 12/12")
     return 0
 
 

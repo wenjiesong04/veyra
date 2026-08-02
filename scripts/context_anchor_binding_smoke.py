@@ -33,6 +33,7 @@ def semantic_understanding(
     speaker: str = "user",
     mention_mode: str = "normal_use",
     modality: str = "asserted",
+    history_links: list[str] | None = None,
 ) -> SimpleNamespace:
     attributes = (
         {"anchor_candidate_token": candidate_token}
@@ -82,7 +83,11 @@ def semantic_understanding(
         },
         source_text=text,
     )
-    return SimpleNamespace(source="model", semantic_frame=frame)
+    return SimpleNamespace(
+        source="model",
+        semantic_frame=frame,
+        history_links=list(history_links or []),
+    )
 
 
 def event(
@@ -248,6 +253,108 @@ def main() -> int:
             "bound_rate": 1.0,
             "overconservative_alert": False,
         }
+
+        # An event-bound token for an existing exact-session Context may carry
+        # a non-authoritative continuation across paraphrase/translation.  It
+        # must reuse the server-owned context id instead of fragmenting the
+        # same conversation into one thread per model wording.
+        continuation_text = "换一种说法继续这个主题"
+        continuation = event(
+            "evt_context_3",
+            continuation_text,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        continuation_index = binder.candidate_index(continuation)
+        continuation_token = next(
+            item["candidate_token"]
+            for item in continuation_index["model_catalog"]
+            if item["kind"] == "context"
+            and item["label"] == "veyra cognitive context anchors"
+        )
+        continuation_envelope = bind_turn(
+            store=store,
+            runtime=runtime,
+            binder=binder,
+            attention=attention,
+            turn=continuation,
+            understanding=semantic_understanding(
+                continuation_text,
+                target_value="Veyra 认知上下文锚点",
+                target_type="topic",
+                candidate_token=continuation_token,
+                history_links=[continuation_token],
+            ),
+            candidate_index=continuation_index,
+        )
+        assert continuation_envelope["anchors"] == [
+            {"kind": "context", "ref_id": first_context_id}
+        ]
+        assert continuation_envelope["threads"] == []
+        assert (
+            continuation_envelope["bindings"][0]["source"]
+            == "owner_session_context_token_continuation"
+        )
+        assert (
+            continuation_envelope["bindings"][0]["candidate_source"][
+                "candidate_token"
+            ]
+            == continuation_token
+        )
+        general = store.read_json("general_situation_state.json")
+        parents = general.get("general_situations") or {}
+        parent = next(iter(parents.values()))
+        assert parent["distinct_event_count"] == 3
+        assert parent["causality_asserted"] is False
+        context_state = store.read_json("context_binding_state.json")
+        assert context_state["coverage"] == {
+            "eligible": 3,
+            "bound": 3,
+            "unresolved": 0,
+            "bound_rate": 1.0,
+            "overconservative_alert": False,
+        }
+
+        # One token occurrence is not enough.  Omitting the independent
+        # history-link expression falls back to a new same-session hypothesis
+        # instead of reusing the existing Context.
+        single_token_text = "只在 target 中带 continuation token"
+        single_token_event = event(
+            "evt_context_single_token",
+            single_token_text,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        single_token_index = binder.candidate_index(single_token_event)
+        single_token = next(
+            item["candidate_token"]
+            for item in single_token_index["model_catalog"]
+            if item["kind"] == "context"
+            and item["label"] == "veyra cognitive context anchors"
+        )
+        attention.focus_for_text(
+            single_token_text,
+            user_id=user_id,
+            session_id=session_id,
+            event=single_token_event,
+        )
+        single_token_understanding = semantic_understanding(
+            single_token_text,
+            target_value="translated context label",
+            target_type="topic",
+            candidate_token=single_token,
+        )
+        single_token_envelope = binder.bind(
+            event=single_token_event,
+            understanding=single_token_understanding,
+            attention_assessment=attention.assess_understanding(
+                text=single_token_text,
+                understanding=single_token_understanding,
+            ),
+            candidate_index=single_token_index,
+        )
+        assert single_token_envelope["anchors"][0]["ref_id"] != first_context_id
+        assert single_token_envelope["bindings"][0]["candidate_source"] is None
 
         # Exact replay is byte-stable across Situation, binding, and parent
         # state; a model retry cannot create a second observation revision.

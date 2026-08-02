@@ -12,11 +12,20 @@ class ResponseSynthesizer:
         summary = str(interpreted.get("summary") or "").strip()
         verifier_status = str(verification.get("status") or "")
         if status in {"submitted", "running", "pending"}:
-            return f"任务已下发给 {executor}，当前状态是 {status}。我会等待 Agent 返回可验证结果后再给结论。"
+            return (
+                f"任务已下发给 {executor}，当前状态是 {status}。"
+                "这里只确认已下发；尚未观察到可验证终态，本轮不承诺稍后自动交付。"
+            )
         if verifier_status == "verified_success":
             return summary or f"{executor} 已完成任务，Verifier 已确认结果有证据支撑。"
         if verifier_status == "partially_success":
-            return summary or f"{executor} 已接收任务，但结果尚未完成验证。"
+            if summary:
+                return (
+                    f"{executor} 报告称：{summary} "
+                    "该内容仍是 Agent 报告，尚未验证为持久执行效果，"
+                    "不能据此标记完成。"
+                )
+            return f"{executor} 已接收任务，但结果尚未完成验证。"
         if verifier_status == "needs_more_probe":
             next_action = verification.get("next_action") or "collect more evidence"
             return f"{executor} 返回了结果，但证据还不够稳定，需要继续验证：{next_action}。"
@@ -55,7 +64,9 @@ class ResponseSynthesizer:
             ] if isinstance(needs, list) else []
             detail = "；".join(questions[:3])
             return (
-                f"Agent 认为还缺少证据：{detail}。我会先验证或补齐这些信息，再决定是否继续。"
+                f"Agent 认为还缺少证据：{detail}。这不是事实结论；"
+                "这些信息需要先被验证或补齐；"
+                "在此之前 Case 保持可继续评估，不会自动继续。"
                 if detail
                 else "Agent 请求补充证据；这不是事实结论，我会先验证请求并保持 Case 可继续评估。"
             )

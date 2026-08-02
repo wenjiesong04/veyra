@@ -8,6 +8,10 @@ from core.capability_registry import CapabilityRegistry
 from core.cognition_pipeline import CognitionPipeline, use_model_first_pipeline
 from core.model_driven_decision_core import ModelDrivenDecisionCore
 from core.definitions import RiskLevel, classify_text_risk
+from core.final_route_projection import (
+    has_effectful_candidate,
+    project_nonexecuting_route,
+)
 from core.memory_policy_runtime import normalize_memory_policy
 from core.reasoning_core import CoreReasoning, safe_model_risk
 from core.semantic_policy import SemanticPolicy, SemanticPolicyCompiler
@@ -177,8 +181,8 @@ class DecisionCore:
 
         locked = self._governance_locked_decision(text, attention_focus, event=event)
         if locked:
-            enriched = self.model_driven.enrich(text, self._with_turn_understanding(locked, understanding), event=event)
-            return finish(enriched)
+            finalized = finish(self._with_turn_understanding(locked, understanding))
+            return self.model_driven.enrich(text, finalized, event=event)
         contract_base = self._rule_decide(text, attention_focus, event=event)
         contract_base = self._apply_understanding_guardrails(text, contract_base, understanding)
         if self._adapter_contract_route_is_deterministic(contract_base):
@@ -190,11 +194,11 @@ class DecisionCore:
             }.get(contract_base.route)
             if deterministic_signal and deterministic_signal not in contract_base.signals:
                 contract_base.signals.append(deterministic_signal)
-            enriched = self.model_driven.enrich(text, self._with_turn_understanding(contract_base, understanding), event=event)
-            return finish(enriched)
+            finalized = finish(self._with_turn_understanding(contract_base, understanding))
+            return self.model_driven.enrich(text, finalized, event=event)
         if self._should_trust_rule_understanding(understanding):
-            enriched = self.model_driven.enrich(text, self._with_turn_understanding(contract_base, understanding), event=event)
-            return finish(enriched)
+            finalized = finish(self._with_turn_understanding(contract_base, understanding))
+            return self.model_driven.enrich(text, finalized, event=event)
         if use_model_first_pipeline(self.reasoning):
             pipeline = CognitionPipeline(self.reasoning, self.state_store, self.capabilities)
             pipeline_decision = pipeline.run(
@@ -206,15 +210,15 @@ class DecisionCore:
             )
             if pipeline_decision is not None:
                 pipeline_decision = self._apply_understanding_guardrails(text, pipeline_decision, understanding)
-                enriched = self.model_driven.enrich(text, self._with_turn_understanding(pipeline_decision, understanding), event=event)
-                return finish(enriched)
+                finalized = finish(self._with_turn_understanding(pipeline_decision, understanding))
+                return self.model_driven.enrich(text, finalized, event=event)
         base = self._rule_decide(text, attention_focus, event=event)
         base = self._apply_understanding_guardrails(text, base, understanding)
         base = self._with_turn_understanding(base, understanding)
         decision = self._apply_model_assist(text, attention_focus, base, event=event)
         decision = self._apply_understanding_guardrails(text, decision, understanding)
-        enriched = self.model_driven.enrich(text, self._with_turn_understanding(decision, understanding), event=event)
-        return finish(enriched)
+        finalized = finish(self._with_turn_understanding(decision, understanding))
+        return self.model_driven.enrich(text, finalized, event=event)
 
     def _governance_locked_decision(self, text: str, attention_focus: list[str], event: VeyraEvent | None = None) -> Decision | None:
         """Deterministic locks that must never be overridden by model routing."""
@@ -336,14 +340,9 @@ class DecisionCore:
                     "policy:semantic_frame_required",
                 ]
             )
-            effectful_route = decision.route in {
-                Route.AGENT,
-                Route.NATIVE_TOOL,
-                Route.PROBE,
-                Route.SKILL,
-            } or decision.needs_agent or decision.needs_probe
+            effectful_route = has_effectful_candidate(decision)
             if effectful_route:
-                return replace(
+                projected = replace(
                     decision,
                     route=Route.ASK_USER,
                     risk_level=self._max_risk(RiskLevel.R1, decision.risk_level),
@@ -364,6 +363,13 @@ class DecisionCore:
                         ]
                     ),
                     model_assist=assist,
+                )
+                return project_nonexecuting_route(
+                    projected,
+                    route=Route.ASK_USER,
+                    reason="semantic frame is required before capability execution",
+                    original=decision,
+                    signal="policy:semantic_frame_missing_nonexecution",
                 )
             decision.model_assist = assist
             decision.signals = signals
@@ -423,7 +429,9 @@ class DecisionCore:
         required_rule_probe = bool(
             decision.route == Route.PROBE
             and decision.selected_probe
+            and decision.selected_probe != "search_probe"
             and (decision.freshness_required or decision.needs_probe)
+            and "policy:required_probe_preserved" in (decision.signals or [])
             and not false_positive_action_words
         )
         safety_locked = decision.route in {Route.BLOCK, Route.HUMAN_REVIEW, Route.ROLLBACK}
@@ -438,7 +446,7 @@ class DecisionCore:
             # original Veyra risk classification and every destructive-action
             # constraint.  This is a no-effect terminal for the current turn,
             # not a risk downgrade.
-            return replace(
+            projected = replace(
                 decision,
                 route=Route.ASK_USER,
                 risk_level=decision.risk_level,
@@ -468,6 +476,13 @@ class DecisionCore:
                 ),
                 model_assist=assist,
             )
+            return project_nonexecuting_route(
+                projected,
+                route=Route.ASK_USER,
+                reason="semantic clarification required before opening a governance review",
+                original=decision,
+                signal="policy:safety_clarification_nonexecution",
+            )
         if safety_locked and not (
             false_positive_action_words and not policy.allowed_effects
         ):
@@ -480,6 +495,7 @@ class DecisionCore:
         route = decision.route
         selected_probe = decision.selected_probe
         capability = decision.capability
+        capability_request = dict(decision.capability_request or {})
         required_capabilities = list(decision.required_capabilities)
         needs_probe = decision.needs_probe
         needs_agent = decision.needs_agent
@@ -489,6 +505,8 @@ class DecisionCore:
         risk = decision.risk_level
         intent = decision.intent
         reason = decision.reason
+        reasoning_mode = decision.reasoning_mode
+        candidate_effectful = has_effectful_candidate(decision)
 
         if preferred == Route.ASK_USER.value:
             route = Route.ASK_USER
@@ -563,9 +581,14 @@ class DecisionCore:
                 needs_confirmation = False
                 requires_confirmation = False
                 reason = "semantic frame authorizes a read-only core response"
+                if candidate_effectful:
+                    signals = self._dedupe(
+                        [*signals, "policy:capability_candidate_denied"]
+                    )
                 if false_positive_action_words and not policy.allowed_effects:
                     risk = RiskLevel.R0
                     signals = self._dedupe([*signals, "policy:mentioned_action_risk_downgraded"])
+                reasoning_mode = "direct"
 
         if not policy.allows_effect("memory.write"):
             memory_policy = "forget"
@@ -579,7 +602,7 @@ class DecisionCore:
         if policy.requires_clarification:
             constraints = self._dedupe([*constraints, "do not produce side effects before clarification"])
 
-        return replace(
+        projected = replace(
             decision,
             route=route,
             risk_level=risk,
@@ -592,12 +615,23 @@ class DecisionCore:
             needs_agent=needs_agent,
             needs_user_confirmation=needs_confirmation,
             memory_policy=memory_policy,
+            reasoning_mode=reasoning_mode,
             intent=intent,
             required_capabilities=self._dedupe(required_capabilities),
+            capability_request=capability_request,
             signals=signals,
             constraints=constraints,
             model_assist=assist,
         )
+        if route in {Route.DIRECT_ANSWER, Route.ASK_USER} and candidate_effectful:
+            return project_nonexecuting_route(
+                projected,
+                route=route,
+                reason=reason,
+                original=decision,
+                signal="policy:capability_candidate_denied",
+            )
+        return projected
 
     def _apply_understanding_guardrails(
         self,
@@ -621,7 +655,7 @@ class DecisionCore:
                 "turn_understanding": understanding.to_dict(include_raw=False),
             }
         )
-        return self._decision(
+        projected = self._decision(
             route=Route.DIRECT_ANSWER,
             risk=decision.risk_level if decision.risk_level in {RiskLevel.R0, RiskLevel.R1} else decision.risk_level,
             reason="understanding-first guardrail: strategic discussion should stay in Veyra Core",
@@ -647,6 +681,13 @@ class DecisionCore:
             },
             constraints=["do not execute tools or Agent for strategic discussion unless explicitly requested"],
             model_assist=assist,
+        )
+        return project_nonexecuting_route(
+            projected,
+            route=Route.DIRECT_ANSWER,
+            reason=projected.reason,
+            original=decision,
+            signal="policy:strategic_discussion_nonexecution",
         )
 
     def _understanding_explicitly_needs_execution_or_runtime(self, text: str, understanding: TurnUnderstanding) -> bool:
@@ -882,7 +923,11 @@ class DecisionCore:
         if (base.freshness_required or model_freshness_required) and candidate_route == Route.DIRECT_ANSWER:
             if base.selected_probe or self._selected_probe_from_model(assist, None):
                 candidate_route = Route.PROBE
-                policy_signals.append("policy:required_probe_preserved")
+                # A model-requested observation is only a candidate.  Keep its
+                # provenance distinct from the deterministic signal installed
+                # by ``decide`` for a Veyra-owned freshness rule; otherwise a
+                # generic model evidence gap can bypass SemanticPolicy.
+                policy_signals.append("policy:model_freshness_probe_requested")
             else:
                 candidate_route = Route.ASK_USER
                 policy_signals.append("policy:freshness_gap_asks_user")
@@ -914,7 +959,13 @@ class DecisionCore:
             selected_probe = self._selected_skill_from_model(assist, base.selected_probe)
 
         reason = str(assist.get("reason") or assist.get("rationale") or "model-assisted core reasoning")
-        signals = self._dedupe(base.signals + self._string_list(assist.get("signals")) + policy_signals + ["model:decision"])
+        model_signal_hints = self._string_list(assist.get("signals"))
+        if model_signal_hints:
+            # Signals are consumed as server-owned policy provenance elsewhere
+            # in the control path.  Model strings therefore remain untrusted
+            # hints and must never enter ``Decision.signals`` verbatim.
+            policy_signals.append("model:untrusted_signals_ignored")
+        signals = self._dedupe(base.signals + policy_signals + ["model:decision"])
         constraints = self._dedupe(base.constraints + self._string_list(assist.get("constraints")) + ["guardian remains final execution boundary"])
         capability_request = capability_request_payload
         required_capabilities = self._dedupe(

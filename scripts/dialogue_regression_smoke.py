@@ -208,9 +208,15 @@ def main() -> int:
         outbox.append(
             {
                 "channel": "smoke",
+                "user_id": "dialogue-regression",
                 "session_id": "dialogue-regression-session",
+                "event_id": "evt_ctx_in_1",
                 "message": "上一轮回答",
-                "metadata": {"route": "direct_answer"},
+                "metadata": {
+                    "route": "direct_answer",
+                    "user_id": "dialogue-regression",
+                    "event_id": "evt_ctx_in_1",
+                },
                 "status": "queued",
                 "created_at": utc_now_iso(),
                 "delivery": "local_outbox",

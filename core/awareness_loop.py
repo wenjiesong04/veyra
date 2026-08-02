@@ -25,6 +25,12 @@ from core.execution_tier import (
     TIER_L5_PROACTIVE,
     classify_execution_tier,
 )
+from core.final_route_projection import (
+    RESPONSE_AUTHORITY_SCHEMA_VERSION,
+    decision_from_public_dict,
+    has_effectful_candidate,
+    project_nonexecuting_route,
+)
 from core.definitions import GuardianDecision, LifecycleStatus, RiskLevel
 from core.decision_core import DecisionCore
 from core.foresight_engine import ForesightEngine
@@ -50,7 +56,7 @@ from core.verifier import Verifier
 from core.veyra_controller import VeyraController
 from core.world_state import WorldStateStore
 from guardian.review_queue import ReviewQueue
-from interface.agent_contract import NON_TERMINAL_STATUSES
+from interface.agent_contract import NON_TERMINAL_STATUSES, TERMINAL_STATUSES
 from interface.agent_adapter import ExecutionResult
 from interface.channel_adapter import ChannelAdapter
 from interface.agent_registry import AgentRegistry
@@ -1274,6 +1280,7 @@ class AwarenessLoop:
                 }
             )
         self._apply_state_change_response_truth(result)
+        self._finalize_result_response_authority(result)
         self._persist_conversation_slots(event, result)
         self._render_final_user_messages(event, result)
         trace = self.runtime_trace.record(
@@ -1334,6 +1341,343 @@ class AwarenessLoop:
         assist = decision.get("model_assist") if isinstance(decision.get("model_assist"), dict) else {}
         plan = assist.get("decision_plan") if isinstance(assist.get("decision_plan"), dict) else {}
         return str(plan.get("execution_tier") or assist.get("execution_tier") or "").strip()
+
+    def _finalize_result_response_authority(self, result: LoopResult) -> None:
+        """Derive response claims from terminal server-owned evidence.
+
+        A model Decision describes a proposal, not what actually happened.  This
+        last boundary runs for every Awareness return path and records the
+        strongest claim the final response may make from persisted runtime
+        evidence.  It also re-projects DIRECT/ASK shortcuts that bypassed the
+        Controller after an execution-shaped proposal.
+        """
+
+        decision_payload = (
+            result.artifacts.get("decision")
+            if isinstance(result.artifacts.get("decision"), dict)
+            else {}
+        )
+        decision = decision_from_public_dict(decision_payload)
+        committed_refs = self._committed_state_change_refs(result.artifacts)
+        claimable_state_change_refs = self._claimable_state_change_refs(
+            result,
+            committed_refs,
+        )
+        no_execution_route = result.route in {
+            Route.DIRECT_ANSWER,
+            Route.ASK_USER,
+        }
+        inherited_nonexecution = bool(
+            decision is not None
+            and self._server_no_execution_required(decision)
+        )
+        early_read_only = self._trusted_early_read_only_response(result.artifacts)
+        state_observation_refs = self._state_observation_refs(
+            result.event_id,
+            result.artifacts,
+        )
+        if (
+            no_execution_route
+            and decision is not None
+            and (
+                has_effectful_candidate(decision)
+                or inherited_nonexecution
+            )
+        ):
+            projected = project_nonexecuting_route(
+                decision,
+                route=result.route,
+                reason=(
+                    "terminal Awareness route completed without an execution "
+                    "or delivery receipt"
+                ),
+                original=decision,
+                signal="runtime:terminal_nonexecution",
+            )
+            result.artifacts["decision"] = projected.to_dict()
+            if (
+                not early_read_only
+                and not inherited_nonexecution
+                and not claimable_state_change_refs
+            ):
+                result.response = self._server_no_execution_response(projected)
+                result.primary_response = result.response
+            authority = dict(projected.response_authority)
+            authority["may_claim_terminal_report"] = False
+            if early_read_only and not state_observation_refs:
+                authority["renderer"] = "server_read_only"
+                authority["reason"] = (
+                    "trusted deterministic read-only response; no capability "
+                    "execution or later delivery"
+                )
+                result.artifacts["response_authority"] = authority
+                return
+            if not state_observation_refs and not claimable_state_change_refs:
+                result.artifacts["response_authority"] = authority
+                return
+
+        trace_refs = self._execution_trace_refs(result.artifacts)
+        compact_observation = bool(
+            result.route == Route.PROBE
+            and isinstance(result.artifacts.get("compact_lookup"), dict)
+            and result.artifacts.get("probe_result")
+        )
+        if compact_observation:
+            trace_refs.append(f"event:{result.event_id}:compact_observation")
+        trace_refs = list(dict.fromkeys(trace_refs))
+        state_observed = bool(state_observation_refs)
+        pending = (
+            result.artifacts.get("pending_task")
+            if isinstance(result.artifacts.get("pending_task"), dict)
+            else {}
+        )
+        dispatch_registered = bool(
+            pending.get("registered_at")
+            or pending.get("registered") is True
+            or (
+                result.route == Route.AGENT
+                and trace_refs
+            )
+        )
+        verification = (
+            result.artifacts.get("verification")
+            if isinstance(result.artifacts.get("verification"), dict)
+            else {}
+        )
+        execution_result = (
+            result.artifacts.get("execution_result")
+            if isinstance(result.artifacts.get("execution_result"), dict)
+            else {}
+        )
+        agent_execution_status = str(
+            execution_result.get("status")
+            or pending.get("status")
+            or ""
+        ).strip()
+        agent_terminal_observed = bool(
+            result.route == Route.AGENT
+            and agent_execution_status in TERMINAL_STATUSES
+        )
+        non_agent_terminal_observed = bool(
+            result.route != Route.AGENT
+            and (
+                result.route in {Route.PROBE, Route.SKILL}
+                or str(result.status or "") not in NON_TERMINAL_STATUSES
+                or str(verification.get("status") or "")
+                in {"verified_success", "success", "failed", "partial"}
+            )
+        )
+        terminal_observed = bool(
+            (trace_refs or state_observed)
+            and (
+                state_observed
+                or agent_terminal_observed
+                or non_agent_terminal_observed
+            )
+        )
+        if claimable_state_change_refs:
+            claim_scope = "verified_effect"
+            execution_status = "verified_effect"
+        elif terminal_observed:
+            claim_scope = "terminal_report"
+            execution_status = (
+                "state_observation"
+                if state_observed and not trace_refs
+                else "terminal_report_observed"
+            )
+        elif dispatch_registered:
+            claim_scope = "dispatch_only"
+            execution_status = "dispatched"
+        else:
+            claim_scope = "none"
+            execution_status = "not_started"
+        dispatch_evidence = bool(dispatch_registered or trace_refs)
+        authority = {
+            "schema_version": RESPONSE_AUTHORITY_SCHEMA_VERSION,
+            "final_route": result.route.value,
+            "claim_scope": claim_scope,
+            "capability_execution_status": execution_status,
+            "execution_receipt_refs": trace_refs,
+            "observation_receipt_refs": state_observation_refs,
+            "state_change_receipt_refs": claimable_state_change_refs,
+            "external_delivery_status": "not_observed_at_core",
+            "delivery_receipt_refs": [],
+            "may_claim_dispatch": not state_observed and dispatch_evidence,
+            "may_claim_capability_progress": not state_observed
+            and dispatch_evidence,
+            "may_claim_terminal_report": claim_scope
+            in {"terminal_report", "verified_effect"},
+            "may_claim_completion": claim_scope == "verified_effect",
+            "may_promise_later_delivery": False,
+            "renderer": "route_result",
+            "reason": "derived from terminal Awareness artifacts",
+        }
+        result.artifacts["response_authority"] = authority
+
+    @classmethod
+    def _claimable_state_change_refs(
+        cls,
+        result: LoopResult,
+        committed_refs: list[str],
+    ) -> list[str]:
+        """Bind completion authority to the response that names the change.
+
+        Profile/memory synchronization may occur alongside an Agent or Probe
+        turn.  Its receipt proves that internal write only; it cannot certify
+        the routed capability.  A global completion claim is therefore allowed
+        only when a server-owned primary commitment response or an explicit
+        preference-memory turn is bound to the same committed result.
+        """
+
+        if not committed_refs or result.route not in {
+            Route.DIRECT_ANSWER,
+            Route.ASK_USER,
+        }:
+            return []
+        artifacts = result.artifacts
+        commitment = (
+            artifacts.get("commitment")
+            if isinstance(artifacts.get("commitment"), dict)
+            else {}
+        )
+        commitment_refs = cls._committed_state_change_refs(
+            {"commitment": commitment}
+        )
+        if artifacts.get("commitment_primary_applied") and commitment_refs:
+            return [
+                ref for ref in committed_refs if ref in set(commitment_refs)
+            ]
+
+        decision = (
+            artifacts.get("decision")
+            if isinstance(artifacts.get("decision"), dict)
+            else {}
+        )
+        memory = (
+            artifacts.get("memory_policy_execution")
+            if isinstance(artifacts.get("memory_policy_execution"), dict)
+            else {}
+        )
+        memory_change = (
+            memory.get("state_change")
+            if isinstance(memory.get("state_change"), dict)
+            else {}
+        )
+        if (
+            str(decision.get("intent") or "") == "preference"
+            and str(memory_change.get("status") or "") == "committed"
+            and memory_change.get("applied") is True
+        ):
+            memory_refs = cls._committed_state_change_refs(
+                {"memory_policy_execution": {"state_change": memory_change}}
+            )
+            return [ref for ref in committed_refs if ref in set(memory_refs)]
+        return []
+
+    @staticmethod
+    def _trusted_early_read_only_response(artifacts: dict[str, Any]) -> bool:
+        early = (
+            artifacts.get("early_awareness")
+            if isinstance(artifacts.get("early_awareness"), dict)
+            else {}
+        )
+        reason = str(early.get("reason") or "")
+        return reason in {
+            "attention_continuation",
+            "project_continuation",
+            "project_identity_direct",
+            "state_grounded_commitment_answer",
+            "state_grounded_learning_memory",
+            "state_grounded_local_answer",
+            "tracking_memory_question",
+            "user_profile_context_plan",
+        }
+
+    @staticmethod
+    def _state_observation_refs(
+        event_id: str,
+        artifacts: dict[str, Any],
+    ) -> list[str]:
+        early = (
+            artifacts.get("early_awareness")
+            if isinstance(artifacts.get("early_awareness"), dict)
+            else {}
+        )
+        reason = str(early.get("reason") or "")
+        if not reason.startswith("state_grounded_"):
+            return []
+        answer = (
+            early.get("state_answer")
+            if isinstance(early.get("state_answer"), dict)
+            else {}
+        )
+        observed_at = str(answer.get("observed_at") or "").strip()
+        refs = [
+            f"state:{source}@{observed_at or 'snapshot'}"
+            for source in answer.get("sources", [])
+            if isinstance(source, str) and source
+        ]
+        if not refs:
+            refs.append(f"event:{event_id}:server_state_read")
+        return list(dict.fromkeys(refs))
+
+    @staticmethod
+    def _execution_trace_refs(artifacts: dict[str, Any]) -> list[str]:
+        refs: list[str] = []
+
+        def add_trace(value: Any) -> None:
+            if not isinstance(value, dict):
+                return
+            trace_id = str(value.get("trace_id") or "").strip()
+            if trace_id:
+                refs.append(trace_id)
+
+        add_trace(artifacts.get("execution_trace"))
+        for value in artifacts.get("execution_traces", []):
+            add_trace(value)
+        for item in artifacts.get("probe_results", []):
+            if isinstance(item, dict):
+                add_trace(item.get("execution_trace"))
+        return list(dict.fromkeys(refs))
+
+    @staticmethod
+    def _committed_state_change_refs(artifacts: dict[str, Any]) -> list[str]:
+        refs: list[str] = []
+        roots = [
+            artifacts.get("commitment"),
+            artifacts.get("profile_state_change"),
+            (
+                artifacts.get("memory_policy_execution", {}).get("state_change")
+                if isinstance(artifacts.get("memory_policy_execution"), dict)
+                else None
+            ),
+        ]
+
+        def inspect(value: Any, *, depth: int) -> None:
+            if depth > 5:
+                return
+            if isinstance(value, dict):
+                if (
+                    str(value.get("status") or "") == "committed"
+                    and value.get("applied") is True
+                ):
+                    ref = str(
+                        value.get("proposal_id")
+                        or value.get("idempotency_key")
+                        or value.get("state_revision")
+                        or ""
+                    ).strip()
+                    if ref:
+                        refs.append(f"state_change:{ref}")
+                for nested in value.values():
+                    inspect(nested, depth=depth + 1)
+            elif isinstance(value, list):
+                for nested in value:
+                    inspect(nested, depth=depth + 1)
+
+        for root in roots:
+            inspect(root, depth=0)
+        return list(dict.fromkeys(refs))
 
     def _early_high_risk_result(self, event: VeyraEvent, text: str) -> LoopResult | None:
         assessment = assess_text_risk(text)
@@ -1474,6 +1818,8 @@ class AwarenessLoop:
         clarification = str(semantic_policy.get("clarification_reason") or "").strip()
         if bool(semantic_policy.get("requires_clarification")) and clarification:
             return self._humanize_semantic_clarification(clarification)
+        if self._server_no_execution_required(decision):
+            return self._server_no_execution_response(decision)
         capability = decision.capability_request.get("capability") if isinstance(decision.capability_request, dict) else ""
         message_type = decision.capability_request.get("message_type") if isinstance(decision.capability_request, dict) else ""
         if capability == "vision":
@@ -1717,23 +2063,37 @@ class AwarenessLoop:
         text = event.payload.get("text", "")
         probe_name = (decision.selected_probe or "").strip()
         if not probe_name:
+            projected = project_nonexecuting_route(
+                decision,
+                route=Route.ASK_USER,
+                reason="probe route reached runtime without an executable probe name",
+                original=decision,
+                signal="runtime:missing_probe_nonexecution",
+            )
             return LoopResult(
                 event_id=event.event_id,
                 route=Route.ASK_USER,
                 status="needs_user_input",
                 response="这个请求需要明确且可执行的探针名称；我不会在缺少探针时默认执行 system_probe。",
                 risk_level=RiskLevel.R1,
-                artifacts={"decision": decision.to_dict(), "next_action": "provide a concrete probe target"},
+                artifacts={"decision": projected.to_dict(), "next_action": "provide a concrete probe target"},
             )
         probe = self.probes.get(probe_name)
         if not probe:
+            projected = project_nonexecuting_route(
+                decision,
+                route=Route.ASK_USER,
+                reason=f"probe `{probe_name}` is not registered in this runtime",
+                original=decision,
+                signal="runtime:unregistered_probe_nonexecution",
+            )
             return LoopResult(
                 event_id=event.event_id,
                 route=Route.ASK_USER,
                 status="needs_user_input",
                 response=f"当前不支持探针 `{probe_name}`。请改用可执行探针后再试。",
                 risk_level=RiskLevel.R1,
-                artifacts={"decision": decision.to_dict(), "next_action": "use a supported probe"},
+                artifacts={"decision": projected.to_dict(), "next_action": "use a supported probe"},
             )
         raw = self._invoke_probe(probe_name=probe_name, probe=probe, text=text, decision=decision, event=event)
         state_patch = self.perception.interpret_probe_result(
@@ -1912,12 +2272,27 @@ class AwarenessLoop:
                 "project_direction_review",
             }:
                 return self._direct_answer_degraded(text=text, decision=decision, answer_assist={})
+        if self._server_no_execution_required(decision):
+            if isinstance(understanding, dict) and str(
+                understanding.get("suggested_mode") or ""
+            ) in {
+                "strategic_discussion",
+                "meta_cognition_discussion",
+                "project_direction_review",
+            }:
+                return self._direct_answer_degraded(
+                    text=text,
+                    decision=decision,
+                    answer_assist={},
+                )
+            return self._server_no_execution_response(decision)
         model_assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
         plan_draft = str(model_assist.get("draft_response") or "").strip()
+        draft_authorized = not self._server_no_execution_required(decision)
         # Speed: the awareness execution-plan step already drafted a final reply for
         # direct answers. Reuse it instead of making a third sequential model call,
         # and only fall back to a dedicated answer pass when that draft is unusable.
-        if plan_draft:
+        if plan_draft and draft_authorized:
             plan_answer = {
                 "status": "model_assisted",
                 "draft_response": plan_draft,
@@ -1935,7 +2310,7 @@ class AwarenessLoop:
             persona_patch=persona_patch,
         )
         draft = str(answer_assist.get("draft_response") or answer_assist.get("response") or "").strip()
-        if not draft and plan_draft:
+        if not draft and plan_draft and draft_authorized:
             draft = plan_draft
             answer_assist = {**answer_assist, "status": "model_assisted", "draft_response": draft}
         if answer_assist.get("status") == "model_assisted" and draft and self._direct_draft_is_usable(text=text, decision=decision, draft=draft, answer_assist=answer_assist):
@@ -1945,6 +2320,56 @@ class AwarenessLoop:
             capability = decision.capability_request.get("capability") if isinstance(decision.capability_request, dict) else ""
             return f"这个问题需要先获取新鲜证据{f'（{capability}）' if capability else ''}，我不会凭模板猜测。"
         return self._direct_answer_degraded(text=text, decision=decision, answer_assist=answer_assist)
+
+    @staticmethod
+    def _server_no_execution_required(decision: Decision) -> bool:
+        authority = (
+            decision.response_authority
+            if isinstance(decision.response_authority, dict)
+            else {}
+        )
+        return bool(
+            authority.get("renderer") == "server_no_execution"
+            and authority.get("may_claim_capability_progress") is False
+            and authority.get("may_promise_later_delivery") is False
+            and str(authority.get("capability_execution_status") or "")
+            == "not_started"
+            and not authority.get("execution_receipt_refs")
+            and not authority.get("delivery_receipt_refs")
+        )
+
+    @staticmethod
+    def _server_no_execution_response(decision: Decision) -> str:
+        """Render a receipt-grounded reply without trusting model prose."""
+
+        if decision.route == Route.ASK_USER:
+            return (
+                "本轮没有执行 Probe、Agent 或外部操作，也没有安排稍后自动交付。"
+                "当前缺少可执行的只读观察能力或必要上下文；请补充可验证信息，"
+                "或明确启用对应能力后再继续。"
+            )
+        assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
+        frame = assist.get("semantic_frame") if isinstance(assist.get("semantic_frame"), dict) else {}
+        acts = frame.get("acts") if isinstance(frame.get("acts"), list) else []
+        evidence_needs = {
+            str(item.get("evidence_need") or "").strip()
+            for item in acts
+            if isinstance(item, dict) and str(item.get("evidence_need") or "").strip()
+        }
+        if evidence_needs.intersection({"fresh_runtime", "runtime", "fresh_local"}):
+            evidence_label = "带来源、观察时间和持久引用的运行态或测试证据"
+        elif evidence_needs.intersection(
+            {"fresh_external", "external", "fresh_external_search", "web_search"}
+        ):
+            evidence_label = "带来源、发布时间和持久引用的外部证据"
+        else:
+            evidence_label = "与当前问题直接绑定、带来源和观察时间的证据"
+        return (
+            "本轮没有执行 Probe、Agent 或外部查询，也没有安排稍后自动交付；"
+            "因此我不会把未取得的结果说成事实。基于当前 Situation，"
+            f"凡是缺少{evidence_label}的具体结论，都只能算待验证假设。"
+            "要把它升级为事实，需要先取得对应观察，并把证据引用绑定到当前 Situation。"
+        )
 
     def _probe_draft_is_usable(self, *, probe_name: str, raw: dict[str, object], draft: str) -> bool:
         if self._looks_like_low_quality_template(draft):
@@ -2000,6 +2425,19 @@ class AwarenessLoop:
 
     def _direct_draft_is_usable(self, *, text: str, decision: Decision, draft: str, answer_assist: dict[str, object]) -> bool:
         if self._looks_like_low_quality_template(draft):
+            return False
+        response_authority = (
+            decision.response_authority
+            if isinstance(decision.response_authority, dict)
+            else {}
+        )
+        if (
+            response_authority.get("may_claim_capability_progress") is False
+            and str(response_authority.get("capability_execution_status") or "")
+            == "not_started"
+            and str(answer_assist.get("execution_status_claim") or "")
+            != "none"
+        ):
             return False
         confidence_raw = answer_assist.get("confidence")
         try:
@@ -3826,12 +4264,22 @@ class AwarenessLoop:
     def _render_user_message(self, event: VeyraEvent, result: LoopResult, message: str, *, primary: bool) -> str:
         text = str(message or "").strip()
         raw = result.artifacts.get("probe_result") if isinstance(result.artifacts.get("probe_result"), dict) else {}
+        response_authority = (
+            result.artifacts.get("response_authority")
+            if isinstance(result.artifacts.get("response_authority"), dict)
+            else {}
+        )
+        probe_render_authorized = bool(
+            result.route == Route.PROBE
+            and response_authority.get("claim_scope")
+            in {"terminal_report", "verified_effect"}
+        )
         # The probe renderer owns only the primary evidence answer. Commitment
         # confirmations and other follow-ups must retain their own text instead
         # of being rewritten into a duplicate search/weather response.
-        if primary and raw.get("probe") == "weather_probe":
+        if primary and probe_render_authorized and raw.get("probe") == "weather_probe":
             return self._weather_user_response(raw)
-        if primary and raw.get("probe") == "search_probe":
+        if primary and probe_render_authorized and raw.get("probe") == "search_probe":
             return self._search_user_response(raw)
         forbidden = (
             "No geocoding result",

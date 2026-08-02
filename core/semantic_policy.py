@@ -141,6 +141,17 @@ class SemanticPolicyCompiler:
         acts = [item for item in acts if item]
         ambiguities = [_as_dict(item) for item in _as_list(payload.get("ambiguities"))]
         relations = [_as_dict(item) for item in _as_list(payload.get("relations"))]
+        condition_relation_act_ids = {
+            str(act_id)
+            for relation in relations
+            if _token(relation.get("kind"))
+            in {"condition", "conditional", "precondition"}
+            for act_id in (
+                relation.get("from_act_id"),
+                relation.get("to_act_id"),
+            )
+            if str(act_id or "").strip()
+        }
 
         allowed_effects: set[str] = set()
         allowed_capabilities: set[str] = {"native_answer"}
@@ -203,12 +214,23 @@ class SemanticPolicyCompiler:
             if effect_family != "read":
                 has_positive_effectful_candidate = True
 
-            if self._has_unresolved_condition(act):
+            unresolved_condition = bool(
+                self._has_unresolved_condition(act)
+                or act_id in condition_relation_act_ids
+            )
+            if act_id in capability_sensitive_act_ids and unresolved_condition:
                 ignored_ids.append(act_id)
                 requires_clarification = True
                 clarification_reason = "conditional request needs a satisfied trigger before capability use"
                 signals.append("semantic_policy:conditional_effect_unresolved")
                 continue
+            if unresolved_condition:
+                # A condition attached to a read-only discourse act is a
+                # constraint on the answer, not a latent capability grant.
+                # Conditions only gate acts that already resolve to a durable
+                # effect or concrete Probe; they must never manufacture an
+                # execution request from an otherwise non-effectful act.
+                signals.append("semantic_policy:read_only_condition_non_authorizing")
 
             if not self._is_authoritative(
                 act,
@@ -419,7 +441,14 @@ class SemanticPolicyCompiler:
     def _effect_family(self, act: dict[str, Any]) -> str:
         kind = _token(act.get("kind"))
         operation_token = _token(act.get("operation"))
-        operation = _joined(act.get("operation"), act.get("goal"), act.get("target"))
+        # Execution authority must come from structured act fields.  Natural-
+        # language goal and target labels are descriptive content: a request to
+        # analyse an "execution boundary" must not become execution merely
+        # because that noun appears in the subject.  The open-world operation
+        # token remains available for backward-compatible effect recognition,
+        # while concrete target shape is handled by the dedicated artifact and
+        # external-execution checks above.
+        operation = operation_token
         if self._looks_like_external_execution(act):
             return "execution"
         if kind in _INFORMATION_KINDS:
@@ -1196,24 +1225,31 @@ class SemanticPolicyCompiler:
             or target_type in {"search", "search_query", "web_search"}
             or evidence_need
             in {
-                "external",
-                "fresh_external",
                 "external_search",
                 "fresh_external_search",
                 "web_search",
             }
         ):
             return "search_probe", "web_search"
+        # ``external`` and ``fresh_external`` describe an evidence class, not
+        # a concrete capability request.  Treating either value as search
+        # authority caused questions about private project context to trigger
+        # blind public-web lookups.  Search therefore requires an explicit
+        # structured operation, target type, or search-specific evidence need.
         # Never scan serialized control objects.  A field name such as
         # ``anchor_candidate_token`` contains ``date`` and previously selected
         # time_probe for unrelated project questions.  Only semantic values
         # may participate in the legacy compatibility fallback below.
+        # Evidence classes and free-form goals describe uncertainty, not the
+        # concrete observer that may resolve it.  Keeping them out of the
+        # compatibility selector prevents generic ``fresh_runtime`` or
+        # ``fresh_local`` model output from becoming an unrelated system
+        # probe.  Only structural target/operation values reach this legacy
+        # path; specific evidence enums were handled above.
         evidence = _joined(
-            evidence_need,
             target_type,
             target.get("value"),
             operation,
-            act.get("goal"),
         )
         if not evidence:
             return None, None
@@ -1237,8 +1273,10 @@ class SemanticPolicyCompiler:
             return "time", "time_probe"
         if _contains(evidence, "url", "web page", "网页", "链接"):
             return "web", "web_url_probe"
-        if _contains(evidence, "current external", "latest", "news", "search", "web search", "外部", "最新", "新闻", "搜索"):
-            return "search_probe", "web_search"
+        # Public search has no lexical compatibility fallback.  Model-written
+        # goal/target prose such as "latest external evidence" is not an
+        # executable capability contract; only the structured search branch
+        # above may authorize ``search_probe``.
         return None, None
 
     def _arguments_for_act(self, act: dict[str, Any], probe: str) -> dict[str, Any]:

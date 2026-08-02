@@ -322,7 +322,9 @@ def check_controller_refreshes_agent_fallbacks() -> None:
                 reason="image understanding needs a governed runtime",
                 intent="information",
                 required_capabilities=["vision"],
-                model_assist=agent_allowed_policy(),
+                model_assist=agent_allowed_policy(
+                    preferred_route=Route.AGENT
+                ),
             )
         )
         expect(
@@ -412,9 +414,9 @@ def check_controller_refresh_failure_is_closed() -> None:
         )
         expect(
             capability_gap.route == Route.ASK_USER
-            and capability_plan.status == "missing_capability"
-            and len(refreshes) == 1,
-            "failed capability-gap refresh remains ASK_USER",
+            and capability_plan.status == "ready"
+            and len(refreshes) == 0,
+            "semantic ASK_USER lock avoids an unnecessary provider refresh",
             {
                 "decision": capability_gap.to_dict(),
                 "plan": capability_plan.to_dict(),
@@ -483,7 +485,9 @@ def check_controller_refresh_scope_and_generic_lock() -> None:
                 reason="explicit governed runtime request",
                 intent="information",
                 needs_agent=True,
-                model_assist=agent_allowed_policy(),
+                model_assist=agent_allowed_policy(
+                    preferred_route=Route.AGENT
+                ),
             )
         )
         expect(
@@ -587,7 +591,9 @@ def check_controller_refresh_scope_and_generic_lock() -> None:
                 reason="generic provider cannot gain dispatch authority",
                 intent="information",
                 required_capabilities=["vision"],
-                model_assist=agent_allowed_policy(),
+                model_assist=agent_allowed_policy(
+                    preferred_route=Route.AGENT
+                ),
             )
         )
         expect(

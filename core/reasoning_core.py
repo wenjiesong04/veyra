@@ -38,6 +38,9 @@ CORE_ANSWER_SYSTEM_FALLBACK = (
     "For volatile facts, use only supplied fresh evidence; if evidence is missing or stale, say exactly what is "
     "missing and do not pretend to know. If an agent proposal is supplied, translate it into a human-readable "
     "answer while preserving Veyra policy, risk, confirmation, and verification boundaries. "
+    "When response_authority says capability execution did not start, never claim that Veyra is searching, "
+    "checking, querying, waiting for a result, or will provide that result later. Give the useful answer supported by "
+    "current context and state the evidence gap truthfully. "
     "If the user is frustrated or confused, acknowledge the issue briefly and then give an actionable conclusion. "
     "If an image/attachment is referenced but only an attachment placeholder is available, say that Veyra has not "
     "received readable image content and ask for OCR/description or enabled vision intake. "
@@ -173,6 +176,11 @@ class CoreReasoning:
         payload = {
             "user_message": text,
             "decision": redact_sensitive(decision),
+            "response_authority": redact_sensitive(
+                decision.get("response_authority")
+                if isinstance(decision.get("response_authority"), dict)
+                else {}
+            ),
             "persona_patch": redact_sensitive(persona_patch or {}, max_string=600, max_list=8),
             "turn_context": self.turn_context.build(
                 user_message=text,
@@ -187,6 +195,7 @@ class CoreReasoning:
                 "used_sources": "list of evidence, memory, or decision inputs used",
                 "memory_policy": "none|read|write_candidate|forget|short_term|long_term",
                 "needs_observation": "boolean",
+                "execution_status_claim": "none|observed_completed|observed_in_progress",
                 "context_gaps": "list",
             },
         }

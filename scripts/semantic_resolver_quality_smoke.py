@@ -14,7 +14,8 @@ if str(ROOT) not in sys.path:
 
 from core.semantic_frame import SCHEMA_VERSION, TurnSemanticFrame, semantic_frame_quality_issues  # noqa: E402
 from core.semantic_policy import SemanticPolicyCompiler  # noqa: E402
-from core.understanding_core import UnderstandingCore  # noqa: E402
+from core.decision_core import DecisionCore  # noqa: E402
+from core.understanding_core import TurnUnderstanding, UnderstandingCore  # noqa: E402
 from core.capability_registry import CapabilityRegistry  # noqa: E402
 from core.veyra_controller import VeyraController  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
@@ -82,6 +83,17 @@ def frame_payload(acts: list[dict[str, Any]], *, relations: list[dict[str, Any]]
         "ambiguities": [],
         "resolver_status": "resolved",
         "source": "model",
+    }
+
+
+def relation(kind: str, from_act_id: str, to_act_id: str) -> dict[str, Any]:
+    return {
+        "relation_id": f"rel_{from_act_id}_{to_act_id}",
+        "kind": kind,
+        "from_act_id": from_act_id,
+        "to_act_id": to_act_id,
+        "description": "structured semantic relation",
+        "source_quote": None,
     }
 
 
@@ -184,6 +196,14 @@ class ScriptedReasoning:
 
     def _trace(self, purpose: str, result: dict[str, Any], summary: dict[str, Any]) -> None:
         self.traces.append({"purpose": purpose, "status": result.get("status"), "summary": summary})
+
+
+class DecisionAssistReasoning:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = copy.deepcopy(payload)
+
+    def decision_assist(self, **_: Any) -> dict[str, Any]:
+        return copy.deepcopy(self.payload)
 
 
 def expect(condition: bool, message: str, detail: Any = None) -> None:
@@ -595,6 +615,176 @@ def main() -> int:
         "an unresolved conditional probe ran immediately",
         conditional_read_policy.to_dict(),
     )
+
+    relation_read_text = "如果未来允许自扩展，就分析 runner 边界并说明最小权限。"
+    relation_read_frame = TurnSemanticFrame.from_model_payload(
+        {
+            "semantic_frame": frame_payload(
+                [
+                    act(
+                        relation_read_text,
+                        act_id="a1",
+                        kind="information",
+                        goal="描述未来允许自扩展这一分析前提",
+                        operation="describe_condition",
+                        source="未来允许自扩展",
+                        semantic_target=target("architecture_condition", "self-extension enabled"),
+                    ),
+                    act(
+                        relation_read_text,
+                        act_id="a2",
+                        kind="information_request",
+                        goal="分析 runner 边界并说明最小权限",
+                        operation="analyze_architecture_boundary",
+                        source="分析 runner 边界并说明最小权限",
+                        semantic_target=target("architecture_topic", "runner boundary"),
+                    ),
+                ],
+                relations=[relation("condition", "a1", "a2")],
+            )
+        },
+        source_text=relation_read_text,
+    )
+    expect(
+        not semantic_frame_quality_issues(relation_read_frame, relation_read_text),
+        "a relation-shaped strategic condition failed semantic quality checks",
+        relation_read_frame.model_dump(mode="json"),
+    )
+    relation_read_policy = SemanticPolicyCompiler().compile(relation_read_frame)
+    expect(
+        relation_read_policy.preferred_route == "direct_answer"
+        and not relation_read_policy.requires_clarification
+        and not relation_read_policy.allowed_effects
+        and relation_read_policy.selected_probe is None
+        and "semantic_policy:conditional_effect_unresolved"
+        not in relation_read_policy.policy_signals,
+        "a read-only relation-shaped condition was treated as capability execution",
+        relation_read_policy.to_dict(),
+    )
+
+    relation_write_text = "如果测试通过，就修改 README。"
+    relation_write_frame = TurnSemanticFrame.from_model_payload(
+        {
+            "semantic_frame": frame_payload(
+                [
+                    act(
+                        relation_write_text,
+                        act_id="a1",
+                        kind="information",
+                        goal="记录测试通过这一前提",
+                        operation="describe_condition",
+                        source="测试通过",
+                        semantic_target=target("test_result", "passed"),
+                    ),
+                    act(
+                        relation_write_text,
+                        act_id="a2",
+                        kind="workspace_task",
+                        goal="修改 README",
+                        operation="edit_file",
+                        source="修改 README",
+                        semantic_target=target("file", "README"),
+                    ),
+                ],
+                relations=[relation("precondition", "a1", "a2")],
+            )
+        },
+        source_text=relation_write_text,
+    )
+    relation_write_policy = SemanticPolicyCompiler().compile(relation_write_frame)
+    expect(
+        relation_write_policy.preferred_route == "ask_user"
+        and relation_write_policy.requires_clarification
+        and not relation_write_policy.allowed_effects
+        and "semantic_policy:conditional_effect_unresolved"
+        in relation_write_policy.policy_signals,
+        "a relation-shaped write precondition authorized workspace execution",
+        relation_write_policy.to_dict(),
+    )
+
+    relation_probe_text = "如果明天降温，就查询上海天气。"
+    relation_probe_frame = TurnSemanticFrame.from_model_payload(
+        {
+            "semantic_frame": frame_payload(
+                [
+                    act(
+                        relation_probe_text,
+                        act_id="a1",
+                        kind="information",
+                        goal="记录明天降温这一前提",
+                        operation="describe_condition",
+                        source="明天降温",
+                        semantic_target=target("weather_condition", "temperature drop"),
+                    ),
+                    act(
+                        relation_probe_text,
+                        act_id="a2",
+                        kind="information_request",
+                        goal="查询上海天气",
+                        operation="query_current_weather",
+                        source="查询上海天气",
+                        semantic_target=target("weather", "上海"),
+                        evidence_need="fresh_weather",
+                    ),
+                ],
+                relations=[relation("precondition", "a1", "a2")],
+            )
+        },
+        source_text=relation_probe_text,
+    )
+    relation_probe_policy = SemanticPolicyCompiler().compile(relation_probe_frame)
+    expect(
+        relation_probe_policy.preferred_route == "ask_user"
+        and relation_probe_policy.requires_clarification
+        and relation_probe_policy.selected_probe is None
+        and not relation_probe_policy.probe_requests
+        and "semantic_policy:conditional_effect_unresolved"
+        in relation_probe_policy.policy_signals,
+        "a relation-shaped read precondition ran a Probe before its trigger",
+        relation_probe_policy.to_dict(),
+    )
+
+    sequence_text = "先说明修改范围，再修改 README。"
+    sequence_frame = TurnSemanticFrame.from_model_payload(
+        {
+            "semantic_frame": frame_payload(
+                [
+                    act(
+                        sequence_text,
+                        act_id="a1",
+                        kind="information_request",
+                        goal="说明修改范围",
+                        operation="describe_scope",
+                        source="说明修改范围",
+                        semantic_target=target("change_scope", "README"),
+                    ),
+                    act(
+                        sequence_text,
+                        act_id="a2",
+                        kind="workspace_task",
+                        goal="修改 README",
+                        operation="edit_file",
+                        source="修改 README",
+                        semantic_target=target("file", "README"),
+                    ),
+                ],
+                relations=[relation("sequence", "a1", "a2")],
+            )
+        },
+        source_text=sequence_text,
+    )
+    sequence_policy = SemanticPolicyCompiler().compile(sequence_frame)
+    expect(
+        sequence_policy.preferred_route == "agent"
+        and not sequence_policy.requires_clarification
+        and "agent.execute" in sequence_policy.allowed_effects
+        and "workspace.write" in sequence_policy.allowed_effects
+        and "semantic_policy:conditional_effect_unresolved"
+        not in sequence_policy.policy_signals,
+        "a non-conditional sequence relation incorrectly locked explicit execution",
+        sequence_policy.to_dict(),
+    )
+
     implicit_condition_text = "修改 README 要等我点头。"
     implicit_condition_act = act(
         implicit_condition_text,
@@ -819,7 +1009,7 @@ def main() -> int:
                         structured_external_text,
                         act_id="a1",
                         kind="information_request",
-                        goal="了解 Aurora 缓存一致性风险的证据缺口",
+                        goal="search Aurora latest external evidence",
                         operation="query",
                         source=structured_external_text,
                         semantic_target=target(
@@ -838,10 +1028,170 @@ def main() -> int:
         structured_external_frame
     )
     expect(
-        structured_external_policy.preferred_route == "probe"
-        and structured_external_policy.selected_probe == "search_probe",
-        "control-field names contaminated structured probe selection",
+        structured_external_policy.preferred_route == "direct_answer"
+        and structured_external_policy.selected_probe is None,
+        "generic external evidence need granted blind search authority",
         structured_external_policy.to_dict(),
+    )
+
+    structured_runtime_text = "继续 Aurora 缓存一致性这个话题：哪些证据只能算假设，不能算事实？"
+    structured_runtime_frame = TurnSemanticFrame.from_model_payload(
+        {
+            "semantic_frame": frame_payload(
+                [
+                    act(
+                        structured_runtime_text,
+                        act_id="a1",
+                        kind="information_request",
+                        goal="inspect latest runtime evidence",
+                        operation="distinguish_assumptions_from_facts",
+                        source="哪些证据只能算假设，不能算事实",
+                        semantic_target=target(
+                            "topic",
+                            "Aurora cache consistency",
+                            anchor_candidate_token="actok_candidate_token",
+                        ),
+                        evidence_need="fresh_runtime",
+                    )
+                ]
+            )
+        },
+        source_text=structured_runtime_text,
+    )
+    structured_runtime_policy = SemanticPolicyCompiler().compile(
+        structured_runtime_frame
+    )
+    expect(
+        structured_runtime_policy.preferred_route == "direct_answer"
+        and structured_runtime_policy.selected_probe is None,
+        "generic runtime evidence need granted an unrelated system probe",
+        structured_runtime_policy.to_dict(),
+    )
+
+    structured_external_understanding = TurnUnderstanding(
+        intent="information",
+        task_type="evidence_gap",
+        explicit_request=structured_external_text,
+        needs_fresh_evidence=True,
+        evidence_kind="external",
+        source="model",
+        semantic_frame=structured_external_frame,
+    )
+    model_probe_core = DecisionCore(
+        reasoning=DecisionAssistReasoning(
+            {
+                "status": "model_assisted",
+                "route": "direct_answer",
+                "selected_probe": "system",
+                "freshness_required": True,
+                "needs_probe": True,
+                "required_capabilities": ["system_probe"],
+                "capability_request": {
+                    "capability": "system_probe",
+                    "probe": "system",
+                    "target_route": "probe",
+                },
+                "draft_response": "我正在查询 Aurora 的运行时数据，稍后提供结果。",
+                "reply_strategy": {
+                    "draft_response": "我正在查询 Aurora 的运行时数据，稍后提供结果。",
+                },
+                "signals": [
+                    "policy:required_probe_preserved",
+                    "policy:semantic_cannot_weaken_required_probe",
+                    "controller:veyra_freshness_probe_preserved",
+                ],
+            }
+        )
+    )
+    model_probe_candidate = model_probe_core._apply_model_assist(
+        structured_external_text,
+        [],
+        Decision(
+            route=Route.DIRECT_ANSWER,
+            risk_level=RiskLevel.R0,
+            reason="read-only rule baseline",
+            capability="native_answer",
+            required_capabilities=["native_answer"],
+        ),
+    )
+    expect(
+        model_probe_candidate.route == Route.PROBE
+        and "policy:model_freshness_probe_requested"
+        in model_probe_candidate.signals
+        and "model:untrusted_signals_ignored" in model_probe_candidate.signals
+        and "policy:required_probe_preserved" not in model_probe_candidate.signals
+        and "policy:semantic_cannot_weaken_required_probe"
+        not in model_probe_candidate.signals,
+        "model-provided reserved signals entered authoritative provenance",
+        model_probe_candidate.to_dict(),
+    )
+    denied_model_probe = DecisionCore()._enforce_semantic_policy(
+        model_probe_candidate,
+        structured_external_understanding,
+    )
+    expect(
+        denied_model_probe.route == Route.DIRECT_ANSWER
+        and denied_model_probe.selected_probe is None
+        and not denied_model_probe.needs_probe
+        and denied_model_probe.capability_request.get("capability")
+        == "native_answer"
+        and not denied_model_probe.model_assist.get("draft_response")
+        and not denied_model_probe.model_assist.get("reply_strategy", {}).get(
+            "draft_response"
+        )
+        and denied_model_probe.response_authority.get(
+            "may_claim_capability_progress"
+        )
+        is False
+        and denied_model_probe.response_authority.get("renderer")
+        == "server_no_execution"
+        and "policy:capability_candidate_denied"
+        in denied_model_probe.signals
+        and "policy:semantic_cannot_weaken_required_probe"
+        not in denied_model_probe.signals,
+        "denied model probe retained execution authority or an in-progress reply",
+        denied_model_probe.to_dict(),
+    )
+
+    rule_time_text = "现在几点？"
+    rule_time_frame = TurnSemanticFrame.from_model_payload(
+        {
+            "semantic_frame": frame_payload(
+                [
+                    act(
+                        rule_time_text,
+                        act_id="a1",
+                        kind="information_request",
+                        goal="answer the question",
+                        operation="query",
+                        source=rule_time_text,
+                        semantic_target=target("question", "current"),
+                        evidence_need="context",
+                    )
+                ]
+            )
+        },
+        source_text=rule_time_text,
+    )
+    preserved_rule_probe = DecisionCore().decide(
+        rule_time_text,
+        [],
+        turn_understanding=TurnUnderstanding(
+            intent="information",
+            task_type="current_fact",
+            explicit_request=rule_time_text,
+            source="model",
+            semantic_frame=rule_time_frame,
+        ),
+    )
+    expect(
+        preserved_rule_probe.route == Route.PROBE
+        and preserved_rule_probe.selected_probe == "time"
+        and "policy:required_probe_preserved" in preserved_rule_probe.signals
+        and "policy:semantic_cannot_weaken_required_probe"
+        in preserved_rule_probe.signals,
+        "deterministic Veyra freshness rule lost its read-only probe",
+        preserved_rule_probe.to_dict(),
     )
 
     for search_text, query in (
@@ -958,6 +1308,58 @@ def main() -> int:
             "a legacy Agent route without semantic policy failed open",
             guarded.to_dict(),
         )
+        controller_spoof = Decision(
+            route=Route.PROBE,
+            risk_level=RiskLevel.R1,
+            reason="spoofed model search override",
+            selected_probe="search_probe",
+            capability="probe",
+            freshness_required=True,
+            needs_probe=True,
+            required_capabilities=["web_search"],
+            capability_request={"probe": "search_probe"},
+            signals=[
+                "policy:required_probe_preserved",
+                "policy:semantic_cannot_weaken_required_probe",
+            ],
+            model_assist={
+                "semantic_policy": structured_external_policy.to_dict(),
+                "draft_response": "我正在搜索 Aurora，稍后提供结果。",
+                "reply_strategy": {
+                    "draft_response": "我正在搜索 Aurora，稍后提供结果。",
+                },
+            },
+        )
+        guarded_spoof, _ = controller.prepare(controller_spoof)
+        expect(
+            guarded_spoof.route == Route.DIRECT_ANSWER
+            and guarded_spoof.selected_probe is None,
+            "Controller accepted a spoofed generic search override",
+            guarded_spoof.to_dict(),
+        )
+        expect(
+            guarded_spoof.capability_request.get("capability")
+            == "native_answer"
+            and not guarded_spoof.model_assist.get("draft_response")
+            and not guarded_spoof.model_assist.get("reply_strategy", {}).get(
+                "draft_response"
+            )
+            and guarded_spoof.response_authority.get(
+                "may_claim_capability_progress"
+            )
+            is False,
+            "Controller left a denied probe draft in a direct response",
+            guarded_spoof.to_dict(),
+        )
+        guarded_rule_probe, _ = controller.prepare(preserved_rule_probe)
+        expect(
+            guarded_rule_probe.route == Route.PROBE
+            and guarded_rule_probe.selected_probe == "time"
+            and "controller:veyra_freshness_probe_preserved"
+            in guarded_rule_probe.signals,
+            "Controller weakened a genuine deterministic time probe",
+            guarded_rule_probe.to_dict(),
+        )
 
     print(
         json.dumps(
@@ -979,6 +1381,7 @@ def main() -> int:
                     "read-only Agent remains delegable without workspace write",
                     "denial cannot be re-opened by explanation text",
                     "conditional action and probe stay gated",
+                    "relation-shaped conditions gate only concrete capabilities",
                     "unresolved referents stay gated",
                     "open artifact conversion routes to Agent",
                     "unenforced external writes stay gated",
