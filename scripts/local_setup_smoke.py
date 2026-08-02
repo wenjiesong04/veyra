@@ -85,11 +85,16 @@ def main() -> int:
         "FEISHU_APP_SECRET": "new-secret",
         "OPENCLAW_BASE_URL": "http://127.0.0.1:18789",
         "VEYRA_GITHUB_TOKEN": "github-read-token",
+        "VEYRA_PHASE6_EXTENSION_DEPLOYMENT_MODE": "record_only",
     }
     merged = _merge_env_text(original, updates)
     expect("VEYRA_CORE_MODEL_ENABLED=1" in merged, "boolean env values are normalized")
     expect("FEISHU_APP_SECRET=new-secret" in merged, "existing secret value is replaced")
     expect("OPENCLAW_BASE_URL=http://127.0.0.1:18789" in merged, "new allowed key is appended")
+    expect(
+        "VEYRA_PHASE6_EXTENSION_DEPLOYMENT_MODE=record_only" in merged,
+        "Phase 6 lifecycle configuration is supported by local setup",
+    )
     expect("UNRELATED=value" in merged, "unmanaged env keys are preserved")
     injected = _merge_env_text("VEYRA_CORE_MODEL=old\n", {"VEYRA_CORE_MODEL": "safe\rINJECTED=1"})
     expect("\nINJECTED=1" not in injected, "carriage returns cannot inject additional env lines", injected)

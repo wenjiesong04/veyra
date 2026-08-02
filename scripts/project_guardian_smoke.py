@@ -783,6 +783,8 @@ def test_modes_projection_and_side_effects(root: Path) -> ProjectGuardianRuntime
         "ops_config.json",
         "event_inbox.json",
         "situation_state.json",
+        "general_situation_state.json",
+        "suggestion_outbox.json",
         runtime.STATE_FILE,
     }
     protected_before = {

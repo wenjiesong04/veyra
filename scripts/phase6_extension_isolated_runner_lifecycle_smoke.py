@@ -150,10 +150,12 @@ class CertifiedFakeBackend:
         self.before_return = before_return
         self.crash = crash
         self.calls = 0
+        self.status_calls = 0
         self.artifact_digests: list[str] = []
         self.bindings: list[IsolatedRunnerBinding] = []
 
     def status(self) -> IsolatedRunnerBackendStatus:
+        self.status_calls += 1
         return self.status_value
 
     def run(
@@ -172,6 +174,16 @@ class CertifiedFakeBackend:
         if self.crash is not None:
             raise self.crash
         return passing_report(binding)
+
+
+class CountingSourceGate:
+    def __init__(self, delegate: ExtensionSourcePolicyGate) -> None:
+        self.delegate = delegate
+        self.calls = 0
+
+    def isolated_runner_subject(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls += 1
+        return self.delegate.isolated_runner_subject(**kwargs)
 
 
 def passed_context(
@@ -210,9 +222,10 @@ def build_gate(
     enabled: bool = True,
     token: str = CONTROL_TOKEN,
 ) -> ExtensionIsolatedRunnerGate:
+    counting_source = CountingSourceGate(context.source_gate)
     gate = ExtensionIsolatedRunnerGate(
         state_store=context.store,
-        source_check_gate=context.source_gate,
+        source_check_gate=counting_source,  # type: ignore[arg-type]
         backend=backend,  # type: ignore[arg-type]
         enabled=enabled,
         control_token=token,
@@ -250,6 +263,18 @@ def start_run(
 
 def runner_state_bytes(context: SourceGateContext) -> bytes:
     return context.store.path_for(RUNNER_STATE_FILE).read_bytes()
+
+
+def persisted_tree_bytes(context: SourceGateContext) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(context.root)): path.read_bytes()
+        for path in sorted(context.root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def source_calls(gate: ExtensionIsolatedRunnerGate) -> int:
+    return int(getattr(gate.source_check_gate, "calls"))
 
 
 def assert_zero_future_authority(value: dict[str, Any], label: str) -> None:
@@ -347,7 +372,9 @@ def authorization_and_unavailable() -> None:
         expect(
             runner_state_bytes(context) == before
             and disabled_backend.calls == 0
-            and bad_token_backend.calls == 0,
+            and disabled_backend.status_calls == 0
+            and bad_token_backend.calls == 0
+            and bad_token_backend.status_calls == 0,
             "authorization failures neither mutate state nor dispatch backend",
         )
 
@@ -368,9 +395,21 @@ def authorization_and_unavailable() -> None:
             "uncertified backend fails closed",
         )
         expect(
-            runner_state_bytes(context) == before_unavailable
-            and unavailable_backend.calls == 0,
-            "unavailable backend causes zero mutation and zero dispatch",
+            runner_state_bytes(context) != before_unavailable
+            and unavailable_backend.calls == 0
+            and unavailable_backend.status_calls == 1,
+            "unavailable backend caches one sanitized observation without dispatch",
+        )
+        unavailable_state = context.store.read_json(RUNNER_STATE_FILE)
+        expect(
+            unavailable_state["runs"] == {}
+            and unavailable_state["operation_index"] == {}
+            and unavailable_state["backend_snapshot"]["backend_status"][
+                "availability"
+            ]
+            == "unavailable",
+            "unavailable backend snapshot grants no run admission",
+            unavailable_state,
         )
 
 
@@ -392,6 +431,46 @@ def success_replay_owner_and_cas() -> None:
 
         backend = CertifiedFakeBackend(before_return=observe_claim)
         gate = build_gate(context, backend)
+        legacy_state = context.store.read_json(RUNNER_STATE_FILE)
+        pure_status_before = persisted_tree_bytes(context)
+        missing_status = gate.status()
+        expect(
+            "backend_snapshot" not in legacy_state
+            and missing_status["status"] == "fail_closed"
+            and missing_status["backend"]["availability"] == "unavailable"
+            and missing_status["backend_snapshot"]["status"] == "missing"
+            and backend.status_calls == 0
+            and source_calls(gate) == 0
+            and persisted_tree_bytes(context) == pure_status_before,
+            "legacy v1 state remains readable and status is a pure missing snapshot",
+            missing_status,
+        )
+        refreshed = gate.refresh_backend(control_token=CONTROL_TOKEN)
+        expect(
+            refreshed["status"]
+            == "technical_complete_isolated_runner_only"
+            and refreshed["backend_snapshot"]["status"] == "fresh"
+            and refreshed["admission"]["start_ready"] is True
+            and backend.status_calls == 1
+            and source_calls(gate) == 0,
+            "token-auth backend refresh is the only readiness observation path",
+            refreshed,
+        )
+        refreshed_tree = persisted_tree_bytes(context)
+        context.clock.current = BASE_TIME + timedelta(seconds=301)
+        stale_status = gate.status()
+        expect(
+            stale_status["status"] == "fail_closed"
+            and stale_status["backend_snapshot"]["status"] == "stale"
+            and stale_status["backend_snapshot"]["reason_code"] == "expired"
+            and stale_status["admission"]["start_ready"] is False
+            and backend.status_calls == 1
+            and source_calls(gate) == 0
+            and persisted_tree_bytes(context) == refreshed_tree,
+            "expired cached readiness is reported stale without active refresh",
+            stale_status,
+        )
+        context.clock.current = BASE_TIME
         result = start_run(
             gate,
             context,
@@ -406,6 +485,7 @@ def success_replay_owner_and_cas() -> None:
             and result["trusted_isolated_runner_status"] == "passed"
             and observed_stages == ["RUNNER_JOB_STARTED"]
             and backend.calls == 1
+            and backend.status_calls == 2
             and backend.artifact_digests == [context.artifact["artifact_sha256"]],
             "durable claim and STARTED state precede one backend dispatch",
             {"result": result, "observed_stages": observed_stages},
@@ -432,7 +512,7 @@ def success_replay_owner_and_cas() -> None:
             label="start result omits source and private owner/runtime data",
         )
 
-        state_before_replay = runner_state_bytes(context)
+        state_before_replay = context.store.read_json(RUNNER_STATE_FILE)
         replay = start_run(
             gate,
             context,
@@ -444,9 +524,18 @@ def success_replay_owner_and_cas() -> None:
             replay["run_id"] == result["run_id"]
             and replay["operation_replayed"] is True
             and backend.calls == 1
-            and runner_state_bytes(context) == state_before_replay,
-            "exact operation replay never reruns or mutates",
+            and backend.status_calls == 3,
+            "exact operation replay refreshes admission but never reruns",
             replay,
+        )
+        state_after_replay = context.store.read_json(RUNNER_STATE_FILE)
+        expect(
+            state_after_replay["runs"] == state_before_replay["runs"]
+            and state_after_replay["binding_index"]
+            == state_before_replay["binding_index"]
+            and state_after_replay["operation_index"]
+            == state_before_replay["operation_index"],
+            "operation replay changes no durable run or idempotency evidence",
         )
         expect_raises(
             (ExtensionIsolatedRunnerConflictError,),
@@ -527,26 +616,42 @@ def success_replay_owner_and_cas() -> None:
             "owner and CAS failures cannot mutate or dispatch",
         )
 
+        get_tree_before = persisted_tree_bytes(context)
+        backend_status_before_get = backend.status_calls
+        backend_runs_before_get = backend.calls
+        source_before_get = source_calls(gate)
+        cached_status = gate.status()
         detail = gate.get(
             run_id=result["run_id"],
             user_id=USER,
             workspace_id=WORKSPACE,
         )
         listed = gate.list(user_id=USER, workspace_id=WORKSPACE)
-        integrity_state = runner_state_bytes(context)
         integrity = gate.integrity(
             run_id=result["run_id"],
             user_id=USER,
             workspace_id=WORKSPACE,
         )
+        projection = gate.projection_for_source_check(
+            check_id=checked["check_id"],
+            user_id=USER,
+            workspace_id=WORKSPACE,
+        )
         expect(
-            listed["count"] == 1
+            cached_status["backend_snapshot"]["status"] == "fresh"
+            and listed["count"] == 1
             and listed["runs"][0]["run_id"] == result["run_id"]
             and detail["run_id"] == result["run_id"]
             and integrity["status"] == "isolated_runner_integrity_passed"
+            and integrity["prerequisite_verification_status"]
+            == "not_refreshed"
             and integrity["state_mutated"] is False
-            and runner_state_bytes(context) == integrity_state,
-            "owner-scoped get/list/integrity preserve exact durable evidence",
+            and projection["trusted_isolated_runner_status"] == "passed"
+            and backend.status_calls == backend_status_before_get
+            and backend.calls == backend_runs_before_get
+            and source_calls(gate) == source_before_get
+            and persisted_tree_bytes(context) == get_tree_before,
+            "all status/get/list/integrity/projection reads preserve bytes and call nothing external",
         )
         for label, value in {
             "detail": detail,
@@ -558,6 +663,55 @@ def success_replay_owner_and_cas() -> None:
                 source=context.source,
                 label=f"{label} is source- and owner-free",
             )
+
+        verify_tree_before = persisted_tree_bytes(context)
+        verified = gate.verify_prerequisite(
+            run_id=result["run_id"],
+            user_id=USER,
+            workspace_id=WORKSPACE,
+            control_token=CONTROL_TOKEN,
+        )
+        expect(
+            verified["status"] == "isolated_runner_prerequisite_verified"
+            and verified["prerequisite_verification_status"] == "verified"
+            and source_calls(gate) == source_before_get + 1
+            and backend.status_calls == backend_status_before_get
+            and backend.calls == backend_runs_before_get
+            and persisted_tree_bytes(context) == verify_tree_before,
+            "token-auth prerequisite verify alone re-opens the artifact without mutation",
+            verified,
+        )
+
+        context.artifact_runtime.revoke(
+            artifact_id=context.artifact["artifact_id"],
+            user_id=USER,
+            workspace_id=WORKSPACE,
+            expected_revision=context.artifact["artifact_revision"],
+            operation_id="runner-success-post-read-revoke",
+            reason="Prove cached GET and active prerequisite verification differ.",
+        )
+        revoked_tree = persisted_tree_bytes(context)
+        revoked_source_before = source_calls(gate)
+        cached_after_revoke = gate.get(
+            run_id=result["run_id"],
+            user_id=USER,
+            workspace_id=WORKSPACE,
+        )
+        blocked = gate.verify_prerequisite(
+            run_id=result["run_id"],
+            user_id=USER,
+            workspace_id=WORKSPACE,
+            control_token=CONTROL_TOKEN,
+        )
+        expect(
+            cached_after_revoke["effective_status"] == "RUNNER_JOB_PASSED"
+            and blocked["effective_status"] == "BLOCKED_PREREQUISITE"
+            and blocked["prerequisite_verification_status"] == "blocked"
+            and source_calls(gate) == revoked_source_before + 1
+            and persisted_tree_bytes(context) == revoked_tree,
+            "cached GET stays historical while explicit verify detects revocation",
+            {"cached": cached_after_revoke, "verified": blocked},
+        )
 
 
 def prerequisite_revoke_expiry_and_tamper() -> None:
@@ -739,8 +893,9 @@ def crash_restart_and_final_drift() -> None:
             and replay["effective_status"] == "RUNNER_JOB_INDETERMINATE"
             and replay["probe_status"] == "indeterminate"
             and replay["operation_replayed"] is True
-            and restarted_backend.calls == 0,
-            "restart preserves STARTED as indeterminate and never auto-reruns",
+            and restarted_backend.calls == 0
+            and restarted_backend.status_calls == 1,
+            "restart refreshes admission but preserves STARTED without auto-rerun",
             replay,
         )
         assert_zero_future_authority(

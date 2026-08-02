@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from uuid import uuid4
 
+from awareness.general_attention_scheduler import GeneralAttentionScheduler
 from awareness.project_guardian import ProjectGuardianEvaluator
 from core.situation_evaluator import SituationEvaluator
 from core.world_state import WorldStateStore
@@ -20,9 +21,11 @@ from interface.event_schema import (
     utc_now_iso,
 )
 from runtime.event_inbox import EventInbox
+from runtime.general_situation_runtime import GeneralSituationRuntime
 from runtime.project_guardian import ProjectGuardianRuntime
 from runtime.project_guardian_github_ci import GitHubActionsCIProvider
 from runtime.project_guardian_signal_ledger import ProjectGuardianSignalLedger
+from runtime.suggestion_outbox import SuggestionOutbox
 
 
 VERIFIED_RESULT_STATUSES = {"verified_failed", "verified_success"}
@@ -56,6 +59,9 @@ class ShadowAwarenessRuntime:
         )
         self.event_inbox = EventInbox(state_store)
         self.situation_evaluator = SituationEvaluator(state_store)
+        self.general_situations = GeneralSituationRuntime(state_store)
+        self.general_attention = GeneralAttentionScheduler(state_store)
+        self.suggestion_outbox = SuggestionOutbox(state_store)
         self.project_guardian_signals = ProjectGuardianSignalLedger(state_store)
         self._project_guardian_git_ingress_capability = object()
         self._project_guardian_git_publisher_issued = False
@@ -1298,6 +1304,7 @@ class ShadowAwarenessRuntime:
                 salience_components=self._explicit_salience(observed_event),
                 observation=self._explicit_observation(observed_event),
             )
+            self._project_general_situation(situation, observed_event)
             situation_id = str(situation.get("situation_id") or "")
             same_event_delivery = canonical_event_id == event.event_id
             if not claimed:
@@ -1574,6 +1581,7 @@ class ShadowAwarenessRuntime:
                 if last_error is not None:
                     raise last_error
                 raise RuntimeError("situation resolution did not return state")
+            self._project_general_situation(resolved, event)
             return {
                 "situation_id": selected_situation_id,
                 "correlation_id": resolved.get("correlation_id"),
@@ -1821,6 +1829,7 @@ class ShadowAwarenessRuntime:
                                 "situation_id": situation.get("situation_id"),
                             },
                         )
+                self._project_general_situation(situation, event)
                 processed.append(
                     {
                         "event_id": event_id,
@@ -1856,6 +1865,90 @@ class ShadowAwarenessRuntime:
             "signal_reconciliation": signal_reconciliation,
             "inbox": self.event_inbox.stats(),
         }
+
+    def reconcile_general_situations(
+        self,
+        *,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Fail-open maintenance for ActiveLoop restart/replay recovery."""
+
+        try:
+            state = self.state_store.read_json("situation_state.json")
+            if state.get("_state_corrupt") is True:
+                return {
+                    "status": "degraded",
+                    "reason": "situation_state_corrupt",
+                    "route_change_allowed": False,
+                }
+            raw = state.get("situations")
+            situations = (
+                list(raw.values())
+                if isinstance(raw, dict)
+                else raw
+                if isinstance(raw, list)
+                else []
+            )
+            return self.general_situations.reconcile(
+                [item for item in situations if isinstance(item, dict)],
+                limit=limit,
+            )
+        except Exception as exc:
+            self._record_error(
+                "general_situation_reconcile_error",
+                "",
+                exc,
+            )
+            return {
+                "status": "degraded",
+                "error_type": type(exc).__name__,
+                "route_change_allowed": False,
+            }
+
+    def _project_general_situation(
+        self,
+        situation: dict[str, Any],
+        event: VeyraEvent,
+    ) -> dict[str, Any]:
+        """Run the informational pipeline without escaping into routing."""
+
+        try:
+            grouped = self.general_situations.ingest_child(
+                situation,
+                event=event,
+            )
+            parent = grouped.get("general_situation")
+            if not isinstance(parent, dict):
+                return {
+                    "status": str(grouped.get("status") or "not_grouped"),
+                    "general_situation": grouped,
+                    "route_change_allowed": False,
+                }
+            assessment = self.general_attention.assess(parent)
+            proposal = self.suggestion_outbox.consider(
+                parent,
+                assessment,
+                user_id=event.source.user_id,
+                session_id=event.source.session_id,
+            )
+            return {
+                "status": "success",
+                "general_situation_status": grouped.get("status"),
+                "attention_status": assessment.get("status"),
+                "suggestion_status": proposal.get("status"),
+                "route_change_allowed": False,
+            }
+        except Exception as exc:
+            self._record_error(
+                "general_situation_pipeline_error",
+                event.event_id,
+                exc,
+            )
+            return {
+                "status": "degraded",
+                "error_type": type(exc).__name__,
+                "route_change_allowed": False,
+            }
 
     def _situation_for_event(self, event: VeyraEvent) -> dict[str, Any] | None:
         items = self.situation_evaluator.list(

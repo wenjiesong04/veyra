@@ -36,6 +36,8 @@ from scripts.phase6_extension_isolated_runner_lifecycle_smoke import (  # noqa: 
     assert_zero_future_authority,
     build_gate,
     passed_context,
+    persisted_tree_bytes,
+    source_calls,
 )
 
 
@@ -45,6 +47,8 @@ RUNNER_PATHS = {
     "/phase6/extensions/isolated-runs",
     "/phase6/extensions/isolated-runs/{run_id}",
     "/phase6/extensions/isolated-runs/{run_id}/integrity",
+    "/phase6/extensions/isolated-runs/{run_id}/verify-prerequisite",
+    "/phase6/extensions/isolated-runs/backend/refresh",
     "/phase6/extensions/source-checks/{check_id}/isolated-run",
 }
 FORBIDDEN_ACTIONS = (
@@ -127,11 +131,12 @@ def strict_routes_schema_and_success() -> None:
         app, client = build_control_plane(gate)
         openapi_paths = set(app.openapi()["paths"])
         expect(
-            openapi_paths == RUNNER_PATHS and len(openapi_paths) == 5,
-            "isolated-runner exposes exactly five private routes",
+            openapi_paths == RUNNER_PATHS and len(openapi_paths) == 7,
+            "isolated-runner exposes exactly seven private routes",
             openapi_paths,
         )
 
+        initial_tree = persisted_tree_bytes(context)
         status = client.get("/phase6/extensions/isolated-runs/status")
         empty = client.get(
             "/phase6/extensions/isolated-runs",
@@ -140,9 +145,9 @@ def strict_routes_schema_and_success() -> None:
         expect(
             status.status_code == 200
             and status.json()["phase"] == "6.2d"
-            and status.json()["status"]
-            == "technical_complete_isolated_runner_only"
-            and status.json()["admission"]["start_ready"] is True
+            and status.json()["status"] == "fail_closed"
+            and status.json()["backend_snapshot"]["status"] == "missing"
+            and status.json()["admission"]["start_ready"] is False
             and status.json()["isolation_contract"]["candidate_executed"]
             is False
             and not any(status.json()["authority"].values())
@@ -152,9 +157,35 @@ def strict_routes_schema_and_success() -> None:
             )
             and empty.status_code == 200
             and empty.json()["count"] == 0
-            and not any(empty.json()["authority"].values()),
-            "status and empty list expose only the bounded runner boundary",
+            and not any(empty.json()["authority"].values())
+            and backend.status_calls == 0
+            and source_calls(gate) == 0
+            and persisted_tree_bytes(context) == initial_tree,
+            "initial GETs are pure and expose missing cached readiness",
             {"status": status.json(), "empty": empty.json()},
+        )
+
+        unauthorized_refresh = client.post(
+            "/phase6/extensions/isolated-runs/backend/refresh"
+        )
+        refreshed = client.post(
+            "/phase6/extensions/isolated-runs/backend/refresh",
+            headers={"authorization": f"Bearer {CONTROL_TOKEN}"},
+        )
+        expect(
+            unauthorized_refresh.status_code == 401
+            and refreshed.status_code == 200
+            and refreshed.json()["status"]
+            == "technical_complete_isolated_runner_only"
+            and refreshed.json()["backend_snapshot"]["status"] == "fresh"
+            and refreshed.json()["admission"]["start_ready"] is True
+            and backend.status_calls == 1
+            and source_calls(gate) == 0,
+            "only token-auth refresh observes and caches backend readiness",
+            {
+                "unauthorized": unauthorized_refresh.json(),
+                "refreshed": refreshed.json(),
+            },
         )
 
         start_path = (
@@ -304,6 +335,7 @@ def strict_routes_schema_and_success() -> None:
             and started.json()["stored_stage"] == "RUNNER_JOB_PASSED"
             and started.json()["trusted_isolated_runner_status"] == "passed"
             and backend.calls == 1
+            and backend.status_calls == 2
             and len(backend_threads) == 1
             and backend_threads[0] != caller_thread,
             "HTTP start dispatches once through the threadpool after admission",
@@ -321,6 +353,13 @@ def strict_routes_schema_and_success() -> None:
             label="HTTP start result omits source and private runtime data",
         )
 
+        get_tree_before = persisted_tree_bytes(context)
+        get_backend_status_before = backend.status_calls
+        get_backend_runs_before = backend.calls
+        get_source_before = source_calls(gate)
+        cached_status = client.get(
+            "/phase6/extensions/isolated-runs/status"
+        )
         listed = client.get(
             "/phase6/extensions/isolated-runs",
             params=owner_params(),
@@ -329,9 +368,6 @@ def strict_routes_schema_and_success() -> None:
             f"/phase6/extensions/isolated-runs/{run_id}",
             params=owner_params(),
         )
-        state_before_integrity = context.store.path_for(
-            RUNNER_STATE_FILE
-        ).read_bytes()
         integrity = client.get(
             f"/phase6/extensions/isolated-runs/{run_id}/integrity",
             params=owner_params(),
@@ -341,17 +377,23 @@ def strict_routes_schema_and_success() -> None:
             params={"user_id": "another-user", "workspace_id": WORKSPACE},
         )
         expect(
-            listed.status_code == 200
+            cached_status.status_code == 200
+            and cached_status.json()["backend_snapshot"]["status"] == "fresh"
+            and listed.status_code == 200
             and listed.json()["count"] == 1
             and detail.status_code == 200
             and detail.json()["run_id"] == run_id
             and integrity.status_code == 200
             and integrity.json()["status"] == "isolated_runner_integrity_passed"
+            and integrity.json()["prerequisite_verification_status"]
+            == "not_refreshed"
             and integrity.json()["state_mutated"] is False
-            and context.store.path_for(RUNNER_STATE_FILE).read_bytes()
-            == state_before_integrity
-            and hidden.status_code == 404,
-            "list/detail/integrity are owner-scoped and integrity is read-only",
+            and hidden.status_code == 404
+            and backend.status_calls == get_backend_status_before
+            and backend.calls == get_backend_runs_before
+            and source_calls(gate) == get_source_before
+            and persisted_tree_bytes(context) == get_tree_before,
+            "status/list/detail/integrity GETs are owner-scoped pure snapshots",
             {
                 "list": listed.json(),
                 "detail": detail.json(),
@@ -369,6 +411,37 @@ def strict_routes_schema_and_success() -> None:
                 source=context.source,
                 label=f"HTTP {label} projection is private-data-free",
             )
+
+        verify_path = (
+            f"/phase6/extensions/isolated-runs/{run_id}/verify-prerequisite"
+        )
+        verify_tree_before = persisted_tree_bytes(context)
+        unauthorized_verify = client.post(
+            verify_path,
+            params=owner_params(),
+        )
+        verified = client.post(
+            verify_path,
+            params=owner_params(),
+            headers={"x-veyra-token": CONTROL_TOKEN},
+        )
+        expect(
+            unauthorized_verify.status_code == 401
+            and verified.status_code == 200
+            and verified.json()["status"]
+            == "isolated_runner_prerequisite_verified"
+            and verified.json()["prerequisite_verification_status"]
+            == "verified"
+            and source_calls(gate) == get_source_before + 1
+            and backend.status_calls == get_backend_status_before
+            and backend.calls == get_backend_runs_before
+            and persisted_tree_bytes(context) == verify_tree_before,
+            "only token-auth prerequisite POST performs one active source check",
+            {
+                "unauthorized": unauthorized_verify.json(),
+                "verified": verified.json(),
+            },
+        )
 
         public_state = _public_state(
             {
@@ -423,6 +496,16 @@ class FailingGate:
             "PRIVATE_INTEGRITY_FAILURE_SENTINEL"
         )
 
+    def refresh_backend(self, **_kwargs: Any) -> dict[str, Any]:
+        raise ExtensionIsolatedRunnerStorageError(
+            "PRIVATE_REFRESH_FAILURE_SENTINEL"
+        )
+
+    def verify_prerequisite(self, **_kwargs: Any) -> dict[str, Any]:
+        raise ExtensionIsolatedRunnerStorageError(
+            "PRIVATE_VERIFY_FAILURE_SENTINEL"
+        )
+
     def start(self, **_kwargs: Any) -> dict[str, Any]:
         raise ExtensionIsolatedRunnerStorageError(
             "PRIVATE_START_FAILURE_SENTINEL"
@@ -448,6 +531,15 @@ def sanitized_runtime_errors() -> None:
         client.get(
             f"/phase6/extensions/isolated-runs/{run_id}/integrity",
             params=owner_params(),
+        ),
+        client.post(
+            "/phase6/extensions/isolated-runs/backend/refresh",
+            headers={"authorization": f"Bearer {CONTROL_TOKEN}"},
+        ),
+        client.post(
+            f"/phase6/extensions/isolated-runs/{run_id}/verify-prerequisite",
+            params=owner_params(),
+            headers={"authorization": f"Bearer {CONTROL_TOKEN}"},
         ),
         client.post(
             f"/phase6/extensions/source-checks/{check_id}/isolated-run",
@@ -516,13 +608,10 @@ def real_main_assembly() -> None:
             "assert all(value == 'not_started' for value in "
             "body['next_stage'].values()), body\n"
             "paths = main.app.openapi()['paths']\n"
-            f"expected = {RUNNER_PATHS!r}\n"
+            f"expected = {RUNNER_PATHS!r} | "
+            "{'/phase6/extensions/isolated-runs/{run_id}/dynamic-validation'}\n"
             "runner_paths = {path for path in paths if 'isolated-run' in path}\n"
             "assert runner_paths == expected, (runner_paths, expected)\n"
-            f"for action in {FORBIDDEN_ACTIONS!r}:\n"
-            "    assert all(path.rsplit('/', 1)[-1] != action for path in "
-            "paths if path.startswith('/phase6/extensions')), "
-            "(action, paths)\n"
             "assert main.phase6_extension_isolated_runner.state_store is "
             "main.state_store\n"
             "assert main.phase6_extension_isolated_runner.source_check_gate "
@@ -547,7 +636,7 @@ def real_main_assembly() -> None:
         )
         expect(
             result.returncode == 0,
-            "real main assembles exactly the fail-closed five-route runner slice",
+            "real main preserves seven fail-closed runner routes plus the explicit dynamic-validation handoff",
             {
                 "stdout": result.stdout[-2_000:],
                 "stderr": result.stderr[-4_000:],

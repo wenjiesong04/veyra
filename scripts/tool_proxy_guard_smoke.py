@@ -425,8 +425,8 @@ def main() -> int:
     )
     expect(
         degraded_natural_restart.get("route") == "ask_user"
-        and degraded_natural_restart.get("risk_level") == "R1",
-        "degraded natural restart fails closed to clarification",
+        and degraded_natural_restart.get("risk_level") == "R4",
+        "degraded natural restart fails closed without weakening risk",
         degraded_natural_restart,
     )
     expect(

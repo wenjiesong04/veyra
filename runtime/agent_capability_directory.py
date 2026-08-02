@@ -13,6 +13,9 @@ from interface.agent_dialogue_contract import (
     DialogueType,
     parse_dialogue_message,
 )
+from interface.extension_artifact import artifact_owner_scope_digest
+from interface.extension_deployment import PublicExtensionCapability
+from interface.extension_generation import initiating_session_digest
 from runtime.authority_fence import agent_transport_authority_fence
 
 
@@ -30,6 +33,14 @@ class AgentCapabilitySelectionError(RuntimeError):
         super().__init__(self.reason)
 
 
+class ExtensionCapabilitySelectionError(RuntimeError):
+    """A promoted extension could not be selected without scope drift."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = str(reason or "extension_capability_not_eligible")
+        super().__init__(self.reason)
+
+
 @dataclass(frozen=True, slots=True)
 class AgentCapabilitySelection:
     runtime: str
@@ -41,13 +52,34 @@ class AgentCapabilitySelection:
     observed_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class PromotedExtensionCapabilitySelection:
+    """Source-free binding to one exact promoted deployment projection."""
+
+    capability_id: str
+    deployment_id: str
+    deployment_revision: int
+    deployment_state_revision: int
+    mode_epoch: int
+    active_pointer_revision: int
+    owner_scope_digest: str
+    workspace_identity_digest: str
+    initiating_session_digest: str
+    release_id: str
+    attestation_digest: str
+    capability_digest: str
+    observed_at: str
+
+
 class AgentCapabilityDirectory:
     """Fresh, operator-bound runtime eligibility for Phase 6 collaboration.
 
-    The directory is deliberately not a router or portfolio. It never changes
-    the selected provider, never falls back, and treats remote capability
-    claims as diagnostics unless the local adapter is Veyra's trusted native
-    OpenClaw adapter with exact current governance enforcement.
+    The Agent runtime directory is deliberately not a router or portfolio. It
+    never changes the selected provider, never falls back, and treats remote
+    capability claims as diagnostics unless the local adapter is Veyra's
+    trusted native OpenClaw adapter with exact current governance enforcement.
+    Promoted extensions stay out of the ambient snapshot and require explicit
+    owner/workspace/session discovery plus deployment-gate invocation.
     """
 
     def __init__(
@@ -55,9 +87,244 @@ class AgentCapabilityDirectory:
         *,
         state_store: WorldStateStore,
         registry: Any,
+        extension_deployment_gate: Any | None = None,
     ) -> None:
         self.state_store = state_store
         self.registry = registry
+        self._extension_deployment_gate = extension_deployment_gate
+
+    def bind_extension_deployment_gate(self, gate: Any) -> None:
+        """Bind the sole extension authority during startup.
+
+        The directory never receives a runner, release subject, source, or
+        ambient control credential. Rebinding to a different gate is rejected
+        so an ordinary Agent cannot swap in an alternate invocation path.
+        """
+
+        required = ("public_registry", "get", "invoke")
+        if gate is None or any(
+            not callable(getattr(gate, method, None)) for method in required
+        ):
+            raise ExtensionCapabilitySelectionError(
+                "extension_deployment_gate_invalid"
+            )
+        current = self._extension_deployment_gate
+        if current is not None and current is not gate:
+            raise ExtensionCapabilitySelectionError(
+                "extension_deployment_gate_rebind_forbidden"
+            )
+        self._extension_deployment_gate = gate
+
+    def discover_promoted_extensions(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str,
+        session_id: str,
+        control_token: str,
+    ) -> dict[str, Any]:
+        """Discover only actively signed extensions for one exact session.
+
+        This is an explicit structured control-plane operation. It is never
+        called from Agent dispatch or natural-language capability selection.
+        Cryptographic freshness and revocation are rechecked by the deployment
+        gate's source-free public registry before any row is returned.
+        """
+
+        gate = self._extension_gate()
+        snapshot = gate.public_registry(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            control_token=control_token,
+        )
+        if not isinstance(snapshot, dict):
+            raise ExtensionCapabilitySelectionError(
+                "extension_registry_projection_invalid"
+            )
+        raw_items = snapshot.get("items")
+        if not isinstance(raw_items, list):
+            raise ExtensionCapabilitySelectionError(
+                "extension_registry_projection_invalid"
+            )
+        expected_owner = artifact_owner_scope_digest(user_id, workspace_id)
+        expected_workspace = self._workspace_identity_digest(workspace_id)
+        expected_session = initiating_session_digest(session_id)
+        items: list[dict[str, Any]] = []
+        for raw in raw_items:
+            try:
+                capability = PublicExtensionCapability.model_validate(
+                    raw,
+                    strict=True,
+                )
+            except Exception as exc:
+                raise ExtensionCapabilitySelectionError(
+                    "extension_registry_projection_invalid"
+                ) from exc
+            if (
+                capability.mode != "promoted"
+                or capability.owner_scope_digest != expected_owner
+                or capability.workspace_identity_digest
+                != expected_workspace
+                or capability.initiating_session_digest
+                != expected_session
+                or capability.execution_boundary
+                != "trusted_isolated_runner_only"
+                or any(
+                    capability.authority.model_dump(mode="python").values()
+                )
+            ):
+                raise ExtensionCapabilitySelectionError(
+                    "extension_registry_scope_or_authority_mismatch"
+                )
+            items.append(capability.model_dump(mode="json"))
+        items.sort(key=lambda item: item["capability_id"])
+        state_revision = snapshot.get("state_revision")
+        if type(state_revision) is not int or state_revision < 0:
+            raise ExtensionCapabilitySelectionError(
+                "extension_registry_projection_invalid"
+            )
+        invalid_or_revoked_count = snapshot.get(
+            "invalid_or_revoked_count"
+        )
+        if (
+            type(invalid_or_revoked_count) is not int
+            or invalid_or_revoked_count < 0
+        ):
+            raise ExtensionCapabilitySelectionError(
+                "extension_registry_projection_invalid"
+            )
+        return {
+            "schema_version": (
+                "veyra.phase6.scoped_extension_capability_directory.v1"
+            ),
+            "state_revision": state_revision,
+            "items": items,
+            "invalid_or_revoked_count": invalid_or_revoked_count,
+            "automatic_selection_allowed": False,
+            "natural_language_routing_allowed": False,
+            "agent_dispatch_allowed": False,
+            "invocation_boundary": "extension_deployment_gate_only",
+            "source_free": True,
+        }
+
+    def select_promoted_extension(
+        self,
+        *,
+        capability_id: str,
+        user_id: str,
+        workspace_id: str,
+        session_id: str,
+        control_token: str,
+    ) -> PromotedExtensionCapabilitySelection:
+        """Bind an exact capability id; never infer one from natural text."""
+
+        selected_id = self._normalized_capability_id(capability_id)
+        first = self.discover_promoted_extensions(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            control_token=control_token,
+        )
+        item = self._exact_extension_item(first["items"], selected_id)
+        gate = self._extension_gate()
+        deployment = gate.get(
+            deployment_id=item["deployment_id"],
+            user_id=user_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            control_token=control_token,
+        )
+        self._require_deployment_matches_capability(deployment, item)
+        second = self.discover_promoted_extensions(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            control_token=control_token,
+        )
+        rebound = self._exact_extension_item(second["items"], selected_id)
+        if (
+            first["state_revision"] != second["state_revision"]
+            or self._digest(item) != self._digest(rebound)
+        ):
+            raise ExtensionCapabilitySelectionError(
+                "extension_capability_changed_during_selection"
+            )
+        return PromotedExtensionCapabilitySelection(
+            capability_id=selected_id,
+            deployment_id=item["deployment_id"],
+            deployment_revision=deployment["revision"],
+            deployment_state_revision=second["state_revision"],
+            mode_epoch=item["mode_epoch"],
+            active_pointer_revision=item["active_pointer_revision"],
+            owner_scope_digest=item["owner_scope_digest"],
+            workspace_identity_digest=item["workspace_identity_digest"],
+            initiating_session_digest=item["initiating_session_digest"],
+            release_id=item["release_id"],
+            attestation_digest=item["attestation_digest"],
+            capability_digest=self._digest(item),
+            observed_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    def invoke_promoted_extension(
+        self,
+        selection: PromotedExtensionCapabilitySelection,
+        *,
+        operation_id: str,
+        request_id: str,
+        user_id: str,
+        workspace_id: str,
+        session_id: str,
+        input_payload: dict[str, Any],
+        control_token: str,
+    ) -> dict[str, Any]:
+        """Invoke only by delegating to the authoritative deployment gate."""
+
+        if not isinstance(
+            selection, PromotedExtensionCapabilitySelection
+        ):
+            raise ExtensionCapabilitySelectionError(
+                "promoted_extension_selection_required"
+            )
+        current = self.select_promoted_extension(
+            capability_id=selection.capability_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            control_token=control_token,
+        )
+        immutable = (
+            "capability_id",
+            "deployment_id",
+            "mode_epoch",
+            "active_pointer_revision",
+            "owner_scope_digest",
+            "workspace_identity_digest",
+            "initiating_session_digest",
+            "release_id",
+            "attestation_digest",
+            "capability_digest",
+        )
+        if any(
+            getattr(selection, field) != getattr(current, field)
+            for field in immutable
+        ):
+            raise ExtensionCapabilitySelectionError(
+                "promoted_extension_selection_is_stale"
+            )
+        return self._extension_gate().invoke(
+            operation_id=operation_id,
+            request_id=request_id,
+            deployment_id=current.deployment_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            expected_state_revision=current.deployment_state_revision,
+            expected_deployment_revision=current.deployment_revision,
+            expected_mode_epoch=current.mode_epoch,
+            input_payload=input_payload,
+            control_token=control_token,
+        )
 
     def snapshot(self) -> dict[str, Any]:
         config = self._config()
@@ -455,6 +722,96 @@ class AgentCapabilityDirectory:
     def _config(self) -> dict[str, Any]:
         value = self.registry.config()
         return value if isinstance(value, dict) else {}
+
+    def _extension_gate(self) -> Any:
+        gate = self._extension_deployment_gate
+        if gate is None:
+            raise ExtensionCapabilitySelectionError(
+                "extension_deployment_gate_unbound"
+            )
+        return gate
+
+    @staticmethod
+    def _exact_extension_item(
+        items: list[dict[str, Any]], capability_id: str
+    ) -> dict[str, Any]:
+        selected = [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and item.get("capability_id") == capability_id
+        ]
+        if not selected:
+            raise ExtensionCapabilitySelectionError(
+                "promoted_extension_not_found"
+            )
+        if len(selected) != 1:
+            raise ExtensionCapabilitySelectionError(
+                "promoted_extension_identity_is_ambiguous"
+            )
+        return dict(selected[0])
+
+    @staticmethod
+    def _require_deployment_matches_capability(
+        deployment: Any,
+        capability: dict[str, Any],
+    ) -> None:
+        if not isinstance(deployment, dict) or (
+            deployment.get("deployment_id")
+            != capability.get("deployment_id")
+            or deployment.get("release_id")
+            != capability.get("release_id")
+            or deployment.get("attestation_digest")
+            != capability.get("attestation_digest")
+            or deployment.get("extension_id")
+            != capability.get("extension_id")
+            or deployment.get("extension_version")
+            != capability.get("extension_version")
+            or deployment.get("mode") != "promoted"
+            or deployment.get("mode_epoch")
+            != capability.get("mode_epoch")
+            or deployment.get("breaker_open") is not False
+            or type(deployment.get("revision")) is not int
+            or deployment["revision"] < 1
+        ):
+            raise ExtensionCapabilitySelectionError(
+                "promoted_extension_deployment_binding_mismatch"
+            )
+
+    @staticmethod
+    def _normalized_capability_id(value: Any) -> str:
+        if not isinstance(value, str):
+            raise ExtensionCapabilitySelectionError(
+                "extension_capability_id_invalid"
+            )
+        selected = value.strip()
+        if (
+            not selected
+            or selected != value
+            or len(selected) > 120
+            or not selected[0].isalpha()
+            or selected[0].lower() != selected[0]
+            or any(
+                character
+                not in "abcdefghijklmnopqrstuvwxyz0123456789_.-"
+                for character in selected
+            )
+        ):
+            raise ExtensionCapabilitySelectionError(
+                "extension_capability_id_invalid"
+            )
+        return selected
+
+    @staticmethod
+    def _workspace_identity_digest(workspace_id: str) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {"workspace_id": str(workspace_id)},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
 
     @staticmethod
     def _selected_runtime(config: dict[str, Any]) -> str:

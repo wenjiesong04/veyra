@@ -51,6 +51,11 @@ DOCKER_CONTEXT_ENV = "VEYRA_ISOLATED_RUNNER_DOCKER_CONTEXT"
 HARNESS_RESULT_SCHEMA_VERSION = (
     "veyra.phase6.fixed_isolation_probe_result.v1"
 )
+# The shared subprocess primitive serves three independently budgeted gates:
+# the 8 KiB isolation probe, 16 KiB signed invocation, and 24 KiB dynamic
+# validator.  This is only the TCB-wide ceiling; each caller still supplies and
+# enforces its smaller policy-specific limit.
+MAX_TRUSTED_RUNNER_COMMAND_STDOUT_BYTES = 24 * 1024
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -1460,7 +1465,9 @@ class TrustedIsolatedRunnerBackend:
             not argv
             or any(not isinstance(item, str) or "\x00" in item for item in argv)
             or not 0.1 <= timeout_seconds <= 30.0
-            or not 64 <= stdout_limit <= MAX_ISOLATED_RUNNER_STDOUT_BYTES
+            or not 64
+            <= stdout_limit
+            <= MAX_TRUSTED_RUNNER_COMMAND_STDOUT_BYTES
         ):
             raise TrustedIsolatedRunnerUnavailableError(
                 "isolated-runner command boundary is invalid"

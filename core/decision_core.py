@@ -420,15 +420,56 @@ class DecisionCore:
                 "semantic_policy:ignored_example",
             )
         )
+        required_rule_probe = bool(
+            decision.route == Route.PROBE
+            and decision.selected_probe
+            and (decision.freshness_required or decision.needs_probe)
+            and not false_positive_action_words
+        )
         safety_locked = decision.route in {Route.BLOCK, Route.HUMAN_REVIEW, Route.ROLLBACK}
-        semantic_clarification_is_safer = (
-            decision.route == Route.HUMAN_REVIEW
+        if (
+            decision.route in {Route.HUMAN_REVIEW, Route.ROLLBACK}
             and policy.requires_clarification
             and not policy.allowed_effects
-        )
+            and not false_positive_action_words
+        ):
+            # An unresolved or degraded semantic frame is not enough to create
+            # a durable Review.  Ask for clarification while retaining the
+            # original Veyra risk classification and every destructive-action
+            # constraint.  This is a no-effect terminal for the current turn,
+            # not a risk downgrade.
+            return replace(
+                decision,
+                route=Route.ASK_USER,
+                risk_level=decision.risk_level,
+                reason=(
+                    "semantic clarification required before opening a "
+                    "governance review"
+                ),
+                requires_confirmation=False,
+                selected_probe=None,
+                capability="ask_user",
+                needs_probe=False,
+                needs_agent=False,
+                needs_user_confirmation=False,
+                memory_policy="forget",
+                required_capabilities=[],
+                signals=self._dedupe(
+                    [
+                        *signals,
+                        "policy:safety_risk_preserved_during_clarification",
+                    ]
+                ),
+                constraints=self._dedupe(
+                    [
+                        *constraints,
+                        "do not create a review or execute before semantic clarification",
+                    ]
+                ),
+                model_assist=assist,
+            )
         if safety_locked and not (
-            (false_positive_action_words and not policy.allowed_effects)
-            or semantic_clarification_is_safer
+            false_positive_action_words and not policy.allowed_effects
         ):
             decision.model_assist = assist
             decision.signals = signals
@@ -483,18 +524,48 @@ class DecisionCore:
             memory_policy = "short_term" if memory_policy == "forget" else memory_policy
             reason = "semantic frame explicitly authorizes governed execution"
         else:
-            route = Route.DIRECT_ANSWER
-            selected_probe = None
-            capability = "native_answer"
-            required_capabilities = ["native_answer"]
-            needs_probe = False
-            needs_agent = False
-            needs_confirmation = False
-            requires_confirmation = False
-            reason = "semantic frame authorizes a read-only core response"
-            if false_positive_action_words and not policy.allowed_effects:
-                risk = RiskLevel.R0
-                signals = self._dedupe([*signals, "policy:mentioned_action_risk_downgraded"])
+            if required_rule_probe:
+                # A semantic frame may narrow an effectful route, but it must
+                # not turn a Veyra-owned freshness invariant into an answer
+                # from stale context.  This preserves only an already-selected
+                # deterministic read-only Probe; it never creates a new tool,
+                # Agent, or side-effect authority from user text.
+                route = Route.PROBE
+                capability = "probe"
+                probe_capability = (
+                    self.capabilities.capability_for_probe(selected_probe)
+                    if self.capabilities is not None
+                    else None
+                )
+                required_capabilities = self._dedupe(
+                    [
+                        item
+                        for item in [*required_capabilities, probe_capability]
+                        if item and item != "probe"
+                    ]
+                )
+                needs_probe = True
+                needs_agent = False
+                needs_confirmation = False
+                requires_confirmation = False
+                memory_policy = "forget"
+                reason = "Veyra freshness policy preserves the required read-only probe"
+                signals = self._dedupe(
+                    [*signals, "policy:semantic_cannot_weaken_required_probe"]
+                )
+            else:
+                route = Route.DIRECT_ANSWER
+                selected_probe = None
+                capability = "native_answer"
+                required_capabilities = ["native_answer"]
+                needs_probe = False
+                needs_agent = False
+                needs_confirmation = False
+                requires_confirmation = False
+                reason = "semantic frame authorizes a read-only core response"
+                if false_positive_action_words and not policy.allowed_effects:
+                    risk = RiskLevel.R0
+                    signals = self._dedupe([*signals, "policy:mentioned_action_risk_downgraded"])
 
         if not policy.allows_effect("memory.write"):
             memory_policy = "forget"
@@ -579,14 +650,8 @@ class DecisionCore:
         )
 
     def _understanding_explicitly_needs_execution_or_runtime(self, text: str, understanding: TurnUnderstanding) -> bool:
-        if understanding.intent == "implementation" or understanding.task_type in {"workspace_task", "code_task", "local_status"}:
-            return True
-        if understanding.needs_fresh_evidence and understanding.evidence_kind in {"runtime", "local", "file", "attachment"}:
-            return True
-        lowered = (text or "").lower()
-        return any(marker in text for marker in ("改代码", "修改代码", "实现", "调试", "运行状态", "日志", "端口", "进程")) or any(
-            marker in lowered for marker in ("implement", "debug", "runtime status", "log", "port", "process")
-        )
+        del text
+        return understanding.requests_governed_effect_or_runtime()
 
     def _should_trust_rule_understanding(self, understanding: TurnUnderstanding | None) -> bool:
         if understanding is None or understanding.source != "rule_fallback" or understanding.confidence < 0.8:

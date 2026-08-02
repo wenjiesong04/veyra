@@ -55,6 +55,27 @@ from routers.phase6_extension_source_checks import (
 from routers.phase6_extension_isolated_runner import (
     build_phase6_extension_isolated_runner_router,
 )
+from routers.phase6_extension_generation import (
+    build_phase6_extension_generation_router,
+)
+from routers.phase6_extension_dynamic_validations import (
+    build_phase6_extension_dynamic_validations_router,
+)
+from routers.phase6_extension_releases import (
+    build_phase6_extension_releases_router,
+)
+from routers.phase6_extension_deployments import (
+    build_phase6_extension_deployments_router,
+)
+from routers.phase6_extension_pipelines import (
+    build_phase6_extension_pipelines_router,
+)
+from routers.phase6_capability_gaps import (
+    build_phase6_capability_gaps_router,
+)
+from routers.structured_observations import (
+    build_structured_observations_router,
+)
 from routers.runtime_observability import build_runtime_observability_router
 from routers.tool_governance import build_tool_governance_router
 from runtime.active_loop import ActiveRuntimeLoop
@@ -99,6 +120,28 @@ from runtime.extension_isolated_runner_gate import (
 )
 from runtime.trusted_isolated_runner import (
     TrustedIsolatedRunnerBackend,
+)
+from runtime.bounded_extension_generator import BoundedExtensionGenerator
+from runtime.extension_generation_gate import ExtensionGenerationGate
+from runtime.extension_dynamic_validation_gate import (
+    ExtensionDynamicValidationGate,
+)
+from runtime.trusted_extension_validation_runner import (
+    TrustedExtensionValidationRunner,
+)
+from runtime.extension_release_runtime import (
+    build_extension_release_registry,
+)
+from runtime.trusted_extension_invocation_runner import (
+    TrustedExtensionInvocationRunner,
+)
+from runtime.extension_deployment_gate import ExtensionDeploymentGate
+from runtime.extension_pipeline_coordinator import (
+    ExtensionPipelineCoordinator,
+)
+from runtime.capability_gap_registry import CapabilityGapRegistry
+from runtime.structured_observation_ingress import (
+    StructuredObservationIngress,
 )
 from runtime.soak_runner import SoakRunner
 from runtime.state_refresh import StateRefresh
@@ -177,6 +220,11 @@ commitment_push = CommitmentPushRuntime(
 routing_metrics = RoutingMetrics(state_store)
 event_normalizer = EventNormalizer()
 intake_gateway = IntakeGateway(awareness_loop, event_normalizer, state_store=state_store)
+structured_observation_ingress = StructuredObservationIngress(
+    state_store=state_store,
+    event_awareness=awareness_loop.event_awareness,
+    control_token=os.getenv("VEYRA_LOCAL_API_TOKEN") or "",
+)
 feishu_adapter = FeishuAdapter(intake_gateway, state_store=state_store)
 feishu_ws_runner = FeishuWsRunner(state_store=state_store, adapter=feishu_adapter)
 console_dir = Path("ui/console")
@@ -420,6 +468,84 @@ phase6_extension_isolated_runner = ExtensionIsolatedRunnerGate(
 )
 phase6_extension_source_checks.bind_isolated_runner_projection(
     phase6_extension_isolated_runner.projection_for_source_check
+)
+phase6_extension_generator = BoundedExtensionGenerator(
+    awareness_loop.core_reasoning.client,
+)
+phase6_extension_generation = ExtensionGenerationGate(
+    state_store=state_store,
+    spec_quarantine=phase6_extension_specs,
+    artifact_quarantine=phase6_extension_artifacts,
+    generator=phase6_extension_generator,
+)
+phase6_extension_validation_backend = TrustedExtensionValidationRunner(
+    isolation_backend=phase6_extension_isolated_backend,
+    expected_validation_conformance_digest=(
+        os.getenv(
+            "VEYRA_PHASE6_DYNAMIC_VALIDATION_CONFORMANCE_DIGEST"
+        )
+        or None
+    ),
+    validation_conformance_certified=(
+        _env_bool(
+            "VEYRA_PHASE6_DYNAMIC_VALIDATION_CONFORMANCE_CERTIFIED"
+        )
+        is True
+    ),
+)
+phase6_extension_dynamic_validations = ExtensionDynamicValidationGate(
+    state_store=state_store,
+    isolated_runner_gate=phase6_extension_isolated_runner,
+    backend=phase6_extension_validation_backend,
+)
+phase6_capability_gaps = CapabilityGapRegistry(
+    state_store=state_store,
+    spec_quarantine=phase6_extension_specs,
+)
+commitment_core.self_improvement.capability_gaps = phase6_capability_gaps
+phase6_extension_releases = build_extension_release_registry(
+    state_store=state_store,
+    generation_gate=phase6_extension_generation,
+    dynamic_validation_gate=phase6_extension_dynamic_validations,
+)
+phase6_extension_invocation_backend = TrustedExtensionInvocationRunner(
+    isolation_backend=phase6_extension_isolated_backend,
+    expected_invocation_conformance_digest=(
+        os.getenv("VEYRA_PHASE6_INVOCATION_CONFORMANCE_DIGEST") or None
+    ),
+    invocation_conformance_certified=(
+        _env_bool("VEYRA_PHASE6_INVOCATION_CONFORMANCE_CERTIFIED") is True
+    ),
+)
+phase6_extension_deployments = ExtensionDeploymentGate(
+    state_store=state_store,
+    release_registry=phase6_extension_releases,
+    invocation_runner=phase6_extension_invocation_backend,
+    control_token=os.getenv("VEYRA_LOCAL_API_TOKEN") or None,
+    approver_token=(
+        os.getenv("VEYRA_PHASE6_EXTENSION_APPROVER_TOKEN") or None
+    ),
+    lifecycle_mode=(
+        os.getenv("VEYRA_PHASE6_EXTENSION_DEPLOYMENT_MODE")
+        or "record_only"
+    ),
+)
+phase6_extension_pipeline = ExtensionPipelineCoordinator(
+    state_store=state_store,
+    generation_gate=phase6_extension_generation,
+    artifact_quarantine=phase6_extension_artifacts,
+    source_check_gate=phase6_extension_source_checks,
+    isolated_runner_gate=phase6_extension_isolated_runner,
+    dynamic_validation_gate=phase6_extension_dynamic_validations,
+    release_registry=phase6_extension_releases,
+    deployment_gate=phase6_extension_deployments,
+    enabled=(
+        _env_bool("VEYRA_PHASE6_EXTENSION_PIPELINE_ENABLED") is True
+    ),
+    control_token=os.getenv("VEYRA_LOCAL_API_TOKEN") or "",
+)
+phase6_capability_directory.bind_extension_deployment_gate(
+    phase6_extension_deployments
 )
 
 
@@ -800,6 +926,41 @@ app.include_router(
 app.include_router(
     build_phase6_extension_isolated_runner_router(
         gate=phase6_extension_isolated_runner,
+    )
+)
+app.include_router(
+    build_phase6_extension_generation_router(
+        gate=phase6_extension_generation,
+    )
+)
+app.include_router(
+    build_phase6_extension_dynamic_validations_router(
+        gate=phase6_extension_dynamic_validations,
+    )
+)
+app.include_router(
+    build_phase6_extension_releases_router(
+        registry=phase6_extension_releases,
+    )
+)
+app.include_router(
+    build_phase6_extension_deployments_router(
+        gate=phase6_extension_deployments,
+    )
+)
+app.include_router(
+    build_phase6_extension_pipelines_router(
+        coordinator=phase6_extension_pipeline,
+    )
+)
+app.include_router(
+    build_phase6_capability_gaps_router(
+        registry=phase6_capability_gaps,
+    )
+)
+app.include_router(
+    build_structured_observations_router(
+        ingress=structured_observation_ingress,
     )
 )
 app.include_router(

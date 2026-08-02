@@ -210,7 +210,12 @@ class AwarenessLoop:
             }
         )
 
-        attention_focus = self.attention.focus_for_text(text)
+        attention_focus = self.attention.focus_for_text(
+            text,
+            user_id=event.source.user_id,
+            session_id=event.source.session_id,
+            event=event,
+        )
         self.belief.update_from_event(event)
         low_latency_response = self._low_latency_short_response(str(text or ""))
         if low_latency_response and str(low_latency_response.get("reason") or "") in {
@@ -275,7 +280,46 @@ class AwarenessLoop:
             turn_context=turn_context,
         )
         understanding_payload = turn_understanding.to_dict(include_raw=False)
+        attention_refinement = self.attention.refine_from_understanding(
+            text=str(text or ""),
+            understanding=turn_understanding,
+            user_id=event.source.user_id,
+            session_id=event.source.session_id,
+            event=event,
+        )
+        refined_focus = attention_refinement.get("focus")
+        if (
+            attention_refinement.get("status") == "refined"
+            and isinstance(refined_focus, list)
+        ):
+            attention_focus = [str(item) for item in refined_focus if str(item)][:12]
+        active_context = (
+            turn_context.get("active_context")
+            if isinstance(turn_context.get("active_context"), dict)
+            else {}
+        )
+        active_context["attention_focus"] = attention_focus
+        turn_context["active_context"] = active_context
         turn_context["turn_understanding"] = understanding_payload
+        route_trace.append(
+            {
+                "phase": "attention_refinement",
+                "status": attention_refinement.get("status"),
+                "source": attention_refinement.get("source"),
+                "focus": attention_focus[:8],
+                "confidence": attention_refinement.get("confidence"),
+                "model_validated": bool(
+                    (
+                        attention_refinement.get("assessment")
+                        if isinstance(
+                            attention_refinement.get("assessment"),
+                            dict,
+                        )
+                        else {}
+                    ).get("model_validated")
+                ),
+            }
+        )
         route_trace.append(
             {
                 "phase": "understanding",
@@ -361,6 +405,47 @@ class AwarenessLoop:
         )
         self.persona_engine.record_binding(event, persona_patch)
         self.runtime_entity.operational_mode = list(persona_patch.get("mode", []))
+        if (
+            decision.route == Route.ASK_USER
+            and "policy:safety_risk_preserved_during_clarification"
+            in set(decision.signals or [])
+        ):
+            # A degraded semantic frame must not create a durable approval
+            # request.  Return the clarification immediately while preserving
+            # the Veyra-owned risk level for audit and future re-evaluation.
+            self.runtime_entity.set_status(
+                LifecycleStatus.WAITING_CONFIRMATION.value
+            )
+            result = LoopResult(
+                event_id=event.event_id,
+                route=Route.ASK_USER,
+                status="needs_user_input",
+                response=self._ask_user_response(decision),
+                risk_level=decision.risk_level,
+                artifacts={
+                    "attention": attention_focus,
+                    "decision": decision.to_dict(),
+                    "controller": controller_plan.to_dict(),
+                    "persona": persona_patch,
+                    "turn_understanding": understanding_payload,
+                    "review_created": False,
+                },
+            )
+            route_trace.append(
+                {
+                    "phase": "semantic_clarification",
+                    "status": "needs_user_input",
+                    "risk_preserved": decision.risk_level.value,
+                    "review_created": False,
+                }
+            )
+            return self._finalize_event(
+                event,
+                result,
+                started_at,
+                route_trace,
+                context_observability,
+            )
         foresight = self._foresight_for_decision(text, decision)
         guardian_decision = self.guardian.review_text_action(text=text, decision=decision, foresight=foresight)
         route_trace.append(
@@ -2453,7 +2538,6 @@ class AwarenessLoop:
         ]
         snapshot = self.state_store.read_snapshot(names)
         task_state = snapshot["task_state.json"]
-        attention = snapshot["attention_state.json"]
         executor = snapshot["executor_state.json"]
         agent_config = snapshot["agent_config.json"]
         commitment_state = snapshot["user_commitments.json"]
@@ -2497,9 +2581,19 @@ class AwarenessLoop:
             tasks.append(str(item.get("title") or item.get("kind") or item.get("commitment_id") or "主动任务"))
 
         topics: list[str] = []
-        focus = attention.get("focus") if isinstance(attention.get("focus"), list) else []
-        if event.source.user_id in {"", "local-user"}:
-            topics.extend(str(item) for item in focus if item)
+        try:
+            attention_scope = self.attention.active_scope(
+                user_id=str(event.source.user_id or "local-user"),
+                session_id=str(event.source.session_id or "local-session"),
+            )
+        except ValueError:
+            attention_scope = {}
+        focus = (
+            attention_scope.get("focus")
+            if isinstance(attention_scope.get("focus"), list)
+            else []
+        )
+        topics.extend(str(item) for item in focus if item)
         watchlist = external.get("watchlist") if isinstance(external.get("watchlist"), list) else []
         for item in watchlist:
             if (

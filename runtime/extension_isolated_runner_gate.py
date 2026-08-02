@@ -13,6 +13,8 @@ from core.world_state import WorldStateStore
 from interface.extension_artifact import artifact_owner_scope_digest
 from interface.extension_isolated_runner import (
     ISOLATED_RUNNER_BACKEND_KIND,
+    ISOLATED_RUNNER_BACKEND_SNAPSHOT_SCHEMA_VERSION,
+    ISOLATED_RUNNER_BACKEND_SNAPSHOT_TTL_SECONDS,
     ISOLATED_RUNNER_BINDING_SCHEMA_VERSION,
     ISOLATED_RUNNER_CPU_MILLIS,
     ISOLATED_RUNNER_HARNESS_REVISION,
@@ -25,12 +27,19 @@ from interface.extension_isolated_runner import (
     ISOLATED_RUNNER_WALL_TIMEOUT_SECONDS,
     MAX_ISOLATED_RUNNER_STDOUT_BYTES,
     IsolatedRunnerAuthority,
+    IsolatedRunnerBackendSnapshot,
     IsolatedRunnerBackendStatus,
     IsolatedRunnerBinding,
     IsolatedRunnerReport,
+    parse_isolated_runner_backend_snapshot,
     parse_isolated_runner_backend_status,
     parse_isolated_runner_binding,
     parse_isolated_runner_report,
+)
+from runtime.extension_artifact_quarantine import (
+    ExtensionArtifactConflictError,
+    ExtensionArtifactNotFoundError,
+    ExtensionArtifactStorageError,
 )
 from runtime.extension_source_policy_gate import (
     ExtensionSourceCheckConflictError,
@@ -117,6 +126,7 @@ _STATE_METADATA_FIELDS = frozenset(
         "status",
     }
 )
+_STATE_OPTIONAL_FIELDS = frozenset({"backend_snapshot"})
 _RECORD_FIELDS = frozenset(
     {
         "schema_version",
@@ -203,6 +213,7 @@ class ExtensionIsolatedRunnerGate:
         self._now = now or (lambda: datetime.now(timezone.utc))
 
     def status(self) -> dict[str, Any]:
+        state: dict[str, Any] | None = None
         try:
             state = self._read_valid_state()
             counts = {stage: 0 for stage in sorted(_STAGES)}
@@ -225,16 +236,8 @@ class ExtensionIsolatedRunnerGate:
                 "counts": {},
             }
             storage_ready = False
-        try:
-            backend = parse_isolated_runner_backend_status(
-                self.backend.status()
-            )
-        except Exception:
-            backend = self._unavailable_backend_status()
-        backend_ready = (
-            backend.availability == "available"
-            and backend.conformance_certified
-            and not any(backend.authority.model_dump().values())
+        backend, backend_snapshot, backend_ready = (
+            self._cached_backend_snapshot(state)
         )
         token_configured = bool(self.control_token)
         start_ready = bool(
@@ -262,6 +265,7 @@ class ExtensionIsolatedRunnerGate:
                 "fixed trusted isolation probe over one exact passed artifact only"
             ),
             "backend": backend.canonical_dict(),
+            "backend_snapshot": backend_snapshot,
             "storage": storage,
             "admission": {
                 "enabled": self.enabled,
@@ -308,6 +312,13 @@ class ExtensionIsolatedRunnerGate:
                 "promotion": "not_started",
             },
         }
+
+    def refresh_backend(self, *, control_token: str) -> dict[str, Any]:
+        """Explicitly observe and cache sanitized backend readiness."""
+
+        self._authorize_control(control_token)
+        self._observe_backend_status()
+        return self.status()
 
     def start(
         self,
@@ -356,7 +367,11 @@ class ExtensionIsolatedRunnerGate:
             owner_scope_digest=owner_scope,
         )
         if replay is not None:
-            return self._public_run_for_owner(
+            # A start command is an active control-plane operation even when
+            # idempotently replayed: refresh backend readiness and re-open the
+            # exact prerequisite before returning the durable record.
+            self._required_backend_status()
+            return self._public_run_with_prerequisite(
                 replay,
                 user_id=selected_user,
                 workspace_id=selected_workspace,
@@ -464,7 +479,7 @@ class ExtensionIsolatedRunnerGate:
                 "isolated-run claim produced no record"
             )
         if operation_replayed or run_existing:
-            return self._public_run_for_owner(
+            return self._public_run_with_prerequisite(
                 claimed,
                 user_id=selected_user,
                 workspace_id=selected_workspace,
@@ -585,7 +600,7 @@ class ExtensionIsolatedRunnerGate:
                 "isolated-run completion produced no record"
             )
         self._audit(finalized)
-        return self._public_run_for_owner(
+        return self._public_run_with_prerequisite(
             finalized,
             user_id=selected_user,
             workspace_id=selected_workspace,
@@ -658,6 +673,205 @@ class ExtensionIsolatedRunnerGate:
         user_id: str,
         workspace_id: str,
     ) -> dict[str, Any]:
+        _selected_user, _selected_workspace, owner_scope, state = (
+            self._read_owner_state(user_id, workspace_id)
+        )
+        record = self._record_by_id(
+            state,
+            self._required_run_id(run_id),
+        )
+        self._require_owner(record, owner_scope)
+        public = self._public_run(record)
+        return {
+            **public,
+            "schema_version": PUBLIC_INTEGRITY_SCHEMA,
+            "status": "isolated_runner_integrity_passed",
+            "report_integrity_status": (
+                "validated" if record["report"] is not None else "unavailable"
+            ),
+            "prerequisite_verification_status": "not_refreshed",
+            "active_verification_required": True,
+            "state_mutated": False,
+        }
+
+    def dynamic_validation_subject(
+        self,
+        *,
+        run_id: str,
+        user_id: str,
+        workspace_id: str,
+        expected_artifact_revision: int,
+        expected_artifact_sha256: str,
+        expected_source_check_report_digest: str,
+        expected_isolated_runner_report_digest: str,
+    ) -> dict[str, Any]:
+        """Re-open one exact passed run for the 6.2e in-process gate.
+
+        This active prerequisite boundary is never called by a GET route.  It
+        returns private source and Spec data only in process after revalidating
+        owner scope, both terminal reports, artifact CAS and source-check
+        binding.  It grants no HTTP, signing, install, registry, canary or
+        promotion authority and does not alter 6.2d's non-executing semantics.
+        """
+
+        selected_run = self._required_run_id(run_id)
+        selected_revision = self._required_revision(
+            expected_artifact_revision
+        )
+        selected_artifact_digest = self._required_digest(
+            expected_artifact_sha256,
+            "expected_artifact_sha256",
+        )
+        selected_source_report = self._required_digest(
+            expected_source_check_report_digest,
+            "expected_source_check_report_digest",
+        )
+        selected_runner_report = self._required_digest(
+            expected_isolated_runner_report_digest,
+            "expected_isolated_runner_report_digest",
+        )
+        selected_user, selected_workspace, owner_scope, state = (
+            self._read_owner_state(user_id, workspace_id)
+        )
+        record = self._record_by_id(state, selected_run)
+        self._require_owner(record, owner_scope)
+        if (
+            record["stage"] != "RUNNER_JOB_PASSED"
+            or record.get("report_digest") != selected_runner_report
+            or not isinstance(record.get("report"), dict)
+        ):
+            raise ExtensionIsolatedRunnerConflictError(
+                "dynamic validation requires the exact passed isolated run"
+            )
+        binding = parse_isolated_runner_binding(record["binding"])
+        report = parse_isolated_runner_report(record["report"])
+        if (
+            binding.run_id != selected_run
+            or binding.owner_scope_digest != owner_scope
+            or binding.artifact_revision != selected_revision
+            or binding.artifact_sha256 != selected_artifact_digest
+            or binding.source_check_report_digest != selected_source_report
+            or report.binding.canonical_dict() != binding.canonical_dict()
+            or report.binding_digest != record["binding_digest"]
+            or report.report_digest() != selected_runner_report
+            or report.probe_status != "passed"
+            or report.isolated_runner_status != "passed"
+            or any(
+                getattr(report, field) != "passed"
+                for field in (
+                    "artifact_identity_status",
+                    "harness_identity_status",
+                    "non_root_status",
+                    "rootfs_read_only_status",
+                    "input_read_only_status",
+                    "network_isolation_status",
+                    "secret_isolation_status",
+                    "host_surface_isolation_status",
+                    "resource_limits_status",
+                )
+            )
+            or any(report.authority.model_dump(mode="python").values())
+        ):
+            raise ExtensionIsolatedRunnerConflictError(
+                "dynamic validation isolated-run evidence changed"
+            )
+        source_subject = self._runner_subject(
+            check_id=binding.check_id,
+            user_id=selected_user,
+            workspace_id=selected_workspace,
+            expected_artifact_revision=selected_revision,
+            expected_artifact_sha256=selected_artifact_digest,
+            expected_source_check_report_digest=selected_source_report,
+        )
+        try:
+            artifact_subject = (
+                self.source_check_gate.artifact_quarantine.source_check_subject(
+                    artifact_id=binding.artifact_id,
+                    user_id=selected_user,
+                    workspace_id=selected_workspace,
+                    expected_artifact_revision=selected_revision,
+                    expected_artifact_sha256=selected_artifact_digest,
+                )
+            )
+        except Exception as exc:
+            raise ExtensionIsolatedRunnerStorageError(
+                "dynamic validation artifact contract is unavailable"
+            ) from exc
+        rebound = self._runner_subject(
+            check_id=binding.check_id,
+            user_id=selected_user,
+            workspace_id=selected_workspace,
+            expected_artifact_revision=selected_revision,
+            expected_artifact_sha256=selected_artifact_digest,
+            expected_source_check_report_digest=selected_source_report,
+        )
+        source_bytes = source_subject.get("source_bytes")
+        spec = artifact_subject.get("source_check_spec")
+        if (
+            source_subject != rebound
+            or not isinstance(source_bytes, bytes)
+            or not isinstance(spec, dict)
+            or artifact_subject.get("source_bytes") != source_bytes
+            or artifact_subject.get("artifact_envelope_digest")
+            != binding.artifact_envelope_digest
+            or artifact_subject.get("owner_scope_digest") != owner_scope
+            or artifact_subject.get("candidate_id") != binding.candidate_id
+            or artifact_subject.get("candidate_revision")
+            != binding.candidate_revision
+            or artifact_subject.get("spec_digest") != binding.spec_digest
+            or artifact_subject.get("extension_id") != binding.extension_id
+            or artifact_subject.get("extension_version")
+            != binding.extension_version
+            or any(artifact_subject.get("authority", {}).values())
+        ):
+            raise ExtensionIsolatedRunnerConflictError(
+                "dynamic validation source or Spec binding changed"
+            )
+        return {
+            "schema_version": (
+                "veyra.phase6.extension_dynamic_validation_subject.v1"
+            ),
+            "run_id": binding.run_id,
+            "isolated_runner_binding_digest": record["binding_digest"],
+            "isolated_runner_report_digest": selected_runner_report,
+            "isolated_runner_stage": "RUNNER_JOB_PASSED",
+            "source_check_id": binding.check_id,
+            "source_check_binding_digest": (
+                binding.source_check_binding_digest
+            ),
+            "source_check_report_digest": selected_source_report,
+            "source_check_stage": "SOURCE_CHECK_PASSED",
+            "candidate_id": binding.candidate_id,
+            "candidate_revision": binding.candidate_revision,
+            "artifact_id": binding.artifact_id,
+            "artifact_revision": binding.artifact_revision,
+            "artifact_envelope_digest": binding.artifact_envelope_digest,
+            "artifact_sha256": binding.artifact_sha256,
+            "artifact_size_bytes": binding.artifact_size_bytes,
+            "owner_scope_digest": binding.owner_scope_digest,
+            "extension_id": binding.extension_id,
+            "extension_version": binding.extension_version,
+            "spec_digest": binding.spec_digest,
+            "parser_identity": binding.source_parser_identity,
+            "ruleset_digest": binding.source_ruleset_digest,
+            "source_check_spec": dict(spec),
+            "source_bytes": source_bytes,
+            "user_id": selected_user,
+            "workspace_id": selected_workspace,
+            "authority": self._authority(),
+        }
+
+    def verify_prerequisite(
+        self,
+        *,
+        run_id: str,
+        user_id: str,
+        workspace_id: str,
+        control_token: str,
+    ) -> dict[str, Any]:
+        """Actively re-open and hash one run's exact prerequisite."""
+
+        self._authorize_control(control_token)
         selected_user, selected_workspace, owner_scope, state = (
             self._read_owner_state(user_id, workspace_id)
         )
@@ -676,13 +890,16 @@ class ExtensionIsolatedRunnerGate:
         except (
             ExtensionSourceCheckConflictError,
             ExtensionSourceCheckNotFoundError,
+            ExtensionIsolatedRunnerConflictError,
         ):
             return {
                 **public,
                 "schema_version": PUBLIC_INTEGRITY_SCHEMA,
                 "effective_status": "BLOCKED_PREREQUISITE",
                 "operational_health": "degraded",
-                "status": "blocked",
+                "status": "prerequisite_verification_blocked",
+                "prerequisite_verification_status": "blocked",
+                "active_verification_required": False,
                 "state_mutated": False,
             }
         except Exception as exc:
@@ -692,10 +909,9 @@ class ExtensionIsolatedRunnerGate:
         return {
             **public,
             "schema_version": PUBLIC_INTEGRITY_SCHEMA,
-            "status": "isolated_runner_integrity_passed",
-            "report_integrity_status": (
-                "validated" if record["report"] is not None else "unavailable"
-            ),
+            "status": "isolated_runner_prerequisite_verified",
+            "prerequisite_verification_status": "verified",
+            "active_verification_required": False,
             "state_mutated": False,
         }
 
@@ -751,6 +967,17 @@ class ExtensionIsolatedRunnerGate:
     def _runner_subject(self, **kwargs: Any) -> dict[str, Any]:
         try:
             subject = self.source_check_gate.isolated_runner_subject(**kwargs)
+        except (
+            ExtensionArtifactConflictError,
+            ExtensionArtifactNotFoundError,
+        ) as exc:
+            raise ExtensionIsolatedRunnerConflictError(
+                "isolated-run prerequisite changed"
+            ) from exc
+        except ExtensionArtifactStorageError as exc:
+            raise ExtensionIsolatedRunnerStorageError(
+                "isolated-run prerequisite is unavailable"
+            ) from exc
         except ExtensionSourceCheckError:
             raise
         except Exception as exc:
@@ -774,14 +1001,7 @@ class ExtensionIsolatedRunnerGate:
         return subject
 
     def _required_backend_status(self) -> IsolatedRunnerBackendStatus:
-        try:
-            status = parse_isolated_runner_backend_status(
-                self.backend.status()
-            )
-        except Exception as exc:
-            raise ExtensionIsolatedRunnerUnavailableError(
-                "trusted isolated runner status is unavailable"
-            ) from exc
+        status = self._observe_backend_status()
         if (
             status.availability != "available"
             or not status.conformance_certified
@@ -794,6 +1014,97 @@ class ExtensionIsolatedRunnerGate:
                 "trusted isolated runner is not certified"
             )
         return status
+
+    def _observe_backend_status(self) -> IsolatedRunnerBackendStatus:
+        """Perform one explicit backend observation and persist its snapshot."""
+
+        try:
+            status = parse_isolated_runner_backend_status(
+                self.backend.status()
+            )
+        except Exception:
+            status = self._unavailable_backend_status()
+        self._persist_backend_snapshot(status)
+        return status
+
+    def _persist_backend_snapshot(
+        self,
+        status: IsolatedRunnerBackendStatus,
+    ) -> None:
+        observed_at = self._now_iso()
+        snapshot = IsolatedRunnerBackendSnapshot(
+            schema_version=(
+                ISOLATED_RUNNER_BACKEND_SNAPSHOT_SCHEMA_VERSION
+            ),
+            observed_at=observed_at,
+            backend_status=status,
+            backend_status_digest=hashlib.sha256(
+                status.canonical_bytes()
+            ).hexdigest(),
+        )
+
+        def persist(state: dict[str, Any]) -> None:
+            self._validate_state(state)
+            state["backend_snapshot"] = snapshot.canonical_dict()
+            state["updated_at"] = observed_at
+
+        self._mutate(persist)
+
+    def _cached_backend_snapshot(
+        self,
+        state: dict[str, Any] | None,
+    ) -> tuple[IsolatedRunnerBackendStatus, dict[str, Any], bool]:
+        missing = {
+            "status": "missing",
+            "reason_code": "not_observed",
+            "observed_at": None,
+            "age_seconds": None,
+            "ttl_seconds": ISOLATED_RUNNER_BACKEND_SNAPSHOT_TTL_SECONDS,
+            "backend_status_digest": None,
+        }
+        if not isinstance(state, dict) or "backend_snapshot" not in state:
+            return self._unavailable_backend_status(), missing, False
+        try:
+            snapshot = parse_isolated_runner_backend_snapshot(
+                state["backend_snapshot"]
+            )
+            now = self._now()
+            if now.tzinfo is None:
+                raise ValueError("now must be timezone-aware")
+            age = (
+                now.astimezone(timezone.utc)
+                - self._parse_time(snapshot.observed_at)
+            ).total_seconds()
+        except Exception:
+            return self._unavailable_backend_status(), {
+                **missing,
+                "status": "stale",
+                "reason_code": "snapshot_invalid",
+            }, False
+        fresh = bool(
+            0 <= age <= ISOLATED_RUNNER_BACKEND_SNAPSHOT_TTL_SECONDS
+        )
+        backend = snapshot.backend_status
+        backend_ready = bool(
+            fresh
+            and backend.availability == "available"
+            and backend.conformance_certified
+            and not any(backend.authority.model_dump().values())
+        )
+        return backend, {
+            "status": "fresh" if fresh else "stale",
+            "reason_code": (
+                "observed"
+                if fresh
+                else "clock_skew"
+                if age < 0
+                else "expired"
+            ),
+            "observed_at": snapshot.observed_at,
+            "age_seconds": max(0, int(age)),
+            "ttl_seconds": ISOLATED_RUNNER_BACKEND_SNAPSHOT_TTL_SECONDS,
+            "backend_status_digest": snapshot.backend_status_digest,
+        }, backend_ready
 
     @staticmethod
     def _binding_from_subject(
@@ -881,6 +1192,24 @@ class ExtensionIsolatedRunnerGate:
             )
 
     def _public_run_for_owner(
+        self,
+        record: dict[str, Any],
+        *,
+        user_id: str,
+        workspace_id: str,
+        operation_replayed: bool = False,
+        run_existing: bool = False,
+    ) -> dict[str, Any]:
+        # Owner scope is checked by the caller from one atomic local snapshot.
+        # Public read paths must never re-open artifacts or invoke integrations.
+        del user_id, workspace_id
+        return self._public_run(
+            record,
+            operation_replayed=operation_replayed,
+            run_existing=run_existing,
+        )
+
+    def _public_run_with_prerequisite(
         self,
         record: dict[str, Any],
         *,
@@ -1084,7 +1413,12 @@ class ExtensionIsolatedRunnerGate:
             not isinstance(state, dict)
             or state.get("_state_corrupt") is True
             or not _STATE_FIELDS.issubset(state)
-            or bool(set(state) - _STATE_FIELDS - _STATE_METADATA_FIELDS)
+            or bool(
+                set(state)
+                - _STATE_FIELDS
+                - _STATE_OPTIONAL_FIELDS
+                - _STATE_METADATA_FIELDS
+            )
             or state.get("schema_version") != STATE_SCHEMA_VERSION
             or not isinstance(state.get("runs"), dict)
             or not isinstance(state.get("binding_index"), dict)
@@ -1101,6 +1435,15 @@ class ExtensionIsolatedRunnerGate:
             raise ExtensionIsolatedRunnerStorageError(
                 "isolated-run private state is invalid"
             )
+        if "backend_snapshot" in state:
+            try:
+                parse_isolated_runner_backend_snapshot(
+                    state["backend_snapshot"]
+                )
+            except Exception as exc:
+                raise ExtensionIsolatedRunnerStorageError(
+                    "isolated-run backend snapshot is invalid"
+                ) from exc
         expected_index: dict[str, str] = {}
         for run_id, record in state["runs"].items():
             if run_id != record.get("run_id"):
@@ -1331,6 +1674,9 @@ class ExtensionIsolatedRunnerGate:
             raise ExtensionIsolatedRunnerUnavailableError(
                 "trusted isolated runner is disabled by policy"
             )
+        self._authorize_control(supplied_token)
+
+    def _authorize_control(self, supplied_token: str) -> None:
         if not self.control_token:
             raise ExtensionIsolatedRunnerUnavailableError(
                 "trusted isolated runner control token is not configured"

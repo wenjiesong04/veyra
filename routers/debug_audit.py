@@ -14,6 +14,7 @@ from runtime.project_guardian_producers import ProjectGuardianGoalConflict
 from runtime.project_guardian_attention_runtime import (
     ProjectGuardianAttentionConflict,
 )
+from runtime.suggestion_outbox import SuggestionOutboxConflict
 
 
 class ReviewDecisionRequest(BaseModel):
@@ -66,6 +67,34 @@ class ReplayRuntimeConfigRequest(BaseModel):
 
 class EventAwarenessConfigRequest(BaseModel):
     mode: str
+
+
+class GeneralSuggestionModeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    mode: Literal["disabled", "record_only", "shadow", "advise_only"]
+    expected_state_revision: int = Field(ge=0)
+
+
+class GeneralSuggestionPolicyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    user_id: str = Field(min_length=1, max_length=240)
+    session_id: str = Field(min_length=1, max_length=240)
+    daily_budget: int = Field(ge=0, le=100)
+    quiet_hours: dict[str, Any] | None = None
+    cooldown_seconds: int = Field(ge=0, le=2592000)
+    dismiss_cooldown_seconds: int = Field(ge=0, le=2592000)
+    expected_state_revision: int = Field(ge=0)
+
+
+class GeneralSuggestionFeedbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    user_id: str = Field(min_length=1, max_length=240)
+    session_id: str = Field(min_length=1, max_length=240)
+    expected_state_revision: int = Field(ge=0)
+    reason: str = Field(default="", max_length=500)
 
 
 class ProjectGuardianConfigRequest(BaseModel):
@@ -294,6 +323,8 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
             return deps["review_queue"].decide(review_id, "rejected", request.reason)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PermissionError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.get("/logs/tools")
     async def tool_logs(limit: int = 100) -> dict[str, Any]:
@@ -527,8 +558,22 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
         return deps["awareness_loop"].belief.stale_report(limit=limit)
 
     @router.get("/attention/active")
-    async def attention_active() -> dict[str, Any]:
-        return deps["awareness_loop"].attention.active_scope()
+    async def attention_active(
+        user_id: str = Query(min_length=1, max_length=240),
+        session_id: str = Query(min_length=1, max_length=240),
+    ) -> dict[str, Any]:
+        try:
+            selected_user = normalize_scope_component(user_id, "user_id")
+            selected_session = normalize_scope_component(
+                session_id,
+                "session_id",
+            )
+            return deps["awareness_loop"].attention.active_scope(
+                user_id=selected_user,
+                session_id=selected_session,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @router.get("/awareness/project-guardian/status")
     async def project_guardian_status() -> dict[str, Any]:
@@ -859,6 +904,111 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
                 detail=str(exc),
             ) from exc
 
+    @router.get("/awareness/general-situations")
+    async def general_situations(
+        user_id: str = Query(min_length=1, max_length=240),
+        session_id: str = Query(min_length=1, max_length=240),
+        limit: int = Query(default=100, ge=0, le=500),
+    ) -> dict[str, Any]:
+        runtime = deps["awareness_loop"].event_awareness.general_situations
+        try:
+            return runtime.list_for_owner(
+                user_id=user_id,
+                session_id=session_id,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.get("/awareness/suggestions/status")
+    async def general_suggestion_status() -> dict[str, Any]:
+        return deps[
+            "awareness_loop"
+        ].event_awareness.suggestion_outbox.status()
+
+    @router.get("/awareness/suggestions/inbox")
+    async def general_suggestion_inbox(
+        user_id: str = Query(min_length=1, max_length=240),
+        session_id: str = Query(min_length=1, max_length=240),
+        limit: int = Query(default=100, ge=0, le=100),
+    ) -> dict[str, Any]:
+        outbox = deps["awareness_loop"].event_awareness.suggestion_outbox
+        try:
+            return outbox.list_inbox(
+                user_id=user_id,
+                session_id=session_id,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.post("/awareness/suggestions/config")
+    async def general_suggestion_config(
+        request: GeneralSuggestionModeRequest,
+    ) -> dict[str, Any]:
+        outbox = deps["awareness_loop"].event_awareness.suggestion_outbox
+        try:
+            return outbox.configure_mode(
+                request.mode,
+                expected_state_revision=request.expected_state_revision,
+            )
+        except SuggestionOutboxConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.post("/awareness/suggestions/policy")
+    async def general_suggestion_policy(
+        request: GeneralSuggestionPolicyRequest,
+    ) -> dict[str, Any]:
+        outbox = deps["awareness_loop"].event_awareness.suggestion_outbox
+        try:
+            return outbox.configure_policy(**request.model_dump())
+        except SuggestionOutboxConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.post("/awareness/suggestions/{proposal_id}/ack")
+    async def general_suggestion_ack(
+        proposal_id: str,
+        request: GeneralSuggestionFeedbackRequest,
+    ) -> dict[str, Any]:
+        outbox = deps["awareness_loop"].event_awareness.suggestion_outbox
+        try:
+            return outbox.acknowledge(
+                proposal_id,
+                **request.model_dump(),
+            )
+        except SuggestionOutboxConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.post("/awareness/suggestions/{proposal_id}/dismiss")
+    async def general_suggestion_dismiss(
+        proposal_id: str,
+        request: GeneralSuggestionFeedbackRequest,
+    ) -> dict[str, Any]:
+        outbox = deps["awareness_loop"].event_awareness.suggestion_outbox
+        try:
+            return outbox.dismiss(
+                proposal_id,
+                **request.model_dump(),
+            )
+        except SuggestionOutboxConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @router.post("/belief/refresh")
     async def belief_refresh(request: BeliefRefreshRequest | None = None) -> dict[str, Any]:
         payload = request or BeliefRefreshRequest()
@@ -886,6 +1036,24 @@ def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
     # must not expose any of these collections.
     public.pop("event_inbox", None)
     public.pop("situation_state", None)
+    public.pop("general_situation_state", None)
+    public.pop("suggestion_outbox", None)
+    attention_state = (
+        public.get("attention_state")
+        if isinstance(public.get("attention_state"), dict)
+        else {}
+    )
+    # The persisted v2 state is a private owner/session map. Keep the legacy
+    # console shape without exposing any tenant scope; callers that need real
+    # focus data must use the explicitly scoped debug endpoint.
+    public["attention_state"] = {
+        "schema_version": attention_state.get("schema_version")
+        or "veyra.attention_state.v2",
+        "source": attention_state.get("source") or "attention_core",
+        "scope_status": "owner_scope_required",
+        "focus": [],
+        "ignored_noise": ["owner_scope_required"],
+    }
     public.pop("agent_memory", None)
     public.pop("durable_case_state", None)
     public.pop("phase6_collaboration_state", None)
@@ -893,6 +1061,12 @@ def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
     public.pop("phase6_extension_artifact_state", None)
     public.pop("phase6_extension_source_check_state", None)
     public.pop("phase6_extension_isolated_runner_state", None)
+    public.pop("phase6_extension_generation_state", None)
+    public.pop("phase6_extension_dynamic_validation_state", None)
+    public.pop("phase6_extension_release_state", None)
+    public.pop("phase6_extension_deployment_state", None)
+    public.pop("phase6_extension_pipeline_state", None)
+    public.pop("phase6_capability_gap_state", None)
     public.pop("project_guardian_state", None)
     public.pop("project_guardian_signal_state", None)
     public.pop("project_guardian_producer_state", None)

@@ -57,6 +57,8 @@ _FAILED_EXECUTION_STATUSES = {
     "verified_failed",
 }
 
+_DEDICATED_EXTENSION_REVIEW_TYPE = "extension_deployment_transition"
+
 
 def _canonical_digest(value: Any) -> str:
     payload = json.dumps(
@@ -289,6 +291,7 @@ class ReviewQueue:
             for item in items:
                 if not isinstance(item, dict) or item.get("review_id") != review_id:
                     continue
+                self._require_general_mutation_allowed(item)
                 if item.get("status") == "pending":
                     item["status"] = decision
                     item["decided_at"] = utc_now_iso()
@@ -343,6 +346,7 @@ class ReviewQueue:
             for item in items:
                 if not isinstance(item, dict) or item.get("review_id") != review_id:
                     continue
+                self._require_general_mutation_allowed(item)
                 status = str(item.get("status") or "")
                 if status == "pending":
                     item["status"] = "approved"
@@ -443,6 +447,7 @@ class ReviewQueue:
                     or item.get("review_id") != normalized_review_id
                 ):
                     continue
+                self._require_general_mutation_allowed(item)
                 if item.get("status") != "approved":
                     raise PermissionError(
                         "Only an approved canonical review can authorize "
@@ -557,6 +562,7 @@ class ReviewQueue:
             for item in items:
                 if not isinstance(item, dict) or item.get("review_id") != review_id:
                     continue
+                self._require_general_mutation_allowed(item)
                 if item.get("status") != "approved":
                     raise PermissionError(
                         f"Only an approved review can record execution: {review_id}"
@@ -640,6 +646,7 @@ class ReviewQueue:
             for item in items:
                 if not isinstance(item, dict) or item.get("review_id") != review_id:
                     continue
+                self._require_general_mutation_allowed(item)
                 if item.get("status") == "pending":
                     item["status"] = status
                     item["decided_at"] = utc_now_iso()
@@ -664,6 +671,16 @@ class ReviewQueue:
             )
             self.state_store.patch_json("risk_state.json", {"current_risk": "R0"})
         return selected
+
+    @staticmethod
+    def _require_general_mutation_allowed(item: dict[str, Any]) -> None:
+        """Keep Phase 6 deployment reviews on their dedicated approver path."""
+
+        if item.get("review_type") == _DEDICATED_EXTENSION_REVIEW_TYPE:
+            raise PermissionError(
+                "Extension deployment reviews require the dedicated Phase 6 "
+                "approver boundary."
+            )
 
     def _diagnostic_item(self, item: dict[str, Any], *, stale_after_days: int) -> dict[str, Any]:
         created_at = str(item.get("created_at") or "")

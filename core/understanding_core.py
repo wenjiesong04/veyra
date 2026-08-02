@@ -17,6 +17,7 @@ from core.semantic_frame import (
     TurnSemanticFrame,
     semantic_frame_quality_issues,
 )
+from core.semantic_policy import SemanticPolicyCompiler
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent
 
@@ -213,6 +214,48 @@ class TurnUnderstanding:
 
     def is_strategic_discussion(self) -> bool:
         return self.suggested_mode in {"strategic_discussion", "meta_cognition_discussion", "project_direction_review"}
+
+    def requests_governed_effect_or_runtime(self) -> bool:
+        """Use the resolved act graph, rather than words inside its target.
+
+        A phrase such as ``讨论自扩展实现边界`` mentions implementation as
+        the object of a discussion.  Treating the word ``实现`` itself as an
+        execution command collapses that distinction.  For a validated model
+        frame, the Veyra-owned semantic policy is the authority boundary.  A
+        malformed model frame remains read-only.  Only the local rule fallback
+        may use its already-derived task classification.
+        """
+
+        frame = self.semantic_frame
+        if frame is not None and frame.source in {"model", "model_repair"}:
+            policy = SemanticPolicyCompiler().compile(frame)
+            if policy.preferred_route in {"agent", "probe"}:
+                return True
+            if policy.allowed_effects:
+                return True
+            effectful_fail_closed_signals = {
+                "semantic_policy:conditional_effect_unresolved",
+                "semantic_policy:external_write_enforcement_required",
+                "semantic_policy:insufficient_authority",
+                "semantic_policy:unscoped_agent_execution_denied",
+            }
+            return bool(
+                effectful_fail_closed_signals.intersection(
+                    policy.policy_signals
+                )
+            )
+        if self.source == "model_invalid_output":
+            return False
+        return bool(
+            self.intent == "implementation"
+            or self.task_type
+            in {"workspace_task", "code_task", "local_status"}
+            or (
+                self.needs_fresh_evidence
+                and self.evidence_kind
+                in {"runtime", "local", "file", "attachment"}
+            )
+        )
 
 
 class UnderstandingCore:

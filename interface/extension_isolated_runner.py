@@ -38,6 +38,9 @@ ISOLATED_RUNNER_REPORT_SCHEMA_VERSION = (
 ISOLATED_RUNNER_BACKEND_STATUS_SCHEMA_VERSION = (
     "veyra.phase6.isolated_runner_backend_status.v1"
 )
+ISOLATED_RUNNER_BACKEND_SNAPSHOT_SCHEMA_VERSION = (
+    "veyra.phase6.isolated_runner_backend_snapshot.v1"
+)
 ISOLATED_RUNNER_POLICY_REVISION = (
     "veyra.phase6.trusted_isolated_runner_policy.v1"
 )
@@ -52,6 +55,7 @@ ISOLATED_RUNNER_CPU_MILLIS = 500
 ISOLATED_RUNNER_NOFILE_LIMIT = 64
 ISOLATED_RUNNER_TMPFS_BYTES = 1024 * 1024
 ISOLATED_RUNNER_WALL_TIMEOUT_SECONDS = 10
+ISOLATED_RUNNER_BACKEND_SNAPSHOT_TTL_SECONDS = 300
 MAX_ISOLATED_RUNNER_STDOUT_BYTES = 8 * 1024
 MAX_ISOLATED_RUNNER_DOCUMENT_BYTES = 32 * 1024
 
@@ -370,6 +374,55 @@ class IsolatedRunnerBackendStatus(BaseModel):
         return _canonical_json_bytes(self.canonical_dict())
 
 
+class IsolatedRunnerBackendSnapshot(BaseModel):
+    """Durable, sanitized result of an explicit backend observation.
+
+    The nested backend status binds the engine, immutable image,
+    conformance certificate, fixed harness and runner policy.  It contains no
+    endpoint, path, command, environment or secret material and is therefore
+    safe for status reads without contacting the backend again.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    schema_version: Literal[
+        ISOLATED_RUNNER_BACKEND_SNAPSHOT_SCHEMA_VERSION
+    ]
+    observed_at: str = Field(min_length=20, max_length=32)
+    backend_status: IsolatedRunnerBackendStatus
+    backend_status_digest: str = Field(min_length=64, max_length=64)
+
+    @field_validator("observed_at")
+    @classmethod
+    def validate_observed_at(cls, value: str) -> str:
+        parsed = _parse_canonical_utc(value)
+        if _canonical_utc(parsed) != value:
+            raise ValueError("observed_at must be canonical UTC")
+        return value
+
+    @field_validator("backend_status_digest")
+    @classmethod
+    def validate_backend_status_digest(cls, value: str) -> str:
+        if not _DIGEST.fullmatch(value):
+            raise ValueError("backend snapshot digest is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def validate_status_digest(self) -> "IsolatedRunnerBackendSnapshot":
+        expected = hashlib.sha256(
+            self.backend_status.canonical_bytes()
+        ).hexdigest()
+        if self.backend_status_digest != expected:
+            raise ValueError("backend snapshot status digest mismatch")
+        return self
+
+    def canonical_dict(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", by_alias=True)
+
+    def canonical_bytes(self) -> bytes:
+        return _canonical_json_bytes(self.canonical_dict())
+
+
 class IsolatedRunnerReport(BaseModel):
     """Canonical public result of only the fixed isolation probe."""
 
@@ -518,6 +571,19 @@ def parse_isolated_runner_backend_status(
     return status
 
 
+def parse_isolated_runner_backend_snapshot(
+    value: Any,
+) -> IsolatedRunnerBackendSnapshot:
+    if isinstance(value, IsolatedRunnerBackendSnapshot):
+        value = value.model_dump(mode="python", by_alias=True)
+    snapshot = IsolatedRunnerBackendSnapshot.model_validate(
+        value,
+        strict=True,
+    )
+    snapshot.canonical_bytes()
+    return snapshot
+
+
 def _canonical_json_bytes(value: Any) -> bytes:
     payload = json.dumps(
         value,
@@ -556,6 +622,8 @@ def _canonical_utc(value: datetime) -> str:
 
 __all__ = [
     "ISOLATED_RUNNER_BACKEND_KIND",
+    "ISOLATED_RUNNER_BACKEND_SNAPSHOT_SCHEMA_VERSION",
+    "ISOLATED_RUNNER_BACKEND_SNAPSHOT_TTL_SECONDS",
     "ISOLATED_RUNNER_BACKEND_STATUS_SCHEMA_VERSION",
     "ISOLATED_RUNNER_BINDING_SCHEMA_VERSION",
     "ISOLATED_RUNNER_CONTAINER_USER",
@@ -573,10 +641,12 @@ __all__ = [
     "MAX_ISOLATED_RUNNER_DOCUMENT_BYTES",
     "MAX_ISOLATED_RUNNER_STDOUT_BYTES",
     "IsolatedRunnerAuthority",
+    "IsolatedRunnerBackendSnapshot",
     "IsolatedRunnerBackendStatus",
     "IsolatedRunnerBinding",
     "IsolatedRunnerIssueCode",
     "IsolatedRunnerReport",
+    "parse_isolated_runner_backend_snapshot",
     "parse_isolated_runner_backend_status",
     "parse_isolated_runner_binding",
     "parse_isolated_runner_report",

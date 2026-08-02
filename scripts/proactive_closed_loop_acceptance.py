@@ -66,6 +66,65 @@ def past_iso() -> str:
     return (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
 
 
+LEARNING_TEXT = "现在我要开始学习深度学习了，你能不能帮我？"
+CONFIRM_TEXT = "好的"
+WEATHER_TEXT = "每天早上帮我推送北京天气"
+
+
+def install_semantic_fixtures(semantic: Any) -> None:
+    """Drive the closed loop through validated production semantic frames."""
+
+    semantic.FRAME_FIXTURES[LEARNING_TEXT] = semantic._frame(
+        acts=[
+            semantic._act(
+                LEARNING_TEXT,
+                act_id="closed-learning-1",
+                kind="proactive_request",
+                operation="create_learning_support",
+                goal="建立深度学习学习辅导并在开启前确认",
+                quote=LEARNING_TEXT,
+                target=semantic._target("learning_topic", "深度学习"),
+                arguments={"topic": "深度学习"},
+            )
+        ]
+    )
+    semantic.FRAME_FIXTURES[CONFIRM_TEXT] = semantic._frame(
+        acts=[
+            semantic._act(
+                CONFIRM_TEXT,
+                act_id="closed-confirm-1",
+                kind="commitment_control",
+                operation="confirm_commitment",
+                goal="确认当前会话中的待确认学习辅导",
+                quote=CONFIRM_TEXT,
+                target=semantic._target("commitment", "current_session"),
+            )
+        ]
+    )
+    semantic.FRAME_FIXTURES[WEATHER_TEXT] = semantic._frame(
+        acts=[
+            semantic._act(
+                WEATHER_TEXT,
+                act_id="closed-weather-1",
+                kind="recurring_request",
+                operation="schedule_weather_push",
+                goal="每天早上接收北京天气",
+                quote=WEATHER_TEXT,
+                target=semantic._target("weather_summary", "北京"),
+                arguments={
+                    "location": "北京",
+                    "schedule": {
+                        "kind": "daily",
+                        "time_local": "08:00",
+                        "timezone": "Asia/Shanghai",
+                        "interval_seconds": 86400.0,
+                    },
+                },
+            )
+        ]
+    )
+
+
 def main() -> int:
     with TemporaryDirectory(prefix="veyra-closed-loop-") as tmp:
         state_root = Path(tmp) / "state"
@@ -74,11 +133,20 @@ def main() -> int:
         os.environ["VEYRA_STATE_ROOT"] = str(state_root)
         os.environ["VEYRA_AGENCY_DIR"] = str(agency_root)
         os.environ["VEYRA_AGENCY_ROOT"] = str(agency_root)
+        os.environ["VEYRA_CORE_MODEL_ENABLED"] = "0"
+        os.environ["VEYRA_ACTIVE_LOOP_AUTOSTART"] = "0"
+        os.environ["VEYRA_FEISHU_WS_AUTOSTART"] = "0"
         agency_root.mkdir(parents=True, exist_ok=True)
         (agency_root / "goals.json").write_text("{}", encoding="utf-8")
 
+        import scripts.semantic_generalization_smoke as semantic_smoke  # noqa: E402
         import main as app_module  # noqa: E402
         import runtime.commitment_push as commitment_push_module  # noqa: E402
+
+        install_semantic_fixtures(semantic_smoke)
+        semantic_model = semantic_smoke.ScriptedSemanticModelClient()
+        app_module.awareness_loop.core_reasoning.client = semantic_model
+        app_module.commitment_core.intent_planner.client = semantic_model
 
         client = TestClient(app_module.app)
         app_module.external_world_refresh.search_probe = FakeSearchProbe()
@@ -87,7 +155,7 @@ def main() -> int:
         learning = client.post(
             "/events/message",
             json={
-                "text": "现在我要开始学习深度学习了，你能不能帮我？",
+                "text": LEARNING_TEXT,
                 "channel": "acceptance",
                 "user_id": "closed-loop-user",
                 "session_id": "learn",
@@ -96,13 +164,16 @@ def main() -> int:
         expect(learning.status_code == 200, "learning request accepted", learning.text)
         learning_body = learning.json()
         artifact = (learning_body.get("artifacts") or {}).get("commitment") or {}
-        expect(artifact.get("status") == "goal_recorded", "learning goal recorded", artifact)
+        expect(artifact.get("status") == "created", "learning commitment recorded", artifact)
+        expect(artifact.get("semantic_source") == "authoritative_semantic_frame", "learning is authorized by semantic frame", artifact)
         pending = artifact.get("commitment") if isinstance(artifact.get("commitment"), dict) else {}
+        expect(pending.get("kind") == "learning_digest", "learning commitment uses bounded digest kind", pending)
         expect(pending.get("status") == "pending_confirmation", "learning push pending before consent", pending)
+        expect(not store.read_json("user_goals.json").get("goals"), "learning request does not silently create a separate durable goal", store.read_json("user_goals.json"))
 
         confirm = client.post(
             "/events/message",
-            json={"text": "好的", "channel": "acceptance", "user_id": "closed-loop-user", "session_id": "learn"},
+            json={"text": CONFIRM_TEXT, "channel": "acceptance", "user_id": "closed-loop-user", "session_id": "learn"},
         )
         expect(confirm.status_code == 200 and (confirm.json().get("artifacts") or {}).get("commitment", {}).get("status") == "confirmed", "learning push confirmed", confirm.text)
         active_learning = client.get(
@@ -113,6 +184,26 @@ def main() -> int:
                 "status": "active",
             },
         ).json()["commitments"][0]
+
+        def install_authorized_learning_watch(external_state: dict[str, Any]) -> dict[str, Any]:
+            watchlist = external_state.get("watchlist") if isinstance(external_state.get("watchlist"), list) else []
+            watchlist.append(
+                {
+                    "target": f"learning:{active_learning['commitment_id']}",
+                    "kind": "learning_search",
+                    "enabled": True,
+                    "topic": "深度学习",
+                    "query": "深度学习 latest tutorial course paper 2026",
+                    "user_id": active_learning["user_id"],
+                    "session_id": active_learning["session_id"],
+                    "commitment_id": active_learning["commitment_id"],
+                    "reason": "authorized_commitment_acceptance_fixture",
+                }
+            )
+            external_state["watchlist"] = watchlist
+            return external_state
+
+        store.mutate_json("external_world.json", install_authorized_learning_watch)
 
         external = client.post("/external/refresh", params={"limit": 5})
         expect(external.status_code == 200 and external.json().get("refreshed"), "authorized external search refreshed", external.text)
@@ -139,7 +230,7 @@ def main() -> int:
 
         weather = client.post(
             "/events/message",
-            json={"text": "每天早上帮我推送北京天气", "channel": "acceptance", "user_id": "closed-loop-user", "session_id": "weather"},
+            json={"text": WEATHER_TEXT, "channel": "acceptance", "user_id": "closed-loop-user", "session_id": "weather"},
         )
         expect(weather.status_code == 200, "weather message accepted", weather.text)
         weather_turn = (weather.json().get("artifacts") or {}).get("commitment", {})

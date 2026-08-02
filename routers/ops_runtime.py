@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 
@@ -92,12 +92,18 @@ def build_ops_runtime_router(deps: dict[str, Any]) -> APIRouter:
     @router.post("/ops/reviews/{review_id}/resolve")
     async def ops_review_resolve(review_id: str, request: ReviewQueueActionRequest | None = None) -> dict[str, Any]:
         payload = request or ReviewQueueActionRequest()
-        return deps["review_queue"].mark_resolved(review_id, payload.reason)
+        try:
+            return deps["review_queue"].mark_resolved(review_id, payload.reason)
+        except PermissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post("/ops/reviews/{review_id}/archive")
     async def ops_review_archive(review_id: str, request: ReviewQueueActionRequest | None = None) -> dict[str, Any]:
         payload = request or ReviewQueueActionRequest()
-        return deps["review_queue"].archive(review_id, payload.reason)
+        try:
+            return deps["review_queue"].archive(review_id, payload.reason)
+        except PermissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.get("/ops/health")
     async def ops_health() -> dict[str, Any]:

@@ -54,7 +54,66 @@ SCENARIOS = (
     "extension_source_check_corrupt",
     "extension_isolated_runner_populated",
     "extension_isolated_runner_corrupt",
+    "general_situation_populated",
+    "general_situation_corrupt",
+    "suggestion_outbox_populated",
+    "suggestion_outbox_corrupt",
+    "extension_generation_populated",
+    "extension_generation_corrupt",
+    "extension_dynamic_validation_populated",
+    "extension_dynamic_validation_corrupt",
+    "extension_release_populated",
+    "extension_release_corrupt",
+    "extension_deployment_populated",
+    "extension_deployment_corrupt",
+    "extension_pipeline_populated",
+    "extension_pipeline_corrupt",
+    "capability_gap_populated",
+    "capability_gap_corrupt",
 )
+
+PRIVATE_STATE_SCENARIOS: dict[str, tuple[str, str, str]] = {
+    "general_situation": (
+        "general_situation_state.json",
+        "general_situations",
+        "veyra.general_situation_state.v1",
+    ),
+    "suggestion_outbox": (
+        "suggestion_outbox.json",
+        "proposals",
+        "veyra.suggestion_outbox.v1",
+    ),
+    "extension_generation": (
+        "phase6_extension_generation_state.json",
+        "generations",
+        "veyra.phase6.extension_generation_state.v1",
+    ),
+    "extension_dynamic_validation": (
+        "phase6_extension_dynamic_validation_state.json",
+        "validations",
+        "veyra.phase6.extension_dynamic_validation_state.v1",
+    ),
+    "extension_release": (
+        "phase6_extension_release_state.json",
+        "releases",
+        "veyra.phase6.extension_release_state.v1",
+    ),
+    "extension_deployment": (
+        "phase6_extension_deployment_state.json",
+        "deployments",
+        "veyra.phase6.extension_deployment_state.v1",
+    ),
+    "extension_pipeline": (
+        "phase6_extension_pipeline_state.json",
+        "pipelines",
+        "veyra.phase6.extension_pipeline_state.v1",
+    ),
+    "capability_gap": (
+        "phase6_capability_gap_state.json",
+        "gaps",
+        "veyra.phase6.capability_gap_state.v1",
+    ),
+}
 
 
 def expect(condition: bool, label: str, detail: Any = None) -> None:
@@ -79,6 +138,68 @@ def seed_phase6(loop: Any, scenario: str) -> None:
     isolated_runner_path = loop.state_store.path_for(
         "phase6_extension_isolated_runner_state.json"
     )
+    for scenario_prefix, (state_file, collection, schema) in (
+        PRIVATE_STATE_SCENARIOS.items()
+    ):
+        if scenario == f"{scenario_prefix}_corrupt":
+            loop.state_store.path_for(state_file).write_text(
+                f"{{invalid-{scenario_prefix.replace('_', '-')}-state",
+                encoding="utf-8",
+            )
+            return
+        if scenario == f"{scenario_prefix}_populated":
+            recorded_at = datetime.now(timezone.utc).isoformat(
+                timespec="microseconds"
+            ).replace("+00:00", "Z")
+
+            def populate_private_state(
+                state: dict[str, Any],
+                *,
+                selected_collection: str = collection,
+                selected_schema: str = schema,
+                selected_prefix: str = scenario_prefix,
+            ) -> None:
+                # This is deliberately inert private data. The route matrix
+                # tests isolation from pre-existing lifecycle records; it
+                # must not construct a model, runner, signer, or deployment
+                # gate merely to seed their durable stores.
+                records = (
+                    state.get(selected_collection)
+                    if isinstance(state.get(selected_collection), dict)
+                    else {}
+                )
+                records["private-route-fixture"] = {
+                    "schema_version": (
+                        f"veyra.phase6.{selected_prefix}.private_fixture.v1"
+                    ),
+                    "user_id": "private-user",
+                    "workspace_id": "private-workspace",
+                    "session_id": "private-session",
+                    "status": "private_fixture_only",
+                    "created_at": recorded_at,
+                }
+                state["schema_version"] = selected_schema
+                state[selected_collection] = records
+                for count_field in (
+                    "general_situation_count",
+                    "proposal_count",
+                    "generation_count",
+                    "validation_count",
+                ):
+                    if count_field in state:
+                        state[count_field] = len(records)
+                if "registry_revision" in state:
+                    state["registry_revision"] = 1
+                if "revision" in state:
+                    state["revision"] = 1
+                if "updated_at" in state:
+                    state["updated_at"] = recorded_at
+
+            loop.state_store.mutate_json(
+                state_file,
+                populate_private_state,
+            )
+            return
     if scenario == "collaboration_corrupt":
         collaboration_path.write_text(
             "{invalid-phase6-collaboration-state",
@@ -567,6 +688,78 @@ def main() -> int:
                     }
                 }
             },
+            "general_situation_state": {
+                "general_situations": {
+                    "private-general-situation": {
+                        "user_id": "private-user",
+                        "session_scope_keys": ["private-session"],
+                        "child_refs": ["private-child-reference"],
+                    }
+                }
+            },
+            "suggestion_outbox": {
+                "proposals": {
+                    "private-suggestion": {
+                        "user_id": "private-user",
+                        "session_id": "private-session",
+                        "summary": "private suggestion",
+                    }
+                }
+            },
+            "phase6_extension_generation_state": {
+                "generations": {
+                    "private-generation": {
+                        "user_id": "private-user",
+                        "workspace_id": "private-workspace",
+                        "binding": "private-generation-binding",
+                    }
+                }
+            },
+            "phase6_extension_dynamic_validation_state": {
+                "validations": {
+                    "private-validation": {
+                        "user_id": "private-user",
+                        "workspace_id": "private-workspace",
+                        "report": "private-validation-report",
+                    }
+                }
+            },
+            "phase6_extension_release_state": {
+                "releases": {
+                    "private-release": {
+                        "owner_scope_digest": "private-owner-scope",
+                        "attestation": "private-attestation",
+                    }
+                }
+            },
+            "phase6_extension_deployment_state": {
+                "deployments": {
+                    "private-deployment": {
+                        "user_id": "private-user",
+                        "workspace_id": "private-workspace",
+                        "release_id": "private-release",
+                    }
+                }
+            },
+            "phase6_extension_pipeline_state": {
+                "pipelines": {
+                    "private-pipeline": {
+                        "user_id": "private-user",
+                        "workspace_id": "private-workspace",
+                        "session_id": "private-session",
+                        "receipts": "private-pipeline-receipts",
+                    }
+                }
+            },
+            "phase6_capability_gap_state": {
+                "gaps": {
+                    "private-gap": {
+                        "user_id": "private-user",
+                        "workspace_id": "private-workspace",
+                        "reason_code": "private-reason",
+                    }
+                }
+            },
         }
     )
     expect(
@@ -575,6 +768,14 @@ def main() -> int:
         and "phase6_extension_artifact_state" not in public_state
         and "phase6_extension_source_check_state" not in public_state
         and "phase6_extension_isolated_runner_state" not in public_state
+        and "general_situation_state" not in public_state
+        and "suggestion_outbox" not in public_state
+        and "phase6_extension_generation_state" not in public_state
+        and "phase6_extension_dynamic_validation_state" not in public_state
+        and "phase6_extension_release_state" not in public_state
+        and "phase6_extension_deployment_state" not in public_state
+        and "phase6_extension_pipeline_state" not in public_state
+        and "phase6_capability_gap_state" not in public_state
         and public_state.get("local_world", {}).get(
             "current_project"
         )
@@ -651,12 +852,14 @@ def main() -> int:
                             "candidate": candidate.to_dict(),
                         }
     expect(
-        len(SCENARIOS) == 10
-        and comparisons == 9 * len(MODES) * len(SCENARIOS) == 270
+        len(SCENARIOS) == 26
+        and comparisons == 9 * len(MODES) * len(SCENARIOS) == 702
         and not failures,
         (
-            "270 isolated populated or corrupt collaboration/extension/"
-            "source-check/runner states cannot weaken complete disabled, "
+            "702 isolated populated or corrupt collaboration, Situation, "
+            "suggestion, extension lifecycle, governed-pipeline, and "
+            "capability-gap states "
+            "cannot weaken complete disabled, "
             "record-only, or shadow Route output/status/risk"
         ),
         failures,

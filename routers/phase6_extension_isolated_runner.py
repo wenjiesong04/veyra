@@ -136,6 +136,19 @@ def build_phase6_extension_isolated_runner_router(
     async def isolated_runner_status() -> dict[str, Any]:
         return await run_in_threadpool(gate.status)
 
+    @router.post("/isolated-runs/backend/refresh")
+    async def refresh_isolated_runner_backend(
+        request: Request,
+    ) -> dict[str, Any]:
+        try:
+            return await run_in_threadpool(
+                gate.refresh_backend,
+                control_token=_control_token(request),
+            )
+        except Exception as exc:
+            _raise_isolated_runner_error(exc)
+            raise AssertionError("unreachable")
+
     @router.get("/isolated-runs")
     async def list_isolated_runs(
         user_id: str = Query(min_length=1, max_length=240),
@@ -182,6 +195,25 @@ def build_phase6_extension_isolated_runner_router(
                 run_id=run_id,
                 user_id=user_id,
                 workspace_id=workspace_id,
+            )
+        except Exception as exc:
+            _raise_isolated_runner_error(exc)
+            raise AssertionError("unreachable")
+
+    @router.post("/isolated-runs/{run_id}/verify-prerequisite")
+    async def verify_isolated_run_prerequisite(
+        request: Request,
+        run_id: str = Path(pattern=_RUN_ID_PATTERN),
+        user_id: str = Query(min_length=1, max_length=240),
+        workspace_id: str = Query(min_length=1, max_length=240),
+    ) -> dict[str, Any]:
+        try:
+            return await run_in_threadpool(
+                gate.verify_prerequisite,
+                run_id=run_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                control_token=_control_token(request),
             )
         except Exception as exc:
             _raise_isolated_runner_error(exc)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -19,6 +20,7 @@ from interface.extension_artifact import (  # noqa: E402
 )
 from interface.extension_isolated_runner import (  # noqa: E402
     ISOLATED_RUNNER_BACKEND_KIND,
+    ISOLATED_RUNNER_BACKEND_SNAPSHOT_SCHEMA_VERSION,
     ISOLATED_RUNNER_BACKEND_STATUS_SCHEMA_VERSION,
     ISOLATED_RUNNER_BINDING_SCHEMA_VERSION,
     ISOLATED_RUNNER_HARNESS_REVISION,
@@ -26,9 +28,11 @@ from interface.extension_isolated_runner import (  # noqa: E402
     ISOLATED_RUNNER_POLICY_REVISION,
     ISOLATED_RUNNER_REPORT_SCHEMA_VERSION,
     IsolatedRunnerAuthority,
+    IsolatedRunnerBackendSnapshot,
     IsolatedRunnerBackendStatus,
     IsolatedRunnerBinding,
     IsolatedRunnerReport,
+    parse_isolated_runner_backend_snapshot,
     parse_isolated_runner_backend_status,
     parse_isolated_runner_binding,
     parse_isolated_runner_report,
@@ -142,6 +146,14 @@ def valid_report() -> IsolatedRunnerReport:
 
 def main() -> int:
     backend = valid_backend_status()
+    snapshot = IsolatedRunnerBackendSnapshot(
+        schema_version=ISOLATED_RUNNER_BACKEND_SNAPSHOT_SCHEMA_VERSION,
+        observed_at=FIXED_TIME,
+        backend_status=backend,
+        backend_status_digest=hashlib.sha256(
+            backend.canonical_bytes()
+        ).hexdigest(),
+    )
     binding = valid_binding()
     report = valid_report()
 
@@ -154,13 +166,17 @@ def main() -> int:
     restatus = parse_isolated_runner_backend_status(
         dict(reversed(list(backend.canonical_dict().items())))
     )
+    resnapshot = parse_isolated_runner_backend_snapshot(
+        dict(reversed(list(snapshot.canonical_dict().items())))
+    )
     expect(
         rebound.canonical_bytes() == binding.canonical_bytes()
         and rebound.binding_digest() == binding.binding_digest()
         and rereport.canonical_bytes() == report.canonical_bytes()
         and rereport.report_digest() == report.report_digest()
-        and restatus.canonical_bytes() == backend.canonical_bytes(),
-        "binding, report, and backend have stable canonical identities",
+        and restatus.canonical_bytes() == backend.canonical_bytes()
+        and resnapshot.canonical_bytes() == snapshot.canonical_bytes(),
+        "binding, report, backend, and snapshot have stable canonical identities",
     )
     expect(
         binding.source_parser_identity == EXTENSION_SOURCE_PARSER_IDENTITY
@@ -221,6 +237,7 @@ def main() -> int:
     payload = json.dumps(
         {
             "backend": backend.canonical_dict(),
+            "backend_snapshot": snapshot.canonical_dict(),
             "binding": binding.canonical_dict(),
             "report": report.canonical_dict(),
         },
@@ -273,6 +290,24 @@ def main() -> int:
     expect_rejected(
         lambda: parse_isolated_runner_backend_status(inconsistent_backend),
         "available backend requires certified exact identities",
+    )
+    tampered_snapshot = copy.deepcopy(snapshot.canonical_dict())
+    tampered_snapshot["backend_status"]["engine_identity_digest"] = "f" * 64
+    expect_rejected(
+        lambda: parse_isolated_runner_backend_snapshot(tampered_snapshot),
+        "snapshot digest binds engine, image, conformance, harness, and policy",
+    )
+    leaked_snapshot = copy.deepcopy(snapshot.canonical_dict())
+    leaked_snapshot["endpoint"] = "PRIVATE_PATH_SENTINEL"
+    expect_rejected(
+        lambda: parse_isolated_runner_backend_snapshot(leaked_snapshot),
+        "snapshot rejects endpoint, path, and environment expansion",
+    )
+    noncanonical_snapshot = copy.deepcopy(snapshot.canonical_dict())
+    noncanonical_snapshot["observed_at"] = "2026-08-02T16:00:00+08:00"
+    expect_rejected(
+        lambda: parse_isolated_runner_backend_snapshot(noncanonical_snapshot),
+        "snapshot requires canonical observed_at UTC",
     )
     tampered_report = copy.deepcopy(report.canonical_dict())
     tampered_report["binding_digest"] = "f" * 64

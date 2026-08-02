@@ -227,7 +227,39 @@ class ActiveRuntimeLoop:
     def _event_inbox_tick(self) -> dict[str, Any]:
         if self.event_consumer is None:
             return {"status": "not_configured"}
-        return self.event_consumer(limit=100)
+        result = self.event_consumer(limit=100)
+        output = dict(result) if isinstance(result, dict) else {
+            "status": "success",
+            "result": result,
+        }
+        # The main runtime already supplies AwarenessLoop.process_event_inbox as
+        # a bound method. Discover its observational maintenance hook without a
+        # new constructor dependency, and keep any failure outside the Active
+        # Loop and foreground route status.
+        maintenance: dict[str, Any] = {"status": "not_configured"}
+        try:
+            owner = getattr(self.event_consumer, "__self__", None)
+            event_awareness = getattr(owner, "event_awareness", None)
+            reconcile = getattr(
+                event_awareness,
+                "reconcile_general_situations",
+                None,
+            )
+            if callable(reconcile):
+                candidate = reconcile(limit=100)
+                maintenance = (
+                    candidate
+                    if isinstance(candidate, dict)
+                    else {"status": "success"}
+                )
+        except Exception as exc:
+            maintenance = {
+                "status": "degraded",
+                "error_type": type(exc).__name__,
+                "route_change_allowed": False,
+            }
+        output["general_situation_maintenance"] = maintenance
+        return output
 
     def _project_guardian_tick(self) -> dict[str, Any]:
         if self.project_guardian is None:

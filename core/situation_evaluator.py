@@ -11,6 +11,10 @@ from uuid import uuid4
 
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent
+from interface.general_situation_contract import (
+    ANCHOR_KINDS,
+    StructuredAnchor,
+)
 
 
 class SituationAccessError(PermissionError):
@@ -60,6 +64,24 @@ class SituationEvaluator:
         "llm",
         "model",
         "model_assist",
+    }
+    _STRUCTURED_ANCHOR_DIRECT_FIELDS = {
+        "goal_id": "goal",
+        "commitment_id": "commitment",
+        "case_id": "case",
+        "task_id": "task",
+        "trace_id": "trace",
+        "entity_id": "entity",
+        "workspace_id": "workspace",
+    }
+    _STRUCTURED_ANCHOR_COLLECTION_FIELDS = {
+        "goal_refs": "goal",
+        "commitment_refs": "commitment",
+        "case_refs": "case",
+        "task_refs": "task",
+        "trace_refs": "trace",
+        "entity_refs": "entity",
+        "workspace_refs": "workspace",
     }
 
     def __init__(
@@ -191,6 +213,14 @@ class SituationEvaluator:
             normalized_commitments,
             self._normalize_refs(commitment_refs),
         )
+        structured_anchor_refs = self._structured_anchor_refs(
+            event=event,
+            payload=payload,
+            correlation_id=correlation,
+            source_event_id=source["event_id"],
+            goal_refs=normalized_goals,
+            commitment_refs=normalized_commitments,
+        )
         normalized_evidence = self._merge_refs(
             self._normalize_refs(getattr(event, "evidence_refs", None), evidence=True),
             self._refs_from_payload(
@@ -266,6 +296,7 @@ class SituationEvaluator:
             "source_event_type": source["type"],
             "goal_refs": normalized_goals,
             "commitment_refs": normalized_commitments,
+            "structured_anchor_refs": structured_anchor_refs,
             "evidence_refs": normalized_evidence,
             "salience_components": normalized_salience["components"],
             "salience_score": normalized_salience["score"],
@@ -396,6 +427,7 @@ class SituationEvaluator:
                     "source_event": source,
                     "goal_refs": normalized_goals,
                     "commitment_refs": normalized_commitments,
+                    "structured_anchor_refs": structured_anchor_refs,
                     "evidence_refs": normalized_evidence,
                     "salience_components": normalized_salience["components"],
                     "salience_score": normalized_salience["score"],
@@ -934,6 +966,11 @@ class SituationEvaluator:
             merged["observation_sequence"] = incoming["observation_sequence"]
         if "observation_id" in incoming:
             merged["observation_id"] = incoming["observation_id"]
+        merged["structured_anchor_refs"] = self._merge_structured_anchor_refs(
+            merged.get("structured_anchor_refs"),
+            incoming["structured_anchor_refs"],
+            replace=sequence_aware,
+        )
         for key in ("goal_refs", "commitment_refs", "evidence_refs"):
             merged[key] = (
                 copy.deepcopy(incoming[key])
@@ -1416,6 +1453,127 @@ class SituationEvaluator:
             "recorded_at": self._now_iso(),
         }
 
+    def _structured_anchor_refs(
+        self,
+        *,
+        event: VeyraEvent,
+        payload: dict[str, Any],
+        correlation_id: str,
+        source_event_id: str,
+        goal_refs: list[dict[str, Any]],
+        commitment_refs: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        """Persist only explicit typed identifiers used for deterministic grouping."""
+
+        anchors: dict[str, StructuredAnchor] = {}
+
+        def add(kind: str, value: Any) -> None:
+            ref_id: Any = value
+            if isinstance(value, dict):
+                ref_id = (
+                    value.get("ref_id")
+                    or value.get("id")
+                    or value.get(f"{kind}_id")
+                    or value.get("value")
+                )
+            anchor = StructuredAnchor(kind, str(ref_id or ""))
+            anchors[anchor.key] = anchor
+
+        for item in goal_refs:
+            add("goal", item)
+        for item in commitment_refs:
+            add("commitment", item)
+
+        subjects = (
+            event.subject
+            if isinstance(event.subject, list)
+            else [event.subject]
+        )
+        for item in subjects:
+            if not isinstance(item, dict):
+                continue
+            kind = str(
+                item.get("kind")
+                or item.get("type")
+                or item.get("subject_type")
+                or ""
+            ).strip().lower().removesuffix("_ref").removesuffix(
+                "_reference"
+            )
+            if kind not in ANCHOR_KINDS:
+                continue
+            add(kind, item)
+
+        for field, kind in self._STRUCTURED_ANCHOR_DIRECT_FIELDS.items():
+            if field in payload and payload.get(field) is not None:
+                add(kind, payload.get(field))
+        for field, kind in self._STRUCTURED_ANCHOR_COLLECTION_FIELDS.items():
+            if field not in payload:
+                continue
+            raw = payload.get(field)
+            values = raw if isinstance(raw, list) else [raw]
+            for item in values:
+                if item is not None:
+                    add(kind, item)
+
+        if correlation_id and correlation_id != source_event_id:
+            add("trace", correlation_id)
+
+        if sum(anchor.kind == "workspace" for anchor in anchors.values()) > 1:
+            raise ValueError("one event cannot bind multiple workspaces")
+        return [anchors[key].to_dict() for key in sorted(anchors)]
+
+    @staticmethod
+    def _normalized_structured_anchor_refs(
+        value: Any,
+    ) -> list[dict[str, str]]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("structured_anchor_refs must be a list")
+        anchors: dict[str, StructuredAnchor] = {}
+        for item in value:
+            anchor = StructuredAnchor.from_dict(item)
+            anchors[anchor.key] = anchor
+        if sum(anchor.kind == "workspace" for anchor in anchors.values()) > 1:
+            raise ValueError("one situation cannot bind multiple workspaces")
+        return [anchors[key].to_dict() for key in sorted(anchors)]
+
+    def _merge_structured_anchor_refs(
+        self,
+        existing: Any,
+        incoming: Any,
+        *,
+        replace: bool,
+    ) -> list[dict[str, str]]:
+        current = self._normalized_structured_anchor_refs(existing)
+        selected = self._normalized_structured_anchor_refs(incoming)
+        current_workspace = next(
+            (
+                item["ref_id"]
+                for item in current
+                if item["kind"] == "workspace"
+            ),
+            None,
+        )
+        incoming_workspace = next(
+            (
+                item["ref_id"]
+                for item in selected
+                if item["kind"] == "workspace"
+            ),
+            None,
+        )
+        if current_workspace is not None and (
+            incoming_workspace != current_workspace
+        ):
+            raise SituationAccessError(
+                "situation belongs to a different workspace"
+            )
+        if replace:
+            return copy.deepcopy(selected)
+        return self._normalized_structured_anchor_refs([*current, *selected])
+
     def _normalize_refs(
         self,
         refs: Iterable[Any] | Any | None,
@@ -1737,6 +1895,7 @@ class SituationEvaluator:
                 "source_event_type",
                 "goal_refs",
                 "commitment_refs",
+                "structured_anchor_refs",
                 "evidence_refs",
                 "salience_components",
                 "salience_score",

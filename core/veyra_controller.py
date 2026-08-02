@@ -374,7 +374,24 @@ class VeyraController:
 
         if decision.route == Route.PROBE:
             probe_capability = self.capabilities.capability_for_probe(decision.selected_probe)
-            if preferred != Route.PROBE.value or (probe_capability and probe_capability not in allowed_capabilities):
+            signals = set(decision.signals or [])
+            veyra_freshness_probe = bool(
+                decision.selected_probe
+                and decision.needs_probe
+                and decision.freshness_required
+                and "policy:required_probe_preserved" in signals
+                and "policy:semantic_cannot_weaken_required_probe" in signals
+                and isinstance(decision.capability_request, dict)
+                and str(decision.capability_request.get("probe") or "")
+                == str(decision.selected_probe or "")
+            )
+            if not veyra_freshness_probe and (
+                preferred != Route.PROBE.value
+                or (
+                    probe_capability
+                    and probe_capability not in allowed_capabilities
+                )
+            ):
                 adjusted = replace(
                     decision,
                     route=Route.DIRECT_ANSWER,
@@ -385,6 +402,16 @@ class VeyraController:
                     signals=list(dict.fromkeys(decision.signals + ["controller:semantic_probe_denied"])),
                 )
                 return adjusted, "semantic policy denied the selected probe"
+            if veyra_freshness_probe:
+                decision = replace(
+                    decision,
+                    signals=list(
+                        dict.fromkeys(
+                            decision.signals
+                            + ["controller:veyra_freshness_probe_preserved"]
+                        )
+                    ),
+                )
 
         if decision.needs_agent and not agent_allowed:
             return (

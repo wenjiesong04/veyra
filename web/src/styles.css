@@ -1053,6 +1053,325 @@ code {
   background: #fbfcfb;
 }
 
+.ownerScopePanel,
+.suggestionPanel,
+.phase6LifecyclePanel {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.ownerScopeGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.ownerScopeGrid label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ownerScopeGrid label > span {
+  color: #68727d;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.ownerScopeGrid input {
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  border: 1px solid #ccd4d2;
+  border-radius: 8px;
+  padding: 0 10px;
+  color: #1f2630;
+  background: #fbfcfb;
+}
+
+.ownerScopeGrid input:focus {
+  outline: 2px solid #8da8a2;
+  outline-offset: 1px;
+}
+
+.scopeBoundary,
+.authorityNotice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border: 1px solid #cfe0dc;
+  border-radius: 8px;
+  padding: 9px 10px;
+  color: #31534f;
+  background: #f1f8f6;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.scopeBoundary svg,
+.authorityNotice svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.situationSummary,
+.suggestionSummary {
+  display: grid;
+  gap: 8px;
+  padding: 14px 14px 0;
+}
+
+.situationSummary {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.suggestionSummary {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  padding: 0;
+}
+
+.situationSummary .metric,
+.suggestionSummary .metric {
+  min-height: 66px;
+  box-shadow: none;
+}
+
+.situationList,
+.suggestionList,
+.phase6StageList {
+  display: grid;
+  gap: 8px;
+}
+
+.situationList {
+  max-height: 520px;
+  overflow: auto;
+  padding: 10px 14px 14px;
+}
+
+.suggestionList {
+  max-height: 520px;
+  overflow: auto;
+}
+
+.situationCard,
+.suggestionCard {
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+  border: 1px solid #e3e7e3;
+  border-radius: 8px;
+  padding: 10px;
+  background: #fbfcfb;
+}
+
+.situationTopline,
+.suggestionTopline,
+.phase6StageTopline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.situationTopline code,
+.suggestionTopline code {
+  min-width: 0;
+  color: #65707d;
+  font-size: 11px;
+}
+
+.situationFacts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.situationFacts > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border-radius: 7px;
+  padding: 8px;
+  background: #ffffff;
+}
+
+.situationFacts span,
+.evidenceRefs > span {
+  color: #68727d;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.situationFacts strong {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.evidenceRefs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.evidenceRefs code {
+  border-radius: 6px;
+  padding: 3px 6px;
+  color: #46545f;
+  background: #edf2f0;
+  font-size: 10px;
+}
+
+.boundaryLine {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: #68727d;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.modeLegend {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid #d8dedb;
+  border-radius: 8px;
+  background: #f4f7f5;
+}
+
+.modeLegend button {
+  min-width: 0;
+  min-height: 32px;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 6px;
+  color: #455260;
+  background: transparent;
+  font-size: 11px;
+  font-weight: 800;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.modeLegend button.active {
+  color: #ffffff;
+  background: #245c56;
+}
+
+.modeLegend button:disabled:not(.active) {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.authorityNotice > div {
+  display: grid;
+  gap: 3px;
+}
+
+.authorityNotice span {
+  color: #55706c;
+}
+
+.whyNowList {
+  display: grid;
+  gap: 6px;
+}
+
+.whyNowList > div {
+  display: grid;
+  gap: 3px;
+  border-left: 2px solid #8fbab2;
+  padding: 5px 7px;
+  background: #ffffff;
+}
+
+.whyNowList strong {
+  color: #33414c;
+  font-size: 11px;
+}
+
+.whyNowList span {
+  color: #68727d;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.suggestionActions {
+  padding: 0;
+}
+
+.suggestionEmpty {
+  padding: 0 4px;
+}
+
+.authorityProjection {
+  justify-content: flex-start;
+  border-top: 1px solid #e3e7e3;
+  padding-top: 8px;
+}
+
+.phase6Boundary {
+  color: #445565;
+  border-color: #d7dfe4;
+  background: #f5f8fa;
+}
+
+.phase6Stage {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  border: 1px solid #e3e7e3;
+  border-radius: 8px;
+  padding: 10px;
+  background: #fbfcfb;
+}
+
+.phase6StageIndex {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  color: #ffffff;
+  background: #38605c;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.phase6StageBody {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.phase6StageBody > span {
+  color: #485561;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.phase6StageBody > small {
+  color: #75808a;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.phase6StageTopline code {
+  color: #68727d;
+  font-size: 11px;
+}
+
 @media (max-width: 1100px) {
   .overviewGrid,
   .logGrid,
@@ -1062,10 +1381,11 @@ code {
   .personaGrid,
   .stateDefinitionGrid,
   .readinessGrid,
-  .traceSummary,
-  .isolationSummary,
-  .isolationStatusRows,
-  .authorityGrid {
+    .traceSummary,
+    .isolationSummary,
+    .isolationStatusRows,
+    .authorityGrid,
+    .suggestionSummary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -1097,7 +1417,18 @@ code {
 
   .overviewGrid,
   .logGrid,
-  .operationsGrid {
+  .operationsGrid,
+  .ownerScopeGrid,
+  .situationSummary,
+  .suggestionSummary {
+    grid-template-columns: 1fr;
+  }
+
+  .modeLegend {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .situationFacts {
     grid-template-columns: 1fr;
   }
 

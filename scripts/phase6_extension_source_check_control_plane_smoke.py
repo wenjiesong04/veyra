@@ -1015,12 +1015,10 @@ def real_main_assembly() -> None:
             "(source_paths, expected)\n"
             "assert '/phase6/extensions/source-checks/"
             "{check_id}/isolated-run' in paths, paths\n"
-            f"for action in {FORBIDDEN_ACTIONS!r}:\n"
-            "    assert all("
-            "path.rsplit('/', 1)[-1] != action "
-            "for path in paths "
-            "if path.startswith('/phase6/extensions')), "
-            "(action, paths)\n"
+            "assert '/phase6/extensions/generations/status' in paths, paths\n"
+            "assert '/phase6/extensions/dynamic-validations/status' in paths, paths\n"
+            "assert '/phase6/extensions/signed-releases/status' in paths, paths\n"
+            "assert '/phase6/extensions/deployments/status' in paths, paths\n"
             "public = client.get('/state')\n"
             "assert public.status_code == 200, public.text\n"
             "assert 'phase6_extension_source_check_state' "
@@ -1044,8 +1042,8 @@ def real_main_assembly() -> None:
         expect(
             assembly.returncode == 0,
             (
-                "real main preserves five source-check routes, adds only "
-                "the fixed isolated-run admission, and no future endpoint"
+                "real main preserves the bounded source-check routes while "
+                "later Phase 6 stages remain separate control planes"
             ),
             {
                 "stdout": assembly.stdout[-2_000:],

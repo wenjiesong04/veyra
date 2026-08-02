@@ -750,14 +750,8 @@ class CognitionPipeline:
         return understanding.is_strategic_discussion()
 
     def _explicitly_asks_execution_or_runtime(self, text: str, understanding: TurnUnderstanding) -> bool:
-        if understanding.intent == "implementation" or understanding.task_type in {"workspace_task", "code_task", "local_status"}:
-            return True
-        if understanding.needs_fresh_evidence and understanding.evidence_kind in {"runtime", "local", "file", "attachment"}:
-            return True
-        lowered = (text or "").lower()
-        return any(marker in text for marker in ("改代码", "修改代码", "实现", "调试", "运行状态", "日志", "端口", "进程")) or any(
-            marker in lowered for marker in ("implement", "debug", "runtime status", "log", "port", "process")
-        )
+        del text
+        return understanding.requests_governed_effect_or_runtime()
 
     def _is_meta_cognition_question(self, text: str) -> bool:
         lowered = (text or "").lower()

@@ -261,7 +261,12 @@ def _run_cases(
             session_id=f"smoke-{case['id']}",
             metadata=case.get("metadata") or {},
         )
-        attention_focus = loop.attention.focus_for_text(case["message"])
+        attention_focus = loop.attention.focus_for_text(
+            case["message"],
+            user_id=event.source.user_id,
+            session_id=event.source.session_id,
+            event=event,
+        )
         rule_decision = loop.decision_core._rule_decide(case["message"], attention_focus, event=event).to_dict()
         turn_context = loop.core_reasoning.turn_context.build(
             user_message=case["message"],

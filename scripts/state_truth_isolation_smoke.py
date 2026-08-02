@@ -10,6 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.awareness_loop import AwarenessLoop
+from awareness.attention_core import AttentionCore
 from core.commitment_core import CommitmentCore
 from core.definitions import RiskLevel
 from core.world_state import WorldStateStore
@@ -142,6 +143,7 @@ def main() -> int:
 
         loop = AwarenessLoop.__new__(AwarenessLoop)
         loop.state_store = store
+        loop.attention = AttentionCore(store)
         loop.commitment_core = CommitmentCore(store)
         user_a = event_for("user-a", "session-a")
         user_b = event_for("user-b", "session-b")

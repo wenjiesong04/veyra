@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import {
   Activity,
   AlertTriangle,
+  Bell,
   Bot,
   Brain,
   BookOpen,
@@ -26,6 +27,7 @@ import {
   ThumbsDown,
   ThumbsUp,
   TerminalSquare,
+  UserRound,
   XCircle
 } from "lucide-react";
 import { fetchJson, isDesktopRuntime, desktopApiBase } from "./api";
@@ -91,9 +93,69 @@ type Definitions = {
   operational_modes: string[];
 };
 
+type OwnerScope = {
+  userId: string;
+  sessionId: string;
+};
+
+type ScopedCollection = {
+  status?: JsonValue;
+  count?: JsonValue;
+  items?: JsonValue;
+  state_revision?: JsonValue;
+  policy?: JsonValue;
+  authority?: JsonValue;
+};
+
+type Phase6StageStatus = {
+  id: string;
+  label: string;
+  access: "public_status" | "private_control";
+  phase: string;
+  health: string;
+  status: string;
+  scope: string;
+};
+
 type WorkbenchSection = "awareness" | "governance" | "runtime" | "ops" | "audit" | "logs";
 
 const initialMessage = "帮我看 18789 端口有没有被占用";
+const defaultOwnerScope: OwnerScope = {
+  userId: "console-user",
+  sessionId: "console-session"
+};
+const ownerScopeStorageKey = "veyra.console.owner-scope.v1";
+
+function readOwnerScope(): OwnerScope {
+  if (typeof window === "undefined") return defaultOwnerScope;
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(ownerScopeStorageKey) ?? "{}") as Partial<OwnerScope>;
+    const userId = String(stored.userId ?? "").trim();
+    const sessionId = String(stored.sessionId ?? "").trim();
+    if (userId && sessionId) return { userId, sessionId };
+  } catch {
+    // Keep deterministic, non-secret Console defaults if local preferences are invalid.
+  }
+  return defaultOwnerScope;
+}
+
+function ownerQuery(scope: OwnerScope): string {
+  return `user_id=${encodeURIComponent(scope.userId)}&session_id=${encodeURIComponent(scope.sessionId)}`;
+}
+
+function jsonItems(value: JsonValue | undefined): Array<Record<string, JsonValue>> {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (item): item is Record<string, JsonValue> => Boolean(item) && typeof item === "object" && !Array.isArray(item)
+  );
+}
+
+function phase6StatusValue(payload: Record<string, JsonValue>, key: "phase" | "status" | "health"): string {
+  if (key === "health") {
+    return String(payload.operational_health ?? payload.availability ?? payload.status ?? "unknown");
+  }
+  return String(payload[key] ?? "unknown");
+}
 
 const workbenchSections: Array<{ id: WorkbenchSection; label: string; icon: React.ReactNode }> = [
   { id: "awareness", label: "Awareness", icon: <Gauge size={15} /> },
@@ -260,6 +322,16 @@ function App() {
   const [rollbackDiff, setRollbackDiff] = useState<Record<string, JsonValue> | null>(null);
   const [isolatedRunnerStatus, setIsolatedRunnerStatus] = useState<Record<string, JsonValue> | null>(null);
   const [isolatedRunnerStatusError, setIsolatedRunnerStatusError] = useState<string | null>(null);
+  const [ownerScope, setOwnerScope] = useState<OwnerScope>(() => readOwnerScope());
+  const [ownerUserDraft, setOwnerUserDraft] = useState(() => readOwnerScope().userId);
+  const [ownerSessionDraft, setOwnerSessionDraft] = useState(() => readOwnerScope().sessionId);
+  const [scopedAttention, setScopedAttention] = useState<Record<string, JsonValue> | null>(null);
+  const [generalSituations, setGeneralSituations] = useState<ScopedCollection>({});
+  const [suggestionStatus, setSuggestionStatus] = useState<Record<string, JsonValue> | null>(null);
+  const [suggestionInbox, setSuggestionInbox] = useState<ScopedCollection>({});
+  const [awarenessPanelError, setAwarenessPanelError] = useState<string | null>(null);
+  const [phase6Stages, setPhase6Stages] = useState<Phase6StageStatus[]>([]);
+  const [phase6StatusUpdatedAt, setPhase6StatusUpdatedAt] = useState<string | null>(null);
   const [message, setMessage] = useState(initialMessage);
   const [snapshotPath, setSnapshotPath] = useState("README.md");
   const [agentBaseUrl, setAgentBaseUrl] = useState("");
@@ -288,6 +360,143 @@ function App() {
     }
   };
 
+  const refreshScopedAwareness = async (scope: OwnerScope = ownerScope) => {
+    const query = ownerQuery(scope);
+    const results = await Promise.allSettled([
+      fetchJson<Record<string, JsonValue>>(`/attention/active?${query}`),
+      fetchJson<ScopedCollection>(`/awareness/general-situations?${query}&limit=50`),
+      fetchJson<Record<string, JsonValue>>("/awareness/suggestions/status"),
+      fetchJson<ScopedCollection>(`/awareness/suggestions/inbox?${query}&limit=50`)
+    ]);
+    const [attentionResult, situationResult, suggestionStatusResult, inboxResult] = results;
+    setScopedAttention(attentionResult.status === "fulfilled" ? attentionResult.value : null);
+    setGeneralSituations(situationResult.status === "fulfilled" ? situationResult.value : {});
+    setSuggestionStatus(suggestionStatusResult.status === "fulfilled" ? suggestionStatusResult.value : null);
+    setSuggestionInbox(inboxResult.status === "fulfilled" ? inboxResult.value : {});
+    const unavailable = [
+      attentionResult.status === "rejected" ? "attention" : null,
+      situationResult.status === "rejected" ? "general situations" : null,
+      suggestionStatusResult.status === "rejected" ? "suggestion status" : null,
+      inboxResult.status === "rejected" ? "suggestion inbox" : null
+    ].filter(Boolean);
+    setAwarenessPanelError(
+      unavailable.length ? `${unavailable.join(", ")} unavailable for this exact owner/session scope` : null
+    );
+  };
+
+  const refreshPhase6Overview = async () => {
+    const probes = [
+      {
+        id: "spec",
+        label: "Spec quarantine",
+        endpoint: "/phase6/extensions/status",
+        fallbackPhase: "6.2a",
+        fallbackScope: "source-free specification quarantine"
+      },
+      {
+        id: "generation",
+        label: "Bounded generation",
+        endpoint: "/phase6/extensions/generations/status",
+        fallbackPhase: "6.2e",
+        fallbackScope: "model output to private artifact quarantine"
+      },
+      {
+        id: "artifact",
+        label: "Artifact quarantine",
+        endpoint: "/phase6/extensions/artifacts/status",
+        fallbackPhase: "6.2b",
+        fallbackScope: "bounded private source artifact quarantine"
+      },
+      {
+        id: "source_check",
+        label: "Static source gate",
+        endpoint: "/phase6/extensions/source-checks/status",
+        fallbackPhase: "6.2c",
+        fallbackScope: "non-executing source policy check"
+      },
+      {
+        id: "isolated_runner",
+        label: "Isolated runner probe",
+        endpoint: "/phase6/extensions/isolated-runs/status",
+        fallbackPhase: "6.2d",
+        fallbackScope: "trusted containment prerequisite probe"
+      },
+      {
+        id: "dynamic_validation",
+        label: "Dynamic validation",
+        endpoint: "/phase6/extensions/dynamic-validations/status",
+        fallbackPhase: "6.2e",
+        fallbackScope: "fixed isolated unit, contract, security, fuzz and behavior validation"
+      }
+    ];
+    const visibleStages = await Promise.all(
+      probes.map(async (probe): Promise<Phase6StageStatus> => {
+        try {
+          const payload = await fetchJson<Record<string, JsonValue>>(probe.endpoint);
+          return {
+            id: probe.id,
+            label: probe.label,
+            access: "public_status",
+            phase: phase6StatusValue(payload, "phase") === "unknown" ? probe.fallbackPhase : phase6StatusValue(payload, "phase"),
+            health: phase6StatusValue(payload, "health"),
+            status: phase6StatusValue(payload, "status"),
+            scope: String(payload.completion_scope ?? probe.fallbackScope)
+          };
+        } catch {
+          return {
+            id: probe.id,
+            label: probe.label,
+            access: "public_status",
+            phase: probe.fallbackPhase,
+            health: "unavailable",
+            status: "status_endpoint_unavailable",
+            scope: probe.fallbackScope
+          };
+        }
+      })
+    );
+    const privateStages: Phase6StageStatus[] = [
+      {
+        id: "capability_gap",
+        label: "Capability-gap registry",
+        access: "private_control",
+        phase: "6.2h",
+        health: "protected",
+        status: "operator_auth_required",
+        scope: "owner/session records are available only to authenticated control-plane clients"
+      },
+      {
+        id: "signed_release",
+        label: "Signed release registry",
+        access: "private_control",
+        phase: "6.2f",
+        health: "protected",
+        status: "operator_auth_required",
+        scope: "signing identity and private release records are not exposed to the browser"
+      },
+      {
+        id: "deployment",
+        label: "Canary & promotion",
+        access: "private_control",
+        phase: "6.2g",
+        health: "protected",
+        status: "operator_auth_required",
+        scope: "transitions remain review-bound and executable only in the trusted isolated runner"
+      },
+      {
+        id: "governed_pipeline",
+        label: "Governed extension pipeline",
+        access: "private_control",
+        phase: "6.2i",
+        health: "protected",
+        status: "operator_auth_required",
+        scope: "explicit start/resume composes every gate but cannot approve scoped canary or promotion"
+      }
+    ];
+    setPhase6Stages([privateStages[0], ...visibleStages, ...privateStages.slice(1)]);
+    setPhase6StatusUpdatedAt(new Date().toISOString());
+  };
+
   const refreshExtensionIsolation = async () => {
     try {
       const status = await fetchJson<Record<string, JsonValue>>("/phase6/extensions/isolated-runs/status");
@@ -299,10 +508,13 @@ function App() {
     }
   };
 
-  const refresh = async () => {
+  const refresh = async (scope: OwnerScope = ownerScope) => {
     // Phase 6 is an additive, fail-closed surface. Its absence must not make the
     // established Console refresh fail or mask the rest of Veyra's state.
     void refreshExtensionIsolation();
+    void refreshPhase6Overview();
+    void refreshScopedAwareness(scope);
+    const scopeQuery = ownerQuery(scope);
     const [
       runtimeData,
       stateData,
@@ -354,13 +566,13 @@ function App() {
       fetchJson<Record<string, JsonValue>>("/tool-proxy/status"),
       fetchJson<LogResponse>("/logs/execution?limit=20"),
       fetchJson<LogResponse>(
-        "/logs/memory?limit=20&user_id=console-user&session_id=console-session"
+        `/logs/memory?limit=20&${scopeQuery}`
       ),
       fetchJson<Record<string, JsonValue>>(
-        "/memory/summary?provider=local&user_id=console-user&session_id=console-session"
+        `/memory/summary?provider=local&${scopeQuery}`
       ),
       fetchJson<Record<string, JsonValue>>(
-        "/memory/providers/diagnostics?provider=all&user_id=console-user&session_id=console-session"
+        `/memory/providers/diagnostics?provider=all&${scopeQuery}`
       ),
       fetchJson<LogResponse>("/logs/core-model?limit=20"),
       fetchJson<LogResponse>("/logs/alerts?limit=20"),
@@ -508,6 +720,84 @@ function App() {
     }
   };
 
+  const applyOwnerScope = async () => {
+    const nextScope = {
+      userId: ownerUserDraft.trim(),
+      sessionId: ownerSessionDraft.trim()
+    };
+    if (!nextScope.userId || !nextScope.sessionId) {
+      setError("Owner and session are both required; Veyra will not fall back to an unscoped read.");
+      return;
+    }
+    if (nextScope.userId.length > 240 || nextScope.sessionId.length > 240) {
+      setError("Owner and session identifiers must be 240 characters or fewer.");
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      setOwnerScope(nextScope);
+      window.localStorage.setItem(ownerScopeStorageKey, JSON.stringify(nextScope));
+      await refresh(nextScope);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unable to load the selected owner scope");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const configureSuggestionMode = async (mode: string) => {
+    const revision = Number(suggestionStatus?.ops_config_revision);
+    if (!Number.isInteger(revision) || revision < 0) {
+      setError("Suggestion configuration revision is unavailable; refresh before changing mode.");
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      await fetchJson<Record<string, JsonValue>>("/awareness/suggestions/config", {
+        method: "POST",
+        body: JSON.stringify({ mode, expected_state_revision: revision })
+      });
+      await refreshScopedAwareness(ownerScope);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unable to update suggestion mode");
+      await refreshScopedAwareness(ownerScope);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const respondToSuggestion = async (proposalId: string, action: "ack" | "dismiss") => {
+    const revision = Number(suggestionInbox.state_revision);
+    if (!proposalId || !Number.isInteger(revision) || revision < 0) {
+      setError("Suggestion inbox revision is unavailable; refresh before responding.");
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      await fetchJson<Record<string, JsonValue>>(
+        `/awareness/suggestions/${encodeURIComponent(proposalId)}/${action}`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            user_id: ownerScope.userId,
+            session_id: ownerScope.sessionId,
+            expected_state_revision: revision,
+            reason: `console_${action}`
+          })
+        }
+      );
+      await refreshScopedAwareness(ownerScope);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : `Unable to ${action} suggestion`);
+      await refreshScopedAwareness(ownerScope);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const submit = async () => {
     setLoading(true);
     setError(null);
@@ -518,8 +808,8 @@ function App() {
         body: JSON.stringify({
           text: message,
           channel: "console",
-          user_id: "console-user",
-          session_id: "console-session"
+          user_id: ownerScope.userId,
+          session_id: ownerScope.sessionId
         })
       });
       setResult(response);
@@ -697,8 +987,8 @@ function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          user_id: "console-user",
-          session_id: "console-session",
+          user_id: ownerScope.userId,
+          session_id: ownerScope.sessionId,
           target: watchTarget,
           reason: "console_watch",
           enabled: true
@@ -813,8 +1103,8 @@ function App() {
         method: "POST",
         body: JSON.stringify({
           provider: "all",
-          user_id: "console-user",
-          session_id: "console-session",
+          user_id: ownerScope.userId,
+          session_id: ownerScope.sessionId,
           write_probe: false
         })
       });
@@ -859,7 +1149,15 @@ function App() {
   };
 
   const latestClaims = useMemo(() => state?.belief_state.claims?.slice(-5).reverse() ?? [], [state]);
-  const focus = state?.attention_state.focus ?? [];
+  const focus = Array.isArray(scopedAttention?.focus) ? scopedAttention.focus.map(String) : [];
+  const situationItems = jsonItems(generalSituations.items);
+  const suggestionItems = jsonItems(suggestionInbox.items);
+  const suggestionMode = String(suggestionStatus?.mode ?? "unavailable");
+  const allowedSuggestionModes = Array.isArray(suggestionStatus?.allowed_modes)
+    ? suggestionStatus.allowed_modes.map(String)
+    : ["disabled", "record_only", "shadow", "advise_only"];
+  const suggestionAuthority = asRecord(suggestionStatus?.authority);
+  const scopeChanged = ownerScope.userId !== ownerUserDraft.trim() || ownerScope.sessionId !== ownerSessionDraft.trim();
   const currentRisk = String(state?.risk_state.current_risk ?? "R0");
   const connected = agentStatus?.connected === true ? "connected" : String(agentStatus?.status ?? "unconfigured");
   const snapshots = Array.isArray(state?.rollback_state?.snapshots) ? (state.rollback_state.snapshots as Array<Record<string, JsonValue>>) : [];
@@ -1068,6 +1366,57 @@ function App() {
         </Section>
       </section>
 
+      <section className={`logGrid single workbenchPane ${activeSection === "awareness" ? "active" : ""}`}>
+        <Section
+          title="Owner / Session Scope"
+          icon={<UserRound size={18} />}
+          action={<StatusPill value={scopeChanged ? "draft" : "exact_scope"} />}
+        >
+          <div className="ownerScopePanel">
+            <div className="ownerScopeGrid">
+              <label>
+                <span>Owner</span>
+                <input
+                  value={ownerUserDraft}
+                  onChange={(event) => setOwnerUserDraft(event.target.value)}
+                  aria-label="Console owner ID"
+                  autoComplete="off"
+                />
+              </label>
+              <label>
+                <span>Session</span>
+                <input
+                  value={ownerSessionDraft}
+                  onChange={(event) => setOwnerSessionDraft(event.target.value)}
+                  aria-label="Console session ID"
+                  autoComplete="off"
+                />
+              </label>
+              <button
+                className="primaryButton"
+                onClick={applyOwnerScope}
+                disabled={loading || !scopeChanged || !ownerUserDraft.trim() || !ownerSessionDraft.trim()}
+              >
+                <RefreshCw size={15} />
+                Apply & refresh
+              </button>
+            </div>
+            <div className="scopeBoundary">
+              <Shield size={15} />
+              <span>
+                Attention, memory, General Situations and suggestions use this exact owner/session pair. The Console stores only these non-secret IDs locally and never falls back to an ownerless read.
+              </span>
+            </div>
+            {awarenessPanelError ? (
+              <div className="isolationNotice">
+                <AlertTriangle size={16} />
+                <span>{awarenessPanelError}</span>
+              </div>
+            ) : null}
+          </div>
+        </Section>
+      </section>
+
       <section className={`workspaceGrid workbenchPane ${activeSection === "awareness" ? "active" : ""}`}>
         <Section title="Core Model" icon={<Brain size={18} />}>
           <div className="configPanel">
@@ -1130,6 +1479,172 @@ function App() {
         </Section>
       </section>
 
+      <section className={`workspaceGrid proactiveGrid workbenchPane ${activeSection === "awareness" ? "active" : ""}`}>
+        <Section
+          title="General Situations"
+          icon={<Layers size={18} />}
+          action={<StatusPill value={String(generalSituations.status ?? "loading")} />}
+        >
+          <div className="situationSummary">
+            <Metric label="Aggregates" value={String(generalSituations.count ?? situationItems.length)} />
+            <Metric label="State revision" value={String(generalSituations.state_revision ?? "-")} />
+          </div>
+          <div className="situationList">
+            {situationItems.map((situation, index) => {
+              const childRefs = jsonItems(situation.child_refs);
+              const anchors = Array.isArray(situation.common_anchor_keys) ? situation.common_anchor_keys.map(String) : [];
+              return (
+                <article className="situationCard" key={String(situation.general_situation_id ?? index)}>
+                  <div className="situationTopline">
+                    <StatusPill value={String(situation.status ?? "unknown")} />
+                    <code>{String(situation.general_situation_id ?? "general situation")}</code>
+                  </div>
+                  <div className="situationFacts">
+                    <div><span>Anchor</span><strong>{String(situation.primary_anchor_key ?? anchors[0] ?? "-")}</strong></div>
+                    <div><span>Distinct events</span><strong>{String(situation.distinct_event_count ?? childRefs.length)}</strong></div>
+                    <div><span>Parent revision</span><strong>{String(situation.parent_revision ?? "-")}</strong></div>
+                    <div><span>Aggregation</span><strong>{String(situation.aggregation_scope ?? "exact_owner_session")}</strong></div>
+                  </div>
+                  <div className="evidenceRefs">
+                    <span>Immutable child evidence</span>
+                    {childRefs.map((ref, refIndex) => (
+                      <code key={`${String(ref.source_event_id ?? refIndex)}:${String(ref.observation_revision ?? "")}`}>
+                        {String(ref.source_event_id ?? "event")} · r{String(ref.observation_revision ?? "?")}
+                      </code>
+                    ))}
+                  </div>
+                  <div className="boundaryLine">
+                    <span>Causality asserted: {String(situation.causality_asserted === true)}</span>
+                    <span>Model merge: {String(situation.model_similarity_used_for_merge === true)}</span>
+                  </div>
+                </article>
+              );
+            })}
+            {!situationItems.length ? (
+              <div className="emptyState">
+                <Layers size={18} />
+                No multi-event aggregate exists for this exact owner/session yet.
+              </div>
+            ) : null}
+          </div>
+        </Section>
+
+        <Section
+          title="Proactive Suggestions"
+          icon={<Bell size={18} />}
+          action={<StatusPill value={suggestionMode} />}
+        >
+          <div className="suggestionPanel">
+            <div className="modeLegend" aria-label="Suggestion delivery modes">
+              {allowedSuggestionModes.map((mode) => (
+                <button
+                  type="button"
+                  key={mode}
+                  className={mode === suggestionMode ? "active" : ""}
+                  onClick={() => configureSuggestionMode(mode)}
+                  disabled={loading || mode === suggestionMode || suggestionStatus === null}
+                  title={
+                    mode === "record_only"
+                      ? "Persist eligible proposals without surfacing them"
+                      : mode === "shadow"
+                        ? "Record what would have been suggested without delivery"
+                        : mode === "advise_only"
+                          ? "Surface informational proposals only in this owner-scoped Console inbox"
+                          : "Do not create proposals"
+                  }
+                >
+                  {mode}
+                </button>
+              ))}
+            </div>
+            <div className="suggestionSummary">
+              <Metric label="Recorded proposals" value={String(suggestionStatus?.proposal_count ?? 0)} />
+              <Metric label="Inbox" value={String(suggestionInbox.count ?? suggestionItems.length)} />
+              <Metric label="Daily budget" value={String(asRecord(suggestionInbox.policy).daily_budget ?? 3)} />
+            </div>
+            <div className="authorityNotice">
+              <Shield size={16} />
+              <div>
+                <strong>Informational only</strong>
+                <span>
+                  No execution, tool, Agent, capability-grant or route-change authority. External and Feishu delivery remain disabled.
+                </span>
+              </div>
+            </div>
+            <div className="suggestionList">
+              {suggestionItems.map((proposal, index) => {
+                const whyNow = jsonItems(proposal.why_now);
+                const evidence = jsonItems(proposal.evidence);
+                const proposalId = String(proposal.proposal_id ?? "");
+                const proposalState = String(proposal.status ?? "unknown");
+                return (
+                  <article className="suggestionCard" key={proposalId || index}>
+                    <div className="suggestionTopline">
+                      <StatusPill value={proposalState} />
+                      <strong>Why now · score {String(proposal.score ?? "-")}</strong>
+                      <code>{proposalId || "proposal"}</code>
+                    </div>
+                    <div className="whyNowList">
+                      {whyNow.map((component, componentIndex) => (
+                        <div key={String(component.component ?? componentIndex)}>
+                          <strong>{String(component.component ?? "signal")}</strong>
+                          <span>
+                            value {String(component.value ?? "-")} · weight {String(component.weight ?? "-")} · {String(component.source ?? "structured evidence")}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="boundaryLine">
+                      <span>{evidence.length} immutable evidence reference(s)</span>
+                      <span>Execution allowed: false</span>
+                    </div>
+                    {proposalState === "pending" || proposalState === "acknowledged" ? (
+                      <div className="buttonRow compact suggestionActions">
+                        <button
+                          className="approveButton"
+                          onClick={() => respondToSuggestion(proposalId, "ack")}
+                          disabled={loading || proposalState === "acknowledged"}
+                        >
+                          <ThumbsUp size={15} />
+                          Acknowledge
+                        </button>
+                        <button
+                          className="rejectButton"
+                          onClick={() => respondToSuggestion(proposalId, "dismiss")}
+                          disabled={loading}
+                        >
+                          <ThumbsDown size={15} />
+                          Dismiss
+                        </button>
+                      </div>
+                    ) : null}
+                  </article>
+                );
+              })}
+              {!suggestionItems.length ? (
+                <div className="emptyState suggestionEmpty">
+                  <Bell size={18} />
+                  {suggestionMode === "record_only"
+                    ? "Record-only keeps eligible proposals in audit state; it does not place them in the Console inbox."
+                    : suggestionMode === "shadow"
+                      ? "Shadow records would-suggest decisions without delivery."
+                      : suggestionMode === "advise_only"
+                        ? "No pending owner-scoped suggestions right now."
+                        : "Suggestion generation is disabled."}
+                </div>
+              ) : null}
+            </div>
+            {Object.keys(suggestionAuthority).length ? (
+              <div className="boundaryLine authorityProjection">
+                {Object.entries(suggestionAuthority).map(([name, value]) => (
+                  <span key={name}>{name.replaceAll("_", " ")}: {String(value)}</span>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        </Section>
+      </section>
+
       <section className={`workspaceGrid workbenchPane ${activeSection === "awareness" ? "active" : ""}`}>
         <Section title="Message Console" icon={<TerminalSquare size={18} />}>
           <textarea
@@ -1177,12 +1692,66 @@ function App() {
               <strong>{focus.length ? focus.join(", ") : "none"}</strong>
             </div>
             <div>
+              <span>Attention scope</span>
+              <strong>{String(scopedAttention?.scope_status ?? "not_loaded")}</strong>
+            </div>
+            <div>
+              <span>Owner / session</span>
+              <strong>{ownerScope.userId} / {ownerScope.sessionId}</strong>
+            </div>
+            <div>
               <span>Current task</span>
               <strong>{String(state?.task_state.current_task ? "active" : "none")}</strong>
             </div>
             <div>
               <span>Executor</span>
               <strong>{String(state?.executor_state.selected_agent ?? "unknown")}</strong>
+            </div>
+          </div>
+        </Section>
+      </section>
+
+      <section className={`logGrid single workbenchPane ${activeSection === "governance" ? "active" : ""}`}>
+        <Section
+          title="Phase 6 Extension Lifecycle"
+          icon={<ListChecks size={18} />}
+          action={
+            <button className="ghostButton compactButton" onClick={refreshPhase6Overview} disabled={loading}>
+              <RefreshCw size={14} />
+              Refresh public status
+            </button>
+          }
+        >
+          <div className="phase6LifecyclePanel">
+            <div className="scopeBoundary phase6Boundary">
+              <Shield size={15} />
+              <span>
+                This Console is an observability surface. It reads public, zero-secret stage status only; private capability-gap, release and deployment state stays in the authenticated control plane. No control token is requested, stored or rendered in the browser.
+              </span>
+            </div>
+            <div className="phase6StageList">
+              {phase6Stages.map((stage, index) => (
+                <div className="phase6Stage" key={stage.id}>
+                  <div className="phase6StageIndex">{index + 1}</div>
+                  <div className="phase6StageBody">
+                    <div className="phase6StageTopline">
+                      <strong>{stage.label}</strong>
+                      <code>{stage.phase}</code>
+                      <StatusPill value={stage.health} />
+                      <StatusPill value={stage.access} />
+                    </div>
+                    <span>{stage.scope}</span>
+                    <small>{stage.status}</small>
+                  </div>
+                </div>
+              ))}
+              {!phase6Stages.length ? (
+                <div className="emptyState"><ListChecks size={18} />Phase 6 public status is loading.</div>
+              ) : null}
+            </div>
+            <div className="boundaryLine">
+              <span>Private transitions: explicit review + CAS + authenticated operator only</span>
+              <span>Last public refresh: {phase6StatusUpdatedAt ?? "not loaded"}</span>
             </div>
           </div>
         </Section>

@@ -7,6 +7,7 @@ from uuid import uuid4
 from core.proactive_intent import ProactiveIntent
 from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
+from runtime.capability_gap_registry import CapabilityGapRegistry
 
 
 class SelfImprovementProposalRegistry:
@@ -16,6 +17,9 @@ class SelfImprovementProposalRegistry:
 
     def __init__(self, state_store: WorldStateStore) -> None:
         self.state_store = state_store
+        self.capability_gaps = CapabilityGapRegistry(
+            state_store=state_store,
+        )
 
     def propose_from_intent(self, intent: ProactiveIntent, *, reason: str = "unknown_proactive_intent") -> dict[str, Any]:
         proposal_id = f"sip_{uuid4().hex[:12]}"
@@ -42,6 +46,36 @@ class SelfImprovementProposalRegistry:
             },
             "intent": intent.to_dict(),
         }
+        try:
+            gap = self.capability_gaps.record_from_proposal(
+                proposal=proposal,
+                intent=intent.to_dict(),
+                reason_code=reason,
+            )
+            proposal["capability_gap_linkage"] = {
+                "schema_version": "veyra.phase6.capability_gap_linkage.v1",
+                "status": "recorded",
+                "gap_id": gap.get("gap_id"),
+                "stage": gap.get("stage"),
+                "required_action": gap.get("required_action"),
+                "gap_existing": gap.get("gap_existing") is True,
+                "raw_user_text_present": False,
+                "automatic_advancement": False,
+                "authority_granted": False,
+            }
+        except Exception:
+            # Gap projection is an additive control-plane aid.  A damaged or
+            # unconfigured gap registry must not suppress the original
+            # self-improvement proposal, and private exception details must
+            # never be copied into the proposal/public response.
+            proposal["capability_gap_linkage"] = {
+                "schema_version": "veyra.phase6.capability_gap_linkage.v1",
+                "status": "unavailable",
+                "gap_id": None,
+                "reason_code": "capability_gap_registry_unavailable",
+                "automatic_advancement": False,
+                "authority_granted": False,
+            }
         self._record(proposal)
         return proposal
 
