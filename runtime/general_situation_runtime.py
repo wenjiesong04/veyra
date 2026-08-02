@@ -544,6 +544,7 @@ class GeneralSituationRuntime:
             "goal_refs",
             "commitment_refs",
             "structured_anchor_refs",
+            "context_bindings",
             "salience_components",
             "salience_score",
             "observations",

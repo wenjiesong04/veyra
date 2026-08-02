@@ -14,6 +14,7 @@ from core.action_risk import assess_text_risk
 from core.agent_session_router import AgentSessionRouter
 from core.capability_registry import CapabilityRegistry
 from core.context_patch_builder import ContextPatchBuilder
+from core.context_anchor_binder import ContextAnchorBinder
 from core.compact_external_lookup import CompactExternalLookup
 from core.context_scope import ContextScopeFilter, exact_owner_visible
 from core.execution_tier import (
@@ -100,6 +101,7 @@ class AwarenessLoop:
         self.capabilities = CapabilityRegistry(state_store)
         self.perception = PerceptionLayer(state_store, reasoning=self.core_reasoning)
         self.attention = AttentionCore(state_store)
+        self.context_anchor_binder = ContextAnchorBinder(state_store)
         self.belief = BeliefCore(state_store)
         self.uncertainty = UncertaintyCore()
         self.decision_core = DecisionCore(state_store=state_store, reasoning=self.core_reasoning)
@@ -253,12 +255,32 @@ class AwarenessLoop:
             target_agent=None,
             decision={},
         )
+        try:
+            anchor_candidate_index = self.context_anchor_binder.candidate_index(
+                event
+            )
+        except Exception as exc:
+            anchor_candidate_index = {
+                "status": "degraded",
+                "reason": f"candidate_index_{type(exc).__name__}",
+                "event_id": event.event_id,
+                "user_id": event.source.user_id,
+                "session_id": event.source.session_id,
+                "candidates": {},
+                "model_catalog": [],
+                "snapshot_digest": "",
+            }
         turn_context = self.core_reasoning.turn_context.build(
             user_message=text,
             attention_focus=attention_focus,
             event=event,
             rule_decision={},
             persona_hint=preliminary_persona,
+            anchor_candidates=(
+                anchor_candidate_index.get("model_catalog")
+                if isinstance(anchor_candidate_index.get("model_catalog"), list)
+                else []
+            ),
         )
         context_observability = {
             "context_metrics": turn_context.get("_context_metrics", {}) if isinstance(turn_context, dict) else {},
@@ -287,6 +309,73 @@ class AwarenessLoop:
             session_id=event.source.session_id,
             event=event,
         )
+        try:
+            if self.event_awareness.mode == "disabled":
+                context_binding = {
+                    "status": "disabled",
+                    "reason": "event_awareness_disabled",
+                    "anchors": [],
+                    "route_change_allowed": False,
+                    "risk_change_allowed": False,
+                }
+                context_projection = {
+                    "status": "disabled",
+                    "route_change_allowed": False,
+                }
+            elif str(shadow_intake.get("event_id") or "") != event.event_id:
+                context_binding = {
+                    "status": "suppressed",
+                    "reason": "event_not_canonical_for_context_binding",
+                    "anchors": [],
+                    "route_change_allowed": False,
+                    "risk_change_allowed": False,
+                }
+                context_projection = {
+                    "status": "suppressed",
+                    "reason": "event_not_canonical_for_context_binding",
+                    "route_change_allowed": False,
+                }
+            else:
+                # Event identity is the binding identity. A delivery replay
+                # must reuse the first immutable sidecar even if the candidate
+                # catalog changed since that delivery.
+                context_binding = self.event_awareness.context_bindings.get(
+                    event.event_id,
+                    user_id=event.source.user_id,
+                    session_id=event.source.session_id,
+                )
+                if context_binding is None:
+                    context_binding = self.context_anchor_binder.bind(
+                        event=event,
+                        understanding=turn_understanding,
+                        attention_assessment=(
+                            attention_refinement.get("assessment")
+                            if isinstance(
+                                attention_refinement.get("assessment"), dict
+                            )
+                            else {}
+                        ),
+                        candidate_index=anchor_candidate_index,
+                    )
+                context_projection = (
+                    self.event_awareness.record_context_binding(
+                        event,
+                        context_binding,
+                    )
+                )
+        except Exception as exc:
+            context_binding = {
+                "status": "degraded",
+                "reason": f"context_binding_{type(exc).__name__}",
+                "anchors": [],
+                "route_change_allowed": False,
+                "risk_change_allowed": False,
+            }
+            context_projection = {
+                "status": "degraded",
+                "error_type": type(exc).__name__,
+                "route_change_allowed": False,
+            }
         refined_focus = attention_refinement.get("focus")
         if (
             attention_refinement.get("status") == "refined"
@@ -318,6 +407,21 @@ class AwarenessLoop:
                         else {}
                     ).get("model_validated")
                 ),
+            }
+        )
+        route_trace.append(
+            {
+                "phase": "context_binding",
+                "status": context_binding.get("status"),
+                "reason": context_binding.get("reason"),
+                "anchor_count": len(context_binding.get("anchors") or []),
+                "candidate_count": len(
+                    anchor_candidate_index.get("model_catalog") or []
+                ),
+                "projection_status": context_projection.get("status"),
+                "epistemic_status": context_binding.get("epistemic_status"),
+                "route_change_allowed": False,
+                "risk_change_allowed": False,
             }
         )
         route_trace.append(

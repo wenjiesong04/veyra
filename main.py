@@ -106,6 +106,7 @@ from runtime.agent_capability_directory import AgentCapabilityDirectory
 from runtime.read_only_agent_collaboration import (
     ReadOnlyAgentCollaborationRuntime,
 )
+from runtime.read_only_cognitive_loop import ReadOnlyCognitiveLoopRuntime
 from runtime.extension_spec_quarantine import (
     ExtensionSpecQuarantine,
 )
@@ -394,6 +395,10 @@ def _schedule_agent_recovery(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 awareness_loop.task_tracker.set_recovery_hook(_schedule_agent_recovery)
+read_only_cognitive_loop = ReadOnlyCognitiveLoopRuntime(
+    state_store=state_store,
+    reasoning=awareness_loop.core_reasoning,
+)
 active_loop = ActiveRuntimeLoop(
     state_store=state_store,
     runtime_entity=runtime_entity,
@@ -412,6 +417,7 @@ active_loop = ActiveRuntimeLoop(
     project_guardian=project_guardian.run_once,
     project_guardian_attention=project_guardian_attention.run_once,
     case_recovery=awareness_loop.bounded_negotiation.recover_pending,
+    cognitive_loop=read_only_cognitive_loop,
 )
 runtime_cron = Cron(state_store=state_store, active_loop=active_loop, commitment_push=commitment_push)
 agent_orchestrator = AgentOrchestrator(
@@ -1039,6 +1045,9 @@ app.include_router(
                 ),
                 "project_guardian_attention": (
                     lambda: project_guardian_attention
+                ),
+                "read_only_cognitive_loop": (
+                    lambda: read_only_cognitive_loop
                 ),
             }
         )

@@ -21,6 +21,7 @@ from interface.event_schema import (
     utc_now_iso,
 )
 from runtime.event_inbox import EventInbox
+from runtime.context_binding_store import ContextBindingStore
 from runtime.general_situation_runtime import GeneralSituationRuntime
 from runtime.project_guardian import ProjectGuardianRuntime
 from runtime.project_guardian_github_ci import GitHubActionsCIProvider
@@ -58,6 +59,7 @@ class ShadowAwarenessRuntime:
             section.get("mode_epoch") if isinstance(section, dict) else 0
         )
         self.event_inbox = EventInbox(state_store)
+        self.context_bindings = ContextBindingStore(state_store)
         self.situation_evaluator = SituationEvaluator(state_store)
         self.general_situations = GeneralSituationRuntime(state_store)
         self.general_attention = GeneralAttentionScheduler(state_store)
@@ -1239,6 +1241,138 @@ class ShadowAwarenessRuntime:
                 mode=self._fabric_snapshot()["mode"],
             )
 
+    def record_context_binding(
+        self,
+        event: VeyraEvent,
+        envelope: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist post-Understanding context without mutating the source Event.
+
+        In ``record_only`` the binding remains a sidecar until EventInbox
+        projection.  In ``shadow`` (or a record-only race where the Event was
+        already projected) it creates a CAS observation revision immediately.
+        Every failure stays outside foreground routing and execution policy.
+        """
+
+        mode = self._fabric_snapshot()["mode"]
+        if mode == "disabled":
+            return {
+                "status": "disabled",
+                "event_id": event.event_id,
+                "route_change_allowed": False,
+            }
+        if (
+            str(envelope.get("event_id") or "") != event.event_id
+            or str(envelope.get("user_id") or "") != event.source.user_id
+            or str(envelope.get("session_id") or "") != event.source.session_id
+        ):
+            return {
+                "status": "rejected",
+                "reason": "context_binding_event_owner_mismatch",
+                "event_id": event.event_id,
+                "route_change_allowed": False,
+            }
+        admitted = self.event_inbox.get_record(event.event_id)
+        admitted_envelope = (
+            admitted.get("envelope")
+            if isinstance(admitted, dict)
+            and isinstance(admitted.get("envelope"), dict)
+            else None
+        )
+        admitted_source = (
+            admitted_envelope.get("source")
+            if isinstance(admitted_envelope, dict)
+            and isinstance(admitted_envelope.get("source"), dict)
+            else {}
+        )
+        expected_privacy = json.dumps(
+            event.privacy_scope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        admitted_privacy = json.dumps(
+            admitted_envelope.get("privacy_scope")
+            if isinstance(admitted_envelope, dict)
+            else None,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if (
+            not isinstance(admitted, dict)
+            or str(admitted.get("event_id") or "") != event.event_id
+            or not isinstance(admitted_envelope, dict)
+            or str(admitted_envelope.get("event_id") or "")
+            != event.event_id
+            or str(admitted_source.get("channel") or "")
+            != event.source.channel
+            or str(admitted_source.get("user_id") or "")
+            != event.source.user_id
+            or str(admitted_source.get("session_id") or "")
+            != event.source.session_id
+            or admitted_privacy != expected_privacy
+        ):
+            return {
+                "status": "suppressed",
+                "reason": "context_binding_event_not_exactly_admitted",
+                "event_id": event.event_id,
+                "route_change_allowed": False,
+                "risk_change_allowed": False,
+                "authority": False,
+            }
+        situation: dict[str, Any] | None = None
+        registration: dict[str, Any]
+        application: dict[str, Any] | None = None
+        with self.state_store.writer_transaction():
+            registration = self.context_bindings.register(envelope)
+            canonical = self.context_bindings.get(
+                event.event_id,
+                user_id=event.source.user_id,
+                session_id=event.source.session_id,
+            )
+            if not isinstance(canonical, dict):
+                raise RuntimeError("registered context binding is unavailable")
+            if canonical.get("status") == "bound":
+                situation = self._situation_for_event(event)
+                if isinstance(situation, dict):
+                    situation = self._apply_context_binding(
+                        situation=situation,
+                        envelope=canonical,
+                    )
+                    application = self.context_bindings.mark_applied(
+                        event_id=event.event_id,
+                        binding_digest=str(
+                            canonical.get("binding_digest") or ""
+                        ),
+                        situation_id=str(situation.get("situation_id") or ""),
+                        observation_revision=int(
+                            situation.get("observation_revision") or 0
+                        ),
+                    )
+        general_projection: dict[str, Any] | None = None
+        if isinstance(situation, dict):
+            general_projection = self._project_general_situation(
+                situation,
+                event,
+            )
+        return {
+            "status": (
+                "applied"
+                if application is not None
+                else "pending"
+                if canonical.get("status") == "bound"
+                else "unresolved"
+            ),
+            "event_id": event.event_id,
+            "registration": registration,
+            "application": application,
+            "general_projection": general_projection,
+            "route_change_allowed": False,
+            "risk_change_allowed": False,
+            "authority": False,
+        }
+
     def _begin_locked(
         self,
         event: VeyraEvent,
@@ -1821,6 +1955,32 @@ class ShadowAwarenessRuntime:
                             salience_components=self._explicit_salience(event),
                             observation=self._explicit_observation(event),
                         )
+                        context_binding = self.context_bindings.get(
+                            event.event_id,
+                            user_id=event.source.user_id,
+                            session_id=event.source.session_id,
+                        )
+                        if (
+                            isinstance(context_binding, dict)
+                            and context_binding.get("resolution_status") == "bound"
+                            and context_binding.get("application_status") != "applied"
+                        ):
+                            situation = self._apply_context_binding(
+                                situation=situation,
+                                envelope=context_binding,
+                            )
+                            self.context_bindings.mark_applied(
+                                event_id=event.event_id,
+                                binding_digest=str(
+                                    context_binding.get("binding_digest") or ""
+                                ),
+                                situation_id=str(
+                                    situation.get("situation_id") or ""
+                                ),
+                                observation_revision=int(
+                                    situation.get("observation_revision") or 0
+                                ),
+                            )
                         self.event_inbox.complete(
                             event_id,
                             consumer_id,
@@ -1873,7 +2033,25 @@ class ShadowAwarenessRuntime:
     ) -> dict[str, Any]:
         """Fail-open maintenance for ActiveLoop restart/replay recovery."""
 
+        if self._fabric_snapshot()["mode"] == "disabled":
+            return {
+                "status": "disabled",
+                "processed_count": 0,
+                "replayed_count": 0,
+                "grouped_count": 0,
+                "failed_count": 0,
+                "context_binding_reconciliation": {
+                    "status": "disabled",
+                    "applied_count": 0,
+                    "failed_count": 0,
+                },
+                "route_change_allowed": False,
+            }
+
         try:
+            binding_reconciliation = self._reconcile_context_bindings(
+                limit=limit,
+            )
             state = self.state_store.read_json("situation_state.json")
             if state.get("_state_corrupt") is True:
                 return {
@@ -1889,10 +2067,14 @@ class ShadowAwarenessRuntime:
                 if isinstance(raw, list)
                 else []
             )
-            return self.general_situations.reconcile(
+            result = self.general_situations.reconcile(
                 [item for item in situations if isinstance(item, dict)],
                 limit=limit,
             )
+            return {
+                **result,
+                "context_binding_reconciliation": binding_reconciliation,
+            }
         except Exception as exc:
             self._record_error(
                 "general_situation_reconcile_error",
@@ -1904,6 +2086,98 @@ class ShadowAwarenessRuntime:
                 "error_type": type(exc).__name__,
                 "route_change_allowed": False,
             }
+
+    def _reconcile_context_bindings(
+        self,
+        *,
+        limit: int,
+    ) -> dict[str, Any]:
+        applied: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        for envelope in self.context_bindings.pending(limit=limit):
+            event_id = str(envelope.get("event_id") or "")
+            try:
+                situations = self.situation_evaluator.list(
+                    user_id=str(envelope.get("user_id") or ""),
+                    session_id=str(envelope.get("session_id") or ""),
+                    limit=self.situation_evaluator.max_situations,
+                    newest_first=True,
+                )
+                situation = next(
+                    (
+                        item
+                        for item in situations
+                        if str(item.get("source_event_id") or "") == event_id
+                    ),
+                    None,
+                )
+                if not isinstance(situation, dict):
+                    continue
+                enriched = self._apply_context_binding(
+                    situation=situation,
+                    envelope=envelope,
+                )
+                receipt = self.context_bindings.mark_applied(
+                    event_id=event_id,
+                    binding_digest=str(envelope.get("binding_digest") or ""),
+                    situation_id=str(enriched.get("situation_id") or ""),
+                    observation_revision=int(
+                        enriched.get("observation_revision") or 0
+                    ),
+                )
+                applied.append(receipt)
+            except Exception as exc:
+                failed.append(
+                    {
+                        "event_id": event_id,
+                        "error_type": type(exc).__name__,
+                    }
+                )
+        return {
+            "status": "success" if not failed else "degraded",
+            "applied_count": len(applied),
+            "failed_count": len(failed),
+            "applied": applied,
+            "failed": failed,
+            "route_change_allowed": False,
+        }
+
+    def _apply_context_binding(
+        self,
+        *,
+        situation: dict[str, Any],
+        envelope: dict[str, Any],
+    ) -> dict[str, Any]:
+        if (
+            str(situation.get("source_event_id") or "")
+            != str(envelope.get("event_id") or "")
+            or str(situation.get("user_id") or "")
+            != str(envelope.get("user_id") or "")
+            or str(situation.get("session_id") or "")
+            != str(envelope.get("session_id") or "")
+        ):
+            raise ValueError("context binding does not belong to Situation")
+        return self.situation_evaluator.record_context_binding(
+            str(situation.get("situation_id") or ""),
+            expected_source_event_id=str(envelope.get("event_id") or ""),
+            expected_observation_revision=int(
+                situation.get("observation_revision") or 0
+            ),
+            operation_id=str(envelope.get("operation_id") or ""),
+            binding_digest=str(envelope.get("binding_digest") or ""),
+            anchors=(
+                copy.deepcopy(envelope.get("anchors"))
+                if isinstance(envelope.get("anchors"), list)
+                else []
+            ),
+            provenance=(
+                copy.deepcopy(envelope.get("bindings"))
+                if isinstance(envelope.get("bindings"), list)
+                else []
+            ),
+            user_id=str(envelope.get("user_id") or ""),
+            session_id=str(envelope.get("session_id") or ""),
+        )
 
     def _project_general_situation(
         self,

@@ -58,6 +58,13 @@ _PROFILE_KINDS = {"profile_update", "self_disclosure", "user_fact"}
 _COMMITMENT_KINDS = {"commitment", "commitment_control", "goal_control", "schedule_control"}
 _PROACTIVE_KINDS = {"proactive_request", "recurring_request", "reminder_request", "subscription_request"}
 
+# Provider-neutral actor vocabulary for an event already authenticated as the
+# current user's turn.  These are structured contract tokens, not free-text
+# aliases.  Third-party, reported, and quoted speakers remain outside the set.
+_USER_SPEAKERS = frozenset(
+    {"", "current_user", "direct_user", "requester", "user"}
+)
+
 
 @dataclass(frozen=True, slots=True)
 class SemanticPolicy:
@@ -533,7 +540,7 @@ class SemanticPolicyCompiler:
             return True
         authority = _token(act.get("authority"))
         speaker = _token(act.get("speaker"))
-        user_speakers = {"", "current_user", "requester", "user"}
+        user_speakers = set(_USER_SPEAKERS)
         if current_user_id:
             user_speakers.add(current_user_id)
         if (
@@ -567,7 +574,7 @@ class SemanticPolicyCompiler:
         speaker = _token(act.get("speaker"))
         source_quote = str(act.get("source_quote") or "").strip()
         explicit = explicitness in {"direct", "explicit", "user_explicit"}
-        user_speakers = {"", "current_user", "requester", "user"}
+        user_speakers = set(_USER_SPEAKERS)
         if current_user_id:
             user_speakers.add(current_user_id)
         user_speaker = speaker in user_speakers
@@ -585,7 +592,7 @@ class SemanticPolicyCompiler:
     ) -> bool:
         authority = _token(act.get("authority"))
         speaker = _token(act.get("speaker"))
-        user_speakers = {"", "current_user", "requester", "user"}
+        user_speakers = set(_USER_SPEAKERS)
         if current_user_id:
             user_speakers.add(current_user_id)
         return (
@@ -1172,13 +1179,42 @@ class SemanticPolicyCompiler:
         ):
             return "web", "web_url_probe"
         if (
+            target_type in {"weather", "temperature"}
+            or evidence_need in {"weather", "fresh_weather"}
+            or operation in {"query_weather", "query_current_weather"}
+        ):
+            return "weather_probe", "weather_probe"
+        if (
+            target_type in {"clock", "date", "time"}
+            or evidence_need in {"current_time", "time"}
+            or operation in {"query_current_date", "query_current_time"}
+        ):
+            return "time", "time_probe"
+        if (
             operation in {"external_search", "search_external", "web_search"}
             or operation.startswith(("external_search_", "search_external_", "web_search_"))
             or target_type in {"search", "search_query", "web_search"}
-            or evidence_need in {"external_search", "fresh_external_search", "web_search"}
+            or evidence_need
+            in {
+                "external",
+                "fresh_external",
+                "external_search",
+                "fresh_external_search",
+                "web_search",
+            }
         ):
             return "search_probe", "web_search"
-        evidence = _joined(act.get("evidence_need"), act.get("target"), act.get("operation"), act.get("goal"))
+        # Never scan serialized control objects.  A field name such as
+        # ``anchor_candidate_token`` contains ``date`` and previously selected
+        # time_probe for unrelated project questions.  Only semantic values
+        # may participate in the legacy compatibility fallback below.
+        evidence = _joined(
+            evidence_need,
+            target_type,
+            target.get("value"),
+            operation,
+            act.get("goal"),
+        )
         if not evidence:
             return None, None
         if _contains(evidence, "weather", "天气", "气温", "temperature"):
@@ -1244,7 +1280,7 @@ class SemanticPolicyCompiler:
         modality = _token(act.get("modality"))
         authority = _token(act.get("authority"))
         speaker = _token(act.get("speaker"))
-        user_speakers = {"", "current_user", "requester", "user"}
+        user_speakers = set(_USER_SPEAKERS)
         if current_user_id:
             user_speakers.add(current_user_id)
         direct_user_authority = authority in {

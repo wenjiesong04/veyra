@@ -424,6 +424,36 @@ def main() -> int:
         identified_user_policy.to_dict(),
     )
 
+    actor_alias_text = "Veyra 现在是什么状态？"
+    actor_alias_frame = TurnSemanticFrame.from_model_payload(
+        {
+            "semantic_frame": frame_payload(
+                [
+                    act(
+                        actor_alias_text,
+                        act_id="a1",
+                        kind="information_request",
+                        goal="了解 Veyra 当前状态",
+                        operation="explain_status",
+                        source=actor_alias_text,
+                        semantic_target=target("project", "Veyra"),
+                        speaker="direct_user",
+                        authority="direct_user",
+                    )
+                ]
+            )
+        },
+        source_text=actor_alias_text,
+    )
+    actor_alias_policy = SemanticPolicyCompiler().compile(actor_alias_frame)
+    expect(
+        actor_alias_policy.preferred_route == "direct_answer"
+        and not actor_alias_policy.requires_clarification
+        and not actor_alias_policy.allowed_effects,
+        "provider direct_user actor alias was mistaken for conflicting authority",
+        actor_alias_policy.to_dict(),
+    )
+
     read_only_agent_text = "请让 Agent 只读分析 Veyra 目录，不修改文件。"
     read_only_agent_frame = TurnSemanticFrame.from_model_payload(
         {
@@ -778,6 +808,40 @@ def main() -> int:
         and not conflicting_speaker_policy.allowed_effects,
         "conflicting speaker and authority fields authorized execution",
         conflicting_speaker_policy.to_dict(),
+    )
+
+    structured_external_text = "Aurora 的缓存一致性风险还缺哪些证据？"
+    structured_external_frame = TurnSemanticFrame.from_model_payload(
+        {
+            "semantic_frame": frame_payload(
+                [
+                    act(
+                        structured_external_text,
+                        act_id="a1",
+                        kind="information_request",
+                        goal="了解 Aurora 缓存一致性风险的证据缺口",
+                        operation="query",
+                        source=structured_external_text,
+                        semantic_target=target(
+                            "project",
+                            "Aurora",
+                            anchor_candidate_token="actok_candidate_token",
+                        ),
+                        evidence_need="fresh_external",
+                    )
+                ]
+            )
+        },
+        source_text=structured_external_text,
+    )
+    structured_external_policy = SemanticPolicyCompiler().compile(
+        structured_external_frame
+    )
+    expect(
+        structured_external_policy.preferred_route == "probe"
+        and structured_external_policy.selected_probe == "search_probe",
+        "control-field names contaminated structured probe selection",
+        structured_external_policy.to_dict(),
     )
 
     for search_text, query in (

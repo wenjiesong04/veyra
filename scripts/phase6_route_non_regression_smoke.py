@@ -642,6 +642,12 @@ def main() -> int:
     public_state = _public_state(
         {
             "local_world": {"current_project": "public-safe"},
+            "context_binding_state": {
+                "bindings": {"private-event": {"user_id": "private-user"}}
+            },
+            "cognitive_loop_state": {
+                "scopes": {"private-scope": {"brief": "private brief"}}
+            },
             "phase6_collaboration_state": {
                 "collaborations": {
                     "private-case": {
@@ -764,6 +770,8 @@ def main() -> int:
     )
     expect(
         "phase6_collaboration_state" not in public_state
+        and "context_binding_state" not in public_state
+        and "cognitive_loop_state" not in public_state
         and "phase6_extension_spec_state" not in public_state
         and "phase6_extension_artifact_state" not in public_state
         and "phase6_extension_source_check_state" not in public_state

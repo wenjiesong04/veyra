@@ -24,6 +24,7 @@ from core.perception_layer import PerceptionLayer  # noqa: E402
 from core.runtime_entity import RuntimeEntity  # noqa: E402
 from core.turn_context_builder import TurnContextBuilder  # noqa: E402
 from core.world_state import (  # noqa: E402
+    DURABLE_STATE_FILES,
     StateReadOnlyError,
     StateRevisionConflictError,
     WorldStateStore,
@@ -337,7 +338,30 @@ def test_fact_and_memory_boundaries(root: Path) -> None:
         for item in schema.get("state_definitions", [])
         if isinstance(item, dict)
     }
-    expect(schema.get("version") == 2 and "risk_policy" in schema_ids, "persisted state schema migrates to code definition")
+    expected_cognitive_ids = {
+        "context_binding_state",
+        "cognitive_loop_state",
+        "event_inbox_state",
+        "situation_state",
+        "general_situation_state",
+        "suggestion_outbox",
+    }
+    expect(
+        schema.get("version") == 2
+        and "risk_policy" in schema_ids
+        and expected_cognitive_ids.issubset(schema_ids),
+        "persisted state schema includes the governed cognition graph",
+        sorted(schema_ids),
+    )
+    expect(
+        {
+            "context_binding_state.json",
+            "cognitive_loop_state.json",
+        }.issubset(DURABLE_STATE_FILES)
+        and store.read_json("context_binding_state.json").get("ttl_seconds") == 0
+        and store.read_json("cognitive_loop_state.json").get("ttl_seconds") == 0,
+        "context binding and cognitive loop state remain durable across restart",
+    )
     hermes_decision = DecisionCore(store)._rule_decide("Hermes runtime 当前状态怎么样", [])
     expect(
         hermes_decision.selected_probe == "hermes",

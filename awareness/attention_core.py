@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from core.context_scope import tenant_scope_storage_key
@@ -34,6 +35,9 @@ class AttentionCore:
     MAX_SCOPES = 200
     MAX_FOCUS = 12
     MIN_SEMANTIC_SCORE = 0.75
+    _DIRECT_USER_SPEAKERS = frozenset(
+        {"user", "current_user", "requester", "direct_user"}
+    )
 
     _CONTINUATIONS = frozenset(
         {
@@ -92,6 +96,8 @@ class AttentionCore:
             return []
         selected_user, selected_session, scope_key = owner
         state, previous_record = self._scope_record(scope_key, owner)
+        if self._scope_expired(previous_record):
+            previous_record = {}
         previous_focus = self._focus_list(previous_record.get("focus"))
         structured = self._structured_event_assessments(event)
         inherited = False
@@ -354,6 +360,23 @@ class AttentionCore:
                 "context_scope": self._context_scope([]),
                 "ignored_noise": [],
             }
+        if self._scope_expired(record):
+            return {
+                "status": "success",
+                "scope_status": "expired",
+                "source": record.get("source") or "attention_core",
+                "updated_at": record.get("updated_at"),
+                "confidence": 0.0,
+                "ttl_seconds": record.get("ttl_seconds", 300),
+                "focus": [],
+                "context_scope": self._context_scope([]),
+                "ignored_noise": ["scope_ttl_expired"],
+                "previous_focus": [],
+                "inherited_from_previous": False,
+                "stage": record.get("stage"),
+                "refinement": {},
+                "component_scores": [],
+            }
         focus = self._focus_list(record.get("focus"))
         return {
             "status": "success",
@@ -412,7 +435,14 @@ class AttentionCore:
         mention_mode = str(getattr(act, "mention_mode", "") or "")
         modality = str(getattr(act, "modality", "") or "")
         explicitness = str(getattr(act, "explicitness", "") or "")
-        direct_user = authority == "direct_user" and speaker == "user"
+        # Some structured-output providers use ``direct_user`` as both the
+        # authority token and the actor token.  This is a schema vocabulary
+        # alias, not a natural-language inference: reported/quoted speakers
+        # remain ineligible and this score still grants no capability.
+        direct_user = (
+            authority == "direct_user"
+            and speaker in self._DIRECT_USER_SPEAKERS
+        )
         normal_use = mention_mode == "normal_use"
         non_hypothetical = modality not in {
             "hypothetical",
@@ -558,6 +588,35 @@ class AttentionCore:
         ):
             return state, {}
         return state, copy.deepcopy(record)
+
+    @staticmethod
+    def _scope_expired(record: dict[str, Any]) -> bool:
+        """Return freshness without mutating or pruning the persisted scope."""
+
+        if not record:
+            return False
+        raw_ttl = record.get("ttl_seconds", 300)
+        if isinstance(raw_ttl, bool):
+            return True
+        try:
+            ttl_seconds = float(raw_ttl)
+        except (TypeError, ValueError):
+            return True
+        if not math.isfinite(ttl_seconds):
+            return True
+        if ttl_seconds <= 0:
+            return False
+
+        updated_at = str(record.get("updated_at") or "")
+        if not updated_at:
+            return True
+        try:
+            parsed = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - parsed).total_seconds() >= ttl_seconds
 
     def _persist_scope(self, scope_key: str, record: dict[str, Any]) -> bool:
         persisted = False

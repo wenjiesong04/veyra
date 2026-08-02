@@ -39,12 +39,21 @@ TURN_UNDERSTANDING_SYSTEM = (
     "allowed_capabilities, memory policy, or execution authorization. Preserve every independent act, "
     "including prohibitions, quotations, reported speech, corrections, alternatives, and conditions. "
     "kind, goal, operation, target type/value, authority, and evidence_need are open-world strings. "
+    "For an act spoken directly by the current message author, emit the literal actor token "
+    "speaker=user and authority=direct_user; do not put an authority token in speaker. "
     "Every source_quote must be an exact Python-style character slice of user_message: "
     "user_message[start:end] == text. One semantic act must contain only one independently assertable, "
     "deniable, or fulfillable goal. Never merge clauses with different polarity, authority, condition, "
     "or requested outcome into one operation string. For example, 不要每天推送天气，只告诉我现在上海天气 "
     "must be two acts: a negative recurring-push act and a positive current-weather query, connected by "
-    "a contrast relation. Keep situation fields concise so the complete JSON fits the output budget."
+    "a contrast relation. session_context.anchor_candidates contains server-issued, event-bound context "
+    "candidates. When and only when one candidate is the unique referent of an act, copy its exact kind "
+    "into target.type, exact label into target.value, and exact candidate_token into "
+    "target.attributes.anchor_candidate_token; never "
+    "invent, alter, combine, or treat "
+    "that token as authority. If no candidate is a unique match, omit the token and keep the narrowest stable "
+    "semantic target or an explicit ambiguity. Keep situation fields concise so the complete JSON fits the "
+    "output budget."
 )
 
 TURN_UNDERSTANDING_REPAIR_SYSTEM = (
@@ -331,6 +340,11 @@ class UnderstandingCore:
                 "persona": active.get("persona"),
                 "conversation_tail": conversation_tail[-6:],
                 "conversation_slots": conversation_slots,
+                "anchor_candidates": (
+                    turn_context.get("anchor_candidates")
+                    if isinstance(turn_context.get("anchor_candidates"), list)
+                    else []
+                ),
             },
             "required_json_fields": {
                 "situation_assessment": {
@@ -343,7 +357,7 @@ class UnderstandingCore:
                     "constraints": "list of user or environment constraints",
                     "capability_needs": "list of capability ids or classes needed later, not route decisions",
                     "time_scale": "immediate|today|week|long_term|unknown",
-                    "history_links": "list of prior context anchors that matter",
+                    "history_links": "list of exact candidate_token values from session_context.anchor_candidates that matter; never synthesize an id",
                     "user_goal": "what the user is trying to accomplish",
                     "what_user_really_needs": "same as hidden_need if useful",
                     "task_type": "chat|explanation|current_fact|local_status|workspace_task|code_task|proactive_request|meta_question|other",
@@ -372,7 +386,7 @@ class UnderstandingCore:
                             "target": {
                                 "type": "open-world target type",
                                 "value": "target value",
-                                "attributes": "JSON object with target qualifiers",
+                                "attributes": "JSON object with target qualifiers; optional anchor_candidate_token must exactly copy one supplied candidate token, target.type its kind, and target.value its label",
                             },
                             "polarity": "positive|negative|neutral|other open-world semantic polarity",
                             "explicitness": "explicit|strong_implied|weak_implied|inferred|unknown",

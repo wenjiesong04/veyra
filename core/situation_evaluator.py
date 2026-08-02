@@ -459,6 +459,196 @@ class SituationEvaluator:
         self._try_flush_trace_outbox()
         return copy.deepcopy(persisted)
 
+    def record_context_binding(
+        self,
+        situation_id: str,
+        *,
+        expected_source_event_id: str,
+        expected_observation_revision: int,
+        operation_id: str,
+        binding_digest: str,
+        anchors: list[dict[str, Any]],
+        provenance: list[dict[str, Any]],
+        user_id: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """CAS-enrich one event-scoped Situation with context associations.
+
+        This is intentionally a separate observation revision rather than a
+        rewrite of the immutable source Event.  The association is always
+        recorded as model inference with ``is_fact=False`` and cannot carry a
+        route, risk, capability, execution, or delivery authority.
+        """
+
+        selected_id = self._text(situation_id, max_length=240)
+        selected_event = self._text(expected_source_event_id, max_length=240)
+        selected_operation = self._text(operation_id, max_length=300)
+        selected_digest = self._text(binding_digest, max_length=128)
+        if not selected_id or not selected_event or not selected_operation:
+            raise ValueError("context binding identity is incomplete")
+        if (
+            len(selected_digest) != 64
+            or any(character not in "0123456789abcdef" for character in selected_digest)
+        ):
+            raise ValueError("context binding digest is invalid")
+        if (
+            isinstance(expected_observation_revision, bool)
+            or not isinstance(expected_observation_revision, int)
+            or expected_observation_revision < 1
+        ):
+            raise ValueError("expected observation revision is invalid")
+        normalized_anchors = self._normalized_structured_anchor_refs(anchors)
+        if not normalized_anchors:
+            raise ValueError("context binding requires at least one structured anchor")
+        if len(normalized_anchors) > 8:
+            raise ValueError("context binding anchor capacity exceeded")
+        normalized_provenance = self._context_binding_provenance(
+            provenance,
+            expected_source_event_id=selected_event,
+            anchors=normalized_anchors,
+        )
+        now = self._now_iso()
+        persisted: dict[str, Any] | None = None
+        replayed = False
+
+        def update(state: dict[str, Any]) -> None:
+            nonlocal persisted, replayed
+            situations = self._state_situations(state)
+            target = next(
+                (
+                    item
+                    for item in situations
+                    if str(item.get("situation_id") or "") == selected_id
+                ),
+                None,
+            )
+            if target is None:
+                raise KeyError(f"unknown situation: {selected_id}")
+            self._assert_owner(target, user_id=user_id, session_id=session_id)
+            if str(target.get("source_event_id") or "") != selected_event:
+                raise ValueError("context binding source event does not match Situation")
+            history = (
+                target.get("context_bindings")
+                if isinstance(target.get("context_bindings"), list)
+                else []
+            )
+            existing = next(
+                (
+                    item
+                    for item in history
+                    if isinstance(item, dict)
+                    and str(item.get("operation_id") or "") == selected_operation
+                ),
+                None,
+            )
+            if isinstance(existing, dict):
+                if str(existing.get("binding_digest") or "") != selected_digest:
+                    raise ValueError(
+                        "context binding operation is already bound to different semantics"
+                    )
+                replayed = True
+                persisted = copy.deepcopy(target)
+                return
+            current_revision = int(target.get("observation_revision") or 0)
+            if current_revision != expected_observation_revision:
+                raise ValueError("context binding observation revision CAS conflict")
+
+            projection = {
+                "operation_id": selected_operation,
+                "binding_digest": selected_digest,
+                "source_event_id": selected_event,
+                "anchors": copy.deepcopy(normalized_anchors),
+                "provenance": copy.deepcopy(normalized_provenance),
+                "epistemic_status": "context_hypothesis",
+                "is_fact": False,
+                "causality_asserted": False,
+                "route_change_allowed": False,
+                "risk_change_allowed": False,
+                "authority": False,
+                "recorded_at": now,
+            }
+            target["structured_anchor_refs"] = self._merge_structured_anchor_refs(
+                target.get("structured_anchor_refs"),
+                normalized_anchors,
+                replace=False,
+            )
+            target["context_bindings"] = [*history, projection][
+                -self.max_history_per_situation :
+            ]
+            inference = self._epistemic_record(
+                {
+                    "kind": "context_binding",
+                    "binding_digest": selected_digest,
+                    "anchors": copy.deepcopy(normalized_anchors),
+                    "provenance": copy.deepcopy(normalized_provenance),
+                    "causality_asserted": False,
+                    "authority": False,
+                },
+                source="context_model",
+                epistemic_status="inference",
+                evidence_refs=[],
+                evidence_verified=False,
+            )
+            target["inferences"] = self._extend_history(
+                target.get("inferences"),
+                [inference],
+            )
+            target["observation_revision"] = current_revision + 1
+            target["updated_at"] = now
+            target["context_projection_fingerprint"] = (
+                self._context_projection_fingerprint(target)
+            )
+            persisted = copy.deepcopy(target)
+            state["schema_version"] = self.SCHEMA_VERSION
+            state["situations"] = situations
+            state["count"] = len(situations)
+            state["updated_at"] = now
+            self._enqueue_trace(
+                state,
+                trace_type="situation_context_bound",
+                situation=persisted,
+                detail={
+                    "operation_id": selected_operation,
+                    "binding_digest": selected_digest,
+                    "source_event_id": selected_event,
+                    "anchors": copy.deepcopy(normalized_anchors),
+                    "epistemic_status": "context_hypothesis",
+                    "is_fact": False,
+                    "causality_asserted": False,
+                    "observation_revision": target["observation_revision"],
+                },
+                timestamp=now,
+            )
+
+        self.state_store.mutate_json(self.state_file, update)
+        self._try_flush_trace_outbox()
+        if persisted is None:  # pragma: no cover - guarded by the mutation.
+            raise KeyError(f"unknown situation: {selected_id}")
+        return {**copy.deepcopy(persisted), "context_binding_replayed": replayed}
+
+    def _context_projection_fingerprint(
+        self,
+        situation: dict[str, Any],
+    ) -> str:
+        semantic = self._stable_transition_value(
+            {
+                "situation_id": situation.get("situation_id"),
+                "source_event_id": situation.get("source_event_id"),
+                "structured_anchor_refs": situation.get(
+                    "structured_anchor_refs"
+                ),
+                "context_bindings": situation.get("context_bindings"),
+            }
+        )
+        encoded = json.dumps(
+            semantic,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return f"scbp_{hashlib.sha256(encoded).hexdigest()[:32]}"
+
     def record_decision(
         self,
         situation_id: str,
@@ -1574,6 +1764,116 @@ class SituationEvaluator:
             return copy.deepcopy(selected)
         return self._normalized_structured_anchor_refs([*current, *selected])
 
+    def _context_binding_provenance(
+        self,
+        value: Any,
+        *,
+        expected_source_event_id: str,
+        anchors: list[dict[str, str]],
+    ) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            raise ValueError("context binding provenance must be a list")
+        anchor_keys = {
+            StructuredAnchor.from_dict(item).key
+            for item in anchors
+        }
+        selected: list[dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise ValueError("context binding provenance entry is invalid")
+            anchor = StructuredAnchor(
+                str(item.get("kind") or ""),
+                str(item.get("ref_id") or ""),
+            )
+            if anchor.key not in anchor_keys:
+                raise ValueError("context binding provenance references an unknown anchor")
+            if (
+                str(item.get("source_event_id") or "")
+                != expected_source_event_id
+                or item.get("is_fact") is not False
+                or item.get("causality_asserted") is not False
+                or item.get("authority") is not False
+                or str(item.get("epistemic_status") or "")
+                != "context_hypothesis"
+            ):
+                raise ValueError("context binding provenance weakens its epistemic boundary")
+            raw_score = item.get("semantic_score")
+            if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+                raise ValueError("context binding semantic score is invalid")
+            score = float(raw_score)
+            if not 0.0 <= score <= 1.0:
+                raise ValueError("context binding semantic score is out of range")
+            quote = item.get("source_quote") if isinstance(item.get("source_quote"), dict) else {}
+            start = quote.get("start")
+            end = quote.get("end")
+            digest = str(quote.get("digest") or "")
+            if (
+                isinstance(start, bool)
+                or not isinstance(start, int)
+                or isinstance(end, bool)
+                or not isinstance(end, int)
+                or start < 0
+                or end <= start
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValueError("context binding source quote proof is invalid")
+            candidate_source = (
+                item.get("candidate_source")
+                if isinstance(item.get("candidate_source"), dict)
+                else None
+            )
+            candidate_revision = 0
+            if candidate_source is not None:
+                raw_revision = candidate_source.get("revision")
+                if (
+                    isinstance(raw_revision, bool)
+                    or not isinstance(raw_revision, int)
+                    or raw_revision < 0
+                ):
+                    raise ValueError("context binding candidate revision is invalid")
+                candidate_revision = raw_revision
+            selected.append(
+                {
+                    "kind": anchor.kind,
+                    "ref_id": anchor.ref_id,
+                    "act_id": self._text(item.get("act_id"), max_length=80),
+                    "relation": self._text(item.get("relation"), max_length=80)
+                    or "about",
+                    "source": self._text(item.get("source"), max_length=120),
+                    "semantic_score": round(score, 6),
+                    "source_quote": {
+                        "start": start,
+                        "end": end,
+                        "digest": digest,
+                    },
+                    "candidate_snapshot_digest": self._text(
+                        item.get("candidate_snapshot_digest"),
+                        max_length=128,
+                    ),
+                    "candidate_source": (
+                        {
+                            "file": self._text(candidate_source.get("file"), max_length=120),
+                            "revision": candidate_revision,
+                            "candidate_token": self._text(
+                                candidate_source.get("candidate_token"),
+                                max_length=120,
+                            ),
+                        }
+                        if candidate_source is not None
+                        else None
+                    ),
+                    "epistemic_status": "context_hypothesis",
+                    "is_fact": False,
+                    "causality_asserted": False,
+                    "authority": False,
+                    "source_event_id": expected_source_event_id,
+                }
+            )
+        if not selected:
+            raise ValueError("context binding provenance cannot be empty")
+        return selected[:8]
+
     def _normalize_refs(
         self,
         refs: Iterable[Any] | Any | None,
@@ -1896,6 +2196,7 @@ class SituationEvaluator:
                 "goal_refs",
                 "commitment_refs",
                 "structured_anchor_refs",
+                "context_bindings",
                 "evidence_refs",
                 "salience_components",
                 "salience_score",

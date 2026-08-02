@@ -15,6 +15,12 @@ ANCHOR_KINDS = frozenset(
         "task",
         "trace",
         "entity",
+        # A context anchor is a server-issued, owner/session-scoped discourse
+        # thread.  It is deliberately distinct from an Entity: the model may
+        # suggest that two turns concern the same subject without asserting
+        # that a real-world entity or fact exists.  Context anchors never count
+        # as durable cross-session authority.
+        "context",
         "workspace",
     }
 )

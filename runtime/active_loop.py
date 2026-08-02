@@ -33,6 +33,7 @@ class ActiveRuntimeLoop:
         project_guardian: Callable[..., Any] | None = None,
         project_guardian_attention: Callable[..., Any] | None = None,
         case_recovery: Callable[..., Any] | None = None,
+        cognitive_loop: Any | None = None,
     ) -> None:
         self.state_store = state_store
         self.runtime_entity = runtime_entity
@@ -48,6 +49,7 @@ class ActiveRuntimeLoop:
         self.project_guardian = project_guardian
         self.project_guardian_attention = project_guardian_attention
         self.case_recovery = case_recovery
+        self.cognitive_loop = cognitive_loop
         self.task_tracker = task_tracker
         self.adapter_resolver = adapter_resolver
         self.verifier = verifier
@@ -62,6 +64,10 @@ class ActiveRuntimeLoop:
                 return {**self.status(), "status": "already_running"}
             loop_id = f"active_{uuid4().hex[:12]}"
             self._stop_event = threading.Event()
+            if self.cognitive_loop is not None:
+                resume = getattr(self.cognitive_loop, "resume", None)
+                if callable(resume):
+                    resume()
             self._write_state(
                 {
                     "status": "running",
@@ -84,16 +90,22 @@ class ActiveRuntimeLoop:
         return self.status()
 
     def stop(self) -> dict[str, Any]:
-        thread = self._thread
-        if thread and thread.is_alive():
-            self._stop_event.set()
-            self._patch_state({"status": "stopping", "enabled": False, "stop_requested_at": utc_now_iso()})
-            thread.join(timeout=2.0)
-        state = self._read_state()
-        if state.get("status") in {"running", "stopping", "stale"}:
-            self._patch_state({"status": "stopped", "enabled": False, "stopped_at": utc_now_iso()})
-        self.state_store.append_jsonl("action_record.jsonl", {"route": "active_loop_stop", "status": self.status().get("status"), "artifacts": self.status()})
-        return self.status()
+        with self._lock:
+            if self.cognitive_loop is not None:
+                stop_cognition = getattr(self.cognitive_loop, "stop", None)
+                if callable(stop_cognition):
+                    stop_cognition()
+            thread = self._thread
+            if thread and thread.is_alive():
+                self._stop_event.set()
+                self._patch_state({"status": "stopping", "enabled": False, "stop_requested_at": utc_now_iso()})
+                thread.join(timeout=2.0)
+            state = self._read_state()
+            if state.get("status") in {"running", "stopping", "stale"}:
+                self._patch_state({"status": "stopped", "enabled": False, "stopped_at": utc_now_iso()})
+            status = self.status()
+            self.state_store.append_jsonl("action_record.jsonl", {"route": "active_loop_stop", "status": status.get("status"), "artifacts": status})
+            return status
 
     def status(self) -> dict[str, Any]:
         state = self._read_state()
@@ -123,6 +135,7 @@ class ActiveRuntimeLoop:
             self._step("stale_state", lambda: self.state_refresh.refresh_stale(limit=20)),
             self._step("proactive", lambda: self.proactive_checks.run_read_only(timeout_seconds=12)),
             self._step("external_world", lambda: self.external_world_refresh.refresh_watchlist(limit=5)),
+            self._step("read_only_cognition", lambda: self._cognitive_loop_tick()),
             self._step("commitment_push", lambda: self._commitment_push_tick()),
             self._step("replay_runtime", lambda: self._run_replay_runtime()),
             self._step("retention", lambda: self._retention_tick()),
@@ -223,6 +236,14 @@ class ActiveRuntimeLoop:
         if self.commitment_push is None:
             return {"status": "not_configured"}
         return self.commitment_push.run_due(limit=10, reason="active_loop")
+
+    def _cognitive_loop_tick(self) -> dict[str, Any]:
+        if self.cognitive_loop is None:
+            return {"status": "not_configured"}
+        schedule = getattr(self.cognitive_loop, "schedule_once", None)
+        if callable(schedule):
+            return schedule(reason="active_loop")
+        return self.cognitive_loop.run_once(reason="active_loop")
 
     def _event_inbox_tick(self) -> dict[str, Any]:
         if self.event_consumer is None:

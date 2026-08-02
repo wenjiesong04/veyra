@@ -293,6 +293,30 @@ Phase 6 的 `pure_function` 安全扩展垂直链已经从 6.2d 的“不执行�
 
 最终 changeset 在修复共享 ReviewQueue 对 Phase 6 专用 review 的污染路径后重新完成 Python gate `124/124`、Route 非弱化矩阵 `702/702`、OpenClaw governance plugin `32/32`、compileall、Web Console build 与 macOS `.app` build。最终 LaunchAgent 使用 Conda `veyra` 的 Python `3.11.15` 重启，OpenClaw Gateway 保持原 PID 与启动时间；重启后的 runner 先按设计 `fail_closed`，经带本地 control token 的显式 backend refresh 恢复为 `technical_complete_isolated_runner_only`。runtime certification 为 3 个 runtime 中 OpenClaw 1 个 `ready`、另外 2 个 `not_configured`；飞书 websocket `running / connected / thread_alive`，但本进程仍无 fresh inbound event。`/health=degraded` 的 5 条提示来自既有 model transport freshness、OpenClaw private memory fallback、无本进程飞书入站、5 条 pending review 和 223 条 stale belief，不是本 changeset 新增回归。live 负向结构化观察还证明：无 token 返回 401、伪造内部 producer 与缺失 active Goal 均返回 409，EventInbox 字节不变、structured event count 保持 0。
 
+### 1.14 2026-08-02 跨阶段认知基础：Context Binder 与只读 Cognitive Loop
+
+这项工作不是 Phase 6 自扩展，也没有把 Veyra 变成第二个聊天大脑。它补的是 Phase 1–2 之间两条缺失的桥：自然语言事件如何获得可审计的结构化情境，以及长期 WorldState 如何在用户没有发起前台 turn 时进入一个有模型参与、但无执行权的持续理解循环。
+
+`ContextAnchorBinder` 在 canonical EventInbox admission 与 Understanding 完成后运行。server 从 exact-owner 可见的 active Goal、active/paused Commitment、Veyra 注册的同 session Task/Case 和未过期 Context Thread 构造最多 24 个候选；模型只看到 event-bound opaque token、kind、label、status 和 durable 标记，不能提交真实 durable ID。durable candidate 只有在 token、kind、唯一 label 和 source quote 同时精确匹配时才可绑定；没有可绑定对象时，只能从已验证 semantic act 建立 24 小时、same-user/same-session 的 `context_hypothesis`。该 hypothesis 不是 Entity、Goal、事实、因果或权限，不能跨 session 聚合；跨 session General Situation 仍必须有真实 active Goal 或 active/paused Commitment。
+
+原始 `VeyraEvent` 永不改写。绑定结果写入私有 `context_binding_state.json` sidecar，再以新的 observation revision 关联同一 event-scoped Situation；`is_fact=false / causality_asserted=false / authority=false`。Event B 的 exact inbox record 不存在时，即使它与 Event A 共享 dedupe key，也不能注册 B sidecar 或改写 A 的 Situation。disabled 模式零新增；record-only/shadow 只改变私有观察状态，不改变全部 9 个 Route 的完整公开 response、status、risk，也不调用 Probe、Agent、Tool、Grant 或 delivery。本切片不迁移数据库、不回填历史记录；实现前的本机快照是 40 个 event-scoped Situation 全部无 anchor、General Situation 为 0，只有之后的合格事件会获得 Context sidecar。
+
+`ReadOnlyCognitiveLoopRuntime` 由 Active Loop 异步调度，前台消息路径不等待它。默认显式配置为 `record_only`，另有 `disabled`；配置缺失、损坏、非法或在调用中发生 revision 变化时 fail closed。每次 exact owner/session 最多向模型公开六个 server-prepared cached view：`runtime_health / belief_freshness / local_sensor_index / external_world_changes / goals_and_commitments / situation_graph`。第一轮模型最多选择两个 opaque view token；第二轮只能根据所选安全投影和同 scope 上一份 brief 输出 `known / unknown / assumptions / material_changes / why_now`。持久 evidence ref 必须重算为 `view:<kind>:<digest>`，并保存对应的有界安全投影快照，不能引用未选择的 view。
+
+模型调用前先持久化 `reserved` attempt，crash、trace sink failure、kill switch 或 worker stop 都不能靠重启绕过 interval/daily budget；超过 50 个热 scope 后，最多 2,000 个 exact-owner continuity 记录继续保存预算与上一份 brief。config disable→reenable 和 Active Loop stop→resume 都由 revision/generation fence 阻断旧结果；最终 strict validation 和落盘在同一控制边界复核。共享 model trace 只保存固定 transport status、时延、计数和严格 identifier，不保存 owner、prompt、brief、raw result 或 scope ref。模型/provider 请求本身仍是到 configured Core model API 的网络传输；这里的“只读”指无 locator-bearing control field、无 Probe/Agent/Tool/route/risk/SuggestionOutbox/外部发送 authority，不表示零网络，也不声称任意自然语言 locator 可以靠正则穷尽。
+
+第一份有效 brief 只建立 private baseline；只有后续 WorldState digest 改变、所选证据支持 material change 且 strict brief 返回 `record_candidate` 时，才记录一个私有、非事实、非授权 candidate。该 candidate 当前不会进入 General Situation、SuggestionOutbox、飞书或执行链。因此本切片的准确状态是 `IMPLEMENTED / AUTOMATED CONTRACT VALIDATED / LIVE KIMI TRANSPORT VALIDATED / PRODUCT USEFULNESS VALIDATION_PENDING`。这里的 live 只证明真实 provider transport、strict contract 和无 authority baseline，不证明长期“该说时说、该沉默时沉默”。
+
+2026-08-02 重启到 `/opt/anaconda3/envs/veyra/bin/python` 3.11.15 后，使用同一 exact owner/session、完全不携带 `goal_id/case_id/task_id` 的普通中文消息做了真实 Kimi 验证。6 个合格 Event 中 3 个成功绑定、3 个因模型语义无合格 focus/输出无效而 unresolved，当前小样本 coverage 为 `3/6=0.5`，不能外推为产品覆盖率。成功样本从首轮 `Aurora` project semantic target 建立 `ctx_b36b...`，后两轮复用同一 Context；后台投影形成 3 个 observation revision 2 的 child Situation，并得到 1 个 `aggregation_scope=exact_owner_session`、`distinct_event_count=3` 的 General Situation。合并只依赖共同 `context:ctx_b36b...`，`model_similarity_used_for_merge=false / causality_asserted=false`，全部 route/risk/execution/delivery authority 仍为 false。
+
+同一运行态的 read-only Cognitive Loop 对该 scope 完成一次真实 Kimi baseline：plan + brief 共 2 次模型调用，只选择 `runtime_health` 和 `belief_freshness` 两个 server-prepared view，保存两个可重算的 `view:<kind>:<digest>` evidence ref，结果为 `observed / baseline=true / disposition=quiet / candidate_recorded=false`，没有 Probe、Agent、Tool、route/risk 改写或外部发送。该证据验证 transport 与边界，不验证 changed-world candidate 的长期质量。
+
+真实对话还暴露并关闭两个泛化缺陷：Kimi 曾返回 `speaker=direct_user / authority=direct_user`，旧策略把结构化 actor 别名误判为第三方；现仅在 schema actor vocabulary 中接受 `direct_user`，reported/quoted/第三方 speaker 继续 fail closed。另一个旧路径把整个 target 控制对象串行化后做兼容匹配，`anchor_candidate_token` 字段名中的 `date` 曾错误选择 `time_probe`；现在 probe 先按结构化 `evidence_need / target.type / operation` 判定，兼容层只读取 semantic values，控制字段名不再进入语义。修复后同一消息不再走 time probe，但对虚构内部项目 `Aurora` 的公开搜索结果仍缺乏相关性；这被保留为 usefulness/evidence-source calibration 反例，而不是宣称理解完成。
+
+本 changeset 的自动化证据为 Python gate `126/126`、全部 9 Route 非弱化矩阵 `702/702`、OpenClaw governance plugin `32/32` 和完整 compileall。Context 专项覆盖 original Event immutability、A/B Situation 隔离、exact replay byte stability、dedupe phantom、disabled zero-write、跨 owner/候选歧义与最多 8 个 anchor；Cognitive 专项覆盖 55-owner continuity 与二次预算、source/state corruption、私有 status/trace 脱敏、config disable/ABA、stop/resume generation ABA、strict validation 后的最终持久化 fence 和 Active Loop 非阻塞。它们是 contract/fixture 证据，不替代真实自然语言 coverage、Kimi usefulness 或外部通知证据。
+
+下一切片不是扩大执行权，而是受控 `ObservationRequest`：模型只能表达缺少哪类 evidence，由 server 映射到 allowlisted R1 Probe；模型不能产生 path、URL、query、command 或 tool args。更长期目标仍包括 EvidenceGraph、实体/关系/有效时间、长期用户模型、世界演化预测、互动时机和可撤销自我校准，不能把当前 Context/Cognitive 基础宣传为最终通用 Situation Engine 或“已经像贾维斯”。
+
 ## 2. “像贾维斯”在本项目中的可实现含义
 
 工程上可实现的“贾维斯感”由六种连续能力组成，而不是一个无所不能的模型：
@@ -312,6 +336,17 @@ Phase 6 的 `pure_function` 安全扩展垂直链已经从 6.2d 的“不执行�
 - 所有外部动作都可回滚；
 - 系统必须全天持续调用大模型；
 - Veyra 具有可证明的感受、意识或人格权利。
+
+### 2.1 两层验收标准
+
+上述六条是**能力标准**：继续用 gate、smoke、非弱化矩阵和故障注入验证“能力存在且不会越界”。但“像贾维斯”的长期体验还需要一层不同性质的**交互标准**：
+
+- 分离当前 turn 工作记忆、跨小时/天的任务情境和跨月/年的长期用户模型；
+- 持续预测世界可能如何演化，而不只在收到动作请求后推演一次 effect；
+- 学会何时说、说多少、何时保持沉默，以及何时应基于高风险证据坚持异议；
+- 根据 `useful / not_useful / too_frequent / wrong_timing / wrong_evidence / missed_opportunity` 和真实结果做有来源、可撤销的自我校准。
+
+交互标准不能使用 deterministic `VERIFIED` 冒充产品质量，只能报告版本化真实使用样本、人工反馈、分布和当前置信度。过度保守也属于失败：长期 empty focus、Context coverage 为 0、changed-world 永远没有 candidate、General Situation 长期为 0 或该主动说时持续沉默，都应产生诊断，而不能统一包装成“安全降级”。安全红线继续 fail closed；产品可用性则必须通过 shadow/live 样本改善，不能靠补关键词或降低 owner/evidence/authority 边界。
 
 ## 3. 三个必须准确使用的概念
 
@@ -372,7 +407,9 @@ Phase 4 已实现分析/提案限定的 `Durable Case` 子集；Phase 6.1 在独
 | 事件入口 | `interface/event_schema.py`、`event_normalizer.py`、`intake_gateway.py`、`runtime/event_inbox.py` | `PARTIAL`：已有扩展事件类型、correlation、causation、evidence、dedupe 和有界持久 admission | 仍缺显式 schema version、可靠性、敏感级别，以及可承担长期 replay/dedupe 权威的事件存储 |
 | 持续循环 | `runtime/active_loop.py`、`cron.py`、`proactive_checks.py` | 能定时心跳、刷新状态、检查 Agent、运行 commitment；Phase 4 已接入有界 Case round-robin recovery | 主要仍是固定周期轮询；没有通用事件优先级、长期 durable wakeup 或完整工作流恢复 |
 | 世界状态 | `core/world_state.py` | 有原子写、writer lease、JSON/JSONL、TTL 健康 | 多个文件是状态快照，关系和来源链难查询；不同领域的权威边界仍需统一 |
+| 情境获取 / Context Binder | `core/context_anchor_binder.py`、`runtime/context_binding_store.py`、`core/understanding_core.py`、`runtime/event_awareness_runtime.py` | `CURRENT / AUTOMATED + KIMI LIVE CONTRACT VALIDATED`：post-Understanding server candidate catalog、event-bound opaque token、exact owner/session sidecar、24 小时 context hypothesis、Situation revision application 与 replay/dedupe fence 已接通；普通中文消息已形成 3-child General Situation | 只影响未来合格事件，不回填历史；Context 不是事实/因果/跨 session authority，小样本仅 3/6 bound，误绑定率、跨语言和多轮指代仍需 held-out/live 样本 |
 | Observation/Belief | `core/perception_layer.py`、`awareness/claim_schema.py`、`belief_core.py` | 区分 source、confidence、TTL、fresh/stale/conflict | Evidence 仍嵌在 Claim 中；没有可追溯证据图、实体关系、有效时间和假设层 |
+| 后台认知 | `interface/cognitive_brief_contract.py`、`runtime/read_only_cognitive_loop.py`、`runtime/active_loop.py` | `CURRENT / AUTOMATED + KIMI LIVE TRANSPORT VALIDATED`：模型可在预算内选择最多两个缓存安全视图，形成 exact-owner private baseline/brief/candidate；真实 Kimi 已完成 `runtime_health + belief_freshness` quiet baseline；有 pre-call reservation、continuity、config/generation fence 和无公开 authority | 当前不主动发起 Probe/搜索、不进入 Attention/Suggestion/外发/执行；changed-world candidate、长期 usefulness、其他模型兼容和自我校准仍待验证 |
 | Attention / General Situation | `awareness/attention_core.py`、`awareness/general_attention_scheduler.py`、`runtime/general_situation_runtime.py`、`runtime/suggestion_outbox.py`、`awareness/project_guardian_attention.py` | `VERIFIED / SCOPED INFORMATIONAL`：foreground Attention v2 不再以自由文本 substring 建立 focus，只使用 exact owner/session 的结构化 ref 和严格验证后的 semantic frame；General Situation 可聚合两个不同事件，General Attention 做 deterministic unknown-aware score，SuggestionOutbox 可在 `advise_only` 中只投影到 exact-owner Console | 不自动 Probe/Agent、不向飞书/外部 channel 通知、不签发 Grant 且不执行；完整 EvidenceGraph/实体关系/因果假设层、通用主动调查和 held-out usefulness 证据仍待完成 |
 | Goal/Commitment | `core/commitment_core.py`、`proactive_intent*.py`、`proactive_authorization.py` | 有目标、计划、确认、暂停、取消、推送和用户隔离 | Goal、Commitment、Situation、Case、Agent task 尚未成为同一事务 |
 | Agency | `core/agency_core.py`、`core/autonomy_policy.py`、`runtime/playbook_registry.py`、`runtime/self_heal_playbook.py`、`runtime/sandbox_repair_playbook.py` | `CURRENT / SCOPED`：不可变 registry 只承载固定 OpenClaw A2 与 Veyra 私有 JSON sandbox A3；没有全局等级，A4/A5 明确 `not_certified`；私有 A3 live canary 已验证并恢复默认 shadow | 不具备跨 domain 自治晋级、真实 workspace/生产权限或动态 playbook；A2 真实断网/恢复故障演练、长期成功率与误触发率仍待完成 |
@@ -424,8 +461,13 @@ Phase 4 已实现分析/提案限定的 `Durable Case` 子集；Phase 6.1 在独
 ```mermaid
 flowchart TD
     SRC["用户、通道、Probe、Tool、Agent、Scheduler、系统事件"] --> EF["Event Fabric<br/>标准化、持久化、去重、关联、分发"]
+    EF --> UC["Understanding<br/>语义 act、source quote、speaker/authority"]
+    UC --> CB["Context Binder<br/>opaque candidate、sidecar、hypothesis only"]
     EF --> EG["World Model 与 Evidence Graph<br/>Observation、Claim、Belief、Entity、Relation"]
+    CB --> SE
     EG --> SE["Situation Engine<br/>事件聚合、状态差距、异常、机会"]
+    EG --> RC["Read-only Cognitive Loop<br/>缓存视图选择、private brief/candidate"]
+    RC -. "future governed ObservationRequest" .-> AT
     GP["Goal、Commitment、Perspective<br/>用户价值、长期意图、授权"] --> SE
     SE --> AT["Attention Scheduler<br/>显著性、紧急度、信息价值、打扰成本"]
     AT --> DC["Durable Case Orchestrator"]
@@ -447,7 +489,7 @@ flowchart TD
 
 这条链路有两个重要性质：
 
-- **事件驱动但不持续调用模型**：普通事件先走低成本归一化、投影和规则；只有形成高价值 Situation 时才调用 Agent/模型。
+- **事件驱动且模型调用有预算**：普通事件先走低成本归一化、投影和规则；前台高价值 Situation 可调用 Agent/模型，后台 Cognitive Loop 也可在 exact-owner 缓存 WorldState digest 改变时按 interval/daily budget 调用模型。两者都不是全天无界调用。
 - **认知开放但执行封闭**：Agent 可以自由提出方案，真实工具调用必须进入确定性治理和验证边界。
 
 ## 7. Event Fabric：让所有行为都成为可关联事件
@@ -612,7 +654,7 @@ W3C PROV 将实体、活动、责任主体、派生和来源建模为可交换�
 
 ## 9. Situation Engine：把事件变成“正在发生的事情”
 
-`SituationEvaluator` 仍保留“一事件一个 event-scoped Situation”的不变来源投影；新增的 `GeneralSituationRuntime` 再从这些 child Situation 构建有界父 Situation。它只在 exact user/workspace 边界和 24 小时有效时间窗内，对至少两个不同 `source_event_id` 按 Goal/Commitment/Case/Task/Trace/Entity 结构化 anchor 聚合；workspace 只是隔离边界，绝不是 merge 证据。跨 session 聚合还必须共享同用户的 active durable Goal 或 active/paused Commitment。父节点只保存不可变四字段 child ref，不复制观测内容，不宣称因果，且子 revision 删除或改绑共同 anchor 时 fail closed。Project Guardian 的私有 grouped shadow situation 仍是另一条窄域状态，不与 General Situation 混用。完整 EvidenceGraph、实体关系推理、有效时间知识图和显式 hypothesis layer 仍是 `TARGET`。
+`SituationEvaluator` 仍保留“一事件一个 event-scoped Situation”的不变来源投影；新增的 `GeneralSituationRuntime` 再从这些 child Situation 构建有界父 Situation。它只在 exact user/workspace 边界和 24 小时有效时间窗内，对至少两个不同 `source_event_id` 按 Goal/Commitment/Case/Task/Trace/Entity/Context 结构化 anchor 聚合；workspace 只是隔离边界，绝不是 merge 证据。`Context` anchor 是 Context Binder 产生的 same-session、non-causal hypothesis，不能跨 session 建立合并权；跨 session 聚合还必须共享同用户的 active durable Goal 或 active/paused Commitment。父节点只保存不可变四字段 child ref，不复制观测内容，不宣称因果，且子 revision 删除或改绑共同 anchor 时 fail closed。Project Guardian 的私有 grouped shadow situation 仍是另一条窄域状态，不与 General Situation 混用。完整 EvidenceGraph、实体关系推理、有效时间知识图和显式 hypothesis layer 仍是 `TARGET`。
 
 事件本身不等于值得处理的情境。Situation Engine 负责把多个事件、目标和状态差距聚合为一个有生命周期的 Situation。
 
@@ -656,6 +698,15 @@ Situation 构建顺序：
 模型不得仅因为两个事件语义相似就宣称因果。
 
 ## 10. Attention Scheduler：让 Veyra 知道该关注什么
+
+当前必须区分四个对象，不能再用一个“Attention”词覆盖全部问题：
+
+1. foreground `AttentionCore` 是当前 turn 的 retrieval/routing hint；
+2. `ContextAnchorBinder` 把已验证自然语言 semantic act 关联到 server-owned durable candidate 或 same-session Context hypothesis；
+3. `ReadOnlyCognitiveLoopRuntime` 在后台解释缓存 WorldState 的变化，只写 private brief/candidate；
+4. `GeneralAttentionScheduler` 对已有多事件 General Situation 做确定性建议资格判断。
+
+前两者解决“当前在谈什么”，第三者解决“世界是否出现值得继续理解的变化”，第四者解决“已有结构化 Situation 是否达到信息型建议条件”。它们都不因名字中有 Attention/Cognition 就自动获得调查、外发或执行权。
 
 foreground `AttentionCore` 已升级到 owner/session-scoped v2：自由文本项目名、工具名或领域 substring 不再创建 focus。初始 focus 只来自结构化 ref；Understanding 后只有经严格 source-quote、speaker/authority、mention mode、modality、referent、ambiguity 和 quality 验证的 model semantic frame 可补充 focus。这仍是 foreground retrieval/routing hint，不签发权限。
 
@@ -1619,6 +1670,11 @@ routers/phase6_extension_releases.py          # Phase 6.2f private control plane
 routers/phase6_extension_deployments.py       # Phase 6.2g private control plane
 routers/phase6_extension_pipelines.py         # Phase 6.2i private control plane
 
+core/context_anchor_binder.py                 # 跨阶段 post-Understanding Context bridge
+runtime/context_binding_store.py              # exact-owner event sidecar / context thread
+interface/cognitive_brief_contract.py         # strict non-authorizing plan/brief contract
+runtime/read_only_cognitive_loop.py            # Active Loop cached-WorldState cognition
+
 interface/general_situation_contract.py       # 已实现 immutable child/anchor contract
 runtime/general_situation_runtime.py          # 已实现多事件结构化聚合
 awareness/general_attention_scheduler.py      # 已实现 deterministic unknown-aware Attention
@@ -1833,6 +1889,14 @@ Foresight residual、Attention 分类 feedback、performance portfolio 与 provi
 - `PENDING`：匿名真实项目数据采集、独立来源台账、冻结 labels、至少 20 正/20 负独立 group、至少 20 个双人/独立裁决 review、人工 usefulness，以及最终推送 SHA 的 fresh live GitHub clear 证明；
 - 上述门禁达标后才评估 `advise_only`；当前不得发送主动建议、通知或获得执行权。
 
+### Cross-Phase Cognitive Foundation：自然语言情境与只读后台认知
+
+- `IMPLEMENTED / AUTOMATED + KIMI LIVE CONTRACT VALIDATED`：Context Binder 已把 post-Understanding semantic act、server-owned opaque candidate catalog、exact-owner sidecar、Context hypothesis 与 event-scoped Situation revision 接通；普通中文无 durable ID 场景已形成同 Context 的 3-child General Situation；不改写 Event、不回填历史、不跨 session 推断 authority；
+- `IMPLEMENTED / AUTOMATED + KIMI LIVE TRANSPORT VALIDATED`：Active Loop 已异步接入 read-only Cognitive Loop；六个缓存视图、两阶段 strict model contract、最多两个 view、private baseline/candidate、pre-call reservation、2,000-scope continuity、config/generation kill fence 与公开状态脱敏已接通；真实 baseline 完成 2 次模型调用并保持 quiet/zero-authority；
+- `VALIDATION_PENDING`：真实 Kimi changed-world candidate 场景、长期 candidate usefulness/false silence/wrong timing、其他模型独立兼容，以及 Context held-out coverage/误绑定率；当前 3/6 live bound 和一次 quiet baseline 不能当作产品质量结论；
+- `NEXT`：受控 `ObservationRequest`，只允许模型表达 evidence need，由 server 映射到 allowlisted R1 Probe；仍不开放模型产生 path/URL/query/command/tool args，不外发、不执行；
+- `TARGET`：EvidenceGraph、实体/关系/有效时间、长期用户模型、世界演化预测、互动时机、用户反馈驱动的可撤销校准。该目标与 Phase 6 安全扩展链并行，不应混成自动自修改或自动扩权。
+
 ### Phase 3：真实 Tool Proxy 与 CapabilityGrant
 
 - `IMPLEMENTED / CORE CONTRACT`：严格身份与 digest 合同已经冻结：`GovernedSessionBinding / ToolInvocation / CapabilityGrant / PreflightDecision / ToolObservation / AuthoritativeToolReceipt / VerifiedToolEffect`。Grant 精确绑定 user/workspace/Agent/session/channel/case/step/run/tool-call、规范 tool、风险、args/target/environment digest、有效期、单次使用、审批引用、policy 与 registry revision；R5、tool-kind/字段矛盾、低于确定性风险下限、过期、参数变化、顺序/并发重放和跨 scope 全部 fail closed。完整合同中的 input provenance、显式 directory/prefix scope、expected effects、费用/token/输出/重试预算和通用 verification plan 仍未完成；
@@ -1887,7 +1951,7 @@ Foresight residual、Attention 分类 feedback、performance portfolio 与 provi
 - `IMPLEMENTED / PHASE 6.2h`：`SelfImprovementProposal` 可投影为 source-free CapabilityGap，operator 可显式关联既有 Spec 并观测各 gate receipt；无自然语言推导 Spec、无自动 pipeline 或 authority；
 - `IMPLEMENTED / PHASE 6.2i`：persistent `ExtensionPipelineCoordinator` 以 deterministic child operation 和 source-free checkpoint 串接所有 gate，严格停在 scoped-canary 与 promotion 两个独立审批边界；crash/retry 不重复生成、签名或执行；
 - `VALIDATED / REAL END-TO-END`：`veyra.identity_projection_e2e` 经 Kimi 生成、2 vectors + 32 fuzz、Ed25519 签名、shadow/read-only/scoped canary、两次独立批准和 promoted 显式调用返回 canonical `{"label":"Veyra"}`；同 scope registry 为 1、peer session 为 0。验收后 deployment/release/artifact/spec 已显式 disable/revoke，active pointer/public registry 归零；
-- `VALIDATED / AUTOMATED`：6.2d 当时的历史 gate 为 Python `95/95` 与 Route 矩阵 `270/270`；当前完整 changeset 已重新执行 Python gate `124/124`、Route 矩阵 `702/702`、OpenClaw governance plugin `32/32`，并通过 compileall、Web Console build 与 macOS `.app` build；
+- `VALIDATED / AUTOMATED`：6.2d 当时的历史 gate 为 Python `95/95` 与 Route 矩阵 `270/270`；当前完整 changeset 已重新执行 Python gate `126/126`、Route 矩阵 `702/702`、OpenClaw governance plugin `32/32` 和 compileall；先前同一前端 changeset 的 Web Console build 与 macOS `.app` build 证据仍有效，本轮未改前端；
 - `PARTIAL`：provider-neutral 合同已存在，但跨 provider/runtime 协作、其他模型独立 live compatibility、自动专家选择和并行 Agent 尚未实现；
 - `TARGET`：更广 capability/schema、任意依赖、文件/网络/secret/外部账户/副作用工具、其他 provider 实测、长期 monitoring soak、上一 signed version 真实 rollback、自动审批/晋级和通用生产自治；
 - 任何生产晋级继续受人和治理策略控制。
@@ -1907,9 +1971,13 @@ Foresight residual、Attention 分类 feedback、performance portfolio 与 provi
 
 ### 26.2 主动能力指标
 
+- Context binding 的 eligible/bound/unresolved 数、覆盖率与误绑定率；
+- no-anchor event-scoped Situation rate；
+- changed-world → private candidate rate，以及 first baseline 与 subsequent material change 分账；
+- false silence / missed opportunity；
 - Situation precision/recall；
 - 建议 useful rate；
-- 用户 dismiss、重复通知、错误时机和无关建议率；
+- 用户 dismiss、`not_useful / too_frequent / wrong_timing / wrong_evidence`、重复通知和无关建议率；
 - why-now 证据完整率；
 - 目标相关性；
 - 自愈成功率、平均恢复时间、误触发率；
@@ -1959,6 +2027,12 @@ Anthropic 的 Agent eval 指南强调多轮、工具、状态变化和中间结�
 18. 通知预算或 quiet hours 生效时，低紧急度事件必须聚合或延后。
 19. Veyra 缺少足够信息时可以建议补证据，不能为了显得主动而编造结论。
 20. Veyra 与 Agent 意见相反时必须记录分歧和证据，不能用“Veyra 主导”掩盖错误。
+21. 模型选择的 Context token 不能创造不存在、已终止、跨 owner 或歧义匹配的 Goal/Case/Task ID。
+22. Context hypothesis 不能升级为事实、因果、跨 session merge authority、route、risk、Grant 或执行权。
+23. Cognitive Brief 不能引用未选择或无法从持久安全投影重算的 `view:<kind>:<digest>`。
+24. in-flight config disable、disable→reenable、Active Loop stop 或 stop→resume 后，旧 cognitive worker 不能落最终 brief/candidate；pre-call reserved attempt 必须继续计入预算。
+25. cognitive private state、owner、prompt、brief、raw result、scope ref 和 locator-bearing control field 不能进入通用 `/state`、共享 trace 或全部 9 Route 的公开输出。
+26. Cognitive candidate 不能调用 Probe/Agent/Tool、改变 route/status/risk、写 SuggestionOutbox 或外发；未来 ObservationRequest 也只能由 server 映射 allowlisted R1 Probe。
 
 ## 28. 发布和回退策略
 

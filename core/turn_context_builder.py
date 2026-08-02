@@ -33,6 +33,7 @@ class TurnContextBuilder:
         event: VeyraEvent | None = None,
         rule_decision: dict[str, Any] | None = None,
         persona_hint: dict[str, Any] | None = None,
+        anchor_candidates: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         state = self._scoped_state()
         relevant_claims = self.belief.relevant_claims(
@@ -54,6 +55,9 @@ class TurnContextBuilder:
         payload_metadata = event.payload.get("metadata") if event else {}
         risk_state = state.get("risk_state", {}) if isinstance(state.get("risk_state"), dict) else {}
         persona = self._persona_summary(state.get("persona_state", {}), persona_hint=persona_hint)
+        safe_anchor_candidates = self._anchor_candidate_catalog(
+            anchor_candidates or []
+        )
         context = redact_sensitive(
             {
                 "active_context": {
@@ -86,6 +90,11 @@ class TurnContextBuilder:
                         session_id=event.source.session_id if event else None,
                     ),
                 },
+                # Installed after the generic redaction pass below. The token
+                # key intentionally matches the global secret detector, while
+                # these particular values are server-issued, event-bound
+                # references rather than credentials.
+                "anchor_candidates": [],
                 "belief": {
                     "summary": self._belief_summary(state.get("belief_state", {}).get("summary", {})),
                     "fresh_claims": fresh_claims[:1],
@@ -108,6 +117,7 @@ class TurnContextBuilder:
             max_string=420,
             max_list=6,
         )
+        context["anchor_candidates"] = safe_anchor_candidates
         context, drift_report = self.drift_detector.apply(context, decision=rule_decision or {})
         context["_context_metrics"] = {
             "context_chars": drift_report["remediated_context_chars"],
@@ -132,6 +142,38 @@ class TurnContextBuilder:
                 },
             )
         return context
+
+    @staticmethod
+    def _anchor_candidate_catalog(
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        for item in candidates[:24]:
+            if not isinstance(item, dict):
+                continue
+            token = str(item.get("candidate_token") or "")
+            if (
+                len(token) != 30
+                or not token.startswith("actok_")
+                or any(character not in "0123456789abcdef" for character in token[6:])
+            ):
+                continue
+            output.append(
+                {
+                    "candidate_token": token,
+                    "kind": str(item.get("kind") or "")[:80],
+                    "label": str(
+                        redact_sensitive(
+                            str(item.get("label") or ""),
+                            max_string=180,
+                            max_list=2,
+                        )
+                    ),
+                    "status": str(item.get("status") or "")[:80],
+                    "durable": bool(item.get("durable")),
+                }
+            )
+        return output
 
     def _scoped_state(self) -> dict[str, Any]:
         return {

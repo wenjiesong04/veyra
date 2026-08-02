@@ -889,6 +889,7 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
             "mode": runtime.mode,
             "mode_epoch": runtime.mode_epoch,
             "allowed_modes": sorted(runtime.MODES),
+            "context_binding": runtime.context_bindings.status(),
         }
 
     @router.post("/events/awareness/config")
@@ -919,6 +920,14 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.get("/awareness/context-bindings/status")
+    async def context_binding_status() -> dict[str, Any]:
+        return deps["awareness_loop"].event_awareness.context_bindings.status()
+
+    @router.get("/awareness/cognitive-loop/status")
+    async def cognitive_loop_status() -> dict[str, Any]:
+        return deps["read_only_cognitive_loop"].status()
 
     @router.get("/awareness/suggestions/status")
     async def general_suggestion_status() -> dict[str, Any]:
@@ -1038,6 +1047,8 @@ def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
     public.pop("situation_state", None)
     public.pop("general_situation_state", None)
     public.pop("suggestion_outbox", None)
+    public.pop("context_binding_state", None)
+    public.pop("cognitive_loop_state", None)
     attention_state = (
         public.get("attention_state")
         if isinstance(public.get("attention_state"), dict)

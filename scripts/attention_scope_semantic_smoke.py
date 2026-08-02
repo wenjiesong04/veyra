@@ -161,6 +161,80 @@ def main() -> int:
             == first,
             "exact owner continuation survives restart",
         )
+
+        expired_event = normalizer.user_message(
+            "检查过期目标",
+            "smoke",
+            "expired-user",
+            "expired-session",
+            subject={"kind": "task", "id": "expired-task"},
+        )
+        expect(
+            restarted.focus_for_text(
+                "检查过期目标",
+                user_id="expired-user",
+                session_id="expired-session",
+                event=expired_event,
+            )
+            == ["ref:task:expired-task"],
+            "structured focus is available before its TTL expires",
+        )
+
+        def expire_attention_scope(state: dict[str, object]) -> dict[str, object]:
+            scopes = state.get("scopes")
+            if not isinstance(scopes, dict):
+                raise AssertionError("attention scopes missing")
+            for record in scopes.values():
+                if (
+                    isinstance(record, dict)
+                    and record.get("user_id") == "expired-user"
+                    and record.get("session_id") == "expired-session"
+                ):
+                    record["updated_at"] = "2000-01-01T00:00:00+00:00"
+                    record["ttl_seconds"] = 300
+                    return state
+            raise AssertionError("expired attention scope missing")
+
+        store.mutate_json("attention_state.json", expire_attention_scope)
+        attention_path = store.path_for("attention_state.json")
+        before_expired_read = attention_path.read_bytes()
+        expired_active = restarted.active_scope(
+            user_id="expired-user",
+            session_id="expired-session",
+        )
+        after_expired_read = attention_path.read_bytes()
+        expect(
+            expired_active.get("scope_status") == "expired"
+            and expired_active.get("focus") == []
+            and expired_active.get("context_scope")
+            == {"probe_priority": [], "structured_refs": [], "semantic_targets": []},
+            "expired scope is projected as empty focus",
+            expired_active,
+        )
+        expect(
+            before_expired_read == after_expired_read,
+            "expired active-scope projection is a pure read",
+        )
+        expect(
+            restarted.focus_for_text(
+                "继续",
+                user_id="expired-user",
+                session_id="expired-session",
+            )
+            == [],
+            "continuation cannot inherit an expired scope",
+        )
+        expired_continuation = restarted.active_scope(
+            user_id="expired-user",
+            session_id="expired-session",
+        )
+        expect(
+            expired_continuation.get("scope_status") == "exact"
+            and expired_continuation.get("focus") == []
+            and expired_continuation.get("inherited_from_previous") is False,
+            "expired continuation starts a fresh empty scope",
+            expired_continuation,
+        )
         expect(
             restarted.focus_for_text(
                 "Veyra 架构 Docker 部署 git 日志",
@@ -228,6 +302,21 @@ def main() -> int:
             and isinstance(rows[0].get("components"), dict),
             "semantic focus exposes deterministic component scores",
             rows,
+        )
+        provider_actor_alias = restarted.assess_understanding(
+            text=semantic_text,
+            understanding=model_understanding(
+                semantic_text,
+                speaker="direct_user",
+            ),
+        )
+        expect(
+            provider_actor_alias.get("status") == "assessed"
+            and provider_actor_alias.get("focus")
+            == ["target:runtime:OpenClaw"]
+            and not provider_actor_alias.get("blockers"),
+            "structured direct_user actor alias remains eligible for read-only focus",
+            provider_actor_alias,
         )
 
         invalid_event = normalizer.user_message(
