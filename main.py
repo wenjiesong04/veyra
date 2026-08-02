@@ -1049,6 +1049,9 @@ app.include_router(
                 "read_only_cognitive_loop": (
                     lambda: read_only_cognitive_loop
                 ),
+                "learning_calibration": (
+                    lambda: learning_calibration
+                ),
             }
         )
     )

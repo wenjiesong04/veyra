@@ -21,6 +21,7 @@ from interface.event_schema import (
     utc_now_iso,
 )
 from runtime.event_inbox import EventInbox
+from runtime.attention_hypothesis_runtime import AttentionHypothesisRuntime
 from runtime.context_binding_store import ContextBindingStore
 from runtime.general_situation_runtime import GeneralSituationRuntime
 from runtime.project_guardian import ProjectGuardianRuntime
@@ -63,6 +64,7 @@ class ShadowAwarenessRuntime:
         self.situation_evaluator = SituationEvaluator(state_store)
         self.general_situations = GeneralSituationRuntime(state_store)
         self.general_attention = GeneralAttentionScheduler(state_store)
+        self.attention_hypotheses = AttentionHypothesisRuntime(state_store)
         self.suggestion_outbox = SuggestionOutbox(state_store)
         self.project_guardian_signals = ProjectGuardianSignalLedger(state_store)
         self._project_guardian_git_ingress_capability = object()
@@ -2199,16 +2201,56 @@ class ShadowAwarenessRuntime:
                     "route_change_allowed": False,
                 }
             assessment = self.general_attention.assess(parent)
+            hypothesis = self.attention_hypotheses.observe(parent, assessment)
+            if hypothesis.get("status") == "fail_closed":
+                return {
+                    "status": "degraded",
+                    "general_situation_status": grouped.get("status"),
+                    "attention_status": assessment.get("status"),
+                    "hypothesis_status": "fail_closed",
+                    "reason": str(
+                        hypothesis.get("reason")
+                        or "attention_hypothesis_fail_closed"
+                    ),
+                    "route_change_allowed": False,
+                }
+            surface_assessment = hypothesis.get("surface_assessment")
+            if not isinstance(surface_assessment, dict):
+                return {
+                    "status": "degraded",
+                    "general_situation_status": grouped.get("status"),
+                    "attention_status": assessment.get("status"),
+                    "hypothesis_status": hypothesis.get("status"),
+                    "reason": str(
+                        hypothesis.get("reason")
+                        or "attention_hypothesis_surface_missing"
+                    ),
+                    "route_change_allowed": False,
+                }
             proposal = self.suggestion_outbox.consider(
                 parent,
-                assessment,
+                surface_assessment,
                 user_id=event.source.user_id,
                 session_id=event.source.session_id,
             )
+            if proposal.get("status") == "fail_closed":
+                return {
+                    "status": "degraded",
+                    "general_situation_status": grouped.get("status"),
+                    "attention_status": assessment.get("status"),
+                    "hypothesis_status": hypothesis.get("status"),
+                    "suggestion_status": "fail_closed",
+                    "reason": str(
+                        proposal.get("reason")
+                        or "suggestion_outbox_fail_closed"
+                    ),
+                    "route_change_allowed": False,
+                }
             return {
                 "status": "success",
                 "general_situation_status": grouped.get("status"),
                 "attention_status": assessment.get("status"),
+                "hypothesis_status": hypothesis.get("status"),
                 "suggestion_status": proposal.get("status"),
                 "route_change_allowed": False,
             }
@@ -2394,7 +2436,18 @@ class ShadowAwarenessRuntime:
         if event.type != EventType.OBSERVATION:
             return None
         observation = event.payload.get("observation")
-        return copy.deepcopy(observation) if isinstance(observation, dict) else None
+        if not isinstance(observation, dict):
+            return None
+        projected = copy.deepcopy(observation)
+        # These fields are part of the typed observation command, not free
+        # text. Persisting them lets Attention verify evidence currentness
+        # without reaching back into an EventInbox payload during reads.
+        if str(projected.get("schema_version") or "") == (
+            "veyra.structured_observation.fact.v1"
+        ):
+            projected["valid_from"] = event.payload.get("valid_from")
+            projected["valid_until"] = event.payload.get("valid_until")
+        return projected
 
     @staticmethod
     def _explicit_situation_id(event: VeyraEvent) -> str | None:

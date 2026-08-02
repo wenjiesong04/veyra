@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
@@ -101,7 +101,9 @@ type OwnerScope = {
 type ScopedCollection = {
   status?: JsonValue;
   count?: JsonValue;
+  hypothesis_count?: JsonValue;
   items?: JsonValue;
+  status_counts?: JsonValue;
   state_revision?: JsonValue;
   policy?: JsonValue;
   authority?: JsonValue;
@@ -118,6 +120,13 @@ type Phase6StageStatus = {
 };
 
 type WorkbenchSection = "awareness" | "governance" | "runtime" | "ops" | "audit" | "logs";
+
+type SuggestionFeedbackLabel =
+  | "useful"
+  | "not_useful"
+  | "too_frequent"
+  | "wrong_timing"
+  | "wrong_evidence";
 
 const initialMessage = "帮我看 18789 端口有没有被占用";
 const defaultOwnerScope: OwnerScope = {
@@ -181,6 +190,7 @@ function StatusPill({ value }: { value: string }) {
     "not_certified",
     "not_configured",
     "not_ready",
+    "overconservative_alert",
     "rejected",
     "timeout",
     "timed_out",
@@ -326,9 +336,14 @@ function App() {
   const [ownerUserDraft, setOwnerUserDraft] = useState(() => readOwnerScope().userId);
   const [ownerSessionDraft, setOwnerSessionDraft] = useState(() => readOwnerScope().sessionId);
   const [scopedAttention, setScopedAttention] = useState<Record<string, JsonValue> | null>(null);
+  const [cognitiveLoopStatus, setCognitiveLoopStatus] = useState<Record<string, JsonValue> | null>(null);
   const [generalSituations, setGeneralSituations] = useState<ScopedCollection>({});
+  const [attentionHypotheses, setAttentionHypotheses] = useState<ScopedCollection>({});
   const [suggestionStatus, setSuggestionStatus] = useState<Record<string, JsonValue> | null>(null);
   const [suggestionInbox, setSuggestionInbox] = useState<ScopedCollection>({});
+  const [suggestionFeedback, setSuggestionFeedback] = useState<ScopedCollection>({});
+  const suggestionFeedbackCommandIds = useRef<Map<string, string>>(new Map());
+  const [suggestionCalibration, setSuggestionCalibration] = useState<Record<string, JsonValue> | null>(null);
   const [awarenessPanelError, setAwarenessPanelError] = useState<string | null>(null);
   const [phase6Stages, setPhase6Stages] = useState<Phase6StageStatus[]>([]);
   const [phase6StatusUpdatedAt, setPhase6StatusUpdatedAt] = useState<string | null>(null);
@@ -364,20 +379,41 @@ function App() {
     const query = ownerQuery(scope);
     const results = await Promise.allSettled([
       fetchJson<Record<string, JsonValue>>(`/attention/active?${query}`),
+      fetchJson<Record<string, JsonValue>>("/awareness/cognitive-loop/status"),
       fetchJson<ScopedCollection>(`/awareness/general-situations?${query}&limit=50`),
+      fetchJson<ScopedCollection>(`/awareness/attention-hypotheses?${query}&limit=50`),
       fetchJson<Record<string, JsonValue>>("/awareness/suggestions/status"),
-      fetchJson<ScopedCollection>(`/awareness/suggestions/inbox?${query}&limit=50`)
+      fetchJson<ScopedCollection>(`/awareness/suggestions/inbox?${query}&limit=50`),
+      fetchJson<ScopedCollection>(`/awareness/suggestions/feedback?${query}&active_only=true&limit=100`),
+      fetchJson<Record<string, JsonValue>>(`/awareness/suggestions/calibration?${query}`)
     ]);
-    const [attentionResult, situationResult, suggestionStatusResult, inboxResult] = results;
+    const [
+      attentionResult,
+      cognitiveLoopResult,
+      situationResult,
+      hypothesisResult,
+      suggestionStatusResult,
+      inboxResult,
+      feedbackResult,
+      calibrationResult
+    ] = results;
     setScopedAttention(attentionResult.status === "fulfilled" ? attentionResult.value : null);
+    setCognitiveLoopStatus(cognitiveLoopResult.status === "fulfilled" ? cognitiveLoopResult.value : null);
     setGeneralSituations(situationResult.status === "fulfilled" ? situationResult.value : {});
+    setAttentionHypotheses(hypothesisResult.status === "fulfilled" ? hypothesisResult.value : {});
     setSuggestionStatus(suggestionStatusResult.status === "fulfilled" ? suggestionStatusResult.value : null);
     setSuggestionInbox(inboxResult.status === "fulfilled" ? inboxResult.value : {});
+    setSuggestionFeedback(feedbackResult.status === "fulfilled" ? feedbackResult.value : {});
+    setSuggestionCalibration(calibrationResult.status === "fulfilled" ? calibrationResult.value : null);
     const unavailable = [
       attentionResult.status === "rejected" ? "attention" : null,
+      cognitiveLoopResult.status === "rejected" ? "cognitive loop" : null,
       situationResult.status === "rejected" ? "general situations" : null,
+      hypothesisResult.status === "rejected" ? "attention hypotheses" : null,
       suggestionStatusResult.status === "rejected" ? "suggestion status" : null,
-      inboxResult.status === "rejected" ? "suggestion inbox" : null
+      inboxResult.status === "rejected" ? "suggestion inbox" : null,
+      feedbackResult.status === "rejected" ? "suggestion feedback" : null,
+      calibrationResult.status === "rejected" ? "suggestion calibration" : null
     ].filter(Boolean);
     setAwarenessPanelError(
       unavailable.length ? `${unavailable.join(", ")} unavailable for this exact owner/session scope` : null
@@ -768,6 +804,115 @@ function App() {
     }
   };
 
+  const configureSuggestionSandbox = async (sandboxEnabled: boolean) => {
+    const revision = Number(suggestionInbox.state_revision);
+    if (!Number.isInteger(revision) || revision < 0) {
+      setError("Suggestion inbox revision is unavailable; refresh before changing the sandbox policy.");
+      return;
+    }
+    const currentPolicy = asRecord(suggestionInbox.policy);
+    const quietHours = currentPolicy.quiet_hours;
+    const boundedNumber = (value: JsonValue | undefined, fallback: number) => {
+      const selected = Number(value);
+      return Number.isInteger(selected) && selected >= 0 ? selected : fallback;
+    };
+    setLoading(true);
+    setError(null);
+    try {
+      await fetchJson<Record<string, JsonValue>>("/awareness/suggestions/policy", {
+        method: "POST",
+        body: JSON.stringify({
+          user_id: ownerScope.userId,
+          session_id: ownerScope.sessionId,
+          sandbox_enabled: sandboxEnabled,
+          daily_budget: boundedNumber(currentPolicy.daily_budget, 1),
+          timezone: String(
+            currentPolicy.timezone ??
+              asRecord(currentPolicy.quiet_hours).timezone ??
+              Intl.DateTimeFormat().resolvedOptions().timeZone ??
+              "UTC"
+          ),
+          quiet_hours:
+            quietHours && typeof quietHours === "object" && !Array.isArray(quietHours)
+              ? quietHours
+              : null,
+          cooldown_seconds: boundedNumber(currentPolicy.cooldown_seconds, 3600),
+          dismiss_cooldown_seconds: boundedNumber(currentPolicy.dismiss_cooldown_seconds, 86400),
+          expected_state_revision: revision
+        })
+      });
+      await refreshScopedAwareness(ownerScope);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unable to update the owner-scoped suggestion sandbox");
+      await refreshScopedAwareness(ownerScope);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const respondWithSuggestionFeedback = async (
+    proposal: Record<string, JsonValue>,
+    label: SuggestionFeedbackLabel,
+    existingFeedback?: Record<string, JsonValue>
+  ) => {
+    const proposalId = String(proposal.proposal_id ?? "");
+    const proposalRevision = String(proposal.proposal_revision ?? "");
+    const generalSituationId = String(proposal.general_situation_id ?? "");
+    const parentRevision = Number(proposal.parent_revision);
+    const outboxRevision = Number(suggestionInbox.state_revision);
+    if (
+      suggestionFeedback.status !== "success" ||
+      String(proposal.schema_version ?? "") !== "veyra.informational_suggestion.v2" ||
+      !proposalId ||
+      !proposalRevision ||
+      !generalSituationId ||
+      !Number.isInteger(parentRevision) ||
+      parentRevision < 1 ||
+      !Number.isInteger(outboxRevision) ||
+      outboxRevision < 0
+    ) {
+      setError("The feedback ledger or exact proposal revision is unavailable; feedback remains locked.");
+      return;
+    }
+    if (String(existingFeedback?.label ?? "") === label) return;
+    const supersedes = String(existingFeedback?.learning_id ?? "").trim();
+    const commandKey = `${proposalRevision}:${label}:${supersedes || "initial"}`;
+    let feedbackId = suggestionFeedbackCommandIds.current.get(commandKey);
+    if (!feedbackId) {
+      feedbackId = `sfb_${crypto.randomUUID()}`;
+      suggestionFeedbackCommandIds.current.set(commandKey, feedbackId);
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      await fetchJson<Record<string, JsonValue>>(
+        `/awareness/suggestions/${encodeURIComponent(proposalId)}/feedback`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            schema_version: "veyra.suggestion_feedback_command.v1",
+            feedback_id: feedbackId,
+            user_id: ownerScope.userId,
+            session_id: ownerScope.sessionId,
+            proposal_revision: proposalRevision,
+            general_situation_id: generalSituationId,
+            parent_revision: parentRevision,
+            label,
+            expected_outbox_state_revision: outboxRevision,
+            supersedes_learning_id: supersedes || null
+          })
+        }
+      );
+      suggestionFeedbackCommandIds.current.delete(commandKey);
+      await refreshScopedAwareness(ownerScope);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unable to record suggestion feedback");
+      await refreshScopedAwareness(ownerScope);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const respondToSuggestion = async (proposalId: string, action: "ack" | "dismiss") => {
     const revision = Number(suggestionInbox.state_revision);
     if (!proposalId || !Number.isInteger(revision) || revision < 0) {
@@ -1151,12 +1296,21 @@ function App() {
   const latestClaims = useMemo(() => state?.belief_state.claims?.slice(-5).reverse() ?? [], [state]);
   const focus = Array.isArray(scopedAttention?.focus) ? scopedAttention.focus.map(String) : [];
   const situationItems = jsonItems(generalSituations.items);
+  const hypothesisItems = jsonItems(attentionHypotheses.items);
+  const hypothesisStatusCounts = asRecord(attentionHypotheses.status_counts);
+  const cognitiveLoopMetrics = asRecord(cognitiveLoopStatus?.metrics);
   const suggestionItems = jsonItems(suggestionInbox.items);
+  const suggestionFeedbackItems = jsonItems(suggestionFeedback.items);
+  const suggestionFeedbackAvailable = suggestionFeedback.status === "success";
   const suggestionMode = String(suggestionStatus?.mode ?? "unavailable");
   const allowedSuggestionModes = Array.isArray(suggestionStatus?.allowed_modes)
     ? suggestionStatus.allowed_modes.map(String)
     : ["disabled", "record_only", "shadow", "advise_only"];
   const suggestionAuthority = asRecord(suggestionStatus?.authority);
+  const suggestionPolicy = asRecord(suggestionInbox.policy);
+  const suggestionSandboxEnabled = suggestionPolicy.sandbox_enabled === true;
+  const suggestionCalibrationCounts = asRecord(suggestionCalibration?.counts);
+  const suggestionUsefulRate = suggestionCalibration?.useful_rate;
   const scopeChanged = ownerScope.userId !== ownerUserDraft.trim() || ownerScope.sessionId !== ownerSessionDraft.trim();
   const currentRisk = String(state?.risk_state.current_risk ?? "R0");
   const connected = agentStatus?.connected === true ? "connected" : String(agentStatus?.status ?? "unconfigured");
@@ -1489,6 +1643,57 @@ function App() {
             <Metric label="Aggregates" value={String(generalSituations.count ?? situationItems.length)} />
             <Metric label="State revision" value={String(generalSituations.state_revision ?? "-")} />
           </div>
+          <div className="hypothesisPanel">
+            <div className="hypothesisHeader">
+              <div>
+                <strong>Attention Hypotheses</strong>
+                <span>Candidate → accumulating → confirmed; readiness is not factual probability.</span>
+              </div>
+              <div className="hypothesisStageCounts">
+                <span>candidate {String(hypothesisStatusCounts.candidate ?? 0)}</span>
+                <span>accumulating {String(hypothesisStatusCounts.accumulating ?? 0)}</span>
+                <span>confirmed {String(hypothesisStatusCounts.confirmed ?? 0)}</span>
+              </div>
+            </div>
+            <div className="cognitiveBalanceRow">
+              <span>model cycles {String(cognitiveLoopMetrics.cycle_count ?? 0)}</span>
+              <span>observed {String(cognitiveLoopMetrics.observed_count ?? 0)}</span>
+              <span>model candidates {String(cognitiveLoopMetrics.candidate_count ?? 0)}</span>
+              <span>candidate rate {String(cognitiveLoopMetrics.candidate_rate ?? 0)}</span>
+              <StatusPill
+                value={
+                  cognitiveLoopMetrics.overconservative_alert === true
+                    ? "overconservative_alert"
+                    : "within_observed_window"
+                }
+              />
+            </div>
+            <div className="hypothesisList">
+              {hypothesisItems.slice(0, 8).map((hypothesis, index) => {
+                const readiness = asRecord(hypothesis.attention_readiness);
+                return (
+                  <article className="hypothesisCard" key={String(hypothesis.hypothesis_id ?? index)}>
+                    <div className="hypothesisTopline">
+                      <StatusPill value={String(hypothesis.status ?? "candidate")} />
+                      <code>{String(hypothesis.hypothesis_id ?? "hypothesis")}</code>
+                    </div>
+                    <div className="hypothesisFacts">
+                      <span>readiness {String(readiness.value ?? "-")}</span>
+                      <span>evidence {String(hypothesis.evidence_count ?? 0)}</span>
+                      <span>revision {String(hypothesis.hypothesis_revision ?? "-")}</span>
+                    </div>
+                    <small>{String(readiness.semantics ?? "attention_policy_readiness_not_factual_probability")}</small>
+                  </article>
+                );
+              })}
+              {!hypothesisItems.length ? (
+                <div className="emptyState compactEmpty">
+                  <Brain size={17} />
+                  No durable attention hypothesis exists for this exact scope yet.
+                </div>
+              ) : null}
+            </div>
+          </div>
           <div className="situationList">
             {situationItems.map((situation, index) => {
               const childRefs = jsonItems(situation.child_refs);
@@ -1560,7 +1765,25 @@ function App() {
             <div className="suggestionSummary">
               <Metric label="Recorded proposals" value={String(suggestionStatus?.proposal_count ?? 0)} />
               <Metric label="Inbox" value={String(suggestionInbox.count ?? suggestionItems.length)} />
-              <Metric label="Daily budget" value={String(asRecord(suggestionInbox.policy).daily_budget ?? 3)} />
+              <Metric label="Daily budget" value={String(suggestionPolicy.daily_budget ?? 1)} />
+            </div>
+            <div className="sandboxControl">
+              <div>
+                <strong>Owner-scoped Suggestion Sandbox</strong>
+                <span>
+                  {suggestionSandboxEnabled
+                    ? "Enabled for this exact owner/session. advise_only is still required before a proposal can enter the Console inbox."
+                    : "Closed by default. Eligible hypotheses remain private until this exact owner/session opts in."}
+                </span>
+              </div>
+              <button
+                type="button"
+                className={suggestionSandboxEnabled ? "rejectButton" : "approveButton"}
+                onClick={() => configureSuggestionSandbox(!suggestionSandboxEnabled)}
+                disabled={loading || suggestionInbox.status !== "success"}
+              >
+                {suggestionSandboxEnabled ? "Close sandbox" : "Enable sandbox"}
+              </button>
             </div>
             <div className="authorityNotice">
               <Shield size={16} />
@@ -1571,12 +1794,59 @@ function App() {
                 </span>
               </div>
             </div>
+            <div className="calibrationPanel">
+              <div className="calibrationHeader">
+                <div>
+                  <strong>Descriptive self-calibration</strong>
+                  <span>Explicit feedback only; no automatic policy or promotion effect.</span>
+                </div>
+                <StatusPill value={String(suggestionCalibration?.support ?? "insufficient_data")} />
+              </div>
+              <div className="calibrationMetrics">
+                <Metric label="Feedback" value={String(suggestionCalibration?.active_feedback_count ?? 0)} />
+                <Metric
+                  label="Useful rate"
+                  value={
+                    typeof suggestionUsefulRate === "number"
+                      ? `${Math.round(suggestionUsefulRate * 100)}%`
+                      : "unavailable"
+                  }
+                />
+                <Metric label="Useful" value={String(suggestionCalibrationCounts.useful ?? 0)} />
+                <Metric label="Not useful" value={String(suggestionCalibrationCounts.not_useful ?? 0)} />
+                <Metric label="Too frequent" value={String(suggestionCalibrationCounts.too_frequent ?? 0)} />
+                <Metric
+                  label="Wrong timing / evidence"
+                  value={`${String(suggestionCalibrationCounts.wrong_timing ?? 0)} / ${String(suggestionCalibrationCounts.wrong_evidence ?? 0)}`}
+                />
+              </div>
+              <small>
+                Accuracy: {String(suggestionCalibration?.accuracy ?? "unavailable_without_verified_outcomes")}
+              </small>
+            </div>
             <div className="suggestionList">
               {suggestionItems.map((proposal, index) => {
                 const whyNow = jsonItems(proposal.why_now);
                 const evidence = jsonItems(proposal.evidence);
                 const proposalId = String(proposal.proposal_id ?? "");
                 const proposalState = String(proposal.status ?? "unknown");
+                const existingFeedback = suggestionFeedbackItems.find(
+                  (item) =>
+                    String(item.proposal_id ?? "") === proposalId &&
+                    String(item.proposal_revision ?? "") === String(proposal.proposal_revision ?? "")
+                );
+                const selectedFeedback = String(existingFeedback?.label ?? "");
+                const proposalFeedbackEligible =
+                  suggestionFeedbackAvailable &&
+                  String(proposal.schema_version ?? "") === "veyra.informational_suggestion.v2" &&
+                  /^sugr_[0-9a-f]{24}$/.test(String(proposal.proposal_revision ?? ""));
+                const feedbackChoices: Array<{ label: SuggestionFeedbackLabel; title: string }> = [
+                  { label: "useful", title: "有用" },
+                  { label: "not_useful", title: "无关" },
+                  { label: "too_frequent", title: "太频繁" },
+                  { label: "wrong_timing", title: "时机不对" },
+                  { label: "wrong_evidence", title: "判断/证据错误" }
+                ];
                 return (
                   <article className="suggestionCard" key={proposalId || index}>
                     <div className="suggestionTopline">
@@ -1597,6 +1867,35 @@ function App() {
                     <div className="boundaryLine">
                       <span>{evidence.length} immutable evidence reference(s)</span>
                       <span>Execution allowed: false</span>
+                    </div>
+                    <div className="feedbackPrompt">
+                      <span>这条建议对你有帮助吗？</span>
+                      <div className="feedbackChoices">
+                        {feedbackChoices.map((choice) => (
+                          <button
+                            type="button"
+                            key={choice.label}
+                            className={selectedFeedback === choice.label ? "selected" : ""}
+                            onClick={() => respondWithSuggestionFeedback(proposal, choice.label, existingFeedback)}
+                            disabled={
+                              loading ||
+                              !proposalFeedbackEligible ||
+                              selectedFeedback === choice.label
+                            }
+                          >
+                            {choice.title}
+                          </button>
+                        ))}
+                      </div>
+                      <small>
+                        {!suggestionFeedbackAvailable
+                          ? "Feedback ledger unavailable; feedback controls are locked."
+                          : !proposalFeedbackEligible
+                          ? "This proposal has no current feedback-safe revision and remains read-only."
+                          : selectedFeedback
+                          ? `Current explicit label: ${selectedFeedback}. Choosing another label records an auditable correction.`
+                          : "Acknowledge and Dismiss remain separate inbox controls and are never inferred as usefulness."}
+                      </small>
                     </div>
                     {proposalState === "pending" || proposalState === "acknowledged" ? (
                       <div className="buttonRow compact suggestionActions">

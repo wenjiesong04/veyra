@@ -25,6 +25,8 @@ GATE_SMOKES = [
     "context_anchor_binding_smoke.py",
     "read_only_cognitive_loop_smoke.py",
     "general_situation_suggestion_smoke.py",
+    "attention_hypothesis_smoke.py",
+    "suggestion_sandbox_smoke.py",
     "structured_observation_control_plane_smoke.py",
     "strategic_discussion_boundary_smoke.py",
     "final_route_projection_smoke.py",

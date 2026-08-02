@@ -14,10 +14,13 @@ from core.learning_record import (
     FEEDBACK_LABELS,
     LearningRecord,
     LearningRecordValidationError,
+    SuggestionFeedbackRecord,
     USEFULNESS_LABELS,
 )
+from core.context_scope import tenant_scope_storage_key
 from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
+from runtime.suggestion_outbox import SuggestionOutbox
 
 
 class LearningCalibrationError(RuntimeError):
@@ -35,11 +38,11 @@ class LearningCalibrationStorageError(LearningCalibrationError):
 class LearningCalibrationRuntime:
     """Persist explicit categorical feedback without changing runtime policy.
 
-    Feedback must bind to one existing Project Guardian Attention assessment
-    and its exact candidate revision. The ledger accepts no notes, message
-    bodies, prompts, channel payloads, or inferred signals. A new label for an
-    already-labelled assessment is an explicit correction and must name the
-    current active ``learning_id`` it supersedes.
+    Feedback binds either to one Project Guardian Attention assessment or to
+    one exact surfaced Suggestion revision. The ledger accepts no notes,
+    message bodies, prompts, channel payloads, or inferred signals. A changed
+    label is an explicit correction and must name the current active
+    ``learning_id`` it supersedes.
     """
 
     STATE_FILE = "learning_calibration_state.json"
@@ -47,6 +50,7 @@ class LearningCalibrationRuntime:
     ATTENTION_STATE_SCHEMA = "veyra.project_guardian_attention_state.v1"
     ASSESSMENT_SCHEMA = "veyra.project_guardian_attention_assessment.v1"
     MAX_RECORDS = 500
+    MAX_SUGGESTION_RECORDS = 2000
     MIN_DESCRIPTIVE_SUPPORT = 20
 
     def __init__(
@@ -251,6 +255,12 @@ class LearningCalibrationRuntime:
             "status": "success",
             "record_count": int(state.get("record_count") or 0),
             "active_count": int(state.get("active_count") or 0),
+            "suggestion_record_count": int(
+                state.get("suggestion_record_count") or 0
+            ),
+            "suggestion_active_count": int(
+                state.get("suggestion_active_count") or 0
+            ),
             "support": (
                 "sufficient_for_description"
                 if int(state.get("active_count") or 0)
@@ -258,6 +268,272 @@ class LearningCalibrationRuntime:
                 else "insufficient_data"
             ),
             "authority": self._authority_contract(),
+        }
+
+    def record_suggestion_feedback(
+        self,
+        *,
+        feedback_id: str,
+        user_id: str,
+        session_id: str,
+        proposal_id: str,
+        proposal_revision: str,
+        general_situation_id: str,
+        parent_revision: int,
+        label: str,
+        expected_outbox_state_revision: int,
+        supersedes_learning_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist exact categorical feedback for one surfaced suggestion."""
+
+        if (
+            isinstance(expected_outbox_state_revision, bool)
+            or not isinstance(expected_outbox_state_revision, int)
+            or expected_outbox_state_revision < 0
+        ):
+            raise ValueError(
+                "expected_outbox_state_revision must be non-negative"
+            )
+        now = self._now()
+        candidate_record = SuggestionFeedbackRecord.create(
+            feedback_id=feedback_id,
+            user_id=user_id,
+            session_id=session_id,
+            proposal_id=proposal_id,
+            proposal_revision=proposal_revision,
+            general_situation_id=general_situation_id,
+            parent_revision=parent_revision,
+            label=label,
+            created_at=now,
+            supersedes_learning_id=supersedes_learning_id,
+        )
+        result: dict[str, Any] = {}
+
+        with self.state_store.writer_transaction():
+            initial_state = self.state_store.read_json(self.STATE_FILE)
+            self._require_state(initial_state)
+            initial_records = self._suggestion_record_map(initial_state)
+            initial_feedback_index = self._optional_string_map(
+                initial_state.get("suggestion_feedback_index"),
+                "suggestion_feedback_index",
+            )
+            existing_id = initial_feedback_index.get(
+                candidate_record.feedback_id
+            )
+            if existing_id is not None:
+                existing = initial_records.get(existing_id)
+                if (
+                    existing is None
+                    or existing.idempotency_semantics()
+                    != candidate_record.idempotency_semantics()
+                ):
+                    raise LearningCalibrationConflict(
+                        "feedback_id is already bound to different semantics"
+                    )
+                return {
+                    "status": "duplicate",
+                    "record": existing.to_dict(),
+                    "authority": self._suggestion_authority_contract(),
+                }
+
+            outbox_state = self.state_store.read_json(
+                SuggestionOutbox.STATE_FILE
+            )
+            self._require_suggestion_outbox_state(outbox_state)
+            outbox_revision = self._state_revision(outbox_state)
+            if outbox_revision != expected_outbox_state_revision:
+                raise LearningCalibrationConflict(
+                    "expected outbox revision does not match suggestion state"
+                )
+            self._require_exact_surfaced_suggestion(
+                outbox_state,
+                candidate_record,
+            )
+
+            def update(state: dict[str, Any]) -> None:
+                self._require_state(state)
+                current_outbox = self.state_store.read_json(
+                    SuggestionOutbox.STATE_FILE
+                )
+                self._require_suggestion_outbox_state(current_outbox)
+                if self._state_revision(current_outbox) != outbox_revision:
+                    raise LearningCalibrationConflict(
+                        "suggestion state changed during feedback admission"
+                    )
+                self._require_exact_surfaced_suggestion(
+                    current_outbox,
+                    candidate_record,
+                )
+
+                records = self._suggestion_record_map(state)
+                feedback_index = self._optional_string_map(
+                    state.get("suggestion_feedback_index"),
+                    "suggestion_feedback_index",
+                )
+                active_by_binding = self._optional_string_map(
+                    state.get("suggestion_active_by_binding"),
+                    "suggestion_active_by_binding",
+                )
+                existing_id = feedback_index.get(
+                    candidate_record.feedback_id
+                )
+                if existing_id is not None:
+                    existing = records.get(existing_id)
+                    if (
+                        existing is None
+                        or existing.idempotency_semantics()
+                        != candidate_record.idempotency_semantics()
+                    ):
+                        raise LearningCalibrationConflict(
+                            "feedback_id is already bound to different semantics"
+                        )
+                    result.update(status="duplicate", record=existing.to_dict())
+                    return
+
+                current_id = active_by_binding.get(
+                    candidate_record.binding_digest
+                )
+                current = records.get(current_id) if current_id else None
+                if current is None:
+                    if candidate_record.supersedes_learning_id is not None:
+                        raise LearningCalibrationConflict(
+                            "supersedes_learning_id has no active target"
+                        )
+                    result_status = "recorded"
+                else:
+                    if (
+                        candidate_record.supersedes_learning_id
+                        != current.learning_id
+                    ):
+                        raise LearningCalibrationConflict(
+                            "an existing label requires an exact correction target"
+                        )
+                    current = current.superseded_by(
+                        candidate_record.learning_id,
+                        updated_at=now,
+                    )
+                    records[current.learning_id] = current
+                    result_status = "corrected"
+
+                if len(records) >= self.MAX_SUGGESTION_RECORDS:
+                    raise LearningCalibrationStorageError(
+                        "suggestion feedback record capacity exhausted"
+                    )
+                if candidate_record.learning_id in records:
+                    raise LearningCalibrationStorageError(
+                        "suggestion learning_id collision detected"
+                    )
+                records[candidate_record.learning_id] = candidate_record
+                feedback_index[candidate_record.feedback_id] = (
+                    candidate_record.learning_id
+                )
+                active_by_binding[candidate_record.binding_digest] = (
+                    candidate_record.learning_id
+                )
+                state["suggestion_records"] = {
+                    learning_id: record.to_dict()
+                    for learning_id, record in sorted(records.items())
+                }
+                state["suggestion_feedback_index"] = dict(
+                    sorted(feedback_index.items())
+                )
+                state["suggestion_active_by_binding"] = dict(
+                    sorted(active_by_binding.items())
+                )
+                state["suggestion_record_count"] = len(records)
+                state["suggestion_active_count"] = len(active_by_binding)
+                state["suggestion_policy_effect"] = "none"
+                state["updated_at"] = utc_now_iso()
+                self._require_state(state)
+                result.update(
+                    status=result_status,
+                    record=candidate_record.to_dict(),
+                )
+
+            self.state_store.mutate_json(self.STATE_FILE, update)
+
+        return {
+            **result,
+            "authority": self._suggestion_authority_contract(),
+        }
+
+    def list_suggestion_feedback(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        active_only: bool = False,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        selected_user = self._selected_identity(user_id, "user_id")
+        selected_session = self._selected_identity(session_id, "session_id")
+        state = self.state_store.read_json(self.STATE_FILE)
+        self._require_state(state)
+        rows = [
+            record.to_dict()
+            for record in self._suggestion_record_map(state).values()
+            if record.user_id == selected_user
+            and record.session_id == selected_session
+            and (not active_only or record.status == "active")
+        ]
+        rows.sort(
+            key=lambda item: (
+                str(item.get("created_at") or ""),
+                str(item.get("learning_id") or ""),
+            ),
+            reverse=True,
+        )
+        return rows[: max(0, min(int(limit), self.MAX_SUGGESTION_RECORDS))]
+
+    def suggestion_summary(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        selected_user = self._selected_identity(user_id, "user_id")
+        selected_session = self._selected_identity(session_id, "session_id")
+        rows = self.list_suggestion_feedback(
+            user_id=selected_user,
+            session_id=selected_session,
+            active_only=True,
+            limit=self.MAX_SUGGESTION_RECORDS,
+        )
+        counts = {
+            label: sum(item.get("label") == label for item in rows)
+            for label in sorted(FEEDBACK_LABELS)
+        }
+        useful = counts["useful"]
+        not_useful = counts["not_useful"]
+        usefulness_total = useful + not_useful
+        return {
+            "status": "success",
+            "user_id": selected_user,
+            "session_id": selected_session,
+            "active_feedback_count": len(rows),
+            "usefulness_feedback_count": usefulness_total,
+            "diagnostic_feedback_count": len(rows) - usefulness_total,
+            "counts": counts,
+            "useful_rate": (
+                round(useful / usefulness_total, 6)
+                if usefulness_total
+                else None
+            ),
+            "accuracy": (
+                "unavailable_without_falsifiable_prediction_and_verified_outcome"
+            ),
+            "support": (
+                "sufficient_for_description"
+                if usefulness_total >= self.MIN_DESCRIPTIVE_SUPPORT
+                else "insufficient_data"
+            ),
+            "minimum_descriptive_support": self.MIN_DESCRIPTIVE_SUPPORT,
+            "usefulness_denominator_labels": sorted(USEFULNESS_LABELS),
+            "categorical_feedback_only": True,
+            "dismissal_inferred_as_usefulness": False,
+            "policy_effect": "none",
+            "promotion_allowed": False,
+            "authority": self._suggestion_authority_contract(),
         }
 
     def list_records(
@@ -359,6 +635,120 @@ class LearningCalibrationRuntime:
         ):
             raise LearningCalibrationConflict(
                 "feedback does not match the exact current Attention assessment"
+            )
+
+    def _require_suggestion_outbox_state(self, state: Any) -> None:
+        if not isinstance(state, dict) or state.get("_state_corrupt") is True:
+            raise LearningCalibrationStorageError(
+                "suggestion outbox state is corrupt"
+            )
+        if str(state.get("schema_version") or "") != SuggestionOutbox.SCHEMA_VERSION:
+            raise LearningCalibrationStorageError(
+                "suggestion outbox state schema is unsupported"
+            )
+        if self._state_revision(state) < 1:
+            raise LearningCalibrationStorageError(
+                "suggestion outbox state revision is invalid"
+            )
+        proposals = state.get("proposals")
+        if not isinstance(proposals, dict):
+            raise LearningCalibrationStorageError(
+                "suggestion proposals must be a mapping"
+            )
+        proposal_count = state.get("proposal_count")
+        if (
+            isinstance(proposal_count, bool)
+            or not isinstance(proposal_count, int)
+            or proposal_count != len(proposals)
+        ):
+            raise LearningCalibrationStorageError(
+                "suggestion proposal_count is inconsistent"
+            )
+        owner_inboxes = state.get("owner_inboxes")
+        if not isinstance(owner_inboxes, dict) or any(
+            not isinstance(key, str) or not isinstance(value, list)
+            for key, value in owner_inboxes.items()
+        ):
+            raise LearningCalibrationStorageError(
+                "suggestion owner inboxes are invalid"
+            )
+
+    def _require_exact_surfaced_suggestion(
+        self,
+        state: dict[str, Any],
+        record: SuggestionFeedbackRecord,
+    ) -> None:
+        proposals = state.get("proposals")
+        proposal = (
+            proposals.get(record.proposal_id)
+            if isinstance(proposals, dict)
+            else None
+        )
+        if not isinstance(proposal, dict):
+            raise LearningCalibrationConflict(
+                "feedback does not match a persisted suggestion"
+            )
+        try:
+            expected_revision = SuggestionOutbox.proposal_revision_for(
+                proposal
+            )
+        except (TypeError, ValueError) as exc:
+            raise LearningCalibrationStorageError(
+                "suggestion proposal revision is invalid"
+            ) from exc
+        delivery = (
+            proposal.get("delivery")
+            if isinstance(proposal.get("delivery"), dict)
+            else {}
+        )
+        authority = (
+            proposal.get("authority")
+            if isinstance(proposal.get("authority"), dict)
+            else {}
+        )
+        owner_inboxes = state.get("owner_inboxes")
+        scope_key = tenant_scope_storage_key(
+            record.user_id,
+            record.session_id,
+        )
+        surfaced_ids = (
+            owner_inboxes.get(scope_key)
+            if isinstance(owner_inboxes, dict)
+            else None
+        )
+        if (
+            proposal.get("schema_version")
+            != SuggestionOutbox.PROPOSAL_SCHEMA_VERSION
+            or proposal.get("proposal_id") != record.proposal_id
+            or proposal.get("proposal_revision") != record.proposal_revision
+            or expected_revision != record.proposal_revision
+            or proposal.get("user_id") != record.user_id
+            or proposal.get("session_id") != record.session_id
+            or proposal.get("general_situation_id")
+            != record.general_situation_id
+            or proposal.get("parent_revision") != record.parent_revision
+            or proposal.get("mode") != "advise_only"
+            or proposal.get("status")
+            not in {"pending", "acknowledged", "dismissed"}
+            or not isinstance(surfaced_ids, list)
+            or record.proposal_id not in surfaced_ids
+            or delivery.get("channel") != "owner_scoped_console"
+            or delivery.get("external_delivery") is not False
+            or delivery.get("feishu_delivery") is not False
+            or delivery.get("agent_delivery") is not False
+            or any(
+                authority.get(key) is not False
+                for key in (
+                    "execution_allowed",
+                    "tool_allowed",
+                    "agent_allowed",
+                    "capability_grant_allowed",
+                    "route_change_allowed",
+                )
+            )
+        ):
+            raise LearningCalibrationConflict(
+                "feedback does not match the exact surfaced suggestion revision"
             )
 
     def _require_attention_state(self, state: Any) -> None:
@@ -931,6 +1321,84 @@ class LearningCalibrationRuntime:
             raise LearningCalibrationStorageError(
                 "learning calibration cannot carry policy authority"
             )
+        suggestion_records = self._suggestion_record_map(state)
+        suggestion_feedback_index = self._optional_string_map(
+            state.get("suggestion_feedback_index"),
+            "suggestion_feedback_index",
+        )
+        suggestion_active_by_binding = self._optional_string_map(
+            state.get("suggestion_active_by_binding"),
+            "suggestion_active_by_binding",
+        )
+        if len(suggestion_records) > self.MAX_SUGGESTION_RECORDS:
+            raise LearningCalibrationStorageError(
+                "suggestion feedback record capacity exceeded"
+            )
+        suggestion_record_count = self._optional_nonnegative_count(
+            state.get("suggestion_record_count"),
+            "suggestion_record_count",
+        )
+        if suggestion_record_count != len(suggestion_records):
+            raise LearningCalibrationStorageError(
+                "suggestion feedback record_count is inconsistent"
+            )
+        active_suggestion_records = {
+            record.learning_id: record
+            for record in suggestion_records.values()
+            if record.status == "active"
+        }
+        suggestion_active_count = self._optional_nonnegative_count(
+            state.get("suggestion_active_count"),
+            "suggestion_active_count",
+        )
+        if suggestion_active_count != len(active_suggestion_records):
+            raise LearningCalibrationStorageError(
+                "suggestion feedback active_count is inconsistent"
+            )
+        if len(suggestion_feedback_index) != len(suggestion_records):
+            raise LearningCalibrationStorageError(
+                "suggestion feedback index is inconsistent"
+            )
+        for feedback_id, learning_id in suggestion_feedback_index.items():
+            record = suggestion_records.get(learning_id)
+            if record is None or record.feedback_id != feedback_id:
+                raise LearningCalibrationStorageError(
+                    "suggestion feedback index is invalid"
+                )
+        if set(suggestion_active_by_binding.values()) != set(
+            active_suggestion_records
+        ):
+            raise LearningCalibrationStorageError(
+                "suggestion feedback active index is inconsistent"
+            )
+        for binding_digest, learning_id in suggestion_active_by_binding.items():
+            record = suggestion_records.get(learning_id)
+            if (
+                record is None
+                or record.status != "active"
+                or record.binding_digest != binding_digest
+            ):
+                raise LearningCalibrationStorageError(
+                    "suggestion feedback active binding is invalid"
+                )
+        for record in suggestion_records.values():
+            if record.status != "superseded":
+                continue
+            successor = suggestion_records.get(
+                str(record.superseded_by_learning_id or "")
+            )
+            if (
+                successor is None
+                or successor.supersedes_learning_id != record.learning_id
+                or successor.binding_digest != record.binding_digest
+            ):
+                raise LearningCalibrationStorageError(
+                    "suggestion feedback correction chain is invalid"
+                )
+        if state.get("suggestion_policy_effect", "none") != "none":
+            raise LearningCalibrationStorageError(
+                "suggestion feedback cannot carry policy authority"
+            )
 
     def _record_map(
         self,
@@ -954,6 +1422,28 @@ class LearningCalibrationRuntime:
             raise LearningCalibrationStorageError(str(exc)) from exc
         return records
 
+    def _suggestion_record_map(
+        self,
+        state: dict[str, Any],
+    ) -> dict[str, SuggestionFeedbackRecord]:
+        raw = state.get("suggestion_records", {})
+        if not isinstance(raw, dict):
+            raise LearningCalibrationStorageError(
+                "suggestion feedback records must be a mapping"
+            )
+        records: dict[str, SuggestionFeedbackRecord] = {}
+        try:
+            for learning_id, value in raw.items():
+                record = SuggestionFeedbackRecord.from_dict(value)
+                if learning_id != record.learning_id:
+                    raise LearningRecordValidationError(
+                        "suggestion feedback key does not match learning_id"
+                    )
+                records[record.learning_id] = record
+        except (LearningRecordValidationError, TypeError, ValueError) as exc:
+            raise LearningCalibrationStorageError(str(exc)) from exc
+        return records
+
     @staticmethod
     def _exact_nonnegative_count(value: Any, field: str) -> int:
         if type(value) is not int or value < 0:
@@ -961,6 +1451,15 @@ class LearningCalibrationRuntime:
                 f"{field} must be a non-negative integer"
             )
         return value
+
+    @staticmethod
+    def _optional_nonnegative_count(value: Any, field: str) -> int:
+        if value is None:
+            return 0
+        return LearningCalibrationRuntime._exact_nonnegative_count(
+            value,
+            field,
+        )
 
     @staticmethod
     def _string_map(value: Any, field: str) -> dict[str, str]:
@@ -975,6 +1474,23 @@ class LearningCalibrationRuntime:
                     f"{field} contains a non-string entry"
                 )
             selected[key] = item
+        return selected
+
+    @staticmethod
+    def _optional_string_map(value: Any, field: str) -> dict[str, str]:
+        if value is None:
+            return {}
+        return LearningCalibrationRuntime._string_map(value, field)
+
+    @staticmethod
+    def _selected_identity(value: Any, field: str) -> str:
+        selected = str(value or "").strip()
+        if (
+            not selected
+            or len(selected) > 240
+            or any(ord(character) < 32 for character in selected)
+        ):
+            raise ValueError(f"{field} is required and must be <= 240 chars")
         return selected
 
     @staticmethod
@@ -1001,6 +1517,23 @@ class LearningCalibrationRuntime:
             "free_text_persisted": False,
             "policy_effect": "none",
             "route_selection_allowed": False,
+            "autonomy_change_allowed": False,
+            "capability_grant_allowed": False,
+            "provider_selection_allowed": False,
+        }
+
+    @staticmethod
+    def _suggestion_authority_contract() -> dict[str, Any]:
+        return {
+            "mode": "suggestion_sandbox_calibration",
+            "exact_owner_session": True,
+            "explicit_feedback_only": True,
+            "dismissal_inferred_as_usefulness": False,
+            "free_text_persisted": False,
+            "policy_effect": "none",
+            "notification_allowed": False,
+            "route_selection_allowed": False,
+            "execution_allowed": False,
             "autonomy_change_allowed": False,
             "capability_grant_allowed": False,
             "provider_selection_allowed": False,

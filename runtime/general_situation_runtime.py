@@ -59,6 +59,26 @@ class GeneralSituationRuntime:
     }
     _GOAL_TERMINAL = {"archived", "cancelled", "closed", "completed", "expired"}
     _COMMITMENT_DURABLE = {"active", "paused"}
+    _PUBLIC_PARENT_KEYS = (
+        "schema_version",
+        "general_situation_id",
+        "user_id",
+        "workspace_anchor_key",
+        "aggregation_scope",
+        "primary_anchor_key",
+        "common_anchor_keys",
+        "child_refs",
+        "distinct_event_count",
+        "parent_revision",
+        "status",
+        "causality_asserted",
+        "model_similarity_used_for_merge",
+        "effective_start",
+        "effective_end",
+        "expires_at",
+        "created_at",
+        "updated_at",
+    )
 
     def __init__(
         self,
@@ -965,6 +985,12 @@ class GeneralSituationRuntime:
             if self._projected_status(parent, now=self._now()) == "expired":
                 continue
             common = set(self._string_list(parent.get("common_anchor_keys")))
+            primary_anchor = str(parent.get("primary_anchor_key") or "")
+            if not primary_anchor or primary_anchor not in anchors:
+                # The parent identity is derived from its primary anchor.  A
+                # child that does not carry that anchor must begin or join a
+                # different candidate instead of silently changing lineage.
+                continue
             shared = common.intersection(anchors)
             merge_shared = self._merge_anchor_keys(shared)
             if not merge_shared or not self._time_matches(
@@ -1133,8 +1159,13 @@ class GeneralSituationRuntime:
                     "child revision changes the parent anchor binding"
                 )
         else:
+            primary_anchor = str(parent.get("primary_anchor_key") or "")
+            if not primary_anchor or primary_anchor not in anchors:
+                raise ValueError(
+                    "new child does not preserve the parent primary anchor"
+                )
             common.intersection_update(anchors)
-        if not common:
+        if not common or str(parent.get("primary_anchor_key") or "") not in common:
             raise ValueError("general Situation common anchor would be lost")
         if not self._workspace_compatible(
             self._stored_workspace_key(parent),
@@ -1301,9 +1332,9 @@ class GeneralSituationRuntime:
         now: datetime,
     ) -> dict[str, Any]:
         output = {
-            key: copy.deepcopy(value)
-            for key, value in parent.items()
-            if key not in {"session_scope_keys"}
+            key: copy.deepcopy(parent.get(key))
+            for key in self._PUBLIC_PARENT_KEYS
+            if key in parent
         }
         output["status"] = self._projected_status(parent, now=now)
         return output

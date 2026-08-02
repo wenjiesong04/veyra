@@ -86,6 +86,7 @@ CORE_MODULES: list[dict[str, str]] = [
     {"id": "situation_evaluator", "path": "core/situation_evaluator.py", "status": "phase1_event_scoped"},
     {"id": "general_situation_runtime", "path": "runtime/general_situation_runtime.py", "status": "phase2_structured_noncausal"},
     {"id": "general_attention_scheduler", "path": "awareness/general_attention_scheduler.py", "status": "phase2_information_only"},
+    {"id": "attention_hypothesis_runtime", "path": "runtime/attention_hypothesis_runtime.py", "status": "cognitive_awakening_record_only"},
     {"id": "suggestion_outbox", "path": "runtime/suggestion_outbox.py", "status": "phase2_console_information_only"},
     {"id": "project_guardian_attention", "path": "runtime/project_guardian_attention_runtime.py", "status": "phase2_shadow"},
     {"id": "autonomy_policy", "path": "core/autonomy_policy.py", "status": "phase5_technical_complete_domain_scoped"},
@@ -243,6 +244,13 @@ STATE_DEFINITIONS: list[dict[str, Any]] = [
         "owner": "Runtime.GeneralSituationRuntime",
         "purpose": "Exact-owner non-causal aggregation of anchored Situations with deterministic child membership.",
         "freshness": "child_projection_backed",
+    },
+    {
+        "id": "attention_hypothesis_state",
+        "file": "state/runtime/attention_hypothesis_state.json",
+        "owner": "Runtime.AttentionHypothesisRuntime",
+        "purpose": "Durable exact-scope attention hypotheses with immutable evidence accumulation and non-factual deterministic readiness.",
+        "freshness": "evidence_and_ruleset_backed",
     },
     {
         "id": "suggestion_outbox",

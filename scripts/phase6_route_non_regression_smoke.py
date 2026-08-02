@@ -56,6 +56,8 @@ SCENARIOS = (
     "extension_isolated_runner_corrupt",
     "general_situation_populated",
     "general_situation_corrupt",
+    "attention_hypothesis_populated",
+    "attention_hypothesis_corrupt",
     "suggestion_outbox_populated",
     "suggestion_outbox_corrupt",
     "extension_generation_populated",
@@ -77,6 +79,11 @@ PRIVATE_STATE_SCENARIOS: dict[str, tuple[str, str, str]] = {
         "general_situation_state.json",
         "general_situations",
         "veyra.general_situation_state.v1",
+    ),
+    "attention_hypothesis": (
+        "attention_hypothesis_state.json",
+        "hypotheses",
+        "veyra.attention_hypothesis_state.v1",
     ),
     "suggestion_outbox": (
         "suggestion_outbox.json",
@@ -182,6 +189,7 @@ def seed_phase6(loop: Any, scenario: str) -> None:
                 state[selected_collection] = records
                 for count_field in (
                     "general_situation_count",
+                    "hypothesis_count",
                     "proposal_count",
                     "generation_count",
                     "validation_count",
@@ -648,6 +656,15 @@ def main() -> int:
             "cognitive_loop_state": {
                 "scopes": {"private-scope": {"brief": "private brief"}}
             },
+            "attention_hypothesis_state": {
+                "hypotheses": {
+                    "private-hypothesis": {
+                        "user_id": "private-user",
+                        "session_scope_keys": ["private-session"],
+                        "primary_anchor_key": "goal:private-goal",
+                    }
+                }
+            },
             "phase6_collaboration_state": {
                 "collaborations": {
                     "private-case": {
@@ -772,6 +789,7 @@ def main() -> int:
         "phase6_collaboration_state" not in public_state
         and "context_binding_state" not in public_state
         and "cognitive_loop_state" not in public_state
+        and "attention_hypothesis_state" not in public_state
         and "phase6_extension_spec_state" not in public_state
         and "phase6_extension_artifact_state" not in public_state
         and "phase6_extension_source_check_state" not in public_state
@@ -860,12 +878,13 @@ def main() -> int:
                             "candidate": candidate.to_dict(),
                         }
     expect(
-        len(SCENARIOS) == 26
-        and comparisons == 9 * len(MODES) * len(SCENARIOS) == 702
+        len(SCENARIOS) == 28
+        and comparisons == 9 * len(MODES) * len(SCENARIOS) == 756
         and not failures,
         (
-            "702 isolated populated or corrupt collaboration, Situation, "
-            "suggestion, extension lifecycle, governed-pipeline, and "
+            "756 isolated populated or corrupt collaboration, Situation, "
+            "AttentionHypothesis, suggestion, extension lifecycle, "
+            "governed-pipeline, and "
             "capability-gap states "
             "cannot weaken complete disabled, "
             "record-only, or shadow Route output/status/risk"

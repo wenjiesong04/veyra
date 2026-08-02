@@ -175,6 +175,21 @@ def main() -> int:
 
         store.mutate_json("ops_config.json", configure)
         awareness = ShadowAwarenessRuntime(store, mode="shadow")
+        awareness.suggestion_outbox.configure_policy(
+            user_id=USER,
+            session_id=SESSION,
+            sandbox_enabled=True,
+            daily_budget=1,
+            quiet_hours=None,
+            cooldown_seconds=3600,
+            dismiss_cooldown_seconds=86400,
+            expected_state_revision=int(
+                store.read_json("suggestion_outbox.json").get(
+                    "_state_revision"
+                )
+                or 0
+            ),
+        )
         ingress = StructuredObservationIngress(
             state_store=store,
             event_awareness=awareness,
@@ -427,6 +442,7 @@ def main() -> int:
             revision=second_revision,
             workspace=workspace,
         )
+        second_payload["facts"]["kind"] = "change_signal"
         second_http = client.post(
             "/awareness/structured-observations",
             headers=headers,

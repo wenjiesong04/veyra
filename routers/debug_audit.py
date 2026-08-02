@@ -7,12 +7,17 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
 from core.definitions import RiskLevel, lifecycle_statuses, operational_modes, risk_catalog
+from core.learning_record import LearningRecordValidationError
 from core.model_client import redact_sensitive
 from interface.event_schema import utc_now_iso
 from memory_bridge.scope import normalize_scope_component
 from runtime.project_guardian_producers import ProjectGuardianGoalConflict
 from runtime.project_guardian_attention_runtime import (
     ProjectGuardianAttentionConflict,
+)
+from runtime.learning_calibration_runtime import (
+    LearningCalibrationConflict,
+    LearningCalibrationStorageError,
 )
 from runtime.suggestion_outbox import SuggestionOutboxConflict
 
@@ -81,7 +86,9 @@ class GeneralSuggestionPolicyRequest(BaseModel):
 
     user_id: str = Field(min_length=1, max_length=240)
     session_id: str = Field(min_length=1, max_length=240)
-    daily_budget: int = Field(ge=0, le=100)
+    sandbox_enabled: bool = False
+    daily_budget: int = Field(default=1, ge=0, le=1)
+    timezone: str | None = Field(default=None, min_length=1, max_length=120)
     quiet_hours: dict[str, Any] | None = None
     cooldown_seconds: int = Field(ge=0, le=2592000)
     dismiss_cooldown_seconds: int = Field(ge=0, le=2592000)
@@ -95,6 +102,30 @@ class GeneralSuggestionFeedbackRequest(BaseModel):
     session_id: str = Field(min_length=1, max_length=240)
     expected_state_revision: int = Field(ge=0)
     reason: str = Field(default="", max_length=500)
+
+
+class GeneralSuggestionCategoricalFeedbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["veyra.suggestion_feedback_command.v1"]
+    feedback_id: str = Field(pattern=r"^[A-Za-z0-9._:-]{1,240}$")
+    user_id: str = Field(min_length=1, max_length=240)
+    session_id: str = Field(min_length=1, max_length=240)
+    proposal_revision: str = Field(pattern=r"^sugr_[0-9a-f]{24}$")
+    general_situation_id: str = Field(pattern=r"^[A-Za-z0-9._:-]{1,240}$")
+    parent_revision: int = Field(ge=1)
+    label: Literal[
+        "useful",
+        "not_useful",
+        "too_frequent",
+        "wrong_timing",
+        "wrong_evidence",
+    ]
+    expected_outbox_state_revision: int = Field(ge=0)
+    supersedes_learning_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9._:-]{1,240}$",
+    )
 
 
 class ProjectGuardianConfigRequest(BaseModel):
@@ -921,6 +952,30 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @router.get("/awareness/attention-hypotheses/status")
+    async def attention_hypothesis_status() -> dict[str, Any]:
+        return deps[
+            "awareness_loop"
+        ].event_awareness.attention_hypotheses.status()
+
+    @router.get("/awareness/attention-hypotheses")
+    async def attention_hypotheses(
+        user_id: str = Query(min_length=1, max_length=240),
+        session_id: str = Query(min_length=1, max_length=240),
+        limit: int = Query(default=100, ge=0, le=500),
+    ) -> dict[str, Any]:
+        runtime = deps[
+            "awareness_loop"
+        ].event_awareness.attention_hypotheses
+        try:
+            return runtime.list_for_owner(
+                user_id=user_id,
+                session_id=session_id,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @router.get("/awareness/context-bindings/status")
     async def context_binding_status() -> dict[str, Any]:
         return deps["awareness_loop"].event_awareness.context_bindings.status()
@@ -1018,6 +1073,84 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @router.post("/awareness/suggestions/{proposal_id}/feedback")
+    async def general_suggestion_categorical_feedback(
+        proposal_id: str,
+        request: GeneralSuggestionCategoricalFeedbackRequest,
+    ) -> dict[str, Any]:
+        learning = deps["learning_calibration"]
+        try:
+            result = await run_in_threadpool(
+                learning.record_suggestion_feedback,
+                proposal_id=proposal_id,
+                **request.model_dump(exclude={"schema_version"}),
+            )
+        except LearningCalibrationConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except LearningCalibrationStorageError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="suggestion_calibration_unavailable",
+            ) from exc
+        except (LearningRecordValidationError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="invalid_suggestion_feedback_contract",
+            ) from exc
+        return _public_suggestion_feedback_result(result)
+
+    @router.get("/awareness/suggestions/feedback")
+    async def general_suggestion_feedback_list(
+        user_id: str = Query(min_length=1, max_length=240),
+        session_id: str = Query(min_length=1, max_length=240),
+        active_only: bool = Query(default=False),
+        limit: int = Query(default=100, ge=0, le=500),
+    ) -> dict[str, Any]:
+        learning = deps["learning_calibration"]
+        try:
+            rows = await run_in_threadpool(
+                learning.list_suggestion_feedback,
+                user_id=user_id,
+                session_id=session_id,
+                active_only=active_only,
+                limit=limit,
+            )
+        except LearningCalibrationStorageError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="suggestion_calibration_unavailable",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "status": "success",
+            "count": len(rows),
+            "items": [
+                _public_suggestion_feedback_record(item) for item in rows
+            ],
+            "authority": learning._suggestion_authority_contract(),
+        }
+
+    @router.get("/awareness/suggestions/calibration")
+    async def general_suggestion_calibration(
+        user_id: str = Query(min_length=1, max_length=240),
+        session_id: str = Query(min_length=1, max_length=240),
+    ) -> dict[str, Any]:
+        learning = deps["learning_calibration"]
+        try:
+            return await run_in_threadpool(
+                learning.suggestion_summary,
+                user_id=user_id,
+                session_id=session_id,
+            )
+        except LearningCalibrationStorageError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="suggestion_calibration_unavailable",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @router.post("/belief/refresh")
     async def belief_refresh(request: BeliefRefreshRequest | None = None) -> dict[str, Any]:
         payload = request or BeliefRefreshRequest()
@@ -1036,8 +1169,8 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
 
 def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
     public = redact_sensitive(payload)
-    # Event, situation, Memory, Durable Case, Guardian, Phase 6 collaboration,
-    # and ExtensionSpec quarantine projections are tenant-scoped. Memory,
+    # Event, situation, AttentionHypothesis, Memory, Durable Case, Guardian,
+    # Phase 6 collaboration, and ExtensionSpec projections are tenant-scoped. Memory,
     # Durable Case, collaboration, and extension documents also carry private
     # bindings or user content, so they must only be exposed through
     # owner-scoped projections.
@@ -1049,6 +1182,7 @@ def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
     public.pop("suggestion_outbox", None)
     public.pop("context_binding_state", None)
     public.pop("cognitive_loop_state", None)
+    public.pop("attention_hypothesis_state", None)
     attention_state = (
         public.get("attention_state")
         if isinstance(public.get("attention_state"), dict)
@@ -1132,6 +1266,48 @@ def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
             core_model["api_key_set"] = bool(original.get("api_key")) if isinstance(original, dict) else False
             core_model["api_key"] = "<redacted>" if core_model.get("api_key") else ""
     return public
+
+
+def _public_suggestion_feedback_record(value: Any) -> dict[str, Any]:
+    record = value if isinstance(value, dict) else {}
+    return {
+        key: record.get(key)
+        for key in (
+            "schema_version",
+            "learning_id",
+            "feedback_id",
+            "proposal_id",
+            "proposal_revision",
+            "general_situation_id",
+            "parent_revision",
+            "label",
+            "status",
+            "supersedes_learning_id",
+            "superseded_by_learning_id",
+            "promotion_status",
+            "policy_effect",
+            "source",
+            "created_at",
+            "updated_at",
+        )
+    }
+
+
+def _public_suggestion_feedback_result(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise HTTPException(
+            status_code=503,
+            detail="suggestion_calibration_invalid_projection",
+        )
+    return {
+        "status": str(value.get("status") or "unknown"),
+        "record": _public_suggestion_feedback_record(value.get("record")),
+        "authority": (
+            value.get("authority")
+            if isinstance(value.get("authority"), dict)
+            else {}
+        ),
+    }
 
 
 def _memory_log_visible(

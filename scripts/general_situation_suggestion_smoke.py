@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -21,13 +22,26 @@ if str(ROOT) not in sys.path:
 
 
 from awareness.general_attention_scheduler import GeneralAttentionScheduler  # noqa: E402
+from awareness.project_guardian import ProjectGuardianEvaluator  # noqa: E402
 from core.situation_evaluator import SituationEvaluator  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
+from interface.event_schema import EventSource, EventType, VeyraEvent  # noqa: E402
 from interface.event_normalizer import EventNormalizer  # noqa: E402
 from interface.general_situation_contract import StructuredAnchor  # noqa: E402
+from interface.structured_observation import (  # noqa: E402
+    STRUCTURED_OBSERVATION_CHANNEL,
+    STRUCTURED_OBSERVATION_EVENT_SCHEMA,
+    canonical_utc,
+)
 from routers.debug_audit import build_debug_audit_router  # noqa: E402
 from runtime.active_loop import ActiveRuntimeLoop  # noqa: E402
+from runtime.attention_hypothesis_runtime import (  # noqa: E402
+    AttentionHypothesisRuntime,
+)
 from runtime.general_situation_runtime import GeneralSituationRuntime  # noqa: E402
+from runtime.project_guardian_attention_runtime import (  # noqa: E402
+    ProjectGuardianAttentionRuntime,
+)
 from runtime.suggestion_outbox import (  # noqa: E402
     SuggestionOutbox,
     SuggestionOutboxConflict,
@@ -93,26 +107,103 @@ def child_for(
     anchor_id: str,
     text: str,
     components: dict[str, float] | None = None,
+    producer_id: str = "local_operator",
+    fact_kind: str = "change_signal",
+    additional_anchors: list[tuple[str, str]] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
-    now = clock().isoformat()
-    event = normalizer.user_message(
-        text,
-        "general-situation-smoke",
-        user_id,
-        session_id,
-        subject={"kind": anchor_kind, "id": anchor_id},
+    del normalizer
+    now = canonical_utc(clock())
+    valid_until = canonical_utc(clock() + timedelta(hours=1))
+    operation_digest = hashlib.sha256(
+        (
+            f"{user_id}:{session_id}:{anchor_kind}:{anchor_id}:"
+            f"{producer_id}:{fact_kind}:{now}:{text}:"
+            f"{sorted(additional_anchors or [])}"
+        ).encode("utf-8")
+    ).hexdigest()
+    event_id = f"sob_{operation_digest[:24]}"
+    operation_id = f"op-{operation_digest[:24]}"
+    receipt_id = f"receipt-{operation_digest[:24]}"
+    evidence = [
+        {
+            "ref_id": f"evidence-{operation_digest[:24]}",
+            "source": "human_verified",
+            "epistemic_status": "observation",
+            "is_fact": False,
+        }
+    ]
+    anchors = [{"kind": anchor_kind, "ref_id": anchor_id}] + [
+        {"kind": kind, "ref_id": ref_id}
+        for kind, ref_id in (additional_anchors or [])
+    ]
+    salience = (
+        copy.deepcopy(COMPONENTS)
+        if components is None
+        else copy.deepcopy(components)
+    )
+    payload = {
+        "schema_version": STRUCTURED_OBSERVATION_EVENT_SCHEMA,
+        "workspace_id": "general-situation-smoke",
+        "structured_anchor_refs": copy.deepcopy(anchors),
+        "evidence_refs": copy.deepcopy(evidence),
+        "salience_components": salience,
+        "observation": {
+            "schema_version": "veyra.structured_observation.fact.v1",
+            "producer_id": producer_id,
+            "producer_receipt_id": receipt_id,
+            "fact_kind": fact_kind,
+            "fact_state": "changed",
+            "categorical_facts": {
+                "severity": "high",
+                "urgency": "immediate",
+                "novelty": "new",
+                "uncertainty": "high",
+                "evidence_quality": "corroborated",
+            },
+            "evidence_count": 1,
+            "payload_claims_verified": False,
+            "fact_certified": False,
+            "valid_from": now,
+            "valid_until": valid_until,
+        },
+        "operation_id": operation_id,
+        "producer_id": producer_id,
+        "producer_receipt_id": receipt_id,
+        "command_digest": operation_digest,
+        "valid_from": now,
+        "valid_until": valid_until,
+        "authority": {
+            "route_change": False,
+            "agent_dispatch": False,
+            "tool_call": False,
+            "capability_grant": False,
+            "external_delivery": False,
+            "execution": False,
+            "fact_certification": False,
+        },
+    }
+    event = VeyraEvent(
+        type=EventType.OBSERVATION,
+        source=EventSource(
+            channel=STRUCTURED_OBSERVATION_CHANNEL,
+            user_id=user_id,
+            session_id=session_id,
+        ),
+        payload=payload,
+        event_id=event_id,
+        timestamp=now,
+        correlation_id=event_id,
+        subject=copy.deepcopy(anchors),
+        evidence_refs=copy.deepcopy(evidence),
+        dedupe_key=f"{producer_id}:{operation_id}:{user_id}:{session_id}",
         occurred_at=now,
         received_at=now,
     )
-    event.payload[f"{anchor_kind}_id"] = anchor_id
     child = evaluator.observe(
         event,
-        salience_components=(
-            copy.deepcopy(COMPONENTS)
-            if components is None
-            else copy.deepcopy(components)
-        ),
-        evidence_refs=[f"evidence:{event.event_id}"],
+        salience_components=salience,
+        evidence_refs=evidence,
+        observation=copy.deepcopy(payload["observation"]),
     )
     clock.advance(seconds=1)
     return event, child
@@ -142,8 +233,12 @@ def group_goal(
             anchor_id=goal_id,
             text=text,
             components=components,
+            fact_kind=fact_kind,
         )
-        for text in (text_a, text_b)
+        for text, fact_kind in (
+            (text_a, "risk_signal"),
+            (text_b, "progress_signal"),
+        )
     ]
     first = runtime.ingest_child(pair[0][1], event=pair[0][0])
     expect(
@@ -185,12 +280,33 @@ def configure_policy(
     outbox.configure_policy(
         user_id=user_id,
         session_id=session_id,
+        sandbox_enabled=True,
         daily_budget=budget,
         quiet_hours=quiet_hours,
         cooldown_seconds=3600,
         dismiss_cooldown_seconds=86400,
         expected_state_revision=revision,
     )
+
+
+def confirmed_surface(
+    scheduler: GeneralAttentionScheduler,
+    hypotheses: AttentionHypothesisRuntime,
+    parent: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    assessment = scheduler.assess(parent)
+    observed = hypotheses.observe(parent, assessment)
+    surface = observed.get("surface_assessment")
+    expect(
+        observed.get("status") == "confirmed"
+        and isinstance(surface, dict)
+        and surface.get("status") == "eligible"
+        and surface.get("eligible") is True
+        and isinstance(surface.get("attention_hypothesis_ref"), dict),
+        "scheduler assessment is admitted through a confirmed AttentionHypothesis",
+        {"assessment": assessment, "hypothesis": observed},
+    )
+    return assessment, surface
 
 
 def main() -> int:
@@ -201,6 +317,7 @@ def main() -> int:
         evaluator = SituationEvaluator(store, clock=clock)
         runtime = GeneralSituationRuntime(store, clock=clock)
         scheduler = GeneralAttentionScheduler(store, clock=clock)
+        hypotheses = AttentionHypothesisRuntime(store, clock=clock)
         outbox = SuggestionOutbox(store, clock=clock)
         user_id = "owner-a"
         session_id = "session-a"
@@ -246,6 +363,95 @@ def main() -> int:
             and abs(float(assessment.get("score") or 0.0) - 0.8925) < 0.00001,
             "structured attention score is eligible",
             assessment,
+        )
+
+        lineage_store = WorldStateStore(Path(tmp) / "lineage-state")
+        lineage_clock = MutableClock(clock())
+        lineage_evaluator = SituationEvaluator(
+            lineage_store,
+            clock=lineage_clock,
+        )
+        lineage_runtime = GeneralSituationRuntime(
+            lineage_store,
+            clock=lineage_clock,
+        )
+        lineage_primary = "lineage-a"
+        lineage_secondary = "lineage-b"
+        set_goals(
+            lineage_store,
+            user_id,
+            [lineage_primary, lineage_secondary],
+        )
+        lineage_pair = [
+            child_for(
+                lineage_evaluator,
+                normalizer,
+                lineage_clock,
+                user_id=user_id,
+                session_id=session_id,
+                anchor_kind="goal",
+                anchor_id=lineage_primary,
+                additional_anchors=[("goal", lineage_secondary)],
+                text=f"lineage evidence {index}",
+                fact_kind=fact_kind,
+            )
+            for index, fact_kind in (
+                (1, "risk_signal"),
+                (2, "progress_signal"),
+            )
+        ]
+        lineage_runtime.ingest_child(
+            lineage_pair[0][1],
+            event=lineage_pair[0][0],
+        )
+        lineage_created = lineage_runtime.ingest_child(
+            lineage_pair[1][1],
+            event=lineage_pair[1][0],
+        )
+        lineage_parent = lineage_created.get("general_situation") or {}
+        secondary_only = child_for(
+            lineage_evaluator,
+            normalizer,
+            lineage_clock,
+            user_id=user_id,
+            session_id=session_id,
+            anchor_kind="goal",
+            anchor_id=lineage_secondary,
+            text="secondary anchor must not rewrite lineage",
+            fact_kind="risk_signal",
+        )
+        separated = lineage_runtime.ingest_child(
+            secondary_only[1],
+            event=secondary_only[0],
+        )
+        persisted_lineage = lineage_runtime.list_for_owner(
+            user_id=user_id,
+            session_id=session_id,
+        ).get("items", [])[0]
+        lineage_attention = GeneralAttentionScheduler(
+            lineage_store,
+            clock=lineage_clock,
+        ).assess(persisted_lineage)
+        expect(
+            lineage_created.get("status") == "created"
+            and lineage_parent.get("primary_anchor_key")
+            == f"goal:{lineage_primary}"
+            and {
+                f"goal:{lineage_primary}",
+                f"goal:{lineage_secondary}",
+            }.issubset(set(lineage_parent.get("common_anchor_keys") or []))
+            and separated.get("status") == "awaiting_distinct_event"
+            and persisted_lineage.get("parent_revision") == 1
+            and persisted_lineage.get("primary_anchor_key")
+            in persisted_lineage.get("common_anchor_keys", [])
+            and lineage_attention.get("eligible") is True,
+            "a child without the primary anchor starts a separate lineage",
+            {
+                "created": lineage_created,
+                "separated": separated,
+                "persisted": persisted_lineage,
+                "attention": lineage_attention,
+            },
         )
         words_changed = copy.deepcopy(parent)
         words_changed["display_text"] = "unrelated paraphrase words are non-authoritative"
@@ -302,6 +508,52 @@ def main() -> int:
             ).get("count")
             == 0,
             "general Situation reads require exact owner and included session",
+        )
+
+        projection_store = WorldStateStore(Path(tmp) / "projection-state")
+        projection_parent = copy.deepcopy(parent)
+        projection_sentinel = "RAW-PRIVATE-GENERAL-SITUATION-SENTINEL"
+        projection_parent["raw_user_text"] = projection_sentinel
+
+        def persist_projection_fixture(state: dict[str, Any]) -> dict[str, Any]:
+            state["schema_version"] = GeneralSituationRuntime.SCHEMA_VERSION
+            state["general_situations"] = {
+                str(projection_parent["general_situation_id"]): copy.deepcopy(
+                    projection_parent
+                )
+            }
+            state["general_situation_count"] = 1
+            return state
+
+        projection_store.mutate_json(
+            GeneralSituationRuntime.STATE_FILE,
+            persist_projection_fixture,
+        )
+        projection_runtime = GeneralSituationRuntime(
+            projection_store,
+            clock=clock,
+        )
+        projection_path = projection_store.path_for(
+            GeneralSituationRuntime.STATE_FILE
+        )
+        projection_bytes = projection_path.read_bytes()
+        projection_view = projection_runtime.list_for_owner(
+            user_id=user_id,
+            session_id=session_id,
+        )
+        projection_public_text = json.dumps(
+            projection_view,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        expect(
+            projection_view.get("status") == "success"
+            and projection_view.get("count") == 1
+            and "raw_user_text" not in projection_public_text
+            and projection_sentinel not in projection_public_text
+            and projection_path.read_bytes() == projection_bytes,
+            "general Situation public projection allowlists safe fields byte-pure",
+            projection_view,
         )
 
         # A decision/outcome written to event B must not mutate event A or be
@@ -450,9 +702,14 @@ def main() -> int:
             outbox.status().get("mode") == "record_only",
             "suggestions default to record_only",
         )
+        _, recorded_surface = confirmed_surface(
+            scheduler,
+            hypotheses,
+            parent,
+        )
         recorded = outbox.consider(
             parent,
-            assessment,
+            recorded_surface,
             user_id=user_id,
             session_id=session_id,
         )
@@ -487,7 +744,11 @@ def main() -> int:
         surfaced_parent = runtime.ingest_child(
             third_child, event=third_event
         )["general_situation"]
-        surfaced_assessment = scheduler.assess(surfaced_parent)
+        _, surfaced_assessment = confirmed_surface(
+            scheduler,
+            hypotheses,
+            surfaced_parent,
+        )
         surfaced = outbox.consider(
             surfaced_parent,
             surfaced_assessment,
@@ -556,9 +817,14 @@ def main() -> int:
         cooldown_parent = runtime.ingest_child(
             fourth_child, event=fourth_event
         )["general_situation"]
+        _, cooldown_assessment = confirmed_surface(
+            scheduler,
+            hypotheses,
+            cooldown_parent,
+        )
         cooldown = outbox.consider(
             cooldown_parent,
-            scheduler.assess(cooldown_parent),
+            cooldown_assessment,
             user_id=user_id,
             session_id=session_id,
         )
@@ -581,9 +847,14 @@ def main() -> int:
             text_a="daily budget observation one",
             text_b="daily budget observation two",
         )
+        _, budget_assessment = confirmed_surface(
+            scheduler,
+            hypotheses,
+            budget_parent,
+        )
         budget_result = outbox.consider(
             budget_parent,
-            scheduler.assess(budget_parent),
+            budget_assessment,
             user_id=user_id,
             session_id=session_id,
         )
@@ -600,7 +871,7 @@ def main() -> int:
             store,
             user_id=user_id,
             session_id=session_id,
-            budget=5,
+            budget=1,
             quiet_hours={
                 "start_hour": 12,
                 "end_hour": 13,
@@ -618,9 +889,14 @@ def main() -> int:
             text_a="quiet-hour observation one",
             text_b="quiet-hour observation two",
         )
+        _, quiet_assessment = confirmed_surface(
+            scheduler,
+            hypotheses,
+            quiet_parent,
+        )
         quiet_result = outbox.consider(
             quiet_parent,
-            scheduler.assess(quiet_parent),
+            quiet_assessment,
             user_id=user_id,
             session_id=session_id,
         )
@@ -636,7 +912,7 @@ def main() -> int:
             store,
             user_id=user_id,
             session_id=session_id,
-            budget=5,
+            budget=1,
             quiet_hours=None,
         )
         ack_parent, _ = group_goal(
@@ -650,9 +926,14 @@ def main() -> int:
             text_a="acknowledgement observation one",
             text_b="acknowledgement observation two",
         )
+        _, ack_assessment = confirmed_surface(
+            scheduler,
+            hypotheses,
+            ack_parent,
+        )
         ack_pending = outbox.consider(
             ack_parent,
-            scheduler.assess(ack_parent),
+            ack_assessment,
             user_id=user_id,
             session_id=session_id,
         )
@@ -683,9 +964,14 @@ def main() -> int:
             text_a="disabled observation one",
             text_b="disabled observation two",
         )
+        _, disabled_assessment = confirmed_surface(
+            scheduler,
+            hypotheses,
+            disabled_parent,
+        )
         disabled = outbox.consider(
             disabled_parent,
-            scheduler.assess(disabled_parent),
+            disabled_assessment,
             user_id=user_id,
             session_id=session_id,
         )
@@ -710,9 +996,14 @@ def main() -> int:
         inbox_count_before_shadow = outbox.list_inbox(
             user_id=user_id, session_id=session_id
         )["count"]
+        _, shadow_assessment = confirmed_surface(
+            scheduler,
+            hypotheses,
+            shadow_parent,
+        )
         shadow = outbox.consider(
             shadow_parent,
-            scheduler.assess(shadow_parent),
+            shadow_assessment,
             user_id=user_id,
             session_id=session_id,
         )
@@ -739,6 +1030,7 @@ def main() -> int:
         awareness = SimpleNamespace(
             event_awareness=SimpleNamespace(
                 general_situations=runtime,
+                attention_hypotheses=hypotheses,
                 suggestion_outbox=outbox,
             )
         )
@@ -800,6 +1092,185 @@ def main() -> int:
             == "degraded",
             "general Situation maintenance failure cannot weaken the event step",
             maintenance_result,
+        )
+
+    # A Project Guardian Attention policy is only current while its exact
+    # release Goal revision and mutable state revision remain active.  The
+    # real Goal transition deliberately retains the old policy record, so the
+    # general Attention/Outbox path must withdraw it rather than treating that
+    # durable residue as current priority evidence.
+    with TemporaryDirectory(prefix="veyra-general-goal-currentness-") as tmp:
+        store = WorldStateStore(Path(tmp) / "state")
+        clock = MutableClock(
+            datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+        )
+        normalizer = EventNormalizer()
+        evaluator = SituationEvaluator(store, clock=clock)
+        runtime = GeneralSituationRuntime(store, clock=clock)
+        scheduler = GeneralAttentionScheduler(store, clock=clock)
+        hypotheses = AttentionHypothesisRuntime(store, clock=clock)
+        outbox = SuggestionOutbox(store, clock=clock)
+        guardian_attention = ProjectGuardianAttentionRuntime(
+            state_store=store,
+            clock=clock,
+        )
+        user_id = "guardian-owner"
+        session_id = "guardian-session"
+        goal_id = "goal-release-currentness"
+        goal_revision = "release-revision-1"
+        goal_scope = {
+            "workspace_id": "general-situation-smoke",
+            "repo_id": "example/veyra",
+            "target_ref": "refs/heads/cognitive-awakening",
+            "target_environment": "local",
+            "release_cycle": "currentness-smoke",
+        }
+        goal = {
+            "schema_version": ProjectGuardianEvaluator.GOAL_SCHEMA,
+            "goal_id": goal_id,
+            "kind": ProjectGuardianEvaluator.GOAL_KIND,
+            "status": "active",
+            "user_id": user_id,
+            "revision": goal_revision,
+            "state_revision": 1,
+            "scope": copy.deepcopy(goal_scope),
+            "target_sha": "a" * 40,
+            "active_from": (clock() - timedelta(hours=1)).isoformat(),
+            "active_until": (clock() + timedelta(days=7)).isoformat(),
+            "source": ProjectGuardianEvaluator.GOAL_SOURCE,
+            "created_at": clock().isoformat(),
+            "updated_at": clock().isoformat(),
+        }
+
+        def persist_guardian_goal(state: dict[str, Any]) -> dict[str, Any]:
+            state["goals"] = [copy.deepcopy(goal)]
+            return state
+
+        store.mutate_json("user_goals.json", persist_guardian_goal)
+        policy = guardian_attention.set_policy(
+            user_id=user_id,
+            goal_id=goal_id,
+            goal_revision=goal_revision,
+            expected_goal_state_revision=1,
+            attention_group_id="release-currentness",
+            goal_priority=0.95,
+            deadline_at=(clock() + timedelta(days=1)).isoformat(),
+            timezone_name="UTC",
+            notifications_paused=False,
+            quiet_hours={"enabled": False},
+            daily_notification_budget=1,
+        )
+        parent, _ = group_goal(
+            evaluator,
+            normalizer,
+            runtime,
+            clock,
+            user_id=user_id,
+            session_id=session_id,
+            goal_id=goal_id,
+            text_a="release risk evidence before completion",
+            text_b="independent progress evidence before completion",
+        )
+        configure_mode(outbox, store, "advise_only")
+        configure_policy(
+            outbox,
+            store,
+            user_id=user_id,
+            session_id=session_id,
+            budget=1,
+        )
+        initial_assessment, initial_surface = confirmed_surface(
+            scheduler,
+            hypotheses,
+            parent,
+        )
+        initial_suggestion = outbox.consider(
+            parent,
+            initial_surface,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        expect(
+            policy.get("goal_state_revision") == 1
+            and initial_assessment.get("components", {})
+            .get("goal_priority", {})
+            .get("value")
+            == 0.95
+            and initial_suggestion.get("status") == "pending"
+            and outbox.list_inbox(
+                user_id=user_id,
+                session_id=session_id,
+            ).get("count")
+            == 1,
+            "exact active Guardian Goal and policy can surface one suggestion",
+            {
+                "policy": policy,
+                "assessment": initial_assessment,
+                "suggestion": initial_suggestion,
+            },
+        )
+
+        def complete_goal_keep_policy(state: dict[str, Any]) -> dict[str, Any]:
+            completed = copy.deepcopy(state["goals"][0])
+            completed["status"] = "completed"
+            completed["state_revision"] = 2
+            completed["updated_at"] = clock().isoformat()
+            state["goals"] = [completed]
+            return state
+
+        store.mutate_json("user_goals.json", complete_goal_keep_policy)
+        completed_assessment = scheduler.assess(parent)
+        withdrawn = hypotheses.observe(parent, completed_assessment)
+        stale_consider = outbox.consider(
+            parent,
+            initial_surface,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        completed_inbox = outbox.list_inbox(
+            user_id=user_id,
+            session_id=session_id,
+        )
+        retained_policy = store.read_json(
+            "project_guardian_attention_state.json"
+        ).get("policies", {}).get(goal_id)
+        expect(
+            isinstance(retained_policy, dict)
+            and retained_policy.get("goal_state_revision") == 1
+            and completed_assessment.get("status") == "awaiting_evidence"
+            and completed_assessment.get("eligible") is False
+            and completed_assessment.get("components", {})
+            .get("goal_priority", {})
+            .get("value")
+            is None
+            and "goal_priority_unknown"
+            in (completed_assessment.get("unknowns") or [])
+            and "active_goal_missing_or_not_current"
+            in (completed_assessment.get("unknowns") or [])
+            and withdrawn.get("status") == "accumulating"
+            and withdrawn.get("surface_assessment", {}).get("eligible")
+            is False
+            and "active_goal_missing_or_not_current"
+            in withdrawn.get("hypothesis", {})
+            .get("attention_readiness", {})
+            .get("critical_unknowns", [])
+            and "critical_unknowns_present"
+            in withdrawn.get("hypothesis", {})
+            .get("attention_readiness", {})
+            .get("confirmation_blockers", [])
+            and stale_consider.get("status") == "fail_closed"
+            and stale_consider.get("reason")
+            == "attention_hypothesis_binding_not_current"
+            and completed_inbox.get("count") == 0
+            and completed_inbox.get("stale_hidden_count") == 1,
+            "completed Goal with retained Guardian policy withdraws canonical suggestion currentness",
+            {
+                "assessment": completed_assessment,
+                "hypothesis": withdrawn,
+                "consider": stale_consider,
+                "inbox": completed_inbox,
+                "retained_policy": retained_policy,
+            },
         )
 
     # Out-of-order, digest conflict, expiry, and corrupt state use isolated
