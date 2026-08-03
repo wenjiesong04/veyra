@@ -50,6 +50,3 @@ venv/
 
 # Local-only backups created by scripts/reset_local_state.sh
 .veyra-local-backups/
-
-# Local-only previous answer kept by scripts/reflection_sandbox.py
-.reflection_sandbox/

@@ -26,6 +26,12 @@ class StateRefresh:
         self.state_store = state_store
         self.reasoning = reasoning or CoreReasoning(state_store)
         self.perception = PerceptionLayer(state_store, reasoning=self.reasoning, model_assist_enabled=model_assist_enabled)
+        #: Probes whose observation is meaningless without an explicit target.
+        #: Running them with an empty argument produces a `missing_target`
+        #: result that describes the call, not the world.
+        self.TARGET_REQUIRED_PROBES = frozenset(
+            {"web_probe", "network_probe", "port_probe"}
+        )
         self.probes = {
             "git_probe": GitProbe(),
             "hermes_probe": HermesProbe(),
@@ -51,12 +57,25 @@ class StateRefresh:
         unsupported = [claim for claim in stale if str(claim.get("source") or "") not in self.probes]
         selected, cursor_before, cursor_after = self._select_fair_batch(supported, limit=limit)
         refreshed: list[dict[str, Any]] = []
+        unresolvable: list[dict[str, Any]] = []
         for claim in selected:
             source = str(claim.get("source") or "")
             probe = self.probes.get(source)
             if probe is None:
                 continue
             target = self._target_for_claim(claim)
+            if target is None:
+                # Fail closed: a probe that needs a target must not run without
+                # one. Guessing a target from the claim's own prose made failed
+                # observations reproduce themselves once per tick.
+                unresolvable.append(
+                    {
+                        "claim": claim.get("key") or claim.get("claim"),
+                        "source": source,
+                        "reason": "no_resolvable_refresh_target",
+                    }
+                )
+                continue
             raw = probe.run(target)
             raw = {
                 **raw,
@@ -80,7 +99,7 @@ class StateRefresh:
                 "reason": f"no probe for source {claim.get('source')}",
             }
             for claim in unsupported[:limit]
-        ]
+        ] + unresolvable
         def record_refresh_batch(state: dict[str, Any]) -> None:
             state.update(
                 {
@@ -140,7 +159,20 @@ class StateRefresh:
         self.state_store.mutate_json("state_refresh_state.json", reserve_batch)
         return selected, cursor_before, cursor_after
 
-    def _target_for_claim(self, claim: dict[str, Any]) -> str:
+    def _target_for_claim(self, claim: dict[str, Any]) -> str | None:
+        """Resolve a structured refresh target, or None when none is available.
+
+        Returning None means "do not probe". A claim's human-readable text is
+        not a probe argument: passing it back made a failed observation
+        reproduce itself, because the summary "Web probe needs an http or https
+        URL." was handed to WebProbe as the URL.
+
+        This is the narrow form of the refresh hygiene rule; the full
+        ``refresh_spec`` (probe_kind + target_ref + resolver_id) is a later
+        slice. Until then, probes that need a target fail closed, and probes
+        that need none keep receiving an empty string.
+        """
+
         evidence = claim.get("evidence") if isinstance(claim.get("evidence"), dict) else {}
         for key in ("target", "url", "host", "path"):
             if evidence.get(key):
@@ -150,6 +182,8 @@ class StateRefresh:
             if details.get(key):
                 value = str(details[key])
                 if key == "path" and not Path(value).exists():
-                    return ""
+                    return None
                 return value
-        return str(claim.get("claim") or "")
+        if str(claim.get("source") or "") in self.TARGET_REQUIRED_PROBES:
+            return None
+        return ""

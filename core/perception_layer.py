@@ -16,6 +16,14 @@ from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
 
 
+#: A probe that never reached a target did not observe the world. Its summary
+#: is an operator hint about the call ("needs an http or https URL"), not a
+#: claim about reality, so it must not become a Belief. Persisting it also fed
+#: a refresh loop: the stale claim was re-selected, its own text was used as the
+#: next probe target, and the failure reproduced itself on every tick.
+_NON_OBSERVATION_STATUSES = frozenset({"missing_target"})
+
+
 class PerceptionLayer:
     def __init__(self, state_store: WorldStateStore, reasoning: CoreReasoning | None = None, *, model_assist_enabled: bool = True) -> None:
         self.state_store = state_store
@@ -122,6 +130,9 @@ class PerceptionLayer:
         explicit = probe_result.get("claims")
         if isinstance(explicit, list) and explicit:
             return [self._normalize_claim(probe_result, claim) for claim in explicit if isinstance(claim, dict)]
+
+        if str(probe_result.get("status") or "") in _NON_OBSERVATION_STATUSES:
+            return []
 
         probe_name = str(probe_result.get("probe") or "unknown")
         confidence = float(probe_result.get("confidence") or 0.75)

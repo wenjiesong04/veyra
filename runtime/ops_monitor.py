@@ -5,6 +5,7 @@ from typing import Any, Callable
 
 from core.world_state import WorldStateStore
 from interface.event_schema import utc_now_iso
+from runtime.conservatism_monitor import ConservatismMonitor
 from runtime.retention_policy import RetentionPolicy
 from runtime.safety_validation import SafetyValidation
 
@@ -30,6 +31,7 @@ class OpsMonitor:
         self.model_status_resolver = model_status_resolver
         self.feishu_status_resolver = feishu_status_resolver
         self.active_loop_status_resolver = active_loop_status_resolver
+        self.conservatism_monitor = ConservatismMonitor(state_store)
 
     def health(self) -> dict[str, Any]:
         alerts = self.alerts()["items"]
@@ -57,6 +59,9 @@ class OpsMonitor:
         items.extend(self._review_alerts())
         items.extend(self._belief_alerts())
         items.extend(self._heartbeat_alerts())
+        # Every alert above answers "did something overstep?". This one answers
+        # "did anything happen at all?", which no other check covers.
+        items.extend(self.conservatism_monitor.findings())
         return {"status": "success", "items": items, "summary": self._alert_summary(items)}
 
     def deployment_readiness(self) -> dict[str, Any]:
