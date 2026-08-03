@@ -11,7 +11,7 @@ from awareness.claim_schema import (
 )
 from core.context_scope import item_visible_to_scope
 from core.world_state import WorldStateStore
-from interface.event_schema import VeyraEvent
+from interface.event_schema import VeyraEvent, utc_now_iso
 
 
 class BeliefCore:
@@ -46,16 +46,17 @@ class BeliefCore:
 
     def upsert_claim(self, claim: dict[str, Any]) -> dict[str, Any]:
         claim = refresh_claim_status(claim)
+        identity = claim_identity_key(claim)
+        if identity is None:
+            return self._reject_unscoped_claim(claim)
 
         def update_belief(belief: dict[str, Any]) -> dict[str, Any]:
             claims = belief.setdefault("claims", [])
             if not isinstance(claims, list):
                 claims = []
-            identity = claim_identity_key(claim)
             for index, current in enumerate(claims):
                 if (
-                    identity is None
-                    or not isinstance(current, dict)
+                    not isinstance(current, dict)
                     or claim_identity_key(current) != identity
                 ):
                     continue
@@ -88,6 +89,41 @@ class BeliefCore:
 
     def upsert_claims(self, claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [self.upsert_claim(claim) for claim in claims]
+
+    MAX_REJECTION_SOURCES = 20
+
+    def _reject_unscoped_claim(self, claim: dict[str, Any]) -> dict[str, Any]:
+        """Refuse a claim that has no resolvable scope identity.
+
+        ``claim_identity_key`` returns ``None`` for exactly the cases that
+        ``item_visible_to_scope`` refuses to return: invalid owner, invalid
+        scope kind, and tenant-scoped claims without an exact owner. Such a
+        claim can never be read back and can never replace an existing entry,
+        so appending it would only consume the bounded claim budget and evict
+        usable claims. Rejecting is the fail-closed behaviour; the counters
+        keep the rejection visible instead of silently dropping it.
+        """
+
+        source = str(claim.get("source") or "unknown")
+
+        def record_rejection(belief: dict[str, Any]) -> dict[str, Any]:
+            rejections = belief.get("unscoped_rejections")
+            if not isinstance(rejections, dict):
+                rejections = {}
+            by_source = rejections.get("by_source")
+            if not isinstance(by_source, dict):
+                by_source = {}
+            if source in by_source or len(by_source) < self.MAX_REJECTION_SOURCES:
+                by_source[source] = int(by_source.get(source) or 0) + 1
+            rejections["count"] = int(rejections.get("count") or 0) + 1
+            rejections["by_source"] = by_source
+            rejections["last_at"] = utc_now_iso()
+            rejections["last_key"] = str(claim.get("key") or "")
+            belief["unscoped_rejections"] = rejections
+            return belief
+
+        self.state_store.mutate_json("belief_state.json", record_rejection)
+        return {**claim, "status": "rejected_unscoped", "persisted": False}
 
     def refresh(
         self,

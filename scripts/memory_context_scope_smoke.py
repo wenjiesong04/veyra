@@ -1347,11 +1347,23 @@ def perception_persistence_scope_checks() -> None:
             "same probe name keeps independent tenant cache slots",
             {"alpha": alpha_probe, "beta": beta_probe},
         )
+        # An ownerless tenant claim can never be replaced (claim_identity_key
+        # returns None) and can never be read back (item_visible_to_scope
+        # refuses the same case), so persisting it only consumes the bounded
+        # claim budget. PerceptionLayer already refuses to persist the probe
+        # side as `local_world.not_persisted`; the claim side now matches, and
+        # the rejection stays diagnosable through counters.
         expect(
-            ownerless_claim.get("scope_kind") == "tenant"
-            and ownerless_claim.get("scope_status") == "ownerless",
-            "PerceptionLayer marks ownerless tenant claim fail-closed",
+            not ownerless_claim,
+            "PerceptionLayer does not persist an unreadable ownerless claim",
             ownerless_claim,
+        )
+        rejections = store.read_json("belief_state.json").get("unscoped_rejections", {})
+        expect(
+            int(rejections.get("count") or 0) >= 1
+            and rejections.get("last_key") == "perception_ownerless:status",
+            "the ownerless claim is rejected visibly rather than dropped silently",
+            rejections,
         )
         expect(
             global_claim.get("scope_kind") == "operator_global",

@@ -56,6 +56,7 @@ GATE_SMOKES = [
     "project_guardian_http_contract_smoke.py",
     "project_guardian_replay_smoke.py",
     "belief_read_purity_smoke.py",
+    "belief_scope_retention_smoke.py",
     "state_integrity_smoke.py",
     "state_truth_isolation_smoke.py",
     "runtime_truth_smoke.py",
