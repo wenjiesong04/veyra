@@ -99,6 +99,7 @@ def command(
             "novelty": "new",
             "uncertainty": "low",
             "evidence_quality": "direct",
+            "epistemic_status": "observed",
         },
     }
 

@@ -126,6 +126,7 @@ def assessment_for(
     clock: MutableClock,
     structured_profile: bool = True,
     model_confidence: float | None = None,
+    epistemic_status: str = "observed",
 ) -> dict[str, Any]:
     children: list[dict[str, Any]] = []
     refs: list[dict[str, Any]] = []
@@ -176,6 +177,8 @@ def assessment_for(
                         "producer_receipt_id": f"receipt-{index}",
                         "fact_kind": fact_kind,
                         "fact_state": "degraded",
+                        "epistemic_status": epistemic_status,
+                        "is_fact": epistemic_status == "observed",
                         "valid_from": occurred_at.isoformat(),
                         "valid_until": (clock() + timedelta(days=7)).isoformat(),
                     }

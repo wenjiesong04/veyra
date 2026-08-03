@@ -29,6 +29,9 @@ class GeneralAttentionScheduler:
         "veyra.general_attention_assessment_binding.v1"
     )
     EVIDENCE_TIME_BUCKET_SECONDS = 15 * 60
+    #: Only a direct observation can satisfy the confirmation threshold. An
+    #: inference or a prediction is retained as context and reported separately.
+    EPISTEMIC_STATUSES = frozenset({"observed", "inference", "prediction"})
     WEIGHTS = {
         "goal_priority": 0.25,
         "severity": 0.20,
@@ -222,6 +225,7 @@ class GeneralAttentionScheduler:
                 continue
             refs[ref.situation_id] = ref
         units: list[dict[str, Any]] = []
+        non_observed: list[dict[str, Any]] = []
         unknowns: list[str] = []
         for child in children:
             situation_id = str(child.get("situation_id") or "")
@@ -256,18 +260,33 @@ class GeneralAttentionScheduler:
             fact = typed[0]
             producer_id = str(fact.get("producer_id") or "").strip()
             fact_kind = str(fact.get("fact_kind") or "").strip()
+            epistemic_status = str(fact.get("epistemic_status") or "").strip()
             occurred_at = self._aware_time(source.get("occurred_at"))
             valid_from = self._aware_time(fact.get("valid_from"))
             valid_until = self._aware_time(fact.get("valid_until"))
             if (
                 not producer_id
                 or not fact_kind
+                or epistemic_status not in self.EPISTEMIC_STATUSES
                 or occurred_at is None
                 or valid_from is None
                 or valid_until is None
                 or valid_from != occurred_at
             ):
                 unknowns.append("structured_evidence_profile_incomplete")
+                continue
+            if epistemic_status != "observed":
+                # An inference or a prediction is recorded as context but never
+                # counts toward the confirmation threshold. Without this, a
+                # model-derived unit with a distinct producer or fact kind would
+                # satisfy diversity on its own.
+                non_observed.append(
+                    {
+                        "child_ref_key": ref.key,
+                        "epistemic_status": epistemic_status,
+                    }
+                )
+                unknowns.append("structured_evidence_not_observed")
                 continue
             if occurred_at > now + timedelta(minutes=5):
                 unknowns.append("structured_evidence_from_future")
@@ -281,6 +300,7 @@ class GeneralAttentionScheduler:
                     "source_event_id": ref.source_event_id,
                     "producer_id": producer_id,
                     "fact_kind": fact_kind,
+                    "epistemic_status": epistemic_status,
                     "utc_time_bucket": int(occurred_at.timestamp())
                     // self.EVIDENCE_TIME_BUCKET_SECONDS,
                 }
@@ -304,7 +324,7 @@ class GeneralAttentionScheduler:
         )
         return {
             "schema_version": self.EVIDENCE_DIVERSITY_SCHEMA_VERSION,
-            "ruleset_version": "typed_producer_fact_time_bucket.v1",
+            "ruleset_version": "observed_producer_fact_time_bucket.v2",
             "time_bucket_seconds": self.EVIDENCE_TIME_BUCKET_SECONDS,
             "units": units,
             "unit_count": len(units),
@@ -313,6 +333,11 @@ class GeneralAttentionScheduler:
             "time_bucket_count": time_bucket_count,
             "profile_complete": profile_complete,
             "diversity_requirement_met": diversity_met,
+            "non_observed_excluded": sorted(
+                non_observed,
+                key=lambda item: str(item["child_ref_key"]),
+            ),
+            "non_observed_excluded_count": len(non_observed),
             "unknowns": list(dict.fromkeys(unknowns)),
             "profile_digest": stable_digest(
                 "veyra.attention_evidence_diversity.profile.v1",

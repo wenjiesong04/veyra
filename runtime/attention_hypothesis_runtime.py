@@ -1043,6 +1043,8 @@ class AttentionHypothesisRuntime:
             "time_bucket_count",
             "profile_complete",
             "diversity_requirement_met",
+            "non_observed_excluded",
+            "non_observed_excluded_count",
             "unknowns",
             "profile_digest",
         }:
@@ -1051,11 +1053,25 @@ class AttentionHypothesisRuntime:
             value.get("schema_version")
             != GeneralAttentionScheduler.EVIDENCE_DIVERSITY_SCHEMA_VERSION
             or value.get("ruleset_version")
-            != "typed_producer_fact_time_bucket.v1"
+            != "observed_producer_fact_time_bucket.v2"
             or value.get("time_bucket_seconds")
             != GeneralAttentionScheduler.EVIDENCE_TIME_BUCKET_SECONDS
         ):
             raise ValueError("attention evidence diversity ruleset mismatch")
+        excluded = value.get("non_observed_excluded")
+        if (
+            not isinstance(excluded, list)
+            or value.get("non_observed_excluded_count") != len(excluded)
+            or any(
+                not isinstance(item, dict)
+                or set(item) != {"child_ref_key", "epistemic_status"}
+                or item.get("epistemic_status") == "observed"
+                or item.get("epistemic_status")
+                not in GeneralAttentionScheduler.EPISTEMIC_STATUSES
+                for item in excluded
+            )
+        ):
+            raise ValueError("attention non-observed exclusion record is invalid")
         raw_units = value.get("units")
         unknowns = value.get("unknowns")
         if (
@@ -1076,6 +1092,7 @@ class AttentionHypothesisRuntime:
                 "source_event_id",
                 "producer_id",
                 "fact_kind",
+                "epistemic_status",
                 "utc_time_bucket",
             }:
                 raise ValueError("attention evidence diversity unit is invalid")
@@ -1083,6 +1100,7 @@ class AttentionHypothesisRuntime:
             source_event_id = str(raw.get("source_event_id") or "")
             producer_id = str(raw.get("producer_id") or "").strip()
             fact_kind = str(raw.get("fact_kind") or "").strip()
+            epistemic_status = str(raw.get("epistemic_status") or "").strip()
             bucket = raw.get("utc_time_bucket")
             ref = ref_by_key.get(ref_key)
             if (
@@ -1092,6 +1110,9 @@ class AttentionHypothesisRuntime:
                 or len(producer_id) > 240
                 or not fact_kind
                 or len(fact_kind) > 240
+                # Re-checked here rather than trusted from the scheduler: a
+                # counted unit must be a direct observation.
+                or epistemic_status != "observed"
                 or isinstance(bucket, bool)
                 or not isinstance(bucket, int)
             ):
@@ -1102,6 +1123,7 @@ class AttentionHypothesisRuntime:
                     "source_event_id": source_event_id,
                     "producer_id": producer_id,
                     "fact_kind": fact_kind,
+                    "epistemic_status": epistemic_status,
                     "utc_time_bucket": bucket,
                 }
             )
@@ -1147,6 +1169,8 @@ class AttentionHypothesisRuntime:
             "time_bucket_seconds": value["time_bucket_seconds"],
             "units": canonical_units,
             **expected_counts,
+            "non_observed_excluded": copy.deepcopy(excluded),
+            "non_observed_excluded_count": len(excluded),
             "unknowns": list(unknowns),
         }
 

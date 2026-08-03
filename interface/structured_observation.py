@@ -142,6 +142,11 @@ class StructuredObservationFacts(BaseModel):
     novelty: Literal["known", "changed", "new"]
     uncertainty: Literal["low", "medium", "high"]
     evidence_quality: Literal["partial", "corroborated", "direct"]
+    #: How the producer came to know this. Required, with no default: an
+    #: unstated epistemic status would silently read as an observation, which
+    #: is exactly what lets a model inference qualify as confirming evidence.
+    #: `is_fact` is never accepted from the caller; the server derives it.
+    epistemic_status: Literal["observed", "inference", "prediction"]
 
 
 class StructuredObservationCommand(BaseModel):

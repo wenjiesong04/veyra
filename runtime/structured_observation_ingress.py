@@ -346,6 +346,11 @@ class StructuredObservationIngress:
                     "uncertainty": command.facts.uncertainty,
                     "evidence_quality": command.facts.evidence_quality,
                 },
+                "epistemic_status": command.facts.epistemic_status,
+                # Derived here, never accepted from the caller: only a direct
+                # observation is a candidate fact. An inference or a prediction
+                # may be recorded, but it cannot present itself as one.
+                "is_fact": command.facts.epistemic_status == "observed",
                 "evidence_count": len(evidence),
                 "payload_claims_verified": False,
                 "fact_certified": False,

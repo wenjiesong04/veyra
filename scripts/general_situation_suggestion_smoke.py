@@ -109,6 +109,7 @@ def child_for(
     components: dict[str, float] | None = None,
     producer_id: str = "local_operator",
     fact_kind: str = "change_signal",
+    epistemic_status: str = "observed",
     additional_anchors: list[tuple[str, str]] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     del normalizer
@@ -160,6 +161,8 @@ def child_for(
                 "uncertainty": "high",
                 "evidence_quality": "corroborated",
             },
+            "epistemic_status": epistemic_status,
+            "is_fact": epistemic_status == "observed",
             "evidence_count": 1,
             "payload_claims_verified": False,
             "fact_certified": False,
