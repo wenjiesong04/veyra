@@ -4,9 +4,11 @@ Virtual Entity for Yielding Real-time Awareness.
 
 Veyra v0.1 is an awareness-first Agent governance runtime for local personal production. It receives events, updates local awareness state, evaluates risk, chooses a route, and either answers directly, runs a read-only probe, blocks unsafe actions, or generates a `VeyraTaskPacket` for the selected Agent Runtime.
 
+The canonical project charter, current capability truth, roadmap, development rules, and Git/GitHub workflow are maintained in [`docs/README_Veyra.md`](docs/README_Veyra.md). This root README remains the quick-start and operator entry point. When status text conflicts, re-check Git, code, tests, and revision-aligned live evidence before updating the canonical document.
+
 Veyra is local-first: configuration, runtime state, and audit data stay on your machine under `.env`, `state/`, and `agency/`. When you enable a model, OpenClaw, Feishu, or another integration, Veyra sends the data required to serve that request to the configured provider. It is not a SaaS service and does not require Veyra cloud tenancy, accounts, or billing.
 
-Veyra is now in Runtime Stabilization and local release hardening. The code-level awareness/governance loop is implemented, while external capabilities report `not_configured`, `validation_pending`, `validated`, `degraded`, or `stale` from observed evidence. Phase 3 now includes a live-validated, scoped OpenClaw pre-tool bridge for explicitly registered Veyra governed sessions. Broader native-tool coverage, cross-process recovery, real-workspace execution, production soak testing, native Memory validation, and fresh-clone/signed-package acceptance remain pending.
+Veyra has implemented substantial awareness, governance, scoped Agent collaboration, and a bounded R0 extension pipeline. These are not equivalent to a finished proactive product: observation-derived suggestions remain record-only and empty in the latest observed runtime, current external validation can become stale, and broader native-tool coverage, multi-provider validation, long-running product evidence, native Memory validation, and fresh-clone/signed-package acceptance remain pending. See the canonical document for the exact multidimensional status.
 
 ## Desktop Local Window
 
@@ -141,10 +143,9 @@ User/Event
 python -B -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Selected operational endpoints are listed below. The mechanically checked
-206-product-route inventory, including Project Guardian, Cases, Tool
-Governance, Phase 5, and Phase 6 control planes, is maintained in
-[`docs/main_route_inventory.md`](docs/main_route_inventory.md).
+Selected operational endpoints are listed below. Do not maintain or trust a
+fixed hand-written route count: the current route truth comes from the checked
+out revision's FastAPI `openapi.json`, `app.routes`, and route/gate tests.
 
 - `GET /` runtime identity and status
 - `POST /events/message` normalize a message and run the Awareness Loop
@@ -315,10 +316,10 @@ Self-tests use temporary `VEYRA_STATE_ROOT` and `VEYRA_AGENCY_ROOT` directories 
 
 ## MVP Governance Workflow
 
-Implementation progress and the current architecture map are tracked in
-[`docs/implementation_progress.md`](docs/implementation_progress.md).
-Route ownership and the first-stage `main.py` split are tracked in
-[`docs/main_route_inventory.md`](docs/main_route_inventory.md).
+The current capability truth and development plan are tracked in
+[`docs/README_Veyra.md`](docs/README_Veyra.md). Detailed architecture and
+historical phase evidence remain in
+[`docs/veyra_proactive_cognitive_architecture.md`](docs/veyra_proactive_cognitive_architecture.md).
 
 ```text
 User message

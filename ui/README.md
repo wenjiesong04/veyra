@@ -1,16 +1,19 @@
-# Veyra Web Control UI
+# Veyra Console Build Output
 
-The UI layer is reserved for the Awareness & Agent Control Console.
+The maintained React/Vite source lives in `web/`. FastAPI serves the checked-in
+production build from `ui/console/` so a fresh local clone can open the Console
+without a separate frontend development server.
 
-Planned v0.1 surfaces:
+Do not edit hashed files under `ui/console/assets/` by hand. Rebuild them from
+the source:
 
-- Setup Wizard
-- Awareness Dashboard
-- Agent Runtime Manager
-- Action Review
-- Persona Manager
-- State / Heartbeat / EventLog
-- Tool Proxy Monitor
-- Rollback / Audit Viewer
+```bash
+cd web
+npm ci
+npm run build
+npm run build:desktop
+```
 
-The backend currently exposes state and event endpoints that these screens can consume.
+The previous per-panel placeholder directories were removed after those views
+became real surfaces in `web/src/main.tsx`. Product status and future UI work are
+tracked in `docs/README_Veyra.md`, not in generated assets or placeholder files.

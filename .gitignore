@@ -1,6 +1,6 @@
+# OS / editor
 .DS_Store
-__pycache__/
-*.py[cod]
+.idea/
 
 web/node_modules/
 web/*.tsbuildinfo
@@ -23,23 +23,17 @@ state/openclaw_device.json
 
 # Runtime state / logs / snapshots
 state/
-state/logs/*.jsonl
-state/*.jsonl
-state/snapshots/
-state/runtime/*_state.json
-state/local/*_state.json
-state/external/*_state.json
-state/user/*_state.json
-state/*_state.json
-state/mvp_self_test_tool_file.txt
 agency/intention_queue.json
 
-# IDE
-.idea/
-
-# Python cache
+# Python cache / local test output
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
 
 # Env
 .env

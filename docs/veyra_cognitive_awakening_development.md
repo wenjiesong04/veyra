@@ -1,5 +1,7 @@
 # Veyra Phase Cognitive Awakening 开发路线
 
+> 历史设计与接受标准说明：本文保留本阶段开始时的基线和详细契约，不是当前运行真值。当前项目状态、下一步优先级和开发流程统一以 [README_Veyra.md](./README_Veyra.md) 为入口，并在每次工作前重新核对 Git、代码、测试和 live revision。
+>
 > 分支：`cognitive-awakening`
 >
 > 基线 commit：`8a8a3d2`

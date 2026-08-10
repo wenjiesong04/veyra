@@ -149,10 +149,10 @@ SMOKE_TIMEOUT_OVERRIDES = {
     # This intentionally exercises eight sequential turns against the live
     # configured model and evidence providers.
     "runtime_e2e_dialogue_smoke.py": 360.0,
-    # This builds 1,404 isolated loops to compare all nine public Routes
-    # across three modes and 26 populated/corrupt private-state scenarios.
+    # This builds 1,512 isolated loops to compare all nine public Routes
+    # across three modes and 28 populated/corrupt private-state scenarios.
     # GitHub-hosted runners can exceed the generic 120-second script budget;
-    # keep the complete 702-comparison matrix and give only this smoke a
+    # keep the complete 756-comparison matrix and give only this smoke a
     # bounded, CI-tolerant allowance.
     "phase6_route_non_regression_smoke.py": 300.0,
 }
