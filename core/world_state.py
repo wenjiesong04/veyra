@@ -753,6 +753,8 @@ class WorldStateStore:
                 "owner_inboxes": {},
                 "feedback": {},
                 "daily_counters": {},
+                "interaction_decisions": {},
+                "interaction_decision_count": 0,
                 "updated_at": None,
             },
             "durable_case_state.json": {

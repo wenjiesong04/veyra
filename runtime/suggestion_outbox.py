@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timedelta, timezone
+import re
 from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -37,6 +38,8 @@ class SuggestionOutbox:
         {"none", "owner_scoped_console", "suppressed"}
     )
     MAX_PROPOSALS = 2000
+    MAX_INTERACTION_DECISIONS = 4000
+    DECISION_SCHEMA_VERSION = "veyra.interaction_decision.v1"
     MAX_INBOX_ITEMS = 100
     DEFAULT_POLICY = {
         "sandbox_enabled": False,
@@ -315,35 +318,56 @@ class SuggestionOutbox:
             assessment
         )
         if decision_disposition != "say":
-            return {
-                "status": "not_proposed",
-                "mode": mode,
-                "reason": decision_reason,
-                "decision_disposition": decision_disposition,
-                "delivery_disposition": "none",
-                "proposal": None,
-                "authority": self._authority_boundary(),
-            }
+            return self._persist_decision_result(
+                general_situation=general_situation,
+                assessment=assessment,
+                attention_hypothesis_ref=attention_hypothesis_ref,
+                user_id=user,
+                session_id=session,
+                output={
+                    "status": "not_proposed",
+                    "mode": mode,
+                    "reason": decision_reason,
+                    "decision_disposition": decision_disposition,
+                    "delivery_disposition": "none",
+                    "proposal": None,
+                },
+                mode_epoch=config.get("mode_epoch"),
+            )
         if mode == "disabled":
-            return {
-                "status": "disabled",
-                "mode": mode,
-                "reason": decision_reason,
-                "decision_disposition": decision_disposition,
-                "delivery_disposition": "none",
-                "proposal": None,
-                "authority": self._authority_boundary(),
-            }
+            return self._persist_decision_result(
+                general_situation=general_situation,
+                assessment=assessment,
+                attention_hypothesis_ref=attention_hypothesis_ref,
+                user_id=user,
+                session_id=session,
+                output={
+                    "status": "disabled",
+                    "mode": mode,
+                    "reason": decision_reason,
+                    "decision_disposition": decision_disposition,
+                    "delivery_disposition": "none",
+                    "proposal": None,
+                },
+                mode_epoch=config.get("mode_epoch"),
+            )
         if assessment.get("eligible") is not True or assessment.get("status") != "eligible":
-            return {
-                "status": "not_proposed",
-                "mode": mode,
-                "reason": decision_reason,
-                "decision_disposition": decision_disposition,
-                "delivery_disposition": "none",
-                "proposal": None,
-                "authority": self._authority_boundary(),
-            }
+            return self._persist_decision_result(
+                general_situation=general_situation,
+                assessment=assessment,
+                attention_hypothesis_ref=attention_hypothesis_ref,
+                user_id=user,
+                session_id=session,
+                output={
+                    "status": "not_proposed",
+                    "mode": mode,
+                    "reason": decision_reason,
+                    "decision_disposition": decision_disposition,
+                    "delivery_disposition": "none",
+                    "proposal": None,
+                },
+                mode_epoch=config.get("mode_epoch"),
+            )
         proposal_id = "sug_" + stable_digest(
             "veyra.informational_suggestion.identity.v2",
             {
@@ -377,6 +401,23 @@ class SuggestionOutbox:
                 or committed_config.get("mode_epoch")
                 != config.get("mode_epoch")
             ):
+                decision_record = self._decision_record(
+                    general_situation=general_situation,
+                    assessment=assessment,
+                    attention_hypothesis_ref=attention_hypothesis_ref,
+                    user_id=user,
+                    session_id=session,
+                    mode=str(committed_config.get("mode") or mode),
+                    mode_epoch=committed_config.get("mode_epoch"),
+                    decision_disposition=decision_disposition,
+                    delivery_disposition="suppressed",
+                    reason="suggestion_mode_changed_before_commit",
+                    proposal_id=None,
+                    now=self._now(),
+                )
+                persisted_decision = self._record_decision_in_state(
+                    current, decision_record
+                )
                 result = {
                     "status": (
                         "disabled"
@@ -388,6 +429,9 @@ class SuggestionOutbox:
                     "decision_disposition": decision_disposition,
                     "delivery_disposition": "suppressed",
                     "proposal": None,
+                    "interaction_decision": self._public_decision(
+                        persisted_decision
+                    ),
                     "authority": self._authority_boundary(),
                 }
                 return current
@@ -418,6 +462,25 @@ class SuggestionOutbox:
                         "mode": mode,
                         "reason": "legacy_proposal_isolated_from_sandbox",
                         "proposal": None,
+                        "interaction_decision": self._public_decision(
+                            self._record_decision_in_state(
+                                current,
+                                self._decision_record(
+                                    general_situation=general_situation,
+                                    assessment=assessment,
+                                    attention_hypothesis_ref=attention_hypothesis_ref,
+                                    user_id=user,
+                                    session_id=session,
+                                    mode=mode,
+                                    mode_epoch=config.get("mode_epoch"),
+                                    decision_disposition=decision_disposition,
+                                    delivery_disposition="none",
+                                    reason="legacy_proposal_isolated_from_sandbox",
+                                    proposal_id=proposal_id,
+                                    now=commit_now,
+                                ),
+                            )
+                        ),
                         "authority": self._authority_boundary(),
                     }
                     return current
@@ -427,7 +490,35 @@ class SuggestionOutbox:
                 result = {
                     "status": "replayed",
                     "mode": mode,
+                    "decision_disposition": existing.get("decision_disposition"),
+                    "delivery_disposition": existing.get("delivery_disposition"),
+                    "reason": existing.get("reason"),
                     "proposal": self._public_proposal(existing),
+                    "interaction_decision": self._public_decision(
+                        self._record_decision_in_state(
+                            current,
+                            self._decision_record(
+                                general_situation=general_situation,
+                                assessment=assessment,
+                                attention_hypothesis_ref=attention_hypothesis_ref,
+                                user_id=user,
+                                session_id=session,
+                                mode=mode,
+                                mode_epoch=config.get("mode_epoch"),
+                                decision_disposition=str(
+                                    existing.get("decision_disposition")
+                                    or decision_disposition
+                                ),
+                                delivery_disposition=str(
+                                    existing.get("delivery_disposition")
+                                    or "none"
+                                ),
+                                reason=str(existing.get("reason") or decision_reason),
+                                proposal_id=proposal_id,
+                                now=commit_now,
+                            ),
+                        )
+                    ),
                     "authority": self._authority_boundary(),
                 }
                 return current
@@ -452,6 +543,25 @@ class SuggestionOutbox:
                         "decision_disposition": decision_disposition,
                         "delivery_disposition": "suppressed",
                         "proposal": None,
+                        "interaction_decision": self._public_decision(
+                            self._record_decision_in_state(
+                                current,
+                                self._decision_record(
+                                    general_situation=general_situation,
+                                    assessment=assessment,
+                                    attention_hypothesis_ref=attention_hypothesis_ref,
+                                    user_id=user,
+                                    session_id=session,
+                                    mode=mode,
+                                    mode_epoch=config.get("mode_epoch"),
+                                    decision_disposition=decision_disposition,
+                                    delivery_disposition="suppressed",
+                                    reason=suppression,
+                                    proposal_id=proposal_id,
+                                    now=commit_now,
+                                ),
+                            )
+                        ),
                         "authority": self._authority_boundary(),
                     }
                     return current
@@ -506,12 +616,195 @@ class SuggestionOutbox:
                 "decision_disposition": decision_disposition,
                 "delivery_disposition": proposal.get("delivery_disposition"),
                 "proposal": self._public_proposal(proposal),
+                "interaction_decision": self._public_decision(
+                    self._record_decision_in_state(
+                        current,
+                        self._decision_record(
+                            general_situation=general_situation,
+                            assessment=assessment,
+                            attention_hypothesis_ref=attention_hypothesis_ref,
+                            user_id=user,
+                            session_id=session,
+                            mode=mode,
+                            mode_epoch=config.get("mode_epoch"),
+                            decision_disposition=decision_disposition,
+                            delivery_disposition=str(
+                                proposal.get("delivery_disposition") or "none"
+                            ),
+                            reason=decision_reason,
+                            proposal_id=proposal_id,
+                            now=commit_now,
+                        ),
+                    )
+                ),
                 "authority": self._authority_boundary(),
             }
             return current
 
         self.state_store.mutate_json(self.STATE_FILE, mutate)
         return result or self._closed("suggestion_outbox_mutation_no_result")
+
+    def _persist_decision_result(
+        self,
+        *,
+        general_situation: dict[str, Any],
+        assessment: dict[str, Any],
+        attention_hypothesis_ref: dict[str, Any],
+        user_id: str,
+        session_id: str,
+        output: dict[str, Any],
+        mode_epoch: Any,
+        proposal_id: str | None = None,
+    ) -> dict[str, Any]:
+        now = self._now()
+        record = self._decision_record(
+            general_situation=general_situation,
+            assessment=assessment,
+            attention_hypothesis_ref=attention_hypothesis_ref,
+            user_id=user_id,
+            session_id=session_id,
+            mode=str(output.get("mode") or self.DEFAULT_MODE),
+            mode_epoch=mode_epoch,
+            decision_disposition=str(
+                output.get("decision_disposition") or "silent"
+            ),
+            delivery_disposition=str(
+                output.get("delivery_disposition") or "none"
+            ),
+            reason=str(output.get("reason") or ""),
+            proposal_id=proposal_id,
+            now=now,
+        )
+        result: dict[str, Any] = {}
+
+        def mutate(current: dict[str, Any]) -> dict[str, Any]:
+            nonlocal result
+            if not self._healthy(current):
+                result = self._closed("suggestion_outbox_state_corrupt")
+                return current
+            selected = self._record_decision_in_state(current, record)
+            result = {
+                **copy.deepcopy(output),
+                "interaction_decision": self._public_decision(selected),
+                "authority": self._authority_boundary(),
+            }
+            return current
+
+        self.state_store.mutate_json(self.STATE_FILE, mutate)
+        return result or self._closed("suggestion_outbox_decision_mutation_no_result")
+
+    def _decision_record(
+        self,
+        *,
+        general_situation: dict[str, Any],
+        assessment: dict[str, Any],
+        attention_hypothesis_ref: dict[str, Any],
+        user_id: str,
+        session_id: str,
+        mode: str,
+        mode_epoch: Any,
+        decision_disposition: str,
+        delivery_disposition: str,
+        reason: str,
+        proposal_id: str | None,
+        now: datetime,
+    ) -> dict[str, Any]:
+        parent_revision = self._nonnegative_int(
+            general_situation.get("parent_revision")
+        )
+        assessment_binding_digest = stable_digest(
+            "veyra.interaction_decision.assessment_binding.v1",
+            assessment.get("assessment_binding") or {},
+        )
+        identity = {
+            "user_id": user_id,
+            "session_id": session_id,
+            "general_situation_id": general_situation.get("general_situation_id"),
+            "parent_revision": parent_revision,
+            "attention_hypothesis_ref": copy.deepcopy(attention_hypothesis_ref),
+            "assessment_binding_digest": assessment_binding_digest,
+            "mode": mode,
+            "mode_epoch": self._nonnegative_int(mode_epoch),
+            "decision_disposition": decision_disposition,
+            "delivery_disposition": delivery_disposition,
+            "reason": reason,
+            "proposal_id": proposal_id,
+        }
+        decision_id = "idec_" + stable_digest(
+            "veyra.interaction_decision.identity.v1", identity
+        )[:24]
+        return {
+            "schema_version": self.DECISION_SCHEMA_VERSION,
+            "decision_id": decision_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "general_situation_id": str(
+                general_situation.get("general_situation_id") or ""
+            ),
+            "parent_revision": parent_revision,
+            "attention_hypothesis_ref": copy.deepcopy(attention_hypothesis_ref),
+            "assessment_binding_digest": assessment_binding_digest,
+            "mode": mode,
+            "mode_epoch": self._nonnegative_int(mode_epoch),
+            "decision_disposition": decision_disposition,
+            "delivery_disposition": delivery_disposition,
+            "reason": reason,
+            "proposal_id": proposal_id,
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+            "authority": self._authority_boundary(),
+        }
+
+    def _record_decision_in_state(
+        self,
+        state: dict[str, Any],
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        decisions = self._records(state.get("interaction_decisions"))
+        decision_id = str(record.get("decision_id") or "")
+        existing = decisions.get(decision_id)
+        if existing is not None:
+            if not self._valid_decision_record(decision_id, existing):
+                raise SuggestionOutboxConflict(
+                    "interaction decision ledger record is corrupt"
+                )
+            immutable = {
+                key: existing.get(key)
+                for key in (
+                    "user_id",
+                    "session_id",
+                    "general_situation_id",
+                    "parent_revision",
+                    "attention_hypothesis_ref",
+                    "assessment_binding_digest",
+                    "mode",
+                    "mode_epoch",
+                    "decision_disposition",
+                    "delivery_disposition",
+                    "reason",
+                    "proposal_id",
+                )
+            }
+            incoming = {key: record.get(key) for key in immutable}
+            if immutable != incoming:
+                raise SuggestionOutboxConflict(
+                    "interaction decision identity was rebound"
+                )
+            return existing
+        if len(decisions) >= self.MAX_INTERACTION_DECISIONS:
+            raise SuggestionOutboxConflict(
+                "interaction decision ledger capacity exhausted"
+            )
+        decisions[decision_id] = copy.deepcopy(record)
+        state["schema_version"] = self.SCHEMA_VERSION
+        state["interaction_decisions"] = decisions
+        state["interaction_decision_count"] = len(decisions)
+        state["updated_at"] = record["updated_at"]
+        return record
+
+    @classmethod
+    def _public_decision(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy.deepcopy(value)
 
     def status(self) -> dict[str, Any]:
         """Pure operational status; it does not resolve or deliver proposals."""
@@ -528,6 +821,9 @@ class SuggestionOutbox:
             "mode_epoch": config["mode_epoch"],
             "allowed_modes": sorted(self.MODES),
             "proposal_count": len(self._records(state.get("proposals"))),
+            "interaction_decision_count": len(
+                self._records(state.get("interaction_decisions"))
+            ),
             "policy_count": len(self._records(state.get("policies"))),
             "state_revision": self._nonnegative_int(state.get("_state_revision")),
             "ops_config_revision": config["ops_config_revision"],
@@ -1525,6 +1821,7 @@ class SuggestionOutbox:
             "owner_inboxes",
             "feedback",
             "daily_counters",
+            "interaction_decisions",
         )
         if any(not isinstance(state.get(name), dict) for name in collection_names):
             return False
@@ -1533,11 +1830,18 @@ class SuggestionOutbox:
         inboxes = state["owner_inboxes"]
         feedback = state["feedback"]
         counters = state["daily_counters"]
+        decisions = state["interaction_decisions"]
         if len(proposals) > cls.MAX_PROPOSALS:
+            return False
+        if len(decisions) > cls.MAX_INTERACTION_DECISIONS:
             return False
         if not cls._exact_count(state.get("policy_count"), len(policies)):
             return False
         if not cls._exact_count(state.get("proposal_count"), len(proposals)):
+            return False
+        if not cls._exact_count(
+            state.get("interaction_decision_count"), len(decisions)
+        ):
             return False
 
         for scope_key, policy in policies.items():
@@ -1585,6 +1889,9 @@ class SuggestionOutbox:
                 return False
         for counter_key, counter in counters.items():
             if not cls._valid_daily_counter(counter_key, counter):
+                return False
+        for decision_id, decision in decisions.items():
+            if not cls._valid_decision_record(decision_id, decision):
                 return False
         return True
 
@@ -1849,6 +2156,97 @@ class SuggestionOutbox:
             and value.get("feishu_delivery") is False
             and value.get("agent_delivery") is False
         )
+
+    @classmethod
+    def _valid_decision_record(cls, decision_id: Any, value: Any) -> bool:
+        if (
+            not isinstance(decision_id, str)
+            or not re.fullmatch(r"idec_[0-9a-f]{24}", decision_id)
+            or not isinstance(value, dict)
+            or set(value)
+            != {
+                "schema_version",
+                "decision_id",
+                "user_id",
+                "session_id",
+                "general_situation_id",
+                "parent_revision",
+                "attention_hypothesis_ref",
+                "assessment_binding_digest",
+                "mode",
+                "mode_epoch",
+                "decision_disposition",
+                "delivery_disposition",
+                "reason",
+                "proposal_id",
+                "created_at",
+                "updated_at",
+                "authority",
+            }
+            or value.get("schema_version") != cls.DECISION_SCHEMA_VERSION
+            or value.get("decision_id") != decision_id
+            or cls._proposal_scope_key(value) is None
+            or not isinstance(value.get("general_situation_id"), str)
+            or not value.get("general_situation_id")
+            or isinstance(value.get("parent_revision"), bool)
+            or not isinstance(value.get("parent_revision"), int)
+            or value.get("parent_revision") < 1
+            or value.get("mode") not in cls.MODES
+            or isinstance(value.get("mode_epoch"), bool)
+            or not isinstance(value.get("mode_epoch"), int)
+            or value.get("mode_epoch") < 0
+            or value.get("decision_disposition") not in cls.INTERACTION_DECISIONS
+            or value.get("delivery_disposition") not in cls.DELIVERY_DISPOSITIONS
+            or not isinstance(value.get("reason"), str)
+            or len(value.get("reason") or "") > 240
+            or value.get("authority") != cls._authority_boundary()
+            or cls._aware_time(value.get("created_at")) is None
+            or cls._aware_time(value.get("updated_at")) is None
+        ):
+            return False
+        ref = value.get("attention_hypothesis_ref")
+        if (
+            ref is not None
+            and (
+                not isinstance(ref, dict)
+                or set(ref)
+                != {
+                    "hypothesis_id",
+                    "hypothesis_revision",
+                    "ruleset_version",
+                    "readiness_semantics",
+                }
+                or not str(ref.get("hypothesis_id") or "").startswith("ahyp_")
+                or isinstance(ref.get("hypothesis_revision"), bool)
+                or not isinstance(ref.get("hypothesis_revision"), int)
+                or ref.get("hypothesis_revision") < 1
+                or ref.get("ruleset_version")
+                != cls.ATTENTION_HYPOTHESIS_RULESET_VERSION
+                or ref.get("readiness_semantics")
+                != cls.ATTENTION_READINESS_SEMANTICS
+            )
+            or not isinstance(value.get("assessment_binding_digest"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value["assessment_binding_digest"])
+        ):
+            return False
+        proposal_id = value.get("proposal_id")
+        if proposal_id is not None and (
+            not isinstance(proposal_id, str)
+            or not proposal_id.startswith("sug_")
+        ):
+            return False
+        created_at = cls._aware_time(value.get("created_at"))
+        updated_at = cls._aware_time(value.get("updated_at"))
+        if created_at is None or updated_at is None or updated_at < created_at:
+            return False
+        mode = value.get("mode")
+        delivery = value.get("delivery_disposition")
+        if mode == "advise_only":
+            if delivery not in {"owner_scoped_console", "suppressed"}:
+                return False
+        elif delivery not in {"none", "suppressed"}:
+            return False
+        return True
 
     @classmethod
     def _valid_feedback_record(

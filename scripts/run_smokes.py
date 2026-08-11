@@ -29,6 +29,7 @@ GATE_SMOKES = [
     "attention_hypothesis_smoke.py",
     "attention_lifecycle_smoke.py",
     "suggestion_sandbox_smoke.py",
+    "interaction_decision_ledger_smoke.py",
     "structured_observation_control_plane_smoke.py",
     "component_health_producer_smoke.py",
     "strategic_discussion_boundary_smoke.py",
