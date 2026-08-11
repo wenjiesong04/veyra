@@ -550,6 +550,8 @@ def main() -> int:
         ] += 1
         expect(
             surfaced.get("status") == "pending"
+            and proposal.get("decision_disposition") == "say"
+            and proposal.get("delivery_disposition") == "owner_scoped_console"
             and proposal.get("proposal_revision")
             == SuggestionOutbox.proposal_revision_for(raw_proposal)
             and proposal.get("attention_hypothesis_ref")
@@ -869,6 +871,8 @@ def main() -> int:
         )
         expect(
             record_only_replay.get("status") == "replayed"
+            and recorded.get("decision_disposition") == "say"
+            and recorded.get("delivery_disposition") == "none"
             and int(
                 store.read_json(SuggestionOutbox.STATE_FILE).get(
                     "proposal_count"

@@ -32,6 +32,8 @@ class SuggestionOutbox:
     ATTENTION_READINESS_SEMANTICS = (
         "attention_policy_readiness_not_factual_probability"
     )
+    INTERACTION_DECISIONS = frozenset({"say", "ask", "wait", "silent"})
+    DELIVERY_DISPOSITIONS = frozenset({"none", "owner_scoped_console"})
     MAX_PROPOSALS = 2000
     MAX_INBOX_ITEMS = 100
     DEFAULT_POLICY = {
@@ -54,6 +56,8 @@ class SuggestionOutbox:
             "mode",
             "status",
             "reason",
+            "decision_disposition",
+            "delivery_disposition",
             "why_now",
             "score",
             "upstream_scorer_version",
@@ -81,6 +85,8 @@ class SuggestionOutbox:
         "mode",
         "status",
         "reason",
+        "decision_disposition",
+        "delivery_disposition",
         "why_now",
         "score",
         "upstream_scorer_version",
@@ -739,6 +745,10 @@ class SuggestionOutbox:
             "mode": mode,
             "status": status,
             "reason": "structured_attention_threshold_met",
+            "decision_disposition": "say",
+            "delivery_disposition": (
+                "owner_scoped_console" if mode == "advise_only" else "none"
+            ),
             "why_now": why_now,
             "score": assessment.get("score"),
             "upstream_scorer_version": assessment.get(
@@ -1096,7 +1106,14 @@ class SuggestionOutbox:
         record_refs = copy.deepcopy(record.get("current_evidence_refs") or [])
         record_readiness = record.get("attention_readiness")
         return bool(
-            proposal.get("source_expires_at") == parent.get("expires_at")
+            proposal.get("decision_disposition") == "say"
+            and proposal.get("delivery_disposition")
+            == (
+                "owner_scoped_console"
+                if proposal.get("mode") == "advise_only"
+                else "none"
+            )
+            and proposal.get("source_expires_at") == parent.get("expires_at")
             and proposal.get("evidence") == record_refs
             and proposal.get("why_now")
             == self._why_now(record.get("components"))
@@ -1365,6 +1382,8 @@ class SuggestionOutbox:
                 "parent_revision",
                 "mode",
                 "reason",
+                "decision_disposition",
+                "delivery_disposition",
                 "why_now",
                 "score",
                 "upstream_scorer_version",
@@ -1635,6 +1654,16 @@ class SuggestionOutbox:
             return False
         if (
             not isinstance(value.get("reason"), str)
+            or value.get("decision_disposition")
+            not in cls.INTERACTION_DECISIONS
+            or value.get("delivery_disposition")
+            not in cls.DELIVERY_DISPOSITIONS
+            or value.get("delivery_disposition")
+            != (
+                "owner_scoped_console"
+                if mode == "advise_only"
+                else "none"
+            )
             or not isinstance(value.get("why_now"), list)
             or not isinstance(value.get("evidence"), list)
             or not isinstance(value.get("unknowns"), list)
