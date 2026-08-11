@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from awareness.belief_economy import economy_value
 from core.perception_layer import PerceptionLayer
 from core.reasoning_core import CoreReasoning
 from core.world_state import WorldStateStore
@@ -137,10 +138,7 @@ class StateRefresh:
             return [], 0, 0
         ordered = sorted(
             claims,
-            key=lambda claim: (
-                str(claim.get("updated_at") or claim.get("observed_at") or ""),
-                str(claim.get("key") or claim.get("claim") or ""),
-            ),
+            key=self._refresh_sort_key,
         )
         count = min(limit, len(ordered))
         selected: list[dict[str, Any]] = []
@@ -163,6 +161,38 @@ class StateRefresh:
 
         self.state_store.mutate_json("state_refresh_state.json", reserve_batch)
         return selected, cursor_before, cursor_after
+
+    @staticmethod
+    def _status_priority(claim: dict[str, Any]) -> int:
+        # Hard stale/expired/conflict obligations are ordered before a merely
+        # old claim.  The caller already filters to refreshable claims, but a
+        # deterministic rank keeps malformed status values fail-closed.
+        return {
+            "expired": 0,
+            "conflict": 1,
+            "stale": 2,
+        }.get(str(claim.get("status") or ""), 3)
+
+    @classmethod
+    def _refresh_sort_key(cls, claim: dict[str, Any]) -> tuple[Any, ...]:
+        value = economy_value(claim.get("economy"))
+        return (
+            cls._status_priority(claim),
+            0 if value is not None else 1,
+            -float(value or 0.0),
+            str(claim.get("updated_at") or claim.get("observed_at") or ""),
+            cls._owner_key(claim),
+            str(claim.get("key") or claim.get("claim") or ""),
+        )
+
+    @staticmethod
+    def _owner_key(claim: dict[str, Any]) -> str:
+        return ":".join(
+            [
+                str(claim.get("user_id") or "ownerless"),
+                str(claim.get("session_id") or "sessionless"),
+            ]
+        )
 
     def _target_for_claim(self, claim: dict[str, Any]) -> str | None:
         """Resolve a structured refresh target, or None when none is available.

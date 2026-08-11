@@ -10,6 +10,7 @@ from core.context_scope import (
     owner_scope,
     scope_kind,
 )
+from awareness.belief_economy import validate_economy
 from awareness.refresh_spec import validate_refresh_spec
 from interface.event_schema import utc_now_iso
 
@@ -29,6 +30,7 @@ def make_claim(
     claim_kind: str = "observed",
     derived_from: str | None = None,
     refresh_spec: dict[str, Any] | None = None,
+    economy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     timestamp = observed_at or utc_now_iso()
     payload: dict[str, Any] = {
@@ -52,6 +54,8 @@ def make_claim(
             refresh_spec,
             source=source,
         )
+    if economy is not None:
+        payload["economy"] = validate_economy(economy)
     if next_action:
         payload["next_action"] = next_action
     return payload

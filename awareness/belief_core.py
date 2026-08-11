@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from awareness.belief_economy import BeliefEconomyError, validate_economy
 from awareness.claim_schema import (
     claim_identity_key,
     detect_conflicts,
@@ -46,6 +47,19 @@ class BeliefCore:
         )
 
     def upsert_claim(self, claim: dict[str, Any]) -> dict[str, Any]:
+        if claim.get("economy") is not None:
+            try:
+                claim = {
+                    **claim,
+                    "economy": validate_economy(claim.get("economy")),
+                }
+            except BeliefEconomyError as exc:
+                return {
+                    **claim,
+                    "status": "rejected_belief_economy",
+                    "persisted": False,
+                    "belief_economy_error": str(exc),
+                }
         claim = refresh_claim_status(claim)
         identity = claim_identity_key(claim)
         if identity is None:
