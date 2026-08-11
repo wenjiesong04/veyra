@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -122,7 +123,22 @@ def main() -> int:
         app_module.ops_monitor.feishu_status_resolver = lambda: {"status": "stopped", "thread_alive": False, "channel_config": {"enabled": False}}
         app_module.ops_monitor.active_loop_status_resolver = lambda: {"status": "stopped", "thread_alive": False, "enabled": False}
 
-        health = client.get("/health").json()
+        with patch(
+            "runtime.isolated_git_snapshot.subprocess.run",
+            side_effect=AssertionError("status GET attempted Git"),
+        ):
+            health = client.get("/health").json()
+            runtime = client.get("/runtime").json()
+        expect(
+            health.get("runtime_build") == runtime.get("runtime_build")
+            and health.get("runtime_build", {}).get("git_checked_on_request")
+            is False,
+            "health and runtime reuse one frozen build identity without Git",
+            {
+                "health": health.get("runtime_build"),
+                "runtime": runtime.get("runtime_build"),
+            },
+        )
         expect(health.get("status") == "healthy", "info-only health remains healthy", health)
         info_codes = {item.get("code") for item in health.get("alerts", []) if item.get("severity") == "info"}
         expect("openclaw_workspace_memory_fallback" in info_codes, "workspace memory fallback is info-level", health)

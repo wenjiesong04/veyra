@@ -9,6 +9,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
+from runtime.build_identity import RuntimeBuildIdentity
+
+
+runtime_build_identity = RuntimeBuildIdentity.capture(
+    repository_root=Path(__file__).resolve().parent,
+)
+
 from core.action_risk import ActionRiskAssessment, assess_action_risk
 from core.architecture import architecture_snapshot
 from core.agency_core import AgencyCore
@@ -123,7 +130,6 @@ from runtime.trusted_isolated_runner import (
     TrustedIsolatedRunnerBackend,
 )
 from runtime.bounded_extension_generator import BoundedExtensionGenerator
-from runtime.build_identity import RuntimeBuildIdentity
 from runtime.extension_generation_gate import ExtensionGenerationGate
 from runtime.extension_dynamic_validation_gate import (
     ExtensionDynamicValidationGate,
@@ -162,9 +168,6 @@ from runtime.safety_validation import SafetyValidation
 load_runtime_env()
 local_control_policy = LocalControlPolicy()
 app = FastAPI(title="Veyra", version="0.1.0")
-runtime_build_identity = RuntimeBuildIdentity.capture(
-    repository_root=Path(__file__).resolve().parent,
-)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(local_control_policy.allowed_origins),
