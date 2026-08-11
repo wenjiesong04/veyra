@@ -4,11 +4,13 @@
 >
 > 文档角色：Veyra 的 canonical project hub（项目总入口）
 >
-> 最近核验：2026-08-10
+> 文档最近维护：2026-08-11
 >
-> 应用代码基线：`cognitive-awakening @ 3bcbaa7`；其后只有本文件和清理类维护提交。实际任务 HEAD 必须用 Git 重新读取
+> 最近事实核验：2026-08-11
 >
-> 运行态说明：本机 API 进程启动于 2026-08-03 15:04:55，早于当前 HEAD 的最后一次提交，不能作为当前 HEAD 的 live validation
+> 已提交应用代码基线：`cognitive-awakening @ 8feda55`；该提交修复启动时 build identity 的隔离与 fail-closed 合同。本文后续的纯文档提交会推进 branch SHA，但不改变应用代码。实际任务 HEAD 与工作区必须用 Git 重新读取
+>
+> 运行态说明：本机 API 于 2026-08-11 06:56:51 UTC 重启并报告 `431c26b / dirty_flag=true`；该进程仍使用审查未通过的第一版启动探测，不能作为当前 worktree 安全修复的 live validation
 
 本文件是一个**可更新的活文档**。它同时回答五个问题：
 
@@ -359,7 +361,7 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 
 ---
 
-## 3. 2026-08-10 当前真实基线
+## 3. 2026-08-10 基线与 2026-08-11 复核
 
 ### 3.1 Git 与 Cursor changeset
 
@@ -368,12 +370,12 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 | 项 | 当前事实 |
 |---|---|
 | 工作分支 | `cognitive-awakening` |
-| 应用代码 HEAD | `3bcbaa7`；本文件的维护提交位于其后，不改变运行行为 |
-| 远端分支 | 当前本地包含一条尚未推送的文档维护提交；开始新任务时重新检查 ahead/behind |
+| 应用代码 HEAD | `8feda55`；在 `431c26b` 之后将启动时 build identity 改为隔离 Git snapshot 与整体 fail-closed 投影 |
+| 远端分支 | 本轮开始时 `origin/cognitive-awakening @ 3bcbaa7`；P0 提交、推送与合并前必须重新检查 ahead/behind |
 | 远端主线 | `origin/main @ 8a8a3d2` |
 | 本地主线 | `main @ 26d77fa`，落后 `origin/main`，不能直接作为新基线 |
-| 分支差异 | 应用代码比 `origin/main` 前进 4 个认知提交，约 9.7k 行新增、174 行删除；另有本文件的维护提交 |
-| 本轮开始时未提交代码 | 0；只有新 README 和一份旧聊天草稿 |
+| 分支差异 | 4 个认知提交之后有 `2c0cfe1` handbook、`431c26b` 运行可观测性与 `8feda55` 安全修复；精确 diff 以当前 Git 为准 |
+| P0 文档状态 | 宪法性架构内容与 Living/Operating 状态分别以小提交维护；最终 branch SHA、远端 CI 与 live evidence 必须在执行完成后重新记录 |
 
 4 个分支提交的目的：
 
@@ -382,33 +384,35 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 3. `55d324f`：切断失败 Probe 自我喂养刷新循环，加入只读 ConservatismMonitor，并删除重复 reflection loop；
 4. `3bcbaa7`：只有 direct observation 能计入 hypothesis confirmed evidence，inference/prediction 只能被记录为排除项。
 
-本轮代码审计尚未发现需要回滚这 4 个提交的确定性回归。已发现的真实问题是文档和注释漂移、运行进程落后 HEAD，以及新认知链仍没有生产 proposal。合并 `main` 前仍必须以完整 gate、当前 HEAD 重启后的 live acceptance 和远端 CI 为准。
+本轮代码审计尚未发现需要回滚 4 个认知提交的确定性回归，但 `431c26b` 的第一版 build identity 存在合并阻塞：启动时普通 `git status` 会继承仓库配置，已复现执行 `core.fsmonitor` hook 和改写 `.git/index`；dirty 探测失败时还会错误投影为 `available + dirty_flag=null`。`8feda55` 已改为两轮隔离 Git snapshot 和整体 fail-closed；它已通过独立只读复审和定向 smoke，但在 clean live restart、完整最终 gate 与远端 CI 前只能标记为 `COMMITTED_FIX / TARGETED_VALIDATED / NOT_LIVE_VALIDATED`。新认知链仍没有生产 proposal。
 
-本轮对该代码基线的自动化结果：
+2026-08-11 文档记录的 `431c26b` 自动化结果：
 
-- Python gate：`133/133`，通过；
+- Python gate：`134/134`，通过；
 - OpenClaw governance plugin：`32/32`，通过；
 - Python compileall：通过；
 - Web production build：通过；
 - Desktop frontend build：通过。
 
-这些结果证明当前 changeset 的自动化边界，没有把旧运行进程升级成当前 HEAD 的 live evidence。
+这些旧结果没有覆盖恶意 Git 配置、index 写入和 partial identity，因此不能推翻上述审查阻塞。`8feda55` 已通过扩展后的 `runtime_build_identity_smoke.py`、`runtime_hygiene_smoke.py`、`start_local_runtime_smoke.py` 及相关认知回归 smoke；最终 `134/134` gate、OpenClaw plugin、compileall、Web/Desktop build、clean restart、live acceptance 和远端 CI 仍须对最终 changeset 重新验证。
 
 ### 3.2 当前运行态快照
 
-当前 API 使用正确的 Conda Python 3.11 运行，但进程早于最后提交，不能代表当前 HEAD。只读探测结果：
+当前 API 使用正确的 Conda Python 3.11 运行，并已在重启后报告 `431c26b`。下表是 2026-08-11 07:05–07:22 UTC 的只读快照；开始新任务时必须重新读取：
 
 | 表面 | 观察结果 | 正确解释 |
 |---|---|---|
-| `/health` | `degraded`，5 条提示 | Core model transport 证据过期；OpenClaw native Memory 不可用而使用 scoped fallback；本进程无 Feishu 入站；5 条旧 Review；8 条 Belief 中 1 条 stale |
+| `/health` | `degraded`，4 条提示；Core Model 为 `ok` | OpenClaw native Memory 不可用而使用 scoped fallback；本进程无 Feishu 入站；5 条旧 Review；9 条 Belief 中 1 条 stale |
 | `/agent/status` | `snapshot_stale` | 历史 capability/certification 不能当作当前 fresh dispatch 证明 |
 | Feishu WS | `running / connected / thread_alive`，但 `last_event_after_start=false` | WebSocket 存活，不等于本进程已收到并回复真实消息 |
-| Cognitive Loop | `record_only`；178 cycles、134 observed、44 degraded、356 model calls、0 candidate | 模型已在只读循环中，但当前实际效果是过度保守，不是主动建议闭环 |
+| Cognitive Loop | `record_only`；180 cycles、135 observed、45 degraded、360 model calls、0 candidate | 模型已在只读循环中，但当前实际效果是过度保守，不是主动建议闭环 |
 | AttentionHypothesis | 0 条 | 技术生命周期存在，没有生产样本 |
 | SuggestionOutbox | 0 proposal、0 policy，external delivery false | 用户目前感受不到 observation-derived 主动建议 |
 | Phase 6 runner | backend 历史快照过期，status `fail_closed / degraded` | 安全的当前行为；必须显式 authenticated refresh 后才能重新声明 backend ready |
 
-由于运行时未暴露 build Git SHA，目前只能用进程启动时间和提交时间判断 revision 漂移。这是一个 P0 可观测性缺口：后续应在启动时固定 `build_revision / dirty_flag / started_at`，只读暴露，不在 GET 中执行 Git 命令。
+截至 2026-08-10，运行时尚未暴露 build Git SHA，只能用进程启动时间和提交时间推断 revision 漂移；这是当时的 P0 历史缺口。
+
+`431c26b` 首次将冻结的 `build_revision / dirty_flag / started_at` 追加到 `/health` 和 `/runtime`，且 GET 本身不执行 Git；本机进程和一次 `direct_answer / R0 / success` 也证明公开投影与消息 Route 没有新增权限。但它的启动探测安全审查未通过，不能继续标记为完整 `LIVE_VALIDATED`。`8feda55` 把扩展后的公开合同显式升级为 `veyra.runtime_build_identity.v2`，增加独立的 `captured_at`、来源和 authority 边界字段；它使用 synthetic Git dir + 临时 index，清理 `GIT_*`，禁用 fsmonitor、optional locks、replace refs 和外部 diff/filter 执行。两轮 HEAD/index/status 任一漂移或任一部分未知时，revision、dirty 和 capture time 整体投影为 `unavailable / null`。它还明确返回 `loaded_code_attested=false`：启动时 Git snapshot 只是有界工作区观察，`dirty_flag=true` 时尤其不能仅凭 SHA 宣称运行字节精确等于该 commit，启动后的工作区变化也不会被冻结快照继续感知。
 
 ### 3.3 当前能力矩阵
 
@@ -426,7 +430,7 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 | Durable Case | `IMPLEMENTED / PARTIAL` | 有 owner scope、CAS、checkpoint、dialogue、cancel 和 recovery；Goal、Commitment、Situation、授权执行和长期 wakeup 尚未统一成一个事务 |
 | Agency / Self-heal | `IMPLEMENTED / NARROW A2+A3` | 只有固定 OpenClaw reconnect 与私有 JSON sandbox；真实断网演练、长期成功率和误触发率不足；A4/A5 未认证 |
 | Foresight | `IMPLEMENTED / SHADOW CALIBRATION` | 固定 capability 有 prediction、authoritative receipt 和 residual；尚不是通用世界演化模拟器，不自动晋级 |
-| Learning / Self model | `IMPLEMENTED / DESCRIPTIVE ONLY` | 支持 exact-bound 五类 suggestion feedback，固定 `policy_effect=none`；真实样本为 0，不会自动修改阈值、route、provider、risk 或 authority |
+| Learning / Self model | `IMPLEMENTED / DESCRIPTIVE ONLY` | 支持 exact-bound 五类 suggestion feedback，固定 `policy_effect=none`；这是当前安全阶段而非 North Star 终态，后续也只允许提出非权限性的认知/交互影响；真实样本为 0，不会自动修改阈值、route、provider、risk 或 authority |
 | Feishu / Desktop / Console | `IMPLEMENTED / OPERATIONS DEGRADED` | 本地 Console 和 Feishu WS 可运行；当前进程无 fresh Feishu inbound；桌面/外部发布仍需与目标平台分别验收 |
 
 ### 3.4 Phase 6 的准确状态
@@ -532,9 +536,9 @@ Veyra 的治理合同是 provider-neutral，这是正确方向；但接口中立
 
 技术上有 feedback schema，不代表系统已经学习。当前 proposal 和 feedback 都为 0。第一条成功不是“fixture 生成了一段聪明文字”，而是从真实 observation 产生一条可检查建议，用户本人 opt in 并给出分类反馈。
 
-### 4.6 运行 revision 与 live evidence 没有自动对齐
+### 4.6 Runtime revision 已可见，安全且完整的 live-evidence identity 尚未收口
 
-运行进程没有暴露 build revision，导致“代码已改”和“服务已加载”只能靠时间推断。任何 live claim 都应绑定 revision、配置摘要、provider identity、进程启动时间和证据 TTL。
+`431c26b` 解决了“完全看不到 revision”的表面缺口，但第一版启动探测安全审查失败；`8feda55` 已提交隔离修复，尚未完成 clean live validation 和远端 CI。即使修复通过，Git snapshot 也只表示启动时工作区观察，不是 loaded-code attestation。完整 live claim 仍应同时绑定应用代码 revision、dirty 状态、配置摘要、provider identity、进程启动时间和证据 TTL；任一未知都必须降低声明强度。
 
 ---
 
@@ -544,14 +548,14 @@ Veyra 的治理合同是 provider-neutral，这是正确方向；但接口中立
 
 ### P0：收口当前 `cognitive-awakening` 分支
 
-目标：证明 Cursor/Codex 的 4 个提交可以安全进入主线。
+目标：证明 `cognitive-awakening` 相对 `origin/main` 的完整 changeset 可以安全进入主线，包括 4 个认知提交、`2c0cfe1` canonical handbook、`431c26b` build identity、当前安全修复，以及按 Stability Zone 拆分的最终文档维护提交。
 
 必须完成：
 
-- 审查未提交差异和 4 个分支提交；
+- 审查完整 branch diff 和所有未提交差异，特别复核 build identity 的启动副作用、非 Git/partial 降级、GET purity、dirty 语义和 revision 声明边界；
 - 修正文档、测试注释和重复占位内容；
-- 运行 133 项 gate、OpenClaw plugin tests、compileall、browser/desktop frontend build；
-- 用当前 HEAD 重启 Veyra，确认解释器和 build revision；
+- 运行 `134/134` gate、OpenClaw plugin tests、compileall、browser/desktop frontend build；
+- 在最后一项运行代码修改后锁定最终应用代码 revision，重启 Veyra 并确认解释器与 `runtime_build` v2 的 revision、dirty、capture time、source 和 authority 边界；其后的纯文档提交可以推进 branch SHA，但不能被描述为运行进程已加载的代码 revision，也不要求仅为文档 SHA 重启；
 - 重新检查 `/health`、Agent、Feishu、Cognitive Loop 和 Phase 6 protected status；
 - 做一条不扩大权限的真实消息/认知场景验收；
 - 通过 GitHub Actions 后再合并 `main`。
@@ -567,9 +571,9 @@ Veyra 的治理合同是 provider-neutral，这是正确方向；但接口中立
 3. 只让 observed evidence 增加 readiness；inference/prediction 保持排除可见；
 4. 补齐 `contradicted / expired`；
 5. 实现 `say / ask / wait / silent` 和 decision/delivery disposition；
-6. 继续保持 `record_only`，先产生 shadow 样本；
-7. 用户显式 opt in 后，只在 owner-scoped Console Sandbox 展示；
-8. 用户给出 `useful / not_useful / too_frequent / wrong_timing / wrong_evidence`；
+6. 在 `record_only` 只生成 `recorded / channel=none` 样本，满足自动化晋级条件后才进入 `shadow`；
+7. `shadow` 只生成 `would_suggest` 样本，仍无交付；有真实 shadow 样本且用户显式 opt in 后才进入 `advise_only`；
+8. `advise_only` 仅在 owner-scoped Console Sandbox 展示，用户再给出 `useful / not_useful / too_frequent / wrong_timing / wrong_evidence`；
 9. Self Model 只增加描述性统计，`policy_effect=none`。
 
 接受标准：至少一条真实、非 fixture、可回放的 proposal；完整证据和未知可检查；外部发送、Agent、Tool、Grant、Route、Risk 和权限均无变化。
@@ -597,7 +601,7 @@ Veyra 的治理合同是 provider-neutral，这是正确方向；但接口中立
 - 增加导出、删除、保留策略和敏感推断审查；
 - 估计用户价值、打扰成本和不确定性成本，但不伪造精确分数；
 - 记录 missed opportunity、false silence、wrong timing 和 excessive interruption；
-- 在足够真实样本前不自动修改策略。
+- 在足够真实样本、独立验收和显式批准前不产生行为影响；达到条件后也只能通过版本化的非权限性认知/交互 proposal、shadow 评估、scoped canary 和可回退晋级产生受治理的后效；安全、授权、provider、交付范围和执行策略始终走独立的人工 authority change。
 
 ### P4：世界演化预测与 Durable Case 统一
 
@@ -611,7 +615,9 @@ Veyra 的治理合同是 provider-neutral，这是正确方向；但接口中立
 
 ### P5：Phase 6 产品硬化，而不是权限扩张
 
-- 为当前 HEAD 重新认证 runner 和 dynamic validation backend；
+P5 可以排在 P1–P4 之后，仅因为 Phase 6 runner 当前保持 `fail_closed / degraded`，且前序认知切片不依赖 extension invocation。任何恢复 extension 生成、验证、canary、显式调用或 promotion 的工作，都必须先完成 P5 的当前 revision 复验；此时 P5 自动成为前置条件。
+
+- 为届时的应用代码 revision 重新认证 runner 和 dynamic validation backend；
 - 做上一 signed version 的真实 rollback 演练；
 - 做 crash/retry、breaker、长期 soak 和资源边界验证；
 - 用第二个模型/provider 独立跑 strict generation 与 fail-closed compatibility；
@@ -677,7 +683,7 @@ python scripts/suggestion_sandbox_smoke.py
 python scripts/memory_context_scope_smoke.py
 python scripts/phase6_extension_pipeline_lifecycle_smoke.py
 
-# 完整 Python gate：当前 manifest 133 项
+# 完整 Python gate：当前 manifest 134 项
 python scripts/run_smokes.py --group gate
 
 # 全部 smoke（比 gate 更广，按任务需要）
@@ -700,7 +706,7 @@ npm run build
 npm run build:desktop
 ```
 
-涉及公开 Route、private state 或 operation mode 时，必须保留全部 9 Route 的非弱化矩阵。当前 `phase6_route_non_regression_smoke.py` 覆盖 9 routes × 3 modes × 28 private-state scenarios = 756 comparisons。
+涉及公开 Route、private state 或 operation mode 时，必须保留当前全部受保护公开 Route 的非弱化矩阵。截至 2026-08-10，`phase6_route_non_regression_smoke.py` 覆盖 9 routes × 3 modes × 28 private-state scenarios = 756 comparisons；Route 或场景集合变化时必须同步更新该 Living Zone 计数和断言。
 
 ### 6.4 必测负向场景
 
@@ -875,6 +881,8 @@ Route 清单不再手工维护固定数量。当前路由事实以当前 revisio
 
 愿景决定方向，但不能覆盖事实：
 
+- 修改前先标明所属 Stability Zone；Constitutional Zone 的变化应使用独立、可审阅的架构提交；
+- Living Zone 应替换陈旧快照并写明 revision、证据类型和核验日期，不把历次临时计数不断累加进正文；
 - 如果代码与愿景冲突，先判断是代码偏航、文档过时，还是现实约束证明愿景需要调整；
 - 不能为了迎合愿景把正确的安全代码删掉；
 - 也不能为了迁就当前代码，把尚未实现的目标从愿景中悄悄移除；
@@ -898,6 +906,7 @@ Route 清单不再手工维护固定数量。当前路由事实以当前 revisio
 10. 行动后结果是否重新进入世界模型并由独立证据验证？
 11. 模型/provider 失败时是否诚实降级，且不过度保守到永久无输出？
 12. 能否用小而真实的纵向场景证明用户价值？
+13. 新认知将怎样受治理地改变未来理解或反应；如果完全没有后效，为什么仍值得长期保存？
 
 最后问：
 
@@ -909,13 +918,16 @@ Route 清单不再手工维护固定数量。当前路由事实以当前 revisio
 
 ### 合入主线前
 
-- [x] 核对工作区，确认本轮没有 Cursor 未提交代码混入；
-- [x] 审阅 4 个 `cognitive-awakening` 提交的目的和边界；
-- [x] 重写 canonical README 并清理冲突文档；
-- [x] 完整 133 项 gate、plugin、compileall、browser/desktop build 对当前代码基线通过；
-- [ ] 用最终 HEAD 重启 Veyra，并暴露/核对 build revision；
-- [ ] 重新做当前 revision 的 runtime 和真实消息验收；
-- [ ] GitHub Actions 对最终 SHA 通过；
+- [x] 核对工作区并识别全部预期修改；当前没有 secret、state 或无关 Cursor 代码混入；
+- [x] 审阅 4 个认知提交、canonical handbook 和 `431c26b`，定位第一版 build identity 的确定性阻塞；
+- [x] 完成隔离 Git snapshot 的 worktree 修复及定向 smoke；
+- [x] 独立只读 review 当前安全修复；未发现 hook/filter/GIT 环境或仓库 index 写入绕过，schema v2、SHA-256、split/linked worktree 和竞态测试已补齐；
+- [x] 按 Constitutional / Living Zone 拆分文档提交；
+- [x] 定向 runtime 与认知回归 smoke 通过；最终 `134/134` gate、plugin、compileall、Web/Desktop frontend build 仍须重跑；
+- [ ] clean restart 最终应用代码 revision，核对 Python、PID、`build_revision`、`dirty_flag=false` 和 GET 纯读；
+- [ ] 重新做该应用代码 revision 的本地消息正反例、runtime surfaces 和 Phase 6 fail-closed 验收；
+- [ ] 取得 fresh Feishu current-run 入站→处理→`provider_sent` 证据；若用户未发送 nonce，必须明确保持 `PENDING`；
+- [ ] GitHub Actions 对最终分支 SHA 通过；
 - [ ] PR 合并 `cognitive-awakening -> main`。
 
 ### 合入后的第一个开发切片
