@@ -124,6 +124,24 @@ class OpsMonitor:
         raw_status = str(status.get("status") or "unknown")
         connected = bool(status.get("connected"))
         alerts: list[dict[str, Any]] = []
+        snapshot = self._agent_snapshot_freshness(status)
+        if snapshot["status"] != "fresh":
+            return [
+                {
+                    "component": "agent",
+                    "severity": "warning",
+                    "code": "agent_runtime_snapshot_stale",
+                    "message": (
+                        "Selected Agent runtime status is a cached "
+                        f"{snapshot['status']} snapshot."
+                    ),
+                    "details": {
+                        "status": raw_status,
+                        "connected": connected,
+                        "snapshot": snapshot,
+                    },
+                }
+            ]
         features = status.get("capabilities", {}).get("features") if isinstance(status.get("capabilities"), dict) else {}
         if connected and isinstance(features, dict) and (features.get("memory_summary") is False or features.get("memory_patch") is False):
             alerts.append(
@@ -151,6 +169,34 @@ class OpsMonitor:
             }
         )
         return alerts
+
+    @staticmethod
+    def _agent_snapshot_freshness(status: dict[str, Any]) -> dict[str, Any]:
+        """Classify persisted Agent status without probing or mutating it."""
+        observed_at = str(status.get("updated_at") or "").strip()
+        try:
+            ttl_seconds = int(status.get("ttl_seconds") or 300)
+        except (TypeError, ValueError):
+            ttl_seconds = 300
+        ttl_seconds = max(0, ttl_seconds)
+        if not observed_at:
+            return {"status": "unknown", "updated_at": None, "ttl_seconds": ttl_seconds}
+        try:
+            parsed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("timestamp must be timezone-aware")
+            age_seconds = max(
+                0,
+                int((datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds()),
+            )
+        except ValueError:
+            return {"status": "invalid", "updated_at": observed_at, "ttl_seconds": ttl_seconds}
+        return {
+            "status": "fresh" if age_seconds <= ttl_seconds else "stale",
+            "updated_at": observed_at,
+            "ttl_seconds": ttl_seconds,
+            "age_seconds": age_seconds,
+        }
 
     def _model_alerts(self) -> list[dict[str, Any]]:
         if self.model_status_resolver is None:

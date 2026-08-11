@@ -174,6 +174,24 @@ def main() -> int:
         info_codes = {item.get("code") for item in health.get("alerts", []) if item.get("severity") == "info"}
         expect("openclaw_workspace_memory_fallback" in info_codes, "workspace memory fallback is info-level", health)
 
+        app_module.ops_monitor.agent_status_resolver = lambda: {
+            **cached_agent,
+            "updated_at": "2020-01-01T00:00:00+00:00",
+            "ttl_seconds": 300,
+        }
+        stale_health = client.get("/health").json()
+        stale_codes = {
+            item.get("code")
+            for item in stale_health.get("alerts", [])
+            if item.get("severity") == "warning"
+        }
+        expect(
+            stale_health.get("status") == "degraded"
+            and "agent_runtime_snapshot_stale" in stale_codes,
+            "health degrades an expired Agent snapshot instead of reporting healthy",
+            stale_health,
+        )
+
     print("runtime hygiene smoke passed")
     return 0
 
