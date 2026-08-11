@@ -116,6 +116,15 @@ class PerceptionLayer:
             if enriched.get("refresh_mode"):
                 claim["refresh_mode"] = str(enriched["refresh_mode"])
         persistence_results = self.belief.upsert_claims(claims)
+        # Keep the persistence receipt deterministic.  ``BeliefCore`` also
+        # evaluates TTL status for its durable write, but age/remaining-TTL
+        # values are runtime projections and must not leak into the public
+        # route artifact (disabled, record_only, and shadow must stay
+        # byte-equivalent).
+        persistence_receipts = [
+            self._persistence_receipt(item)
+            for item in persistence_results
+        ]
         accepted = [
             item
             for item in persistence_results
@@ -153,7 +162,7 @@ class PerceptionLayer:
             "belief.claims": claims,
             "belief_persistence": {
                 "status": persistence_status,
-                "results": persistence_results,
+                "results": persistence_receipts,
                 "accepted_count": len(accepted),
                 "conflicted_count": len(conflicted),
                 "rejected_count": len(rejected),
@@ -163,6 +172,26 @@ class PerceptionLayer:
         if model_interpretation:
             result["model_interpretation"] = model_interpretation
         return result
+
+    @staticmethod
+    def _persistence_receipt(item: dict[str, Any]) -> dict[str, Any]:
+        receipt: dict[str, Any] = {}
+        for key in (
+            "key",
+            "persisted",
+            "belief_value_persisted",
+            "persistence_status",
+            "evidence_graph_status",
+            "evidence_graph_conflict_refs",
+            "evidence_refs",
+            "evidence_value_digest",
+            "evidence_graph_error",
+            "belief_economy_error",
+        ):
+            value = item.get(key)
+            if value is not None:
+                receipt[key] = value
+        return receipt
 
     def _claims_from_probe(self, probe_result: dict[str, Any]) -> list[dict[str, Any]]:
         explicit = probe_result.get("claims")
