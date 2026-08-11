@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from awareness.claim_schema import detect_conflicts, refresh_claim_status
+from awareness.general_attention_scheduler import GeneralAttentionScheduler
 from core.context_scope import (
     item_visible_to_scope,
     tenant_scope_storage_key,
@@ -23,6 +24,8 @@ from interface.cognitive_brief_contract import (
 from interface.event_schema import utc_now_iso
 from interface.general_situation_contract import stable_digest
 from memory_bridge.scope import normalize_scope_component
+from runtime.attention_hypothesis_runtime import AttentionHypothesisRuntime
+from runtime.general_situation_runtime import GeneralSituationRuntime
 
 
 COGNITIVE_PLAN_SYSTEM = (
@@ -821,6 +824,9 @@ class ReadOnlyCognitiveLoopRuntime:
             "model_calls": 2,
             "created_at": utc_now_iso(),
         }
+        cycle["attention_bridge"] = self._bridge_candidate_to_attention(
+            cycle
+        )
         try:
             persisted = self._persist_cycle(
                 scope_key=scope_key,
@@ -852,6 +858,65 @@ class ReadOnlyCognitiveLoopRuntime:
             candidate_recorded=candidate_recorded,
             selected_kinds=cycle["selected_kinds"],
         )
+
+    def _bridge_candidate_to_attention(self, cycle: dict[str, Any]) -> dict[str, Any]:
+        """Admit only an exactly bound CognitiveBrief candidate to Attention.
+
+        The model never names a parent directly: it can only cite the
+        server-prepared situation_graph projection.  This method re-resolves
+        that projection against durable state immediately before admission.
+        """
+        if cycle.get("candidate_recorded") is not True:
+            return {"status": "not_candidate"}
+        observations = cycle.get("selected_observations")
+        if not isinstance(observations, list):
+            return {"status": "rejected", "reason": "selected_views_invalid"}
+        graphs = [
+            item for item in observations
+            if isinstance(item, dict) and item.get("kind") == "situation_graph"
+        ]
+        if len(graphs) != 1:
+            return {"status": "rejected", "reason": "unique_situation_graph_required"}
+        graph = graphs[0]
+        payload = graph.get("payload") if isinstance(graph.get("payload"), dict) else {}
+        parent_ref = payload.get("attention_parent")
+        refs = graph.get("evidence_refs")
+        brief = cycle.get("brief") if isinstance(cycle.get("brief"), dict) else {}
+        changes = brief.get("material_changes") if isinstance(brief.get("material_changes"), list) else []
+        cited = any(
+            isinstance(change, dict) and refs == change.get("evidence_refs")
+            for change in changes
+        )
+        if not isinstance(parent_ref, dict) or not cited:
+            return {"status": "rejected", "reason": "material_change_not_bound_to_parent"}
+        parent_id = str(parent_ref.get("general_situation_id") or "")
+        parent_revision = parent_ref.get("parent_revision")
+        if not parent_id or isinstance(parent_revision, bool) or not isinstance(parent_revision, int):
+            return {"status": "rejected", "reason": "parent_reference_invalid"}
+        state = self.state_store.read_json(GeneralSituationRuntime.STATE_FILE)
+        records = state.get("general_situations") if isinstance(state.get("general_situations"), dict) else {}
+        parent = records.get(parent_id)
+        scope_key = tenant_scope_storage_key(cycle["user_id"], cycle["session_id"])
+        if not isinstance(parent, dict) or (
+            parent.get("user_id") != cycle["user_id"]
+            or scope_key not in set(parent.get("session_scope_keys") or [])
+            or parent.get("parent_revision") != parent_revision
+        ):
+            return {"status": "rejected", "reason": "parent_not_current_or_scoped"}
+        assessment = GeneralAttentionScheduler(self.state_store).assess(parent)
+        admitted = AttentionHypothesisRuntime(self.state_store).observe(parent, assessment)
+        return {
+            "status": str(admitted.get("status") or "rejected"),
+            "reason": admitted.get("reason"),
+            "general_situation_id": parent_id,
+            "parent_revision": parent_revision,
+            "cognitive_cycle_id": cycle["cycle_id"],
+            "world_digest": cycle["world_digest"],
+            "brief_digest": stable_digest("veyra.cognitive_brief.binding.v1", brief),
+            "material_change_digest": stable_digest("veyra.cognitive_material_change.binding.v1", changes),
+            "attention_hypothesis": admitted.get("hypothesis"),
+            "authority": False,
+        }
 
     def _opportunities(
         self,
