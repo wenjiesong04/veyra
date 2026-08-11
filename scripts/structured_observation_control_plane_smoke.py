@@ -108,7 +108,9 @@ def main() -> int:
     with TemporaryDirectory(prefix="veyra-structured-observation-") as raw:
         state_root = Path(raw) / "state"
         store = WorldStateStore(state_root)
-        workspace = str(Path(raw) / "workspace")
+        # Use a path-shaped identifier so the EventInbox privacy redactor is
+        # exercised without losing the typed workspace binding on replay.
+        workspace = "/Users/example/veyra-structured-workspace"
         store.mutate_json(
             "local_world.json",
             lambda state: {**state, "current_project": workspace},

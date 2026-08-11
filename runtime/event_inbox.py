@@ -464,8 +464,29 @@ class EventInbox:
         if not isinstance(raw_envelope.get("payload"), dict):
             raise ValueError("event envelope requires a payload mapping")
         self._json_value(raw_envelope)
+        typed_workspace_id: str | None = None
+        source = raw_envelope.get("source")
+        payload = raw_envelope.get("payload")
+        if (
+            isinstance(source, dict)
+            and source.get("channel") == "structured_observation"
+            and isinstance(payload, dict)
+            and payload.get("schema_version")
+            == "veyra.structured_observation.event.v1"
+            and isinstance(payload.get("workspace_id"), str)
+        ):
+            # workspace_id is a typed binding, not free-form text.  The
+            # generic sensitive-value redactor would turn an absolute local
+            # workspace path into ``<local_path>`` and make the durable event
+            # impossible to replay into the Situation graph.  It remains
+            # private: event inbox projections expose queue metadata only.
+            typed_workspace_id = payload["workspace_id"]
         envelope = self._redact_free_text(raw_envelope)
         envelope = redact_sensitive(envelope, max_string=4000, max_list=100)
+        if typed_workspace_id is not None:
+            redacted_payload = envelope.get("payload")
+            if isinstance(redacted_payload, dict):
+                redacted_payload["workspace_id"] = typed_workspace_id
         self._json_value(envelope)
         # Never persist an unsalted digest derived from raw free text or
         # secret-bearing fields: short values could be brute-forced. The
