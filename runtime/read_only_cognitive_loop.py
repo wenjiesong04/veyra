@@ -857,6 +857,7 @@ class ReadOnlyCognitiveLoopRuntime:
             cycle_id=cycle_id,
             candidate_recorded=candidate_recorded,
             selected_kinds=cycle["selected_kinds"],
+            attention_bridge=copy.deepcopy(cycle["attention_bridge"]),
         )
 
     def _bridge_candidate_to_attention(self, cycle: dict[str, Any]) -> dict[str, Any]:

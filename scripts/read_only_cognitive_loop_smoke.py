@@ -6,6 +6,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -19,6 +20,14 @@ if str(ROOT) not in sys.path:
 from core.world_state import WorldStateStore  # noqa: E402
 from core.context_scope import tenant_scope_storage_key  # noqa: E402
 from interface.cognitive_brief_contract import CognitiveBrief  # noqa: E402
+from runtime.attention_hypothesis_runtime import AttentionHypothesisRuntime  # noqa: E402
+from scripts.attention_hypothesis_smoke import (  # noqa: E402
+    CONFIRMING_VALUES,
+    MutableClock,
+    assessment_for,
+    parent_for,
+    persist_parent,
+)
 from runtime.active_loop import ActiveRuntimeLoop  # noqa: E402
 from runtime.read_only_cognitive_loop import (  # noqa: E402
     ReadOnlyCognitiveLoopRuntime,
@@ -400,7 +409,90 @@ def age_last_cycle(store: WorldStateStore) -> None:
     store.mutate_json("cognitive_loop_state.json", mutate)
 
 
+def test_cognitive_brief_attention_bridge() -> None:
+    with tempfile.TemporaryDirectory(prefix="veyra-brief-bridge-") as tmp:
+        clock = MutableClock(
+            datetime(2026, 8, 11, 10, 0, tzinfo=timezone.utc)
+        )
+        store = WorldStateStore(tmp)
+        parent = parent_for(
+            user_id="bridge-user",
+            session_id="bridge-session",
+            revision=1,
+            child_count=2,
+            clock=clock,
+            anchor="goal:bridge",
+            general_id="gsit-brief-bridge",
+        )
+        persist_parent(store, parent)
+        assessment_for(
+            parent,
+            values=CONFIRMING_VALUES,
+            store=store,
+            clock=clock,
+        )
+        runtime = ReadOnlyCognitiveLoopRuntime(
+            state_store=store,
+            reasoning=FakeReasoning(FakeClient()),
+        )
+        evidence_refs = ["view:situation_graph:bridge-evidence"]
+        cycle = {
+            "candidate_recorded": True,
+            "user_id": "bridge-user",
+            "session_id": "bridge-session",
+            "cycle_id": "cog_bridge_0000000000000001",
+            "world_digest": "a" * 64,
+            "selected_observations": [
+                {
+                    "kind": "situation_graph",
+                    "evidence_refs": evidence_refs,
+                    "payload": {
+                        "attention_parent": {
+                            "general_situation_id": "gsit-brief-bridge",
+                            "parent_revision": 1,
+                        }
+                    },
+                }
+            ],
+            "brief": {
+                "material_changes": [
+                    {
+                        "evidence_refs": evidence_refs,
+                        "kind": "structured_situation_change",
+                    }
+                ]
+            },
+        }
+        admitted = runtime._bridge_candidate_to_attention(cycle)  # noqa: SLF001
+        first_revision = int(
+            store.read_json(AttentionHypothesisRuntime.STATE_FILE).get(
+                "_state_revision"
+            )
+            or 0
+        )
+        replayed = runtime._bridge_candidate_to_attention(cycle)  # noqa: SLF001
+        second_revision = int(
+            store.read_json(AttentionHypothesisRuntime.STATE_FILE).get(
+                "_state_revision"
+            )
+            or 0
+        )
+        assert admitted.get("status") == "confirmed", admitted
+        assert admitted.get("general_situation_id") == "gsit-brief-bridge"
+        assert admitted.get("parent_revision") == 1
+        assert admitted.get("authority") is False
+        assert replayed.get("status") == "confirmed", replayed
+        assert first_revision == second_revision
+        assert (
+            store.read_json(AttentionHypothesisRuntime.STATE_FILE).get(
+                "hypothesis_count"
+            )
+            == 1
+        )
+
+
 def main() -> int:
+    test_cognitive_brief_attention_bridge()
     with tempfile.TemporaryDirectory(prefix="veyra-cognitive-loop-") as tmp:
         store = WorldStateStore(tmp)
         cognitive_config = store.read_json("ops_config.json")["cognitive_loop"]
@@ -501,6 +593,8 @@ def main() -> int:
         assert changed["status"] == "observed", changed
         assert changed["results"][0]["candidate_recorded"] is True
         assert changed["results"][0]["reason"] == "record_candidate"
+        assert changed["results"][0]["attention_bridge"]["status"] == "rejected"
+        assert changed["results"][0]["attention_bridge"]["reason"] == "material_change_not_bound_to_parent"
         assert changed["external_delivery"] is False
         state = store.read_json("cognitive_loop_state.json")
         assert state["metrics"]["cycle_count"] == 2
