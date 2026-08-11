@@ -275,7 +275,10 @@ class AttentionHypothesisRuntime:
                 return current
             evidence_added = len(evidence_by_stream) - evidence_before
 
-            if evaluated["confirmable"]:
+            lifecycle = self._lifecycle_status(evaluated)
+            if lifecycle is not None:
+                status = lifecycle
+            elif evaluated["confirmable"]:
                 status = "confirmed"
             elif previous is None:
                 status = "candidate"
@@ -738,6 +741,25 @@ class AttentionHypothesisRuntime:
             "assessment_binding": assessment_binding,
             "confirmable": not blockers,
         }
+
+    @staticmethod
+    def _lifecycle_status(evaluated: dict[str, Any]) -> str | None:
+        """Return a terminal epistemic state from typed evidence markers."""
+        unknowns = {
+            str(item).strip().lower()
+            for item in evaluated.get("unknowns", [])
+            if isinstance(item, str)
+        }
+        if "general_situation_expired" in unknowns:
+            return "expired"
+        if any(
+            item == "contradicted"
+            or item.startswith("contradicted:")
+            or item.endswith("_contradicted")
+            for item in unknowns
+        ):
+            return "contradicted"
+        return None
 
     def _current_parent_issue(
         self,
@@ -1723,8 +1745,11 @@ class AttentionHypothesisRuntime:
             "model_confidence_used": False,
             "semantics": "attention_policy_readiness_not_factual_probability",
         }
+        lifecycle = cls._lifecycle_status({"unknowns": unknowns})
         expected_status = (
-            "confirmed"
+            lifecycle
+            if lifecycle is not None
+            else "confirmed"
             if not blockers
             else "candidate"
             if evaluation_count == 1
@@ -1863,7 +1888,13 @@ class AttentionHypothesisRuntime:
     def _status_counts(
         hypotheses: dict[str, dict[str, Any]],
     ) -> dict[str, int]:
-        counts = {"candidate": 0, "accumulating": 0, "confirmed": 0}
+        counts = {
+            "candidate": 0,
+            "accumulating": 0,
+            "confirmed": 0,
+            "contradicted": 0,
+            "expired": 0,
+        }
         for item in hypotheses.values():
             status = str(item.get("status") or "")
             if status in counts:

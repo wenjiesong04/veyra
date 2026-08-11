@@ -577,7 +577,13 @@ def main() -> int:
             owner_view.get("status") == "success"
             and owner_view.get("hypothesis_count") == 2
             and owner_view.get("status_counts")
-            == {"candidate": 1, "accumulating": 0, "confirmed": 1}
+            == {
+                "candidate": 1,
+                "accumulating": 0,
+                "confirmed": 1,
+                "contradicted": 0,
+                "expired": 0,
+            }
             and third.get("hypothesis", {}).get("hypothesis_id") in visible_ids
             and counter.get("hypothesis", {}).get("hypothesis_id") in visible_ids
             and foreign_owner_view.get("hypothesis_count") == 1

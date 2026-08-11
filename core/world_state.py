@@ -545,6 +545,8 @@ class WorldStateStore:
                     "candidate": 0,
                     "accumulating": 0,
                     "confirmed": 0,
+                    "contradicted": 0,
+                    "expired": 0,
                 },
                 "updated_at": None,
             },
