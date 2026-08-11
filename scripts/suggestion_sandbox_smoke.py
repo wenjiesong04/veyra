@@ -416,6 +416,74 @@ def real_clock_currentness_case() -> None:
         )
 
 
+def interaction_disposition_case() -> None:
+    """Decision economics is typed and never creates a delivery side effect."""
+
+    with TemporaryDirectory(prefix="veyra-interaction-disposition-") as tmp:
+        store = WorldStateStore(Path(tmp) / "state")
+        clock = MutableClock(NOW)
+        outbox = SuggestionOutbox(store, clock=clock)
+        parent = {
+            "user_id": USER,
+            "session_scope_keys": [tenant_scope_storage_key(USER, SESSION)],
+            "general_situation_id": "gsit-interaction-disposition",
+            "parent_revision": 1,
+        }
+        base = {
+            "general_situation_id": parent["general_situation_id"],
+            "parent_revision": 1,
+            "authority": outbox._authority_boundary(),
+            "eligible": False,
+        }
+        cases = (
+            ("candidate", "wait", "attention_evidence_accumulating"),
+            ("accumulating", "wait", "attention_evidence_accumulating"),
+            ("contradicted", "silent", "attention_hypothesis_contradicted"),
+            ("expired", "silent", "attention_hypothesis_expired"),
+        )
+        for hypothesis_status, expected_decision, expected_reason in cases:
+            result = outbox.consider(
+                parent,
+                {
+                    **base,
+                    "hypothesis_status": hypothesis_status,
+                },
+                user_id=USER,
+                session_id=SESSION,
+            )
+            expect(
+                result.get("status") == "not_proposed"
+                and result.get("decision_disposition") == expected_decision
+                and result.get("delivery_disposition") == "none"
+                and result.get("reason") == expected_reason
+                and result.get("proposal") is None,
+                f"{hypothesis_status} produces {expected_decision} without delivery",
+                result,
+            )
+        ask = outbox.consider(
+            parent,
+            {
+                **base,
+                "hypothesis_status": "confirmed",
+                "interaction_gap": {
+                    "kind": "owner_question",
+                    "gap_id": "gap_interaction_missing_input",
+                    "answerable": True,
+                },
+            },
+            user_id=USER,
+            session_id=SESSION,
+        )
+        expect(
+            ask.get("status") == "not_proposed"
+            and ask.get("decision_disposition") == "ask"
+            and ask.get("delivery_disposition") == "none"
+            and ask.get("reason") == "structured_owner_question_pending",
+            "typed owner gap produces ask without an external prompt",
+            ask,
+        )
+
+
 def pipeline_fail_closed_projection_case() -> None:
     parent = {
         "general_situation_id": "gsit_pipeline_fail_closed",
@@ -491,6 +559,8 @@ def main() -> int:
             not_opted_in.get("status") == "suppressed"
             and not_opted_in.get("reason")
             == "suggestion_sandbox_not_enabled"
+            and not_opted_in.get("decision_disposition") == "say"
+            and not_opted_in.get("delivery_disposition") == "suppressed"
             and outbox.list_inbox(user_id=USER, session_id=SESSION)["count"]
             == 0,
             "advise_only cannot surface without exact-scope sandbox opt-in",
@@ -1047,6 +1117,7 @@ def main() -> int:
     )
     legacy_proposal_isolation_case()
     real_clock_currentness_case()
+    interaction_disposition_case()
     pipeline_fail_closed_projection_case()
 
     print("suggestion sandbox smoke passed")

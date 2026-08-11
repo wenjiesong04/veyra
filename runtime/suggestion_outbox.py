@@ -33,7 +33,9 @@ class SuggestionOutbox:
         "attention_policy_readiness_not_factual_probability"
     )
     INTERACTION_DECISIONS = frozenset({"say", "ask", "wait", "silent"})
-    DELIVERY_DISPOSITIONS = frozenset({"none", "owner_scoped_console"})
+    DELIVERY_DISPOSITIONS = frozenset(
+        {"none", "owner_scoped_console", "suppressed"}
+    )
     MAX_PROPOSALS = 2000
     MAX_INBOX_ITEMS = 100
     DEFAULT_POLICY = {
@@ -302,6 +304,19 @@ class SuggestionOutbox:
             )
         except (TypeError, ValueError) as exc:
             return self._closed("invalid_suggestion_binding", detail=type(exc).__name__)
+        decision_disposition, decision_reason = self._interaction_decision(
+            assessment
+        )
+        if decision_disposition != "say":
+            return {
+                "status": "not_proposed",
+                "mode": str(self._mode_snapshot().get("mode") or self.DEFAULT_MODE),
+                "reason": decision_reason,
+                "decision_disposition": decision_disposition,
+                "delivery_disposition": "none",
+                "proposal": None,
+                "authority": self._authority_boundary(),
+            }
         state = self.state_store.read_json(self.STATE_FILE)
         if not self._healthy(state):
             return self._closed("suggestion_outbox_state_corrupt")
@@ -313,6 +328,9 @@ class SuggestionOutbox:
             return {
                 "status": "disabled",
                 "mode": mode,
+                "reason": decision_reason,
+                "decision_disposition": decision_disposition,
+                "delivery_disposition": "none",
                 "proposal": None,
                 "authority": self._authority_boundary(),
             }
@@ -320,7 +338,9 @@ class SuggestionOutbox:
             return {
                 "status": "not_proposed",
                 "mode": mode,
-                "reason": "structured_attention_not_eligible",
+                "reason": decision_reason,
+                "decision_disposition": decision_disposition,
+                "delivery_disposition": "none",
                 "proposal": None,
                 "authority": self._authority_boundary(),
             }
@@ -365,6 +385,8 @@ class SuggestionOutbox:
                     ),
                     "mode": committed_config.get("mode"),
                     "reason": "suggestion_mode_changed_before_commit",
+                    "decision_disposition": decision_disposition,
+                    "delivery_disposition": "suppressed",
                     "proposal": None,
                     "authority": self._authority_boundary(),
                 }
@@ -427,6 +449,8 @@ class SuggestionOutbox:
                         "status": "suppressed",
                         "mode": mode,
                         "reason": suppression,
+                        "decision_disposition": decision_disposition,
+                        "delivery_disposition": "suppressed",
                         "proposal": None,
                         "authority": self._authority_boundary(),
                     }
@@ -479,6 +503,8 @@ class SuggestionOutbox:
             result = {
                 "status": str(proposal.get("status") or "recorded"),
                 "mode": mode,
+                "decision_disposition": decision_disposition,
+                "delivery_disposition": proposal.get("delivery_disposition"),
                 "proposal": self._public_proposal(proposal),
                 "authority": self._authority_boundary(),
             }
@@ -801,6 +827,36 @@ class SuggestionOutbox:
             for name, value in sorted(selected.items())
             if isinstance(value, dict)
         ]
+
+    @classmethod
+    def _interaction_decision(cls, assessment: dict[str, Any]) -> tuple[str, str]:
+        """Choose a typed interaction disposition without adding authority."""
+
+        gap = assessment.get("interaction_gap")
+        if (
+            isinstance(gap, dict)
+            and gap.get("kind") == "owner_question"
+            and gap.get("answerable") is True
+            and isinstance(gap.get("gap_id"), str)
+            and gap.get("gap_id", "").startswith("gap_")
+        ):
+            return "ask", "structured_owner_question_pending"
+        hypothesis_status = str(assessment.get("hypothesis_status") or "")
+        if (
+            assessment.get("status") == "eligible"
+            and assessment.get("eligible") is not False
+            and not hypothesis_status
+        ):
+            return "say", "structured_attention_threshold_met"
+        if hypothesis_status == "confirmed" and assessment.get("eligible") is True:
+            return "say", "structured_attention_threshold_met"
+        if hypothesis_status in {"candidate", "accumulating"}:
+            return "wait", "attention_evidence_accumulating"
+        if hypothesis_status == "contradicted":
+            return "silent", "attention_hypothesis_contradicted"
+        if hypothesis_status == "expired":
+            return "silent", "attention_hypothesis_expired"
+        return "silent", "structured_attention_not_eligible"
 
     def _surface_suppression(
         self,
