@@ -5,6 +5,11 @@ from typing import Any
 
 from awareness.belief_core import BeliefCore
 from awareness.claim_schema import make_claim
+from awareness.refresh_spec import (
+    REFRESH_RESOLVER_DEFAULT,
+    REFRESH_RESOLVER_LITERAL,
+    make_refresh_spec,
+)
 from core.context_scope import (
     OPERATOR_GLOBAL_SCOPE,
     TENANT_SCOPE,
@@ -177,6 +182,7 @@ class PerceptionLayer:
                 observed_at=observed_at,
                 evidence=evidence,
                 claim_kind="observed",
+                refresh_spec=self._refresh_spec_for_probe(probe_result),
             )
         ]
 
@@ -191,7 +197,46 @@ class PerceptionLayer:
             observed_at=str(claim.get("observed_at") or probe_result.get("observed_at") or probe_result.get("timestamp") or utc_now_iso()),
             evidence=dict(claim.get("evidence") or self._compact_evidence(probe_result)),
             claim_kind="observed",
+            refresh_spec=(
+                claim.get("refresh_spec")
+                if claim.get("refresh_spec") is not None
+                else self._refresh_spec_for_probe(probe_result)
+            ),
         )
+
+    def _refresh_spec_for_probe(
+        self,
+        probe_result: dict[str, Any],
+    ) -> dict[str, str] | None:
+        probe_name = str(probe_result.get("probe") or "unknown")
+        details = (
+            probe_result.get("details")
+            if isinstance(probe_result.get("details"), dict)
+            else {}
+        )
+        target = probe_result.get("target")
+        if target in (None, ""):
+            target = details.get("target")
+        if target not in (None, ""):
+            return make_refresh_spec(
+                probe_kind=probe_name,
+                target_ref=str(target),
+                resolver_id=REFRESH_RESOLVER_LITERAL,
+            )
+        if probe_name in {
+            "git_probe",
+            "system_probe",
+            "process_probe",
+            "time_probe",
+            "openclaw_probe",
+            "hermes_probe",
+            "mcp_probe",
+        }:
+            return make_refresh_spec(
+                probe_kind=probe_name,
+                resolver_id=REFRESH_RESOLVER_DEFAULT,
+            )
+        return None
 
     def _compact_evidence(self, probe_result: dict[str, Any]) -> dict[str, Any]:
         skipped = {"claims", "details"}

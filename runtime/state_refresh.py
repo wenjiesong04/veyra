@@ -6,6 +6,11 @@ from typing import Any
 from core.perception_layer import PerceptionLayer
 from core.reasoning_core import CoreReasoning
 from core.world_state import WorldStateStore
+from awareness.refresh_spec import (
+    REFRESH_RESOLVER_DEFAULT,
+    REFRESH_RESOLVER_LITERAL,
+    validate_refresh_spec,
+)
 from interface.event_schema import utc_now_iso
 from probes.git_probe import GitProbe
 from probes.hermes_probe import HermesProbe
@@ -173,6 +178,18 @@ class StateRefresh:
         that need none keep receiving an empty string.
         """
 
+        source = str(claim.get("source") or "")
+        if "refresh_spec" in claim:
+            try:
+                spec = validate_refresh_spec(claim.get("refresh_spec"), source=source)
+            except ValueError:
+                return None
+            if spec["resolver_id"] == REFRESH_RESOLVER_LITERAL:
+                return spec["target_ref"]
+            if spec["resolver_id"] == REFRESH_RESOLVER_DEFAULT:
+                return ""
+            return None
+
         evidence = claim.get("evidence") if isinstance(claim.get("evidence"), dict) else {}
         for key in ("target", "url", "host", "path"):
             if evidence.get(key):
@@ -184,6 +201,6 @@ class StateRefresh:
                 if key == "path" and not Path(value).exists():
                     return None
                 return value
-        if str(claim.get("source") or "") in self.TARGET_REQUIRED_PROBES:
+        if source in self.TARGET_REQUIRED_PROBES:
             return None
         return ""

@@ -10,6 +10,7 @@ from core.context_scope import (
     owner_scope,
     scope_kind,
 )
+from awareness.refresh_spec import validate_refresh_spec
 from interface.event_schema import utc_now_iso
 
 
@@ -27,6 +28,7 @@ def make_claim(
     source_trust: float | None = None,
     claim_kind: str = "observed",
     derived_from: str | None = None,
+    refresh_spec: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     timestamp = observed_at or utc_now_iso()
     payload: dict[str, Any] = {
@@ -45,6 +47,11 @@ def make_claim(
     }
     if derived_from:
         payload["derived_from"] = derived_from
+    if refresh_spec is not None:
+        payload["refresh_spec"] = validate_refresh_spec(
+            refresh_spec,
+            source=source,
+        )
     if next_action:
         payload["next_action"] = next_action
     return payload
