@@ -373,7 +373,7 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 | 远端分支 | `origin/cognitive-awakening` 已包含该应用代码 HEAD；未 push 的代码差异为 0 |
 | 远端主线 | `origin/main @ 8a8a3d2` |
 | 本地主线 | `main @ 26d77fa`，落后 `origin/main`，不能直接作为新基线 |
-| 分支关系 | 应用代码提交相对 `origin/main` 为 ahead 41 / behind 0；本次 Living 文档提交纳入后预期为 ahead 42 / behind 0；最终 branch SHA 以提交后 Git 复核为准 |
+| 分支关系 | 应用代码 changeset 相对 `origin/main` 为 ahead 41 / behind 0；其后包含 docs-only Living Zone 提交，最终 branch ahead/behind 与 SHA 始终以 Git 实时复核为准 |
 | M1 状态 | `PARTIAL + AUTOMATED_VALIDATED + BOUNDED HAPPY-PATH LIVE`：typed observation → AttentionHypothesis → interaction decision → record/shadow → owner-scoped advise → explicit feedback/calibration 已有闭环，但长时间真实样本、bridge 全生命周期故障恢复和非 happy-path 仍不足；权限、Route、Risk、外部交付均未扩大 |
 | P2 状态 | `PARTIAL + AUTOMATED_VALIDATED + BOUNDED HAPPY-PATH LIVE`：refresh-spec、EvidenceGraph bounded frontier/node compaction、typed conflict/CAS 回执和 Belief Economy 窄切片已验证；claim-level CAS、TTL/background 调度、owner 公平归档、owner-scoped graph projection 与完整真实前后对照仍未完成 |
 | 合并状态 | 尚未合入 `main`；按当前执行窗口保留在 `cognitive-awakening`，后续 PR/Actions/合并另行收口 |
