@@ -114,21 +114,52 @@ def main() -> int:
         expect(client.get("/ops/reviews/diagnostic").json().get("pending_count") == 0, "resolved/archived reviews no longer pending", store.read_json("review_queue.json"))
 
         app_module.runtime_entity.set_status("online")
-        app_module.ops_monitor.agent_status_resolver = lambda: {
-            "status": "available",
-            "connected": True,
-            "capabilities": {"features": {"memory_summary": False, "memory_patch": False}},
-        }
+        app_module.ops_monitor.agent_status_resolver = lambda: store.read_json(
+            "executor_state.json"
+        )
         app_module.ops_monitor.model_status_resolver = lambda: {"enabled": True, "configured": True, "status": "configured", "api_key_set": True}
         app_module.ops_monitor.feishu_status_resolver = lambda: {"status": "stopped", "thread_alive": False, "channel_config": {"enabled": False}}
         app_module.ops_monitor.active_loop_status_resolver = lambda: {"status": "stopped", "thread_alive": False, "enabled": False}
 
+        def state_digest() -> tuple[tuple[str, int, str], ...]:
+            import hashlib
+
+            rows = []
+            for path in sorted(store.root.rglob("*")):
+                if path.is_file():
+                    rows.append(
+                        (
+                            path.relative_to(store.root).as_posix(),
+                            path.stat().st_size,
+                            hashlib.sha256(path.read_bytes()).hexdigest(),
+                        )
+                    )
+            return tuple(rows)
+
+        cached_agent = {
+            "name": "openclaw",
+            "status": "available",
+            "connected": True,
+            "capabilities": {
+                "features": {"memory_summary": False, "memory_patch": False}
+            },
+        }
+        store.patch_json("executor_state.json", cached_agent)
+        before_health = state_digest()
         with patch(
             "runtime.isolated_git_snapshot.subprocess.run",
             side_effect=AssertionError("status GET attempted Git"),
+        ), patch.object(
+            app_module.awareness_loop.agent_registry.selected(),
+            "connection_status",
+            side_effect=AssertionError("health GET attempted OpenClaw probe"),
         ):
             health = client.get("/health").json()
             runtime = client.get("/runtime").json()
+        expect(
+            state_digest() == before_health,
+            "health GET does not write cached state",
+        )
         expect(
             health.get("runtime_build") == runtime.get("runtime_build")
             and health.get("runtime_build", {}).get("git_checked_on_request")

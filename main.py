@@ -321,7 +321,11 @@ state_refresh = StateRefresh(state_store, reasoning=awareness_loop.core_reasonin
 external_world_refresh = ExternalWorldRefresh(state_store, reasoning=awareness_loop.core_reasoning)
 ops_monitor = OpsMonitor(
     state_store,
-    agent_status_resolver=lambda: awareness_loop.agent_registry.selected().connection_status(),
+    # Health is a read-only cached projection.  A fresh adapter probe belongs
+    # to the active loop or an explicit control-plane refresh, never a GET.
+    agent_status_resolver=lambda: state_store.read_json(
+        "executor_state.json"
+    ),
     retention_policy=retention_policy,
     safety_validation=safety_validation,
     model_status_resolver=lambda: awareness_loop.core_reasoning.status(),
