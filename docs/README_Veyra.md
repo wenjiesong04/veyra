@@ -399,11 +399,11 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 
 ### 3.2 当前运行态快照
 
-当前 API 使用正确的 Conda Python 3.11 运行，PID `32854` 于 2026-08-11 09:53:25 UTC 启动；`/runtime` 的 `started_at=2026-08-11T09:53:30.387299+00:00`、`captured_at=2026-08-11T09:53:30.908637+00:00`。下表是 2026-08-11 10:05 UTC 左右的只读快照；开始新任务时必须重新读取：
+当前 API 使用正确的 Conda Python 3.11 运行，PID `32854` 于 2026-08-11 09:53:25 UTC 启动；`/runtime` 的 `started_at=2026-08-11T09:53:30.387299+00:00`、`captured_at=2026-08-11T09:53:30.908637+00:00`。下表是 2026-08-11 10:12 UTC 左右的只读快照；开始新任务时必须重新读取：
 
 | 表面 | 观察结果 | 正确解释 |
 |---|---|---|
-| `/health` | `degraded`，4 条既有告警；核心模型、active loop、memory、safety 均 `ok` | stale Agent snapshot、无当前进程 Feishu event、5 条历史 Review、2 条 stale Belief；没有新增 critical |
+| `/health` | `degraded`，5 条既有/时间相关告警；active loop、memory、safety 均 `ok` | `core_model_stale`（info）、stale Agent snapshot、无当前进程 Feishu event、5 条历史 Review、2 条 stale Belief；没有新增 critical |
 | `/runtime` | schema `veyra.runtime_build_identity.v2`，revision `07f26c3ce6a503901bac1103453e425d2518f8df`，`dirty_flag=false` | `source=startup_git_snapshot`、`loaded_code_attested=false`、`unavailable_reason=null`、`git_checked_on_request=false`；`captured_at >= started_at` |
 | `/agent/status` | `snapshot_stale`，observed status `available` | 历史 capability/certification 不能当作当前 fresh dispatch 证明 |
 | Feishu WS | `running / connected / thread_alive`，`last_event_after_start=false` | WebSocket 存活，不等于本进程已收到并回复真实消息；fresh nonce 留待外部交付阶段 |
