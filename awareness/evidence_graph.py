@@ -39,6 +39,7 @@ def empty_evidence_graph() -> dict[str, Any]:
         # compare against every historical node for the same identity.
         "frontiers": {},
         "compaction_count": 0,
+        "node_compaction_count": 0,
         "summary": {
             "nodes": 0,
             "edges": 0,
@@ -79,6 +80,8 @@ def ingest_claim(
         projection["status"] = "duplicate"
         return current, existing, projection
 
+    if len(current["nodes"]) >= MAX_EVIDENCE_NODES:
+        _compact_nodes(current)
     if len(current["nodes"]) >= MAX_EVIDENCE_NODES:
         raise EvidenceGraphError("evidence_graph_capacity_exhausted")
 
@@ -199,6 +202,14 @@ def _validate_graph(graph: Any) -> dict[str, Any]:
     if isinstance(compaction_count, bool) or not isinstance(compaction_count, int) or compaction_count < 0:
         raise EvidenceGraphError("evidence_graph_compaction_invalid")
     detached["compaction_count"] = compaction_count
+    node_compaction_count = detached.get("node_compaction_count", 0)
+    if (
+        isinstance(node_compaction_count, bool)
+        or not isinstance(node_compaction_count, int)
+        or node_compaction_count < 0
+    ):
+        raise EvidenceGraphError("evidence_graph_node_compaction_invalid")
+    detached["node_compaction_count"] = node_compaction_count
     return detached
 
 
@@ -265,6 +276,95 @@ def _compact_edges(graph: dict[str, Any]) -> None:
     retained_ids = {str(item.get("edge_id")) for item in safety + recent_supports}
     graph["edges"] = [item for item in edges if str(item.get("edge_id")) in retained_ids]
     graph["compaction_count"] = int(graph.get("compaction_count") or 0) + len(edges) - len(graph["edges"])
+
+
+def _compact_nodes(graph: dict[str, Any]) -> None:
+    """Retain safety evidence while rotating old support-only observations.
+
+    Contradiction and supersession edges are governance-relevant and therefore
+    pin both endpoint nodes.  The bounded identity frontiers pin the recent
+    observations used for future relation inference.  Older support-only
+    nodes, edges, and unresolved records are retention data and may be
+    compacted to keep normal refreshes writable indefinitely.
+    """
+
+    nodes = [item for item in graph.get("nodes", []) if isinstance(item, dict)]
+    if len(nodes) < MAX_EVIDENCE_NODES:
+        return
+    node_ids = {
+        str(item.get("evidence_id"))
+        for item in nodes
+        if item.get("evidence_id")
+    }
+    safety_ids: set[str] = set()
+    for edge in graph.get("edges", []):
+        if not isinstance(edge, dict) or edge.get("relation") == "supports":
+            continue
+        for field in ("from", "to"):
+            value = edge.get(field)
+            if isinstance(value, str) and value in node_ids:
+                safety_ids.add(value)
+    frontier_ids = {
+        str(evidence_id)
+        for values in (graph.get("frontiers") or {}).values()
+        if isinstance(values, list)
+        for evidence_id in values
+        if isinstance(evidence_id, str) and evidence_id in node_ids
+    }
+    protected = safety_ids | frontier_ids
+    removable = [
+        item
+        for item in nodes
+        if str(item.get("evidence_id")) not in protected
+    ]
+    required = len(nodes) - (MAX_EVIDENCE_NODES - 1)
+    if len(removable) < required:
+        raise EvidenceGraphError("evidence_graph_safety_node_capacity_exhausted")
+    remove_ids = {
+        str(item.get("evidence_id"))
+        for item in removable[:required]
+    }
+    retained_ids = node_ids - remove_ids
+    graph["nodes"] = [
+        item
+        for item in nodes
+        if str(item.get("evidence_id")) in retained_ids
+    ]
+    graph["edges"] = [
+        edge
+        for edge in graph.get("edges", [])
+        if isinstance(edge, dict)
+        and str(edge.get("from") or "") in retained_ids
+        and str(edge.get("to") or "") in retained_ids
+    ]
+    graph["unresolved"] = [
+        item
+        for item in graph.get("unresolved", [])
+        if isinstance(item, dict)
+        and str(item.get("evidence_id") or "") in retained_ids
+        and (
+            not item.get("related_evidence_id")
+            or str(item.get("related_evidence_id")) in retained_ids
+        )
+    ]
+    frontiers = graph.get("frontiers")
+    if isinstance(frontiers, dict):
+        for identity_digest, values in list(frontiers.items()):
+            if not isinstance(values, list):
+                frontiers.pop(identity_digest, None)
+                continue
+            filtered = [
+                value for value in values
+                if isinstance(value, str) and value in retained_ids
+            ][-MAX_FRONTIER_PER_IDENTITY:]
+            if filtered:
+                frontiers[identity_digest] = filtered
+            else:
+                frontiers.pop(identity_digest, None)
+    graph["node_compaction_count"] = (
+        int(graph.get("node_compaction_count") or 0) + len(remove_ids)
+    )
+    _refresh_summary(graph)
 
 
 def _node_from_claim(claim: dict[str, Any], identity: tuple[str, ...]) -> dict[str, Any]:

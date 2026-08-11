@@ -195,7 +195,7 @@ def main() -> int:
         # edge cap, and old corroboration edges may be compacted safely.
         long_store = WorldStateStore(Path(tmp) / "long-state")
         long_belief = BeliefCore(long_store)
-        for index in range(220):
+        for index in range(520):
             observed = (base + timedelta(seconds=index)).isoformat()
             result = long_belief.upsert_claim(
                 claim(
@@ -209,15 +209,17 @@ def main() -> int:
             expect(result.get("persisted") is True, "bounded graph accepts long-lived observations", result)
         long_graph = long_store.read_json("belief_state.json")["evidence_graph"]
         expect(
-            len(long_graph["nodes"]) == 220
+            len(long_graph["nodes"]) == 500
             and len(long_graph["edges"]) <= 1000
             and long_graph.get("compaction_count", 0) > 0
+            and long_graph.get("node_compaction_count", 0) > 0
             and all(len(item) <= 8 for item in long_graph.get("frontiers", {}).values()),
             "identity frontier and support retention stay bounded",
             {
                 "nodes": len(long_graph["nodes"]),
                 "edges": len(long_graph["edges"]),
                 "compaction_count": long_graph.get("compaction_count"),
+                "node_compaction_count": long_graph.get("node_compaction_count"),
                 "frontiers": long_graph.get("frontiers"),
             },
         )
