@@ -304,19 +304,6 @@ class SuggestionOutbox:
             )
         except (TypeError, ValueError) as exc:
             return self._closed("invalid_suggestion_binding", detail=type(exc).__name__)
-        decision_disposition, decision_reason = self._interaction_decision(
-            assessment
-        )
-        if decision_disposition != "say":
-            return {
-                "status": "not_proposed",
-                "mode": str(self._mode_snapshot().get("mode") or self.DEFAULT_MODE),
-                "reason": decision_reason,
-                "decision_disposition": decision_disposition,
-                "delivery_disposition": "none",
-                "proposal": None,
-                "authority": self._authority_boundary(),
-            }
         state = self.state_store.read_json(self.STATE_FILE)
         if not self._healthy(state):
             return self._closed("suggestion_outbox_state_corrupt")
@@ -324,6 +311,19 @@ class SuggestionOutbox:
         if config.get("status") == "fail_closed":
             return config
         mode = str(config["mode"])
+        decision_disposition, decision_reason = self._interaction_decision(
+            assessment
+        )
+        if decision_disposition != "say":
+            return {
+                "status": "not_proposed",
+                "mode": mode,
+                "reason": decision_reason,
+                "decision_disposition": decision_disposition,
+                "delivery_disposition": "none",
+                "proposal": None,
+                "authority": self._authority_boundary(),
+            }
         if mode == "disabled":
             return {
                 "status": "disabled",
