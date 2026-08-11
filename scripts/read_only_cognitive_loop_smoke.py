@@ -445,6 +445,7 @@ def main() -> int:
             "overconservative_alert": False,
         }
         assert by_kind["situation_graph"]["general_situation_count"] == 1
+        assert by_kind["situation_graph"]["attention_parent"] is None
         assert by_kind["external_world_changes"]["summary_count"] == 1
         assert "OWN_EXTERNAL_VISIBLE" in serialized_views
 

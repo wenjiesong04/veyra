@@ -993,6 +993,39 @@ class ReadOnlyCognitiveLoopRuntime:
             if item.get("resolution_status") == "bound"
         )
         scoped_eligible = len(scoped_bindings)
+        general_records = (
+            documents["general"].get("general_situations")
+            if isinstance(documents["general"].get("general_situations"), dict)
+            else {}
+        )
+        scoped_general = [
+            item
+            for item in general_records.values()
+            if isinstance(item, dict)
+            and str(item.get("user_id") or "") == user_id
+            and scope_key in set(item.get("session_scope_keys") or [])
+        ]
+        bridgeable_general = [
+            item
+            for item in scoped_general
+            if isinstance(item.get("general_situation_id"), str)
+            and isinstance(item.get("parent_revision"), int)
+            and item.get("parent_revision", 0) > 0
+        ]
+        # A CognitiveBrief may only receive a bridgeable parent when there is
+        # exactly one current owner/session candidate.  Ambiguity stays
+        # visible as an ordinary graph summary; it is never resolved by model
+        # text or by choosing an arbitrary parent.
+        attention_parent = (
+            {
+                "general_situation_id": bridgeable_general[0][
+                    "general_situation_id"
+                ],
+                "parent_revision": bridgeable_general[0]["parent_revision"],
+            }
+            if len(bridgeable_general) == 1
+            else None
+        )
         binding_payload = {
             "coverage": {
                 "eligible": scoped_eligible,
@@ -1020,13 +1053,8 @@ class ReadOnlyCognitiveLoopRuntime:
                 and str(item.get("user_id") or "") == user_id
                 and str(item.get("session_id") or "") == session_id
             ][:16],
-            "general_situation_count": sum(
-                1
-                for item in (documents["general"].get("general_situations") or {}).values()
-                if isinstance(item, dict)
-                and str(item.get("user_id") or "") == user_id
-                and scope_key in set(item.get("session_scope_keys") or [])
-            ),
+            "general_situation_count": len(scoped_general),
+            "attention_parent": attention_parent,
             "suggestion_mode": documents["suggestions"].get("mode"),
             "external_delivery": False,
         }
