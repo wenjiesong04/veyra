@@ -24,6 +24,22 @@
 
 ---
 
+## 文档稳定性分区
+
+本文件同时包含长期宪章、工程契约和当前快照。维护时必须先判断修改属于哪个区域，不能为了让文档看起来与当前实现一致，就用短期事实改写长期身份。
+
+| 区域 | 本文件中的主要范围 | 维护规则 |
+|---|---|---|
+| **Constitutional Zone** | 第 1 节、第 2.1–2.2 节和第 11 节 | 定义 Veyra 的身份、North Star、核心循环和不可破坏不变量。只能通过明确的架构/身份决策修改，不能仅为迁就当前实现而改变 |
+| **Operating Contract Zone** | 第 0 节和第 6–9 节中的规范性内容 | 定义事实纪律、开发、验证、Git、文档维护和交接方式。可以演进，但变更必须说明原因及对开发流程和验收的影响 |
+| **Living Zone** | 文件头事实快照、开篇当前结论、第 2.3 节、第 3–5 节、第 10 节，以及全文任何显式日期、SHA、数量和当前状态 | 描述当前 revision、运行态、能力边界、路线图和下一步。应随最新 Git、代码、配置、测试与 live evidence 更新，并明确证据日期和新鲜度 |
+
+Stable 不表示永远不可修改，Living 也不表示可以随意书写。前者要求显式架构决策，后者要求可复核证据；两者冲突时，应记录实现差距，而不是静默降低 North Star。
+
+分区以内容语义优先于章节位置。同一段若同时包含长期规则与当前计数，应尽量拆开；无法拆开时，规则按其所属契约维护，日期、SHA、数量和状态仍按 Living Zone 更新。
+
+---
+
 ## 0. 每个新开发窗口先读这里
 
 ### 0.1 事实优先级
@@ -106,9 +122,11 @@ which python
 
 Veyra 不以成为另一个通用 Agent Runtime 为目标。
 
-Veyra 的工程定位是：
+Veyra 的目标身份是：
 
-> **一个 local-first、持续有状态的认知与治理控制面。它维护对用户、世界、自身和下游 Agent 的连续理解，在证据和权限边界内选择合适的反应，并在结果发生后重新观察和校准。**
+> **Veyra 是一个工程意义上 local-first、持续有状态的认知系统。它以有证据约束、可修正且有作用域的状态模型与假设，持续维护对用户、世界和自身能力边界的理解，并据此选择合适的反应。**
+
+在工程角色上，Veyra 同时作为下游模型、Agent 与工具的认知和治理控制面：它在证据和权限边界内组织上下文、约束现实副作用，并在结果发生后重新观察和校准。治理 Agent 和现实副作用是这种反应能力的重要组成部分，不是 Veyra 的全部身份或终极目的。
 
 本文有时使用“认知主体”描述这种持续性。这是架构隐喻，不是意识、感受、人格权利或独立意志的宣称。
 
@@ -276,9 +294,24 @@ Veyra 不是：
 - **Reuse before Replace**：优先复用成熟 Agent 能力。
 - **Verify after Act**：Agent 的“完成了”不能替代现实证据。
 - **Learn without Pretending**：只从真实反馈和结果学习。
+- **Cognition Must Have Governed Aftereffects**：经验证、仍新鲜且 scope 正确的认知，最终应能在可审计、可回退的边界内改善未来的上下文选择、Attention、置信边界或交互方式；如果长期没有任何可衡量的理解或交互影响，就不能宣称形成了学习闭环。
 - **Safety without Paralysis**：安全边界不能把系统变成永久无输出。
 - **Generalize before Patching**：优先修复可泛化机制，不堆关键词。
 - **No Authority by Inference**：模型、分数、Attention 或历史成功不能自行产生权限。
+
+“后效性”不表示模型或一次反馈可以直接修改权限或生产策略。当前 Self Model 的 `policy_effect=none` 是正确的安全阶段，而不是 North Star 的永久终态。近期后效只允许作用于非权限性的上下文选择、Attention 优先级建议、置信校准，以及用户已授权范围内的交互偏好，并且必须服从 quiet hours、预算、明确 opt-out 和现有 hard policy。未来任何此类影响都必须走受治理的渐进路径：
+
+```text
+descriptive evidence
+  -> versioned non-authority cognition / interaction proposal
+  -> shadow counterfactual evaluation
+  -> explicitly approved scoped canary
+  -> reversible bounded promotion
+```
+
+每一步都必须保留证据绑定、作用域、审计、独立验收和回退。Guardian、risk floor、Route authority、provider、TCB、审批、交付范围和执行权限不属于学习型 policy promotion 的候选；它们的任何变化都必须作为独立、人工定义的架构或 authority change 重新设计和验收。认知可以提出上述非权限性改变，但不能自行产生改变现实或扩大自身权限的权力。
+
+未来的后效机制应由新的、版本化的 proposal/evaluation artifact 承载，并引用原始 feedback、outcome 和 evidence；不得回写历史学习记录，或把当前 `policy_effect=none` 的记录事后解释为已经产生过策略效果。
 
 ---
 
@@ -302,11 +335,11 @@ Event / Observation
 
 Veyra Core 负责持续状态、理解编排、治理和验证；受信 Probe 提供只读观察；Agent 提供开放推理或受治理执行；Tool Proxy、Guardian、Review、Verifier 和 Audit 共同构成 effect 边界。
 
-### 2.2 当前必须始终成立的不变量
+### 2.2 必须始终成立的不变量
 
 1. 事件 B 不能把结果写入事件 A 的 Situation；父级聚合只能保存不可变 child reference。
 2. 没有真实、与目标 claim 相匹配的持久执行证据时，不能标记 `verified`，并且 Case/Situation 必须保持可继续评估。
-3. `disabled / record_only / shadow` 下，9 个公开 Route 的完整输出、status 和 risk 不能因私有认知或 Phase 6 状态而弱化。
+3. `disabled / record_only / shadow` 下，所有受保护公开 Route 的完整输出、status 和 risk 不能因私有认知、扩展链或其他新增私有子系统状态而弱化。
 4. ownerless、跨 owner、冲突 scope 或无法验证的 session 数据必须 fail closed。
 5. 声称纯读的 GET 不得刷新 provider、运行模型/Probe、创建 proposal、改变 revision 或写业务状态。
 6. 模型 inference、Agent completion text 和 caller 自报字段不能自动成为 observed fact、verified outcome 或 authority。
