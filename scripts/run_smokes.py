@@ -17,6 +17,7 @@ GATE_SMOKES = [
     "capability_registry_unified_smoke.py",
     "local_setup_smoke.py",
     "start_local_runtime_smoke.py",
+    "runtime_build_identity_smoke.py",
     "proactive_review_execution_smoke.py",
     "agency_state_source_smoke.py",
     "user_profile_isolation_smoke.py",

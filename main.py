@@ -123,6 +123,7 @@ from runtime.trusted_isolated_runner import (
     TrustedIsolatedRunnerBackend,
 )
 from runtime.bounded_extension_generator import BoundedExtensionGenerator
+from runtime.build_identity import RuntimeBuildIdentity
 from runtime.extension_generation_gate import ExtensionGenerationGate
 from runtime.extension_dynamic_validation_gate import (
     ExtensionDynamicValidationGate,
@@ -161,6 +162,9 @@ from runtime.safety_validation import SafetyValidation
 load_runtime_env()
 local_control_policy = LocalControlPolicy()
 app = FastAPI(title="Veyra", version="0.1.0")
+runtime_build_identity = RuntimeBuildIdentity.capture(
+    repository_root=Path(__file__).resolve().parent,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(local_control_policy.allowed_origins),
@@ -643,7 +647,10 @@ async def startup_integrations() -> None:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    return ops_monitor.health()
+    return {
+        **ops_monitor.health(),
+        "runtime_build": runtime_build_identity.public_projection(),
+    }
 
 
 class MessageRequest(BaseModel):
@@ -1830,6 +1837,7 @@ async def mvp_status():
 @app.get("/runtime")
 async def runtime():
     return {
+        "runtime_build": runtime_build_identity.public_projection(),
         "identity": {
             "name": runtime_entity.identity.name,
             "full_name": runtime_entity.identity.full_name,
