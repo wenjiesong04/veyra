@@ -1486,7 +1486,7 @@ class AttentionHypothesisRuntime:
             and identity.get("primary_anchor_key")
             == record.get("primary_anchor_key")
             and str(record.get("status") or "")
-            in {"candidate", "accumulating", "confirmed"}
+            in {"candidate", "accumulating", "confirmed", "contradicted", "expired"}
             and isinstance(hypothesis_revision, int)
             and not isinstance(hypothesis_revision, bool)
             and hypothesis_revision >= 1

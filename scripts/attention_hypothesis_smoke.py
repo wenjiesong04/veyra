@@ -1075,6 +1075,52 @@ def main() -> int:
             },
         )
 
+        expiry_root = Path(tmp) / "terminal-expiry-state"
+        expiry_store = WorldStateStore(expiry_root)
+        expiry_clock = MutableClock(clock())
+        expiry_runtime = AttentionHypothesisRuntime(
+            expiry_store,
+            clock=expiry_clock,
+        )
+        expiry_parent = parent_for(
+            user_id=user_id,
+            session_id=session_id,
+            revision=1,
+            child_count=2,
+            clock=expiry_clock,
+            general_id="gsit-terminal-expiry",
+        )
+        expiry_first = expiry_runtime.observe(
+            expiry_parent,
+            assessment_for(
+                expiry_parent,
+                values=LOW_VALUES,
+                store=expiry_store,
+                clock=expiry_clock,
+            ),
+        )
+        expiry_clock.advance(days=8)
+        expiry_result = expiry_runtime.observe(
+            expiry_parent,
+            GeneralAttentionScheduler(
+                expiry_store,
+                clock=expiry_clock,
+            ).assess(expiry_parent),
+        )
+        expect(
+            expiry_first.get("status") == "candidate"
+            and expiry_result.get("status") == "expired"
+            and expiry_result.get("hypothesis", {}).get("status") == "expired"
+            and expiry_result.get("surface_assessment", {}).get("eligible") is False
+            and expiry_runtime.status().get("status_counts", {}).get("expired") == 1,
+            "expired parent enters terminal lifecycle and remains ineligible",
+            {
+                "initial": expiry_first,
+                "after_expiry": expiry_result,
+                "status": expiry_runtime.status(),
+            },
+        )
+
         corrupt_root = Path(tmp) / "corrupt-state"
         corrupt_store = WorldStateStore(corrupt_root)
         corrupt_runtime = AttentionHypothesisRuntime(corrupt_store, clock=clock)
