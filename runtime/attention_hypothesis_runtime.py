@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timezone
+import re
 from typing import Any, Callable
 
 from awareness.general_attention_scheduler import GeneralAttentionScheduler
@@ -30,7 +31,24 @@ class AttentionHypothesisRuntime:
     MIN_PARTIAL_WEIGHTED_SCORE = 0.45
     MAX_HYPOTHESES = 2000
     MAX_EVIDENCE_REFS = 256
+    MAX_LIFECYCLE_EVENTS = 2000
     MAX_ASSESSMENT_ADMISSION_AGE_SECONDS = 5
+    LIFECYCLE_SIGNAL_SCHEMA_VERSION = "veyra.attention_hypothesis.lifecycle_signal.v1"
+    LIFECYCLE_EVENT_SCHEMA_VERSION = "veyra.attention_hypothesis.lifecycle_event.v1"
+    LIFECYCLE_SIGNAL_KINDS = {"contradiction", "supersede"}
+    LIFECYCLE_REASON_CODES = {
+        "direct_counter_observation",
+        "source_withdrawn",
+        "parent_superseded",
+        "operator_correction",
+    }
+    LIFECYCLE_PRODUCERS = {
+        "component_health",
+        "commitment_runtime",
+        "local_operator",
+        "task_runtime",
+    }
+    TERMINAL_STATUSES = {"contradicted", "expired", "superseded"}
     _HIGH_IMPACT_COMPONENTS = {"goal_priority", "severity", "urgency"}
     _REQUIRED_AUTHORITY_KEYS = {
         "execution_allowed",
@@ -127,11 +145,14 @@ class AttentionHypothesisRuntime:
         self,
         general_situation: dict[str, Any],
         assessment: dict[str, Any],
+        *,
+        lifecycle_signal: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Record one exact, structured assessment and return an Outbox surface."""
 
         try:
             evaluated = self._evaluate(general_situation, assessment)
+            signal = self._validated_lifecycle_signal(lifecycle_signal)
         except (TypeError, ValueError) as exc:
             return self._closed(
                 "invalid_attention_hypothesis_input",
@@ -146,6 +167,12 @@ class AttentionHypothesisRuntime:
             )
 
         hypothesis_id = "ahyp_" + evaluated["identity_digest"][:24]
+        if signal is not None and signal["kind"] == "contradiction":
+            if signal["target_hypothesis_id"] != hypothesis_id:
+                return self._closed(
+                    "attention_contradiction_target_mismatch",
+                    evaluated=evaluated,
+                )
         result: dict[str, Any] = {}
 
         def mutate(current: dict[str, Any]) -> dict[str, Any]:
@@ -164,6 +191,48 @@ class AttentionHypothesisRuntime:
 
             hypotheses = self._records(current.get("hypotheses"))
             identity_index = self._string_map(current.get("identity_index"))
+            lifecycle_events = self._records(current.get("lifecycle_events"))
+            if signal is not None:
+                existing_event = lifecycle_events.get(signal["signal_id"])
+                if existing_event is not None:
+                    if not self._valid_lifecycle_event(
+                        signal["signal_id"], existing_event
+                    ) or any(
+                        existing_event.get(key) != signal.get(key)
+                        for key in (
+                            "kind",
+                            "target_hypothesis_id",
+                            "target_hypothesis_revision",
+                            "evidence_id",
+                            "reason_code",
+                            "producer_id",
+                            "observed_at",
+                        )
+                    ):
+                        result = self._closed(
+                            "attention_lifecycle_signal_rebound",
+                            evaluated=evaluated,
+                        )
+                        return current
+                    replay_id = str(
+                        existing_event.get("replacement_hypothesis_id")
+                        or existing_event.get("target_hypothesis_id")
+                        or ""
+                    )
+                    replay_record = hypotheses.get(replay_id)
+                    if isinstance(replay_record, dict):
+                        result = self._result(
+                            replay_record,
+                            evaluated=evaluated,
+                            replayed=True,
+                            evidence_added_count=0,
+                        )
+                        return current
+                    result = self._closed(
+                        "attention_lifecycle_event_target_missing",
+                        evaluated=evaluated,
+                    )
+                    return current
             indexed_id = identity_index.get(evaluated["identity_digest"])
             if indexed_id and indexed_id != hypothesis_id:
                 result = self._closed(
@@ -190,6 +259,8 @@ class AttentionHypothesisRuntime:
                 )
                 return current
             if (
+                signal is None
+                and
                 previous is not None
                 and str(previous.get("last_assessment_digest") or "")
                 == evaluated["assessment_digest"]
@@ -201,7 +272,7 @@ class AttentionHypothesisRuntime:
                     evidence_added_count=0,
                 )
                 return current
-            if previous is not None and self._same_assessment_generation(
+            if signal is None and previous is not None and self._same_assessment_generation(
                 previous,
                 evaluated,
             ):
@@ -209,6 +280,98 @@ class AttentionHypothesisRuntime:
                     previous,
                     evaluated=evaluated,
                     replayed=True,
+                    evidence_added_count=0,
+                )
+                return current
+            if (
+                previous is not None
+                and previous.get("status") in self.TERMINAL_STATUSES
+                and signal is None
+            ):
+                result = self._terminal_result(
+                    previous,
+                    evaluated=evaluated,
+                )
+                return current
+            supersede_target = None
+            if signal is not None and signal["kind"] == "supersede":
+                if signal["target_hypothesis_id"] == hypothesis_id:
+                    result = self._closed(
+                        "attention_supersede_requires_new_identity",
+                        evaluated=evaluated,
+                    )
+                    return current
+                supersede_target = hypotheses.get(signal["target_hypothesis_id"])
+                if not isinstance(supersede_target, dict):
+                    result = self._closed(
+                        "attention_supersede_target_missing",
+                        evaluated=evaluated,
+                    )
+                    return current
+                if (
+                    supersede_target.get("hypothesis_revision")
+                    != signal["target_hypothesis_revision"]
+                    or supersede_target.get("status") in self.TERMINAL_STATUSES
+                ):
+                    result = self._closed(
+                        "attention_supersede_target_not_current",
+                        evaluated=evaluated,
+                    )
+                    return current
+                if (
+                    str(supersede_target.get("user_id") or "")
+                    != evaluated["user_id"]
+                    or not set(evaluated["session_scope_keys"]).intersection(
+                        set(supersede_target.get("session_scope_keys") or [])
+                    )
+                ):
+                    result = self._closed(
+                        "attention_supersede_owner_mismatch",
+                        evaluated=evaluated,
+                    )
+                    return current
+            if signal is not None and signal["kind"] == "contradiction":
+                if previous is None:
+                    result = self._closed(
+                        "attention_contradiction_target_missing",
+                        evaluated=evaluated,
+                    )
+                    return current
+                if previous.get("hypothesis_revision") != signal["target_hypothesis_revision"]:
+                    result = self._closed(
+                        "attention_contradiction_target_not_current",
+                        evaluated=evaluated,
+                    )
+                    return current
+                terminal = self._terminalize_record(
+                    previous,
+                    status="contradicted",
+                    marker=f"typed_contradiction:{signal['signal_id']}",
+                    now=commit_now,
+                )
+                lifecycle_events[signal["signal_id"]] = self._lifecycle_event(
+                    signal,
+                    replacement_hypothesis_id=terminal["hypothesis_id"],
+                    recorded_at=commit_now,
+                )
+                hypotheses[terminal["hypothesis_id"]] = terminal
+                current.update(
+                    {
+                        "schema_version": self.STATE_SCHEMA_VERSION,
+                        "ruleset_version": self.RULESET_VERSION,
+                        "hypotheses": hypotheses,
+                        "identity_index": identity_index,
+                        "lifecycle_events": lifecycle_events,
+                        "lifecycle_event_count": len(lifecycle_events),
+                        "hypothesis_count": len(hypotheses),
+                        "status_counts": self._status_counts(hypotheses),
+                        "updated_at": commit_now.isoformat(),
+                    }
+                )
+                result = self._result(
+                    terminal,
+                    evaluated=evaluated,
+                    replayed=False,
                     evidence_added_count=0,
                 )
                 return current
@@ -284,6 +447,16 @@ class AttentionHypothesisRuntime:
                 status = "candidate"
             else:
                 status = "accumulating"
+
+            if supersede_target is not None:
+                supersede_target = self._terminalize_record(
+                    supersede_target,
+                    status="superseded",
+                    marker=(
+                        f"typed_supersede:{signal['signal_id']}:{hypothesis_id}"
+                    ),
+                    now=commit_now,
+                )
 
             created_at = (
                 str(previous.get("created_at") or "")
@@ -371,6 +544,13 @@ class AttentionHypothesisRuntime:
                 "updated_at": commit_now.isoformat(),
             }
             hypotheses[hypothesis_id] = record
+            if supersede_target is not None:
+                hypotheses[supersede_target["hypothesis_id"]] = supersede_target
+                lifecycle_events[signal["signal_id"]] = self._lifecycle_event(
+                    signal,
+                    replacement_hypothesis_id=hypothesis_id,
+                    recorded_at=commit_now,
+                )
             identity_index[evaluated["identity_digest"]] = hypothesis_id
             current.update(
                 {
@@ -378,6 +558,8 @@ class AttentionHypothesisRuntime:
                     "ruleset_version": self.RULESET_VERSION,
                     "hypotheses": hypotheses,
                     "identity_index": identity_index,
+                    "lifecycle_events": lifecycle_events,
+                    "lifecycle_event_count": len(lifecycle_events),
                     "hypothesis_count": len(hypotheses),
                     "status_counts": self._status_counts(hypotheses),
                     "updated_at": commit_now.isoformat(),
@@ -752,6 +934,10 @@ class AttentionHypothesisRuntime:
         }
         if "general_situation_expired" in unknowns:
             return "expired"
+        if any(item.startswith("typed_supersede:") for item in unknowns):
+            return "superseded"
+        if any(item.startswith("typed_contradiction:") for item in unknowns):
+            return "contradicted"
         if any(
             item == "contradicted"
             or item.startswith("contradicted:")
@@ -760,6 +946,177 @@ class AttentionHypothesisRuntime:
         ):
             return "contradicted"
         return None
+
+    @classmethod
+    def _validated_lifecycle_signal(
+        cls,
+        value: Any,
+    ) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        if not isinstance(value, dict) or set(value) != {
+            "schema_version",
+            "signal_id",
+            "kind",
+            "target_hypothesis_id",
+            "target_hypothesis_revision",
+            "evidence_id",
+            "reason_code",
+            "producer_id",
+            "observed_at",
+        }:
+            raise ValueError("attention lifecycle signal shape is invalid")
+        signal_id = str(value.get("signal_id") or "")
+        target_id = str(value.get("target_hypothesis_id") or "")
+        evidence_id = str(value.get("evidence_id") or "")
+        if (
+            value.get("schema_version") != cls.LIFECYCLE_SIGNAL_SCHEMA_VERSION
+            or not re.fullmatch(r"als_[A-Za-z0-9_.:/-]{1,120}", signal_id)
+            or value.get("kind") not in cls.LIFECYCLE_SIGNAL_KINDS
+            or not re.fullmatch(r"ahyp_[0-9a-f]{24}", target_id)
+            or isinstance(value.get("target_hypothesis_revision"), bool)
+            or not isinstance(value.get("target_hypothesis_revision"), int)
+            or value["target_hypothesis_revision"] < 1
+            or not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,240}", evidence_id)
+            or value.get("reason_code") not in cls.LIFECYCLE_REASON_CODES
+            or value.get("producer_id") not in cls.LIFECYCLE_PRODUCERS
+            or cls._aware_time(value.get("observed_at")) is None
+        ):
+            raise ValueError("attention lifecycle signal values are invalid")
+        return {
+            **copy.deepcopy(value),
+            "signal_id": signal_id,
+            "target_hypothesis_id": target_id,
+            "observed_at": cls._aware_time(value["observed_at"]).isoformat(),
+        }
+
+    @classmethod
+    def _lifecycle_event(
+        cls,
+        signal: dict[str, Any],
+        *,
+        replacement_hypothesis_id: str,
+        recorded_at: datetime,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": cls.LIFECYCLE_EVENT_SCHEMA_VERSION,
+            **copy.deepcopy(signal),
+            "replacement_hypothesis_id": replacement_hypothesis_id,
+            "recorded_at": recorded_at.isoformat(),
+            "authority": cls._authority_boundary(),
+        }
+
+    @classmethod
+    def _valid_lifecycle_event(
+        cls,
+        signal_id: Any,
+        value: Any,
+    ) -> bool:
+        if not isinstance(value, dict) or set(value) != {
+            "schema_version",
+            "signal_id",
+            "kind",
+            "target_hypothesis_id",
+            "target_hypothesis_revision",
+            "evidence_id",
+            "reason_code",
+            "producer_id",
+            "observed_at",
+            "replacement_hypothesis_id",
+            "recorded_at",
+            "authority",
+        }:
+            return False
+        try:
+            signal = cls._validated_lifecycle_signal(
+                {
+                    key: value.get(key)
+                    for key in (
+                        "schema_version",
+                        "signal_id",
+                        "kind",
+                        "target_hypothesis_id",
+                        "target_hypothesis_revision",
+                        "evidence_id",
+                        "reason_code",
+                        "producer_id",
+                        "observed_at",
+                    )
+                }
+            )
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            signal is not None
+            and signal_id == signal["signal_id"]
+            and re.fullmatch(
+                r"ahyp_[0-9a-f]{24}",
+                str(value.get("replacement_hypothesis_id") or ""),
+            )
+            and cls._aware_time(value.get("recorded_at")) is not None
+            and value.get("authority") == cls._authority_boundary()
+        )
+
+    @classmethod
+    def _terminalize_record(
+        cls,
+        record: dict[str, Any],
+        *,
+        status: str,
+        marker: str,
+        now: datetime,
+    ) -> dict[str, Any]:
+        if status not in cls.TERMINAL_STATUSES:
+            raise ValueError("terminal lifecycle status is invalid")
+        updated = copy.deepcopy(record)
+        unknowns = [str(item) for item in updated.get("unknowns") or []]
+        if marker not in unknowns:
+            unknowns.append(marker)
+        updated["unknowns"] = list(dict.fromkeys(unknowns))
+        updated["status"] = status
+        updated["hypothesis_revision"] = cls._nonnegative_int(
+            updated.get("hypothesis_revision")
+        ) + 1
+        updated["evaluation_count"] = cls._nonnegative_int(
+            updated.get("evaluation_count")
+        ) + 1
+        updated["confirmed_at"] = None
+        updated["updated_at"] = now.isoformat()
+        updated["last_assessment_digest"] = stable_digest(
+            "veyra.attention_hypothesis.assessment.v1",
+            {
+                "identity_digest": updated.get("identity_digest"),
+                "general_situation_id": updated.get("general_situation_id"),
+                "parent_revision": updated.get("parent_revision"),
+                "evidence": copy.deepcopy(updated.get("current_evidence_refs") or []),
+                "components": copy.deepcopy(updated.get("components") or {}),
+                "unknowns": updated["unknowns"],
+                "readiness": copy.deepcopy(updated.get("attention_readiness") or {}),
+                "evidence_diversity": copy.deepcopy(
+                    updated.get("evidence_diversity") or {}
+                ),
+                "assessment_binding": copy.deepcopy(
+                    updated.get("assessment_binding") or {}
+                ),
+            },
+        )
+        return updated
+
+    def _terminal_result(
+        self,
+        record: dict[str, Any],
+        *,
+        evaluated: dict[str, Any],
+    ) -> dict[str, Any]:
+        result = self._result(
+            record,
+            evaluated=evaluated,
+            replayed=False,
+            evidence_added_count=0,
+        )
+        result["reason"] = "attention_hypothesis_terminal_non_revivable"
+        result["replayed"] = False
+        return result
 
     def _current_parent_issue(
         self,
@@ -1393,9 +1750,14 @@ class AttentionHypothesisRuntime:
             return False
         hypotheses = state.get("hypotheses")
         identity_index = state.get("identity_index")
+        lifecycle_events = state.get("lifecycle_events", {})
         if (
             not isinstance(hypotheses, dict)
             or not isinstance(identity_index, dict)
+            or not isinstance(lifecycle_events, dict)
+            or len(lifecycle_events) > cls.MAX_LIFECYCLE_EVENTS
+            or state.get("lifecycle_event_count", len(lifecycle_events))
+            != len(lifecycle_events)
             or not all(
                 isinstance(key, str)
                 and bool(key)
@@ -1416,6 +1778,11 @@ class AttentionHypothesisRuntime:
                 state.get("updated_at") is not None
                 and cls._aware_time(state.get("updated_at")) is None
             )
+        ):
+            return False
+        if any(
+            not cls._valid_lifecycle_event(signal_id, event)
+            for signal_id, event in lifecycle_events.items()
         ):
             return False
         return all(
@@ -1486,7 +1853,14 @@ class AttentionHypothesisRuntime:
             and identity.get("primary_anchor_key")
             == record.get("primary_anchor_key")
             and str(record.get("status") or "")
-            in {"candidate", "accumulating", "confirmed", "contradicted", "expired"}
+            in {
+                "candidate",
+                "accumulating",
+                "confirmed",
+                "contradicted",
+                "expired",
+                "superseded",
+            }
             and isinstance(hypothesis_revision, int)
             and not isinstance(hypothesis_revision, bool)
             and hypothesis_revision >= 1
@@ -1894,6 +2268,7 @@ class AttentionHypothesisRuntime:
             "confirmed": 0,
             "contradicted": 0,
             "expired": 0,
+            "superseded": 0,
         }
         for item in hypotheses.values():
             status = str(item.get("status") or "")

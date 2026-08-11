@@ -542,6 +542,8 @@ class WorldStateStore:
                 "ruleset_version": "veyra.attention_hypothesis.rules.v1",
                 "hypotheses": {},
                 "identity_index": {},
+                "lifecycle_events": {},
+                "lifecycle_event_count": 0,
                 "hypothesis_count": 0,
                 "status_counts": {
                     "candidate": 0,
@@ -549,6 +551,7 @@ class WorldStateStore:
                     "confirmed": 0,
                     "contradicted": 0,
                     "expired": 0,
+                    "superseded": 0,
                 },
                 "updated_at": None,
             },
