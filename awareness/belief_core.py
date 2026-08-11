@@ -181,9 +181,7 @@ class BeliefCore:
                 else:
                     accepted = {
                         **claim,
-                        "evidence_refs": result_claim.get("evidence_refs", []),
                         "evidence_graph_status": graph_status,
-                        "evidence_value_digest": evidence_node.get("value_digest"),
                     }
                     if result_claim.get("evidence_graph_conflict_refs"):
                         accepted["evidence_graph_conflict_refs"] = result_claim[
@@ -209,12 +207,16 @@ class BeliefCore:
             else:
                 accepted = {
                     **claim,
-                    "evidence_refs": result_claim.get("evidence_refs", []),
                     "evidence_graph_status": graph_status,
-                    "evidence_value_digest": evidence_node.get("value_digest"),
                     "refresh_count": 0,
                 }
                 if graph_status == "unresolved":
+                    accepted.update(
+                        {
+                            "evidence_refs": result_claim.get("evidence_refs", []),
+                            "evidence_value_digest": evidence_node.get("value_digest"),
+                        }
+                    )
                     accepted.update(
                         {
                             "status": "conflict",
