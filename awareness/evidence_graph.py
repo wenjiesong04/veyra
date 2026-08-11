@@ -19,6 +19,7 @@ EVIDENCE_EDGE_SCHEMA_VERSION = "veyra.belief.evidence_edge.v1"
 MAX_EVIDENCE_NODES = 500
 MAX_EVIDENCE_EDGES = 1000
 MAX_UNRESOLVED = 256
+MAX_FRONTIER_PER_IDENTITY = 8
 RELATIONS = frozenset({"supports", "contradicts", "supersedes"})
 
 
@@ -33,6 +34,11 @@ def empty_evidence_graph() -> dict[str, Any]:
         "nodes": [],
         "edges": [],
         "unresolved": [],
+        # Only this bounded frontier is used for inferred relations.  The
+        # graph remains a provenance record, but new observations must not
+        # compare against every historical node for the same identity.
+        "frontiers": {},
+        "compaction_count": 0,
         "summary": {
             "nodes": 0,
             "edges": 0,
@@ -83,9 +89,7 @@ def ingest_claim(
     explicit_edges = _explicit_edges(current, node, claim)
     relation_edges: list[dict[str, Any]] = []
 
-    for previous in current["nodes"]:
-        if not isinstance(previous, dict) or previous.get("identity_digest") != identity_digest:
-            continue
+    for previous in _frontier_nodes(current, identity_digest):
         relation, reason = _infer_relation(node, previous)
         if relation is not None:
             relation_edges.append(_edge(node, previous, relation, reason))
@@ -122,12 +126,12 @@ def ingest_claim(
         _record_unresolved(current, node, None, f"valid_time_{node['valid_time']['status']}")
         projection_status = "unresolved"
 
-    if len(current["edges"]) + len(relation_edges) > MAX_EVIDENCE_EDGES:
-        raise EvidenceGraphError("evidence_graph_edge_capacity_exhausted")
     current["nodes"].append(node)
     for edge in relation_edges:
         if not any(existing_edge.get("edge_id") == edge["edge_id"] for existing_edge in current["edges"]):
             current["edges"].append(edge)
+    _compact_edges(current)
+    _update_frontier(current, identity_digest, node["evidence_id"])
     current["revision"] = int(current.get("revision") or 0) + 1
     _refresh_summary(current)
     projection = {
@@ -177,7 +181,90 @@ def _validate_graph(graph: Any) -> dict[str, Any]:
     for item in unresolved:
         if not isinstance(item, dict) or not _bounded_text(item.get("unresolved_id"), 80):
             raise EvidenceGraphError("evidence_graph_unresolved_invalid")
-    return json.loads(json.dumps(graph, ensure_ascii=False))
+    detached = json.loads(json.dumps(graph, ensure_ascii=False))
+    frontiers = detached.get("frontiers")
+    if frontiers is None:
+        frontiers = {}
+        detached["frontiers"] = frontiers
+    if not isinstance(frontiers, dict) or len(frontiers) > MAX_EVIDENCE_NODES:
+        raise EvidenceGraphError("evidence_graph_frontier_invalid")
+    for identity_digest, evidence_ids in frontiers.items():
+        if not _is_digest(identity_digest) or not isinstance(evidence_ids, list):
+            raise EvidenceGraphError("evidence_graph_frontier_invalid")
+        if len(evidence_ids) > MAX_FRONTIER_PER_IDENTITY or any(
+            not _bounded_text(item, 80) for item in evidence_ids
+        ):
+            raise EvidenceGraphError("evidence_graph_frontier_invalid")
+    compaction_count = detached.get("compaction_count", 0)
+    if isinstance(compaction_count, bool) or not isinstance(compaction_count, int) or compaction_count < 0:
+        raise EvidenceGraphError("evidence_graph_compaction_invalid")
+    detached["compaction_count"] = compaction_count
+    return detached
+
+
+def _frontier_nodes(graph: dict[str, Any], identity_digest: str) -> list[dict[str, Any]]:
+    """Return a bounded relation frontier, rebuilding legacy graphs once."""
+
+    by_id = {
+        str(item.get("evidence_id")): item
+        for item in graph.get("nodes", [])
+        if isinstance(item, dict) and item.get("evidence_id")
+    }
+    frontiers = graph.setdefault("frontiers", {})
+    selected_ids = frontiers.get(identity_digest)
+    if not isinstance(selected_ids, list) or not selected_ids:
+        selected_ids = [
+            str(item.get("evidence_id"))
+            for item in graph.get("nodes", [])
+            if isinstance(item, dict) and item.get("identity_digest") == identity_digest
+        ][-MAX_FRONTIER_PER_IDENTITY:]
+        frontiers[identity_digest] = selected_ids
+    return [
+        by_id[evidence_id]
+        for evidence_id in selected_ids[-MAX_FRONTIER_PER_IDENTITY:]
+        if evidence_id in by_id and by_id[evidence_id].get("identity_digest") == identity_digest
+    ]
+
+
+def _update_frontier(graph: dict[str, Any], identity_digest: str, evidence_id: str) -> None:
+    frontiers = graph.setdefault("frontiers", {})
+    previous = frontiers.get(identity_digest)
+    selected = list(previous) if isinstance(previous, list) else []
+    selected = [item for item in selected if item != evidence_id]
+    selected.append(evidence_id)
+    frontiers[identity_digest] = selected[-MAX_FRONTIER_PER_IDENTITY:]
+
+
+def _compact_edges(graph: dict[str, Any]) -> None:
+    """Keep safety relations and a recent bounded support frontier.
+
+    Support edges are corroboration history and can be compacted.  Contradiction
+    and supersession edges are retained because dropping either would hide a
+    governance-relevant relation.  This makes the edge bound a retention
+    policy rather than a sporadic write failure.
+    """
+
+    edges = [item for item in graph.get("edges", []) if isinstance(item, dict)]
+    if len(edges) <= MAX_EVIDENCE_EDGES:
+        return
+    safety = [item for item in edges if item.get("relation") != "supports"]
+    if len(safety) > MAX_EVIDENCE_EDGES:
+        raise EvidenceGraphError("evidence_graph_safety_edge_capacity_exhausted")
+    node_order = {
+        str(item.get("evidence_id")): index
+        for index, item in enumerate(graph.get("nodes", []))
+        if isinstance(item, dict)
+    }
+    supports = [item for item in edges if item.get("relation") == "supports"]
+    keep_support_count = MAX_EVIDENCE_EDGES - len(safety)
+    recent_supports = sorted(
+        supports,
+        key=lambda item: (node_order.get(str(item.get("from") or ""), -1), str(item.get("edge_id") or "")),
+        reverse=True,
+    )[:keep_support_count]
+    retained_ids = {str(item.get("edge_id")) for item in safety + recent_supports}
+    graph["edges"] = [item for item in edges if str(item.get("edge_id")) in retained_ids]
+    graph["compaction_count"] = int(graph.get("compaction_count") or 0) + len(edges) - len(graph["edges"])
 
 
 def _node_from_claim(claim: dict[str, Any], identity: tuple[str, ...]) -> dict[str, Any]:
@@ -404,7 +491,10 @@ def _entity_refs(claim: dict[str, Any], evidence: dict[str, Any]) -> tuple[list[
 
 
 def _value_digest(claim: dict[str, Any], evidence: dict[str, Any]) -> tuple[str, str]:
-    for field in ("status", "value", "dirty", "exists", "state", "phase"):
+    # Git observations may carry both a transport status (usually ``ok``) and
+    # the typed workspace fact ``dirty``.  The fact must win; otherwise a
+    # clean-to-dirty transition is incorrectly classified as support.
+    for field in ("dirty", "status", "value", "exists", "state", "phase"):
         if field in evidence:
             return _digest({"field": field, "value": evidence[field]}), "typed"
     return _digest({"claim": str(claim.get("claim") or "")}), "claim_digest"

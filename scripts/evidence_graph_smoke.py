@@ -14,7 +14,9 @@ if str(ROOT) not in sys.path:
 
 from awareness.belief_core import BeliefCore
 from awareness.claim_schema import make_claim
+from core.perception_layer import PerceptionLayer
 from core.world_state import WorldStateStore
+from runtime.state_refresh import StateRefresh
 
 
 def expect(condition: bool, label: str, details: object = None) -> None:
@@ -102,6 +104,14 @@ def main() -> int:
         expect(contradiction.get("evidence_graph_status") == "unresolved", "overlap conflict stays unresolved", contradiction)
         expect(graph["summary"]["contradiction"] >= 1, "contradiction edge is durable", graph)
         expect(graph["summary"]["unresolved"] >= 1, "conflict is visible in summary", graph)
+        stored_conflict = store.read_json("belief_state.json")["claims"][0]
+        expect(
+            stored_conflict.get("claim") == "api is ok"
+            and stored_conflict.get("status") == "conflict"
+            and stored_conflict.get("conflict_observations"),
+            "conflicting observation cannot silently overwrite the current belief",
+            stored_conflict,
+        )
 
         disjoint = belief.upsert_claim(
             claim(
@@ -179,6 +189,133 @@ def main() -> int:
         after = store.read_json("belief_state.json")
         expect(rejected.get("status") == "rejected_evidence_graph", "corrupt graph rejects new claim", rejected)
         expect(after["claims"] == before["claims"], "corrupt graph rejection does not append claim", after)
+
+        # Long-lived same-value observations use only a bounded identity
+        # frontier.  They must remain writable without exhausting the global
+        # edge cap, and old corroboration edges may be compacted safely.
+        long_store = WorldStateStore(Path(tmp) / "long-state")
+        long_belief = BeliefCore(long_store)
+        for index in range(220):
+            observed = (base + timedelta(seconds=index)).isoformat()
+            result = long_belief.upsert_claim(
+                claim(
+                    value="ok",
+                    observed_at=observed,
+                    valid_from=start,
+                    valid_to=end,
+                    key="service:long-lived:status",
+                )
+            )
+            expect(result.get("persisted") is True, "bounded graph accepts long-lived observations", result)
+        long_graph = long_store.read_json("belief_state.json")["evidence_graph"]
+        expect(
+            len(long_graph["nodes"]) == 220
+            and len(long_graph["edges"]) <= 1000
+            and long_graph.get("compaction_count", 0) > 0
+            and all(len(item) <= 8 for item in long_graph.get("frontiers", {}).values()),
+            "identity frontier and support retention stay bounded",
+            {
+                "nodes": len(long_graph["nodes"]),
+                "edges": len(long_graph["edges"]),
+                "compaction_count": long_graph.get("compaction_count"),
+                "frontiers": long_graph.get("frontiers"),
+            },
+        )
+
+        # Transport status must not mask the typed Git dirty fact.
+        git_store = WorldStateStore(Path(tmp) / "git-state")
+        git_belief = BeliefCore(git_store)
+        clean = claim(value="clean", observed_at=start, valid_from=start, valid_to=end, key="git_workspace:dirty")
+        clean["source"] = "git_probe"
+        clean["claim"] = "git workspace is clean"
+        clean["evidence"] = {"status": "ok", "dirty": False, "producer": "git_probe"}
+        clean.update({"scope_kind": "operator_global"})
+        for key in ("tenant_derived", "user_id", "session_id"):
+            clean.pop(key, None)
+        git_belief.upsert_claim(clean)
+        dirty = dict(clean)
+        dirty["claim"] = "git workspace has uncommitted changes"
+        dirty["evidence"] = {"status": "ok", "dirty": True, "producer": "git_probe"}
+        dirty["observed_at"] = (base + timedelta(seconds=1)).isoformat()
+        dirty["updated_at"] = dirty["observed_at"]
+        dirty["expires_at"] = (base + timedelta(minutes=5)).isoformat()
+        dirty_result = git_belief.upsert_claim(dirty)
+        git_claim = git_store.read_json("belief_state.json")["claims"][0]
+        expect(
+            dirty_result.get("evidence_graph_status") == "unresolved"
+            and git_claim.get("status") == "conflict"
+            and git_claim.get("claim") == "git workspace is clean",
+            "Git clean-to-dirty is a typed contradiction rather than support",
+            {"result": dirty_result, "claim": git_claim},
+        )
+
+        # A successful probe whose value is rejected by the evidence graph is
+        # a degraded refresh, never a reported success.
+        refresh_store = WorldStateStore(Path(tmp) / "refresh-state")
+        perception = PerceptionLayer(refresh_store, model_assist_enabled=False)
+        perception.interpret_probe_result(
+            {
+                "probe": "git_probe",
+                "status": "ok",
+                "dirty": False,
+                "summary": "git workspace is clean",
+                "observed_at": start,
+                "ttl_seconds": 1,
+                "scope_kind": "operator_global",
+            }
+        )
+        refresh_store.mutate_json(
+            "belief_state.json",
+            lambda state: {
+                **state,
+                "claims": [
+                    {
+                        **state["claims"][0],
+                        "status": "stale",
+                        "next_action": "refresh_probe",
+                    }
+                ],
+            },
+        )
+
+        class DirtyGitProbe:
+            def run(self, target: str = "") -> dict[str, object]:
+                return {
+                    "probe": "git_probe",
+                    "status": "ok",
+                    "dirty": True,
+                    "summary": "git workspace is dirty",
+                    "observed_at": (base + timedelta(seconds=1)).isoformat(),
+                    "ttl_seconds": 60,
+                    "scope_kind": "operator_global",
+                }
+
+        refresh = StateRefresh(refresh_store, model_assist_enabled=False)
+        refresh.probes["git_probe"] = DirtyGitProbe()
+        class ConflictPerception:
+            def interpret_probe_result(self, raw: dict[str, object]) -> dict[str, object]:
+                return {
+                    "status": "conflict",
+                    "belief_persistence": {
+                        "status": "conflict",
+                        "results": [],
+                        "accepted_count": 0,
+                        "conflicted_count": 1,
+                        "rejected_count": 0,
+                    },
+                    "probe": raw,
+                }
+
+        refresh.perception = ConflictPerception()
+        refresh_result = refresh.refresh_stale(limit=1)
+        expect(
+            refresh_result["status"] == "degraded"
+            and refresh_result["refreshed"] == []
+            and refresh_result["failed"]
+            and refresh_result["failed"][0]["reason"] == "belief_persistence_conflict",
+            "refresh propagates conflict instead of reporting a false success",
+            refresh_result,
+        )
 
     print("evidence graph smoke passed")
     return 0

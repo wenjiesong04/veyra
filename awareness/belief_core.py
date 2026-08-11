@@ -65,22 +65,34 @@ class BeliefCore:
         if identity is None:
             return self._reject_unscoped_claim(claim)
 
-        result_claim: dict[str, Any] = dict(claim)
+        result_claim: dict[str, Any] = {
+            **claim,
+            "persisted": False,
+            "belief_value_persisted": False,
+            "persistence_status": "pending",
+        }
 
         def update_belief(belief: dict[str, Any]) -> dict[str, Any]:
             nonlocal result_claim
-            graph, _, graph_projection = ingest_claim(
+            graph, evidence_node, graph_projection = ingest_claim(
                 belief.get("evidence_graph"),
                 claim,
                 identity=identity,
             )
+            graph_status = str(graph_projection.get("status") or "unresolved")
             result_claim = {
                 **claim,
+                "persisted": True,
+                "belief_value_persisted": graph_status != "unresolved",
+                "persistence_status": (
+                    "accepted" if graph_status != "unresolved" else "conflict"
+                ),
                 "evidence_refs": self._merge_evidence_refs(
                     claim.get("evidence_refs"),
                     graph_projection.get("evidence_refs"),
                 ),
-                "evidence_graph_status": graph_projection.get("status") or "unresolved",
+                "evidence_graph_status": graph_status,
+                "evidence_value_digest": evidence_node.get("value_digest"),
             }
             conflict_refs = graph_projection.get("conflict_refs")
             if isinstance(conflict_refs, list) and conflict_refs:
@@ -96,6 +108,13 @@ class BeliefCore:
                     or claim_identity_key(current) != identity
                 ):
                     continue
+                unresolved = graph_status == "unresolved"
+                current_status = str(current.get("status") or "")
+                current_conflict = current_status == "conflict"
+                stale_replacement = (
+                    current_status in {"stale", "expired"}
+                    and claim.get("refresh_mode") == "stale_claim"
+                )
                 history = current.get("history") if isinstance(current.get("history"), list) else []
                 history.append(
                     {
@@ -104,16 +123,122 @@ class BeliefCore:
                         "confidence": current.get("confidence"),
                     }
                 )
-                claims[index] = {
-                    **current,
-                    **claim,
-                    "history": history[-12:],
-                    "refresh_count": int(current.get("refresh_count") or 0) + 1,
-                }
+                if (unresolved and not stale_replacement) or current_conflict:
+                    # The graph has recorded the new observation, but it has
+                    # not established that this value may replace the current
+                    # belief.  Keep the existing value and retain a compact
+                    # typed conflict record so the disagreement is durable.
+                    conflicts = current.get("conflict_observations")
+                    if not isinstance(conflicts, list):
+                        conflicts = []
+                    conflicts.append(
+                        {
+                            "key": claim.get("key"),
+                            "source": claim.get("source"),
+                            "observed_at": claim.get("observed_at"),
+                            "value_digest": evidence_node.get("value_digest"),
+                            "evidence_refs": result_claim.get("evidence_refs", []),
+                            "conflict_refs": result_claim.get(
+                                "evidence_graph_conflict_refs", []
+                            ),
+                            "evidence_graph_status": graph_status,
+                        }
+                    )
+                    result_claim.update(
+                        {
+                            "status": "conflict",
+                            "next_action": "refresh_probe",
+                            "belief_value_persisted": False,
+                        }
+                    )
+                    claims[index] = {
+                        **current,
+                        "status": "conflict",
+                        "next_action": "refresh_probe",
+                        "evidence_refs": self._merge_evidence_refs(
+                            current.get("evidence_refs"),
+                            result_claim.get("evidence_refs"),
+                        ),
+                        "evidence_graph_status": "unresolved",
+                        "evidence_graph_conflict_refs": sorted(
+                            {
+                                *(
+                                    current.get("evidence_graph_conflict_refs")
+                                    if isinstance(current.get("evidence_graph_conflict_refs"), list)
+                                    else []
+                                ),
+                                *(
+                                    result_claim.get("evidence_graph_conflict_refs")
+                                    if isinstance(result_claim.get("evidence_graph_conflict_refs"), list)
+                                    else []
+                                ),
+                            }
+                        ),
+                        "conflict_observations": conflicts[-12:],
+                        "history": history[-12:],
+                        "refresh_count": int(current.get("refresh_count") or 0) + 1,
+                    }
+                else:
+                    accepted = {
+                        **claim,
+                        "evidence_refs": result_claim.get("evidence_refs", []),
+                        "evidence_graph_status": graph_status,
+                        "evidence_value_digest": evidence_node.get("value_digest"),
+                    }
+                    if result_claim.get("evidence_graph_conflict_refs"):
+                        accepted["evidence_graph_conflict_refs"] = result_claim[
+                            "evidence_graph_conflict_refs"
+                        ]
+                    if unresolved:
+                        # A stale value is allowed to be replaced by a fresh
+                        # probe result, while the graph still exposes the
+                        # historical contradiction for review.
+                        result_claim.update(
+                            {
+                                "belief_value_persisted": True,
+                                "persistence_status": "accepted_with_conflict",
+                            }
+                        )
+                    claims[index] = {
+                        **current,
+                        **accepted,
+                        "history": history[-12:],
+                        "refresh_count": int(current.get("refresh_count") or 0) + 1,
+                    }
                 break
             else:
-                claim.setdefault("refresh_count", 0)
-                claims.append(claim)
+                accepted = {
+                    **claim,
+                    "evidence_refs": result_claim.get("evidence_refs", []),
+                    "evidence_graph_status": graph_status,
+                    "evidence_value_digest": evidence_node.get("value_digest"),
+                    "refresh_count": 0,
+                }
+                if graph_status == "unresolved":
+                    accepted.update(
+                        {
+                            "status": "conflict",
+                            "next_action": "refresh_probe",
+                            "conflict_observations": [
+                                {
+                                    "key": claim.get("key"),
+                                    "source": claim.get("source"),
+                                    "observed_at": claim.get("observed_at"),
+                                    "value_digest": evidence_node.get("value_digest"),
+                                    "evidence_refs": result_claim.get("evidence_refs", []),
+                                    "evidence_graph_status": graph_status,
+                                }
+                            ],
+                        }
+                    )
+                    result_claim.update(
+                        {
+                            "status": "conflict",
+                            "next_action": "refresh_probe",
+                            "belief_value_persisted": False,
+                        }
+                    )
+                claims.append(accepted)
             belief["claims"] = detect_conflicts(
                 [refresh_claim_status(item) for item in claims if isinstance(item, dict)]
             )[-250:]
@@ -128,6 +253,8 @@ class BeliefCore:
                 **claim,
                 "status": "rejected_evidence_graph",
                 "persisted": False,
+                "belief_value_persisted": False,
+                "persistence_status": "rejected",
                 "evidence_graph_error": str(exc),
             }
         return result_claim

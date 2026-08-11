@@ -113,7 +113,32 @@ class PerceptionLayer:
         claims = self._claims_from_probe(enriched) + self._claims_from_model(enriched, model_assist)
         for claim in claims:
             claim.update(scope_metadata)
-        self.belief.upsert_claims(claims)
+            if enriched.get("refresh_mode"):
+                claim["refresh_mode"] = str(enriched["refresh_mode"])
+        persistence_results = self.belief.upsert_claims(claims)
+        accepted = [
+            item
+            for item in persistence_results
+            if item.get("belief_value_persisted") is True
+        ]
+        conflicted = [
+            item
+            for item in persistence_results
+            if item.get("persistence_status") == "conflict"
+        ]
+        rejected = [
+            item
+            for item in persistence_results
+            if item.get("persisted") is not True
+        ]
+        if not claims:
+            persistence_status = "no_observation"
+        elif rejected:
+            persistence_status = "partial" if accepted else "rejected"
+        elif conflicted:
+            persistence_status = "partial" if accepted else "conflict"
+        else:
+            persistence_status = "accepted"
         local_path = (
             "local_world.probes"
             if scope_metadata.get("scope_kind") == OPERATOR_GLOBAL_SCOPE
@@ -126,6 +151,14 @@ class PerceptionLayer:
         result = {
             local_path: {probe_name: enriched},
             "belief.claims": claims,
+            "belief_persistence": {
+                "status": persistence_status,
+                "results": persistence_results,
+                "accepted_count": len(accepted),
+                "conflicted_count": len(conflicted),
+                "rejected_count": len(rejected),
+            },
+            "status": persistence_status,
         }
         if model_interpretation:
             result["model_interpretation"] = model_interpretation

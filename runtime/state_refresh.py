@@ -63,6 +63,7 @@ class StateRefresh:
         unsupported = [claim for claim in stale if str(claim.get("source") or "") not in self.probes]
         selected, cursor_before, cursor_after = self._select_fair_batch(supported, limit=limit)
         refreshed: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
         unresolvable: list[dict[str, Any]] = []
         for claim in selected:
             source = str(claim.get("source") or "")
@@ -85,6 +86,7 @@ class StateRefresh:
             raw = probe.run(target)
             raw = {
                 **raw,
+                "refresh_mode": "stale_claim",
                 **{
                     key: claim.get(key)
                     for key in (
@@ -97,7 +99,37 @@ class StateRefresh:
                 },
             }
             patch = self.perception.interpret_probe_result(raw)
-            refreshed.append({"claim": claim.get("key") or claim.get("claim"), "probe_result": raw, "state_patch": patch})
+            persistence = patch.get("belief_persistence") if isinstance(patch, dict) else None
+            persistence_status = (
+                str(persistence.get("status") or "")
+                if isinstance(persistence, dict)
+                else ""
+            )
+            entry = {
+                "claim": claim.get("key") or claim.get("claim"),
+                "probe_result": raw,
+                "state_patch": patch,
+            }
+            if persistence is None:
+                # Keep compatibility with bounded test doubles and older
+                # perception adapters, which returned an explicit accepted
+                # status without the detailed persistence envelope.
+                if patch.get("status") in {None, "accepted", "success"}:
+                    refreshed.append(entry)
+                else:
+                    failed.append({**entry, "reason": f"belief_persistence_{patch.get('status')}"})
+            elif persistence_status in {"accepted", "accepted_with_conflict"}:
+                refreshed.append(entry)
+            else:
+                # A probe can be successful while its observation is
+                # conflicted or rejected.  It must not be counted as a
+                # successful refresh until the Belief value is accepted.
+                failed.append(
+                    {
+                        **entry,
+                        "reason": f"belief_persistence_{persistence_status or 'unknown'}",
+                    }
+                )
         skipped = [
             {
                 "claim": claim.get("key") or claim.get("claim"),
@@ -121,8 +153,9 @@ class StateRefresh:
 
         self.state_store.mutate_json("state_refresh_state.json", record_refresh_batch)
         return {
-            "status": "success",
+            "status": "degraded" if failed else "success",
             "refreshed": refreshed,
+            "failed": failed,
             "skipped": skipped,
             "remaining_stale": max(0, len(supported) - len(refreshed)),
             "unsupported_stale": len(unsupported),

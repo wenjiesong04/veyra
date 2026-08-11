@@ -282,14 +282,20 @@ def belief_scope_identity_checks() -> None:
         expect(
             len(stored_after_update) == 4
             and any(
-                item.get("claim") == "PRIVATE_A_UPDATED"
+                item.get("claim") == "PRIVATE_A"
+                and item.get("status") == "conflict"
+                and any(
+                    observation.get("value_digest")
+                    for observation in item.get("conflict_observations", [])
+                    if isinstance(observation, dict)
+                )
                 for item in stored_after_update
             )
             and any(
                 item.get("claim") == "PRIVATE_B"
                 for item in stored_after_update
             ),
-            "same-scope Belief refresh merges without replacing peers",
+            "same-scope conflicting Belief remains durable without replacing peers",
             stored_after_update,
         )
         false_conflicts = []
