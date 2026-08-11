@@ -440,7 +440,7 @@ def test_cognitive_brief_attention_bridge() -> None:
             "candidate_recorded": True,
             "user_id": "bridge-user",
             "session_id": "bridge-session",
-            "cycle_id": "cog_bridge_0000000000000001",
+            "cycle_id": "cog_bbbbbbbbbbbbbbbb",
             "world_digest": "a" * 64,
             "selected_observations": [
                 {
@@ -463,6 +463,12 @@ def test_cognitive_brief_attention_bridge() -> None:
                 ]
             },
         }
+        bridge_ref = runtime._projection_ref(
+            "situation_graph",
+            cycle["selected_observations"][0]["payload"],
+        )  # noqa: SLF001
+        cycle["selected_observations"][0]["evidence_refs"] = [bridge_ref]
+        cycle["brief"]["material_changes"][0]["evidence_refs"] = [bridge_ref]
         admitted = runtime._bridge_candidate_to_attention(cycle)  # noqa: SLF001
         first_revision = int(
             store.read_json(AttentionHypothesisRuntime.STATE_FILE).get(
@@ -497,6 +503,142 @@ def test_cognitive_brief_attention_bridge() -> None:
         assert binding.get("hypothesis_id") == admitted.get("hypothesis_id")
         assert binding.get("general_situation_id") == "gsit-brief-bridge"
         assert binding.get("parent_revision") == 1
+
+        # Simulate a process crash after the durable prepared phase but before
+        # Attention admission.  Active-loop reconciliation must retry the
+        # exact cycle binding rather than leave the row pending forever.
+        durable_payload = cycle["selected_observations"][0]["payload"]
+        durable_ref = runtime._projection_ref("situation_graph", durable_payload)  # noqa: SLF001
+        durable_cycle = {
+            **cycle,
+            "status": "observed",
+            "reason": "smoke",
+            "mode": "record_only",
+            "created_at": clock().isoformat(),
+            "selected_opportunity_tokens": ["cogview_bridge"],
+            "selected_kinds": ["situation_graph"],
+            "evidence_refs": [durable_ref],
+            "selected_observations": [
+                {
+                    **cycle["selected_observations"][0],
+                    "evidence_refs": [durable_ref],
+                }
+            ],
+            "baseline": False,
+            "model_calls": 0,
+            "epistemic_status": "hypothesis",
+            "is_fact": False,
+            "authority": False,
+            "external_delivery": False,
+            "agent_execution": False,
+            "tool_execution": False,
+            "route_change_allowed": False,
+            "risk_change_allowed": False,
+        }
+        durable_cycle["brief"] = {
+            **cycle["brief"],
+            "material_changes": [
+                {
+                    **cycle["brief"]["material_changes"][0],
+                    "evidence_refs": [durable_ref],
+                }
+            ],
+        }
+        durable_scope_key = tenant_scope_storage_key("bridge-user", "bridge-session")
+        store.mutate_json(
+            "cognitive_loop_state.json",
+            lambda state: {
+                **state,
+                "scopes": {
+                    durable_scope_key: {
+                        "user_id": "bridge-user",
+                        "session_id": "bridge-session",
+                        "cycles": [durable_cycle],
+                        "cycle_count": 1,
+                        "last_cycle_id": durable_cycle["cycle_id"],
+                        "last_model_at": durable_cycle["created_at"],
+                        "last_checked_at": durable_cycle["created_at"],
+                        "updated_at": durable_cycle["created_at"],
+                        "last_world_digest": durable_cycle["world_digest"],
+                        "last_brief": durable_cycle["brief"],
+                    }
+                },
+                "scope_count": 1,
+            },
+        )
+        store.mutate_json(
+            "cognitive_loop_state.json",
+            lambda state: {
+                **state,
+                "metrics": runtime._metrics(  # noqa: SLF001
+                    state.get("scopes") or {},
+                    state.get("continuity") or {},
+                ),
+            },
+        )
+        prepared = {
+            **binding,
+            "status": "prepared",
+            "hypothesis_revision": None,
+            "committed_at": None,
+            "rejection_reason": None,
+        }
+        store.mutate_json(
+            "cognitive_loop_state.json",
+            lambda state: {
+                **state,
+                "bridge_bindings": {binding["binding_id"]: prepared},
+                "bridge_binding_count": 1,
+            },
+        )
+        store.mutate_json(
+            AttentionHypothesisRuntime.STATE_FILE,
+            lambda state: {
+                **state,
+                "hypotheses": {},
+                "identity_index": {},
+                "hypothesis_count": 0,
+                "status_counts": {
+                    "candidate": 0,
+                    "accumulating": 0,
+                    "confirmed": 0,
+                    "contradicted": 0,
+                    "expired": 0,
+                    "superseded": 0,
+                },
+            },
+        )
+        runtime._reconcile_attention_bridges()  # noqa: SLF001
+        recovered_state = store.read_json("cognitive_loop_state.json")
+        recovered_binding = recovered_state["bridge_bindings"][binding["binding_id"]]
+        assert recovered_binding.get("status") == "committed", recovered_binding
+        assert (
+            store.read_json(AttentionHypothesisRuntime.STATE_FILE).get("hypothesis_count")
+            == 1
+        )
+
+        # A same-ID binding with a forged parent revision is rejected rather
+        # than reconciled merely because the hypothesis ID still exists.
+        tampered = {
+            **recovered_binding,
+            "status": "prepared",
+            "parent_revision": 999,
+            "hypothesis_revision": None,
+            "committed_at": None,
+            "rejection_reason": None,
+        }
+        store.mutate_json(
+            "cognitive_loop_state.json",
+            lambda state: {
+                **state,
+                "bridge_bindings": {binding["binding_id"]: tampered},
+                "bridge_binding_count": 1,
+            },
+        )
+        runtime._reconcile_attention_bridges()  # noqa: SLF001
+        rejected_binding = store.read_json("cognitive_loop_state.json")["bridge_bindings"][binding["binding_id"]]
+        assert rejected_binding.get("status") == "rejected", rejected_binding
+        assert rejected_binding.get("rejection_reason"), rejected_binding
 
 
 def main() -> int:

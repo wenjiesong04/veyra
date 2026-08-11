@@ -682,6 +682,85 @@ class SuggestionOutbox:
             if not self._healthy(current):
                 result = self._closed("suggestion_outbox_state_corrupt")
                 return current
+            committed_config = self._mode_snapshot()
+            if committed_config.get("status") == "fail_closed":
+                result = committed_config
+                return current
+            committed_mode = str(
+                committed_config.get("mode") or output.get("mode") or self.DEFAULT_MODE
+            )
+            committed_epoch = committed_config.get("mode_epoch")
+            if (
+                committed_mode != str(output.get("mode") or self.DEFAULT_MODE)
+                or committed_epoch != mode_epoch
+            ):
+                suppressed = self._decision_record(
+                    general_situation=general_situation,
+                    assessment=assessment,
+                    attention_hypothesis_ref=attention_hypothesis_ref,
+                    user_id=user_id,
+                    session_id=session_id,
+                    mode=committed_mode,
+                    mode_epoch=committed_epoch,
+                    decision_disposition=str(
+                        output.get("decision_disposition") or "silent"
+                    ),
+                    delivery_disposition="suppressed",
+                    reason="suggestion_mode_changed_before_commit",
+                    proposal_id=proposal_id,
+                    now=self._now(),
+                )
+                selected = self._record_decision_in_state(current, suppressed)
+                result = {
+                    **copy.deepcopy(output),
+                    "status": "suppressed",
+                    "mode": committed_mode,
+                    "reason": "suggestion_mode_changed_before_commit",
+                    "delivery_disposition": "suppressed",
+                    "interaction_decision": self._public_decision(selected),
+                    "authority": self._authority_boundary(),
+                }
+                return current
+            if (
+                str(output.get("decision_disposition") or "silent") != "say"
+                and isinstance(attention_hypothesis_ref, dict)
+            ):
+                attention_issue = self._current_attention_binding_issue(
+                    general_situation=general_situation,
+                    assessment=assessment,
+                    attention_hypothesis_ref=attention_hypothesis_ref,
+                    user_id=user_id,
+                    scope_key=tenant_scope_storage_key(user_id, session_id),
+                    now=self._now(),
+                    require_confirmed=False,
+                )
+                if attention_issue is not None:
+                    rejected = self._decision_record(
+                        general_situation=general_situation,
+                        assessment=assessment,
+                        attention_hypothesis_ref=attention_hypothesis_ref,
+                        user_id=user_id,
+                        session_id=session_id,
+                        mode=committed_mode,
+                        mode_epoch=committed_epoch,
+                        decision_disposition=str(
+                            output.get("decision_disposition") or "silent"
+                        ),
+                        delivery_disposition="suppressed",
+                        reason=attention_issue,
+                        proposal_id=proposal_id,
+                        now=self._now(),
+                    )
+                    selected = self._record_decision_in_state(current, rejected)
+                    result = {
+                        **copy.deepcopy(output),
+                        "status": "fail_closed",
+                        "reason": attention_issue,
+                        "delivery_disposition": "suppressed",
+                        "interaction_decision": self._public_decision(selected),
+                        "authority": self._authority_boundary(),
+                    }
+                    return current
             selected = self._record_decision_in_state(current, record)
             result = {
                 **copy.deepcopy(output),
@@ -1228,6 +1307,7 @@ class SuggestionOutbox:
         user_id: str,
         scope_key: str,
         now: datetime,
+        require_confirmed: bool = True,
     ) -> str | None:
         """Require an exact, current confirmed ledger record before surfacing."""
 
@@ -1277,7 +1357,12 @@ class SuggestionOutbox:
             != attention_hypothesis_ref.get("hypothesis_revision")
             or record.get("ruleset_version")
             != attention_hypothesis_ref.get("ruleset_version")
-            or record.get("status") != "confirmed"
+            or (require_confirmed and record.get("status") != "confirmed")
+            or (
+                assessment.get("hypothesis_status") is not None
+                and str(assessment.get("hypothesis_status") or "")
+                != str(record.get("status") or "")
+            )
             or record.get("general_attention_scorer_version")
             != assessment.get("upstream_scorer_version")
         ):
@@ -1286,6 +1371,7 @@ class SuggestionOutbox:
             current_parent,
             record=record,
             now=now,
+            require_confirmable=require_confirmed,
         )
         if canonical is None:
             return "attention_hypothesis_evidence_not_current"
@@ -1385,6 +1471,7 @@ class SuggestionOutbox:
         *,
         record: dict[str, Any],
         now: datetime,
+        require_confirmable: bool = True,
     ) -> dict[str, Any] | None:
         from awareness.general_attention_scheduler import GeneralAttentionScheduler
         from runtime.attention_hypothesis_runtime import AttentionHypothesisRuntime
@@ -1403,7 +1490,7 @@ class SuggestionOutbox:
         except (TypeError, ValueError):
             return None
         if (
-            evaluated.get("confirmable") is not True
+            (require_confirmable and evaluated.get("confirmable") is not True)
             or record.get("general_attention_scorer_version")
             != evaluated.get("general_attention_scorer_version")
             or not runtime._same_assessment_generation(record, evaluated)

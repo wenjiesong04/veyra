@@ -604,6 +604,26 @@ def main() -> int:
             "forged score and freshness cannot enter the suggestion ledger",
             forged,
         )
+        stale_wait_surface = copy.deepcopy(assessment)
+        stale_wait_surface["eligible"] = False
+        stale_wait_surface["status"] = "not_eligible"
+        stale_wait_surface["hypothesis_status"] = "candidate"
+        stale_wait = outbox.consider(
+            parent,
+            stale_wait_surface,
+            user_id=USER,
+            session_id=SESSION,
+        )
+        expect(
+            stale_wait.get("status") == "fail_closed"
+            and stale_wait.get("reason") == "attention_hypothesis_binding_not_current"
+            and stale_wait.get("decision_disposition") == "wait"
+            and stale_wait.get("delivery_disposition") == "suppressed"
+            and store.read_json(SuggestionOutbox.STATE_FILE).get("proposal_count") == 0
+            and store.read_json(SuggestionOutbox.STATE_FILE).get("interaction_decision_count", 0) >= 1,
+            "non-say decisions reject a stale Attention surface inside the writer fence",
+            stale_wait,
+        )
         surfaced = outbox.consider(
             parent,
             assessment,

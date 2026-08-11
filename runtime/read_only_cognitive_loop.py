@@ -1125,28 +1125,70 @@ class ReadOnlyCognitiveLoopRuntime:
         bindings = state.get("bridge_bindings") if isinstance(state, dict) else None
         if not isinstance(bindings, dict):
             return
-        attention_state = self.state_store.read_json(AttentionHypothesisRuntime.STATE_FILE)
-        hypotheses = attention_state.get("hypotheses") if isinstance(attention_state, dict) else {}
-        if not isinstance(hypotheses, dict):
-            return
         for binding in list(bindings.values()):
             if not isinstance(binding, dict) or binding.get("status") not in {"prepared", "admitted"}:
                 continue
-            hypothesis = hypotheses.get(str(binding.get("hypothesis_id") or ""))
-            if not isinstance(hypothesis, dict):
+            cycle = self._cycle_for_bridge_binding(binding)
+            if cycle is None:
+                self._reject_reconciling_bridge(binding, "bridge_cycle_missing_or_scope_mismatch")
                 continue
-            committed = {
-                **copy.deepcopy(binding),
-                "status": "committed",
-                "hypothesis_revision": hypothesis.get("hypothesis_revision"),
-                "committed_at": utc_now_iso(),
-                "rejection_reason": None,
-            }
             try:
-                with self.state_store.writer_transaction():
-                    self._persist_bridge_binding(committed)
+                # Re-run the full admission path.  It recomputes parent,
+                # scope, evidence, digest, and canonical Attention bindings;
+                # if the process had crashed before hypothesis admission this
+                # safely retries it instead of leaving a permanent pending row.
+                admitted = self._bridge_candidate_to_attention(cycle)
             except (RuntimeError, ValueError):
-                return
+                admitted = {"status": "rejected", "reason": "bridge_recovery_failed"}
+            if str(admitted.get("binding_status") or "") in {"committed", "rejected"}:
+                continue
+            self._reject_reconciling_bridge(
+                binding,
+                str(admitted.get("reason") or "bridge_recovery_rejected"),
+            )
+
+    def _cycle_for_bridge_binding(self, binding: dict[str, Any]) -> dict[str, Any] | None:
+        """Resolve the exact durable cycle that prepared a bridge binding."""
+
+        try:
+            scope_key = tenant_scope_storage_key(
+                str(binding.get("user_id") or ""),
+                str(binding.get("session_id") or ""),
+            )
+        except (TypeError, ValueError):
+            return None
+        state = self.state_store.read_json(self.STATE_FILE)
+        scopes = state.get("scopes") if isinstance(state, dict) else None
+        scope = scopes.get(scope_key) if isinstance(scopes, dict) else None
+        if not isinstance(scope, dict):
+            return None
+        for cycle in scope.get("cycles") or []:
+            if not isinstance(cycle, dict) or cycle.get("cycle_id") != binding.get("cognitive_cycle_id"):
+                continue
+            if (
+                cycle.get("user_id") != binding.get("user_id")
+                or cycle.get("session_id") != binding.get("session_id")
+                or cycle.get("world_digest") != binding.get("world_digest")
+            ):
+                return None
+            return copy.deepcopy(cycle)
+        return None
+
+    def _reject_reconciling_bridge(self, binding: dict[str, Any], reason: str) -> None:
+        rejected = {
+            **copy.deepcopy(binding),
+            "status": "rejected",
+            "hypothesis_revision": None,
+            "committed_at": None,
+            "rejection_reason": str(reason)[:160] or "bridge_recovery_rejected",
+        }
+        try:
+            with self.state_store.writer_transaction():
+                self._persist_bridge_binding(rejected)
+        except (RuntimeError, ValueError):
+            # A concurrent writer may have finalized or replaced the same
+            # binding.  Recovery is best effort and must never claim a commit.
+            return
 
     def _opportunities(
         self,
