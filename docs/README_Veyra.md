@@ -8,9 +8,9 @@
 >
 > 最近事实核验：2026-08-11
 >
-> 已提交应用代码基线（最后一项运行代码提交）：`cognitive-awakening @ acfacebf934a00c73b6d2a53a625efa455d26835`；该提交持久化 interaction-decision ledger，并包含本轮 durable bridge、component-health producer 和 typed terminal lifecycle changes。本文后续的纯文档提交会推进 branch SHA，但不改变应用代码。实际任务 HEAD 与工作区必须用 Git 重新读取
+> 已提交应用代码基线（最后一项运行代码提交）：`cognitive-awakening @ 3e5a74e5c20d091968fd0bec3345248078a0fea6`；该提交为可刷新 Belief claim 增加 versioned typed `refresh_spec`，并让 refresh target binding 对 invalid/mismatched spec fail closed，同时保留旧 structured evidence 的兼容读取。它建立在前一轮 durable bridge、component-health producer、typed terminal lifecycle 和 interaction-decision ledger 之上。本文后续的纯文档提交会推进 branch SHA，但不改变应用代码。实际任务 HEAD 与工作区必须用 Git 重新读取
 >
-> 运行态说明：本机 API 于 2026-08-11 11:07:33 UTC 以 PID `69019` 重启，使用 `/opt/anaconda3/envs/veyra/bin/python`（Python 3.11），并报告 `veyra.runtime_build_identity.v2 / acfacebf934a00c73b6d2a53a625efa455d26835 / dirty=false`。`started_at=2026-08-11T11:07:36.284940+00:00`、`captured_at=2026-08-11T11:07:36.730221+00:00`；后续纯文档 SHA 不等于进程已加载的应用代码 SHA。
+> 运行态说明：本机 API 于 2026-08-11 11:26:13 UTC 以 PID `81871` 重启，使用 `/opt/anaconda3/envs/veyra/bin/python`（Python 3.11），并报告 `veyra.runtime_build_identity.v2 / 3e5a74e5c20d091968fd0bec3345248078a0fea6 / dirty=false`。`started_at=2026-08-11T11:26:17.546824+00:00`、`captured_at=2026-08-11T11:26:18.005872+00:00`；后续纯文档 SHA 不等于进程已加载的应用代码 SHA。
 
 本文件是一个**可更新的活文档**。它同时回答五个问题：
 
@@ -361,7 +361,7 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 
 ---
 
-## 3. 2026-08-11 复核与 Cognitive Awakening M1 证据
+## 3. 2026-08-11 复核与 Cognitive Awakening M1 / P2 refresh-spec 证据
 
 ### 3.1 Git 与 Cursor changeset
 
@@ -369,12 +369,13 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 
 | 项 | 当前事实 |
 |---|---|
-| 工作分支 | `cognitive-awakening`；应用代码 HEAD `acfacebf934a00c73b6d2a53a625efa455d26835`；文档提交前工作树 clean |
+| 工作分支 | `cognitive-awakening`；应用代码 HEAD `3e5a74e5c20d091968fd0bec3345248078a0fea6`；文档提交前工作树 clean |
 | 远端分支 | `origin/cognitive-awakening` 已包含该应用代码 HEAD；未 push 的代码差异为 0 |
 | 远端主线 | `origin/main @ 8a8a3d2` |
 | 本地主线 | `main @ 26d77fa`，落后 `origin/main`，不能直接作为新基线 |
-| 分支关系 | 应用代码提交相对 `origin/main` 为 ahead 26 / behind 0；本次 Living 文档提交纳入后预期为 ahead 27 / behind 0；最终 branch SHA 以提交后 Git 复核为准 |
+| 分支关系 | 应用代码提交相对 `origin/main` 为 ahead 28 / behind 0；本次 Living 文档提交纳入后预期为 ahead 29 / behind 0；最终 branch SHA 以提交后 Git 复核为准 |
 | M1 状态 | 真实 typed observation → AttentionHypothesis → interaction decision → record/shadow → owner-scoped advise → explicit feedback/calibration 已在本地运行态完成；权限、Route、Risk、外部交付均未扩大 |
+| P2 状态 | refresh-spec 首个窄切片已实现并通过本地 gate、重启和 Belief GET purity；EvidenceGraph、valid-time 仲裁、trusted Git/test/CI producer 和多真实样本校准仍未完成 |
 | 合并状态 | 尚未合入 `main`；按当前执行窗口保留在 `cognitive-awakening`，后续 PR/Actions/合并另行收口 |
 
 本轮垂直切片新增代码提交的目的：
@@ -383,29 +384,30 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 2. `98c1edf`：增加由服务端 `/health` 派生、禁止 caller 自报 facts 的 `component_health` typed producer；
 3. `b99f227`：增加 typed contradiction/supersede、终态不可复活和显式 replacement binding；
 4. `acfacebf`：持久化 exact owner/session、hypothesis ref、decision/delivery 和 policy digest 的 interaction-decision ledger。
+5. `3e5a74e`：为可刷新 claim 绑定严格的 `veyra.belief.refresh_spec.v1`，literal/default resolver 均由 typed spec 决定；缺失、invalid 或 source mismatch 不再从 claim prose 猜测 target。
 
-本轮代码复核未发现需要回滚的确定性回归。`8feda55` 的隔离 Git snapshot 已由 `acfacebf` 运行态验证：启动只捕获一次，GET 不运行 Git，schema v2 可用，dirty 为 false，`git_checked_on_request=false`；双轮 snapshot 漂移或 partial identity 仍整体 fail closed。新的 durable bridge、server-derived component-health producer、typed terminal lifecycle 和 interaction ledger 均已通过定向 smoke，并保持 `policy_effect=none` 与 authority locks 关闭。
+本轮代码复核未发现需要回滚的确定性回归。`8feda55` 的隔离 Git snapshot 先由 `acfacebf` 完成实现，现已由 `3e5a74e` 进程重新验证：启动只捕获一次，GET 不运行 Git，schema v2 可用，dirty 为 false，`git_checked_on_request=false`；双轮 snapshot 漂移或 partial identity 仍整体 fail closed。新的 durable bridge、server-derived component-health producer、typed terminal lifecycle 和 interaction ledger 均已通过定向 smoke，并保持 `policy_effect=none` 与 authority locks 关闭。
 
-2026-08-11 当前应用代码 `acfacebf` 的自动化结果：
+2026-08-11 当前应用代码 `3e5a74e` 的自动化结果：
 
 - 定向 runtime/认知/结构化观测 smoke：全部通过；AttentionHypothesis 为 `21/21`，typed lifecycle 为 `6/6`，component-health producer 为 `5/5`，interaction ledger 为 `3/3`，结构化观测控制面为 `10/10`；
-- Python gate：`137/137`，通过；
+- Python gate：`138/138`，通过；新增 `belief_refresh_spec_smoke.py` 验证 exact literal/default binding、source mismatch 和 prose-only fail closed；
 - OpenClaw governance plugin：`32/32`，通过；
 - Python compileall（临时 `PYTHONPYCACHEPREFIX`）：通过；
 - Web production build 与 Desktop frontend build：均通过，且构建未产生 tracked diff；
-- clean restart 与 live GET purity：通过；关键 state bytes、Git HEAD/index/worktree 均未变化；`/health` 与 `/runtime` 的 runtime projection 完全一致且连续读取冻结。
+- clean restart 与 live GET purity：通过；PID `81871` 使用 Conda Python 3.11 加载 `3e5a74e`，关键 state bytes、Git HEAD/index/worktree 均未变化；`/health` 与 `/runtime` 的 runtime projection 完全一致且连续读取冻结；`/belief/status` 与 `/belief/stale` 连续读取不写 `belief_state.json`。
 - 真实本地正例：`component_health` 入站使用服务端当前 health snapshot 生成 `availability_signal/degraded`，EventInbox revision `229 → 230`，server-owned receipt/evidence 可追溯，authority 全部为 false；真实反例：caller 自报 `component_health` + facts 以 HTTP `409` fail closed，EventInbox、Attention、Suggestion、Cognitive 和 Phase 6 authority 未变化。
 
 这些结果只证明当前本地 changeset 与本机运行态；它们不等于 GitHub Actions 或 Feishu 外部交付验收。Feishu 当前仍是 `running / connected / thread_alive`、`readiness=waiting_for_event`，但没有本进程 fresh inbound；按本阶段范围不阻塞 Console-only M1。GitHub Actions/PR 尚未在本窗口合并 main。
 
 ### 3.2 当前运行态快照
 
-当前 API 使用正确的 Conda Python 3.11 运行，PID `69019` 于 2026-08-11 11:07:33 UTC 启动；`/runtime` 的 `started_at=2026-08-11T11:07:36.284940+00:00`、`captured_at=2026-08-11T11:07:36.730221+00:00`。下表是 2026-08-11 11:11 UTC 左右的只读快照；开始新任务时必须重新读取：
+当前 API 使用正确的 Conda Python 3.11 运行，PID `81871` 于 2026-08-11 11:26:13 UTC 启动；`/runtime` 的 `started_at=2026-08-11T11:26:17.546824+00:00`、`captured_at=2026-08-11T11:26:18.005872+00:00`。下表是 2026-08-11 11:27 UTC 左右的只读快照；开始新任务时必须重新读取：
 
 | 表面 | 观察结果 | 正确解释 |
 |---|---|---|
 | `/health` | `degraded`，当前 5 条既有/时间相关告警；active loop、memory、safety 均 `ok` | `core_model_stale`（info）、stale Agent snapshot、无当前进程 Feishu event、历史 Review、stale Belief；没有新增 critical |
-| `/runtime` | schema `veyra.runtime_build_identity.v2`，revision `acfacebf934a00c73b6d2a53a625efa455d26835`，`dirty_flag=false` | `source=startup_git_snapshot`、`loaded_code_attested=false`、`unavailable_reason=null`、`git_checked_on_request=false`；`captured_at >= started_at`，连续 `/health` 与 `/runtime` 投影一致 |
+| `/runtime` | schema `veyra.runtime_build_identity.v2`，revision `3e5a74e5c20d091968fd0bec3345248078a0fea6`，`dirty_flag=false` | `source=startup_git_snapshot`、`loaded_code_attested=false`、`unavailable_reason=null`、`git_checked_on_request=false`；`captured_at >= started_at`，连续 `/health` 与 `/runtime` 投影一致 |
 | `/agent/status` | `snapshot_stale`，observed status `available` | 历史 capability/certification 不能当作当前 fresh dispatch 证明 |
 | Feishu WS | `running / connected / thread_alive`，`last_event_after_start=false` | WebSocket 存活，不等于本进程已收到并回复真实消息；fresh nonce 留待外部交付阶段 |
 | Cognitive Loop | `record_only`；191 cycles、140 observed、51 degraded、382 model calls、0 candidate；`overconservative_alert=true` | 模型只看 server-prepared cached views；无 Agent/Tool/外部交付/Route/Risk 变化，背景循环仍不是产品价值证明；bridge durable binding 当前 live count 为 0，绑定/reconcile 已由 smoke 覆盖 |
@@ -415,7 +417,7 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 | Calibration | exact owner/session 下 `useful=1`、useful rate `1.0`，support `insufficient_data`，`policy_effect=none` | 这是描述性校准样本，不自动改阈值、Route、provider、risk 或 authority |
 | Phase 6 runner / dynamic validation | runner snapshot `stale / fail_closed / degraded`；dynamic validation admission `start_ready=false` | 既有 fail-closed 降级；本轮未启动 runner、dynamic validation、pipeline 或 autonomous extension |
 
-历史上，`431c26b` 首次将冻结的 `build_revision / dirty_flag / started_at` 追加到 `/health` 和 `/runtime`，但普通 Git 探测会继承仓库配置；`8feda55` 随后把公开合同升级为 `veyra.runtime_build_identity.v2`，增加 `captured_at`、来源和 authority 边界字段，并使用 synthetic Git dir + 临时 index、清理 `GIT_*`、禁用 fsmonitor/optional locks/replace refs/外部 filter-diff 执行。当前 `acfacebf` 已对该修复完成 clean live validation：两轮 HEAD/index/status 任一漂移或任一 partial identity 仍整体投影为 `unavailable / null`，并明确 `loaded_code_attested=false`；启动时 Git snapshot 是有界工作区观察，不是运行字节 attestation。
+历史上，`431c26b` 首次将冻结的 `build_revision / dirty_flag / started_at` 追加到 `/health` 和 `/runtime`，但普通 Git 探测会继承仓库配置；`8feda55` 随后把公开合同升级为 `veyra.runtime_build_identity.v2`，增加 `captured_at`、来源和 authority 边界字段，并使用 synthetic Git dir + 临时 index、清理 `GIT_*`、禁用 fsmonitor/optional locks/replace refs/外部 filter-diff 执行。当前 `3e5a74e` 进程已对该修复完成 clean live validation：两轮 HEAD/index/status 任一漂移或任一 partial identity 仍整体投影为 `unavailable / null`，并明确 `loaded_code_attested=false`；启动时 Git snapshot 是有界工作区观察，不是运行字节 attestation。
 
 ### 3.3 当前能力矩阵
 
@@ -539,7 +541,7 @@ Hypothesis 已支持 `candidate / accumulating / confirmed / contradicted / expi
 
 ### 4.6 Runtime revision 已安全收口，但不是 loaded-code attestation
 
-`acfacebf` 已完成 clean restart 和 live validation：启动快照为 schema v2、full SHA、`dirty_flag=false`，两轮一致，GET 不运行 Git；`captured_at >= started_at`，`source=startup_git_snapshot`，`loaded_code_attested=false`。这证明当前应用代码的启动观察安全且可复核，不等于进程以后会感知工作区变化，也不等于纯文档提交已加载；未知或 partial identity 仍必须整体降级。
+`3e5a74e` 已完成 clean restart 和 live validation：启动快照为 schema v2、full SHA、`dirty_flag=false`，两轮一致，GET 不运行 Git；`captured_at >= started_at`，`source=startup_git_snapshot`，`loaded_code_attested=false`。这证明当前应用代码的启动观察安全且可复核，不等于进程以后会感知工作区变化，也不等于纯文档提交已加载；未知或 partial identity 仍必须整体降级。
 
 ---
 
@@ -549,7 +551,7 @@ Hypothesis 已支持 `candidate / accumulating / confirmed / contradicted / expi
 
 ### P0：当前 `cognitive-awakening` 分支的本地收口状态
 
-应用代码 changeset 已完成审阅、定向 smoke、`137/137` gate、OpenClaw plugin `32/32`、compileall、Web/Desktop build、clean restart、runtime surface、真实 component-health 正反例和 GET purity 验收。应用代码 revision 是 `acfacebf934a00c73b6d2a53a625efa455d26835`；文档提交前当前分支相对 `origin/main` ahead 26 / behind 0，仍留在 `cognitive-awakening`，尚未合入 main。
+应用代码 changeset 已完成审阅、定向 smoke、`138/138` gate、OpenClaw plugin `32/32`、compileall、Web/Desktop build、clean restart、runtime surface、真实 component-health 正反例和 GET purity 验收。当前应用代码 revision 是 `3e5a74e5c20d091968fd0bec3345248078a0fea6`；文档提交前当前分支相对 `origin/main` ahead 28 / behind 0，仍留在 `cognitive-awakening`，尚未合入 main。
 
 剩余收口动作是 GitHub Actions、PR 审阅和按用户明确窗口执行的合并；这些动作不能倒推为本地 live 或 Feishu 外部交付已经通过。纯文档提交推进的 branch SHA 必须与运行进程的 application revision 分开记录；本轮不因缺少 Feishu fresh nonce 阻塞 M1，但也不把 WebSocket connected 当作外部交付通过。
 
@@ -572,12 +574,12 @@ Hypothesis 已支持 `candidate / accumulating / confirmed / contradicted / expi
 
 M1 接受标准已满足：真实、非 fixture、可回放的 proposal；证据、未知、owner/session 和 replay 可检查；Agent、Tool、Grant、Route、Risk、authority、业务 state 和外部发送均未扩大。Feishu fresh nonce 属于未来外部交付验证，本阶段不作为 M1 阻塞条件。
 
-### P2：Belief Economy 与 EvidenceGraph v1
+### P2：Belief Economy 与 EvidenceGraph v1（已启动）
 
 目标：让系统不只是保存 claim，而是知道什么值得刷新、证据怎样关联。
 
-- 为可刷新 claim 引入结构化 `refresh_spec`；
-- 删除所有从 claim 自由文本推导 probe target 的 fallback；
+- [x] 为可刷新 claim 引入结构化 `veyra.belief.refresh_spec.v1`；literal/default resolver 和 source binding 已由 schema 校验；
+- [x] 删除从 claim 自由文本推导 probe target 的 fallback；缺失或 mismatched typed spec 对需要 target 的刷新请求 fail closed；旧 structured evidence 仅作兼容读取，不再覆盖显式 spec；
 - 维护 provenance、valid time、entity refs、support/contradiction 和 supersession；
 - 建立最小 EvidenceGraph，不急于更换数据库；
 - 让刷新预算考虑 importance、change probability 和 decision impact；任一 unknown 时不猜值；
@@ -917,18 +919,18 @@ Route 清单不再手工维护固定数量。当前路由事实以当前 revisio
 - [x] 完成隔离 Git snapshot 的 worktree 修复及定向 smoke；
 - [x] 独立只读 review 当前安全修复；未发现 hook/filter/GIT 环境或仓库 index 写入绕过，schema v2、SHA-256、split/linked worktree 和竞态测试已补齐；
 - [x] 按 Constitutional / Living Zone 拆分文档提交；
-- [x] 定向 runtime、认知和结构化观测 smoke 通过；`137/137` gate、plugin `32/32`、compileall、Web/Desktop frontend build 均通过；
-- [x] clean restart 最终应用代码 revision，核对 Python 3.11、PID `69019`、`build_revision=acfacebf934a00c73b6d2a53a625efa455d26835`、`dirty_flag=false` 和 GET 纯读；
+- [x] 定向 runtime、认知、结构化观测和 Belief refresh-spec smoke 通过；`138/138` gate、plugin `32/32`、compileall、Web/Desktop frontend build 均通过；
+- [x] clean restart 最新应用代码 revision，核对 Python 3.11、PID `81871`、`build_revision=3e5a74e5c20d091968fd0bec3345248078a0fea6`、`dirty_flag=false` 和 GET 纯读；
 - [x] 重新做该应用代码 revision 的真实 component-health typed-observation 正例、伪造 producer fail-closed 反例、runtime surfaces 和 Phase 6 fail-closed 验收；
 - [x] 验证 durable bridge、typed contradiction/supersede、不可复活、persistent interaction-decision ledger 的定向 smoke 与重启后状态边界；
 - [ ] Feishu fresh current-run 入站→处理→`provider_sent` 证据；该证据属于未来外部交付阶段，本次 Console-only M1 不阻塞；
 - [ ] GitHub Actions 对最终分支 SHA 通过；
 - [ ] 按当前窗口通过 PR 合并 `cognitive-awakening -> main`。
 
-### M1 之后的下一开发切片（P2 起，尚未开始）
+### M1 之后的下一开发切片（P2，refresh-spec 已完成）
 
 - [ ] trusted Git/test/CI typed observation producer；
-- [ ] EvidenceGraph v1、valid-time 和冲突仲裁；
+- [ ] EvidenceGraph v1、valid-time 和冲突仲裁（下一切片）；
 - [ ] 多真实样本下的 usefulness / timing / evidence 校准；
 - [ ] 保持 external delivery、Agent、Tool、Route、Risk 和 authority 全部不变。
 
