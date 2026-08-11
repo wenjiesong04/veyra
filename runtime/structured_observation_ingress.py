@@ -13,8 +13,10 @@ from core.world_state import WorldStateStore
 from interface.event_schema import EventSource, EventType, VeyraEvent
 from interface.structured_observation import (
     STRUCTURED_OBSERVATION_CHANNEL,
+    STRUCTURED_OBSERVATION_COMMAND_SCHEMA,
     STRUCTURED_OBSERVATION_EVENT_SCHEMA,
     StructuredObservationAuthority,
+    ComponentHealthObservationRequest,
     StructuredObservationCommand,
     canonical_digest,
     canonical_utc,
@@ -136,6 +138,7 @@ class StructuredObservationIngress:
         state_store: WorldStateStore,
         event_awareness: ShadowAwarenessRuntime,
         control_token: str | None = None,
+        component_health_snapshot: Callable[[], dict[str, Any]] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.state_store = state_store
@@ -145,6 +148,7 @@ class StructuredObservationIngress:
             if control_token is None
             else control_token
         ).strip()
+        self.component_health_snapshot = component_health_snapshot
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def status(self) -> dict[str, Any]:
@@ -206,6 +210,14 @@ class StructuredObservationIngress:
             # future in-process bindings.  A network caller must never be able
             # to self-assert a component/runtime identity in the request body.
             "http_producer_allowlist": ["local_operator"],
+            "trusted_producer_capabilities": (
+                ["component_health"]
+                if callable(self.component_health_snapshot)
+                else []
+            ),
+            "component_health_producer_configured": callable(
+                self.component_health_snapshot
+            ),
             "numeric_salience_accepted": False,
             "free_text_or_metadata_accepted": False,
             "authority": self._authority(),
@@ -291,6 +303,110 @@ class StructuredObservationIngress:
                     durable_event_status=durable_status,
                 )
         return selected
+
+    def submit_component_health(
+        self,
+        request: ComponentHealthObservationRequest,
+        *,
+        control_token: str,
+    ) -> dict[str, Any]:
+        """Publish a server-derived health observation under an exact owner.
+
+        The request carries only owner/workspace/session and an EventInbox CAS.
+        Component status, severity, evidence id and timestamps come from the
+        server callback, so a network caller cannot self-assert health or
+        impersonate another typed producer.
+        """
+
+        self._authorize(control_token)
+        if not isinstance(request, ComponentHealthObservationRequest):
+            request = ComponentHealthObservationRequest.model_validate(
+                request,
+                strict=True,
+            )
+        if not callable(self.component_health_snapshot):
+            raise StructuredObservationUnavailableError(
+                "component health producer is not configured"
+            )
+        try:
+            snapshot = self.component_health_snapshot()
+        except Exception as exc:
+            raise StructuredObservationUnavailableError(
+                "component health snapshot is unavailable"
+            ) from exc
+        if not isinstance(snapshot, dict):
+            raise StructuredObservationUnavailableError(
+                "component health snapshot is invalid"
+            )
+        status = str(snapshot.get("status") or "").strip().lower()
+        if status not in {"healthy", "degraded", "critical"}:
+            raise StructuredObservationUnavailableError(
+                "component health status is outside the typed producer contract"
+            )
+        alerts = snapshot.get("alerts")
+        if not isinstance(alerts, list) or any(not isinstance(item, dict) for item in alerts):
+            raise StructuredObservationUnavailableError(
+                "component health alerts are invalid"
+            )
+        now = parse_aware_utc(request.occurred_at)
+        snapshot_digest = canonical_digest(
+            {
+                "status": status,
+                "alert_count": len(alerts),
+                "alerts": alerts,
+                "components": snapshot.get("components")
+                if isinstance(snapshot.get("components"), dict)
+                else {},
+            }
+        )
+        if status == "critical":
+            state, severity, urgency, novelty, uncertainty = (
+                "degraded", "critical", "immediate", "changed", "high"
+            )
+            evidence_quality = "corroborated"
+        elif status == "degraded":
+            state, severity, urgency, novelty, uncertainty = (
+                "degraded", "high", "soon", "changed", "medium"
+            )
+            evidence_quality = "corroborated"
+        else:
+            state, severity, urgency, novelty, uncertainty = (
+                "present", "info", "routine", "known", "low"
+            )
+            evidence_quality = "direct"
+        command = StructuredObservationCommand.model_validate(
+            {
+                "schema_version": STRUCTURED_OBSERVATION_COMMAND_SCHEMA,
+                "operation_id": request.operation_id,
+                "producer_id": "component_health",
+                "producer_receipt_id": "component_health:" + snapshot_digest[:32],
+                "user_id": request.user_id,
+                "workspace_id": request.workspace_id,
+                "session_id": request.session_id,
+                "expected_event_inbox_revision": request.expected_event_inbox_revision,
+                "occurred_at": canonical_utc(now),
+                "valid_until": canonical_utc(now + timedelta(minutes=15)),
+                "anchors": [{"kind": "entity", "ref_id": "component:veyra"}],
+                "evidence": [
+                    {
+                        "evidence_id": "component-health:" + snapshot_digest[:32],
+                        "source": "derived_rule",
+                    }
+                ],
+                "facts": {
+                    "kind": "availability_signal",
+                    "state": state,
+                    "severity": severity,
+                    "urgency": urgency,
+                    "novelty": novelty,
+                    "uncertainty": uncertainty,
+                    "evidence_quality": evidence_quality,
+                    "epistemic_status": "observed",
+                },
+            },
+            strict=True,
+        )
+        return self.submit(command, control_token=control_token)
 
     def _event(
         self,

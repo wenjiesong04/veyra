@@ -221,6 +221,38 @@ class StructuredObservationCommand(BaseModel):
         return canonical_digest(payload)
 
 
+class ComponentHealthObservationRequest(BaseModel):
+    """Scope and CAS only; health facts are always derived server-side."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    schema_version: Literal["veyra.component_health_observation.request.v1"]
+    operation_id: str = Field(min_length=1, max_length=240)
+    user_id: str = Field(min_length=1, max_length=240)
+    workspace_id: str = Field(min_length=1, max_length=1024)
+    session_id: str = Field(min_length=1, max_length=240)
+    expected_event_inbox_revision: StrictInt = Field(
+        ge=0,
+        le=2_147_483_647,
+    )
+    occurred_at: str = Field(min_length=20, max_length=40)
+
+    @field_validator("operation_id")
+    @classmethod
+    def validate_identifier(cls, value: str) -> str:
+        if not _IDENTIFIER.fullmatch(value):
+            raise ValueError("component health operation identifier is invalid")
+        return value
+
+    @field_validator("occurred_at")
+    @classmethod
+    def validate_time(cls, value: str) -> str:
+        parsed = parse_aware_utc(value)
+        if canonical_utc(parsed) != value:
+            raise ValueError("component health time must be canonical UTC")
+        return value
+
+
 __all__ = [
     "STRUCTURED_OBSERVATION_CHANNEL",
     "STRUCTURED_OBSERVATION_COMMAND_SCHEMA",
@@ -228,6 +260,7 @@ __all__ = [
     "StructuredObservationAnchor",
     "StructuredObservationAuthority",
     "StructuredObservationCommand",
+    "ComponentHealthObservationRequest",
     "StructuredObservationEvidence",
     "StructuredObservationFacts",
     "canonical_digest",

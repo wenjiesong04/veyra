@@ -213,8 +213,9 @@ def main() -> int:
             == {
                 ("/awareness/structured-observations/status", "GET"),
                 ("/awareness/structured-observations", "POST"),
+                ("/awareness/structured-observations/component-health", "POST"),
             },
-            "structured ingress exposes exactly one public status and one private command",
+            "structured ingress exposes one pure status and two private typed producers",
             paths,
         )
 

@@ -232,6 +232,7 @@ structured_observation_ingress = StructuredObservationIngress(
     state_store=state_store,
     event_awareness=awareness_loop.event_awareness,
     control_token=os.getenv("VEYRA_LOCAL_API_TOKEN") or "",
+    component_health_snapshot=lambda: ops_monitor.health(),
 )
 feishu_adapter = FeishuAdapter(intake_gateway, state_store=state_store)
 feishu_ws_runner = FeishuWsRunner(state_store=state_store, adapter=feishu_adapter)

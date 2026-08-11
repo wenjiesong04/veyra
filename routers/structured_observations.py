@@ -5,7 +5,10 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 
-from interface.structured_observation import StructuredObservationCommand
+from interface.structured_observation import (
+    ComponentHealthObservationRequest,
+    StructuredObservationCommand,
+)
 from routers.private_control_plane import PrivateControlPlaneRoute
 from runtime.structured_observation_ingress import (
     StructuredObservationConflictError,
@@ -79,6 +82,21 @@ def build_structured_observations_router(
         try:
             return await run_in_threadpool(
                 ingress.submit,
+                command,
+                control_token=_control_token(request),
+            )
+        except Exception as exc:
+            _raise_ingress_error(exc)
+            raise AssertionError("unreachable")
+
+    @router.post("/component-health")
+    async def submit_component_health_observation(
+        request: Request,
+        command: ComponentHealthObservationRequest,
+    ) -> dict[str, Any]:
+        try:
+            return await run_in_threadpool(
+                ingress.submit_component_health,
                 command,
                 control_token=_control_token(request),
             )
