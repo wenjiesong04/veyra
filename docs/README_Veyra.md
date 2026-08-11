@@ -406,7 +406,7 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 - clean restart 与 live GET purity：通过；PID `91916` 使用 Conda Python 3.11.15 加载 `5b80a26`，关键 state bytes、Git HEAD/index/worktree 均未变化；`/health` 与 `/runtime` 的 runtime projection 完全一致且连续读取冻结；`/health`、`/runtime`、`/phase6/status` 等 11 个 GET 端点均未写 `state/local`，`openclaw_device.json` 也保持不变。当前 active loop 的 `stale_state` 因无 event probe 报 `degraded`，不再假报 refreshed success；component-health background step 默认 `not_configured`。
 - 真实本地正例：本轮 server-derived component-health producer、durable conflict receipt、bridge recovery、non-say stale surface rejection 均通过真实本地/受控运行验证；authority 全部为 false。真实反例：caller 自报 `component_health` + facts 以 HTTP `409` fail closed，EventInbox、Attention、Suggestion、Cognitive 和 Phase 6 authority 未变化；交替 conflicting observation 保留旧 Belief 值并在安全容量不足时拒绝新写入。
 
-这些结果只证明当前本地 changeset 与本机运行态；它们不等于 Feishu 外部交付验收。Feishu 当前仍是 `running / connected`、`last_event_after_start=false`，没有本进程 fresh inbound；按本阶段范围不阻塞 Console-only M1。`5b80a26` 的 GitHub Actions 在文档核验时仍为 `in_progress`，因此不能写成 green；文档提交会触发新的 exact-SHA run。本分支尚未合入 `main`。
+这些结果只证明当前本地 changeset 与本机运行态；它们不等于 Feishu 外部交付验收。Feishu 当前仍是 `running / connected`、`last_event_after_start=false`，没有本进程 fresh inbound；按本阶段范围不阻塞 Console-only M1。GitHub Actions 是独立的 exact-SHA 外部证据，每次 push 后必须重新检查；`in_progress / pending / failure / cancelled` 都不能写成 green。本分支尚未合入 `main`。
 
 ### 3.2 当前运行态快照
 
