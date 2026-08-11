@@ -522,6 +522,8 @@ class WorldStateStore:
                 "scope_count": 0,
                 "continuity": {},
                 "continuity_count": 0,
+                "bridge_bindings": {},
+                "bridge_binding_count": 0,
                 "metrics": {
                     "cycle_count": 0,
                     "observed_count": 0,

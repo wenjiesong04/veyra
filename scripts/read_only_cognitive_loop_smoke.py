@@ -489,6 +489,14 @@ def test_cognitive_brief_attention_bridge() -> None:
             )
             == 1
         )
+        bridge_state = store.read_json("cognitive_loop_state.json")
+        bridge_bindings = bridge_state.get("bridge_bindings") or {}
+        assert len(bridge_bindings) == 1
+        binding = next(iter(bridge_bindings.values()))
+        assert binding.get("status") == "committed"
+        assert binding.get("hypothesis_id") == admitted.get("hypothesis_id")
+        assert binding.get("general_situation_id") == "gsit-brief-bridge"
+        assert binding.get("parent_revision") == 1
 
 
 def main() -> int:
