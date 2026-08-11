@@ -127,7 +127,9 @@ def main() -> int:
             rejections,
         )
 
-        # Non-regression: an ordinary owner-scoped claim still upserts in place.
+        # Non-regression: an ordinary owner-scoped claim still upserts in
+        # place, while a conflicting value is retained as evidence instead of
+        # silently replacing the current belief.
         for index in range(30):
             belief.upsert_claim(scoped_claim(f"observation-{index}"))
 
@@ -140,14 +142,20 @@ def main() -> int:
             len(platform),
         )
         expect(
-            platform[0].get("claim") == "observation-29",
-            "the surviving row holds the newest observation",
+            platform[0].get("claim") == "observation-0"
+            and platform[0].get("status") == "conflict",
+            "the surviving row preserves the current value on conflict",
             platform[0].get("claim"),
         )
         expect(
             int(platform[0].get("refresh_count") or 0) == 29,
             "refresh_count still tracks replacement history",
             platform[0].get("refresh_count"),
+        )
+        expect(
+            len(platform[0].get("conflict_observations") or []) <= 12,
+            "conflict observations remain bounded",
+            len(platform[0].get("conflict_observations") or []),
         )
         expect(
             item_visible_to_scope(platform[0], user_id="user_a", session_id="session_a"),
