@@ -476,6 +476,22 @@ class WorldStateStore:
             },
             "belief_state.json": {
                 "claims": [],
+                "evidence_graph": {
+                    "schema_version": "veyra.belief.evidence_graph.v1",
+                    "revision": 0,
+                    "nodes": [],
+                    "edges": [],
+                    "unresolved": [],
+                    "summary": {
+                        "nodes": 0,
+                        "edges": 0,
+                        "support": 0,
+                        "contradiction": 0,
+                        "supersession": 0,
+                        "unresolved": 0,
+                        "invalid_valid_time": 0,
+                    },
+                },
                 "summary": {
                     "fresh": 0,
                     "stale": 0,

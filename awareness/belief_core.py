@@ -9,6 +9,7 @@ from awareness.claim_schema import (
     make_claim,
     refresh_claim_status,
 )
+from awareness.evidence_graph import EvidenceGraphError, ingest_claim
 from core.context_scope import item_visible_to_scope
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent, utc_now_iso
@@ -50,7 +51,28 @@ class BeliefCore:
         if identity is None:
             return self._reject_unscoped_claim(claim)
 
+        result_claim: dict[str, Any] = dict(claim)
+
         def update_belief(belief: dict[str, Any]) -> dict[str, Any]:
+            nonlocal result_claim
+            graph, _, graph_projection = ingest_claim(
+                belief.get("evidence_graph"),
+                claim,
+                identity=identity,
+            )
+            result_claim = {
+                **claim,
+                "evidence_refs": self._merge_evidence_refs(
+                    claim.get("evidence_refs"),
+                    graph_projection.get("evidence_refs"),
+                ),
+                "evidence_graph_status": graph_projection.get("status") or "unresolved",
+            }
+            conflict_refs = graph_projection.get("conflict_refs")
+            if isinstance(conflict_refs, list) and conflict_refs:
+                result_claim["evidence_graph_conflict_refs"] = sorted(
+                    {str(item) for item in conflict_refs if str(item)}
+                )
             claims = belief.setdefault("claims", [])
             if not isinstance(claims, list):
                 claims = []
@@ -81,11 +103,20 @@ class BeliefCore:
             belief["claims"] = detect_conflicts(
                 [refresh_claim_status(item) for item in claims if isinstance(item, dict)]
             )[-250:]
+            belief["evidence_graph"] = graph
             belief["summary"] = self.summary_from_claims(belief["claims"])
             return belief
 
-        self.state_store.mutate_json("belief_state.json", update_belief)
-        return claim
+        try:
+            self.state_store.mutate_json("belief_state.json", update_belief)
+        except EvidenceGraphError as exc:
+            return {
+                **claim,
+                "status": "rejected_evidence_graph",
+                "persisted": False,
+                "evidence_graph_error": str(exc),
+            }
+        return result_claim
 
     def upsert_claims(self, claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [self.upsert_claim(claim) for claim in claims]
@@ -124,6 +155,20 @@ class BeliefCore:
 
         self.state_store.mutate_json("belief_state.json", record_rejection)
         return {**claim, "status": "rejected_unscoped", "persisted": False}
+
+    @staticmethod
+    def _merge_evidence_refs(*values: Any) -> list[str]:
+        refs: set[str] = set()
+        for value in values:
+            if isinstance(value, str) and value:
+                refs.add(value)
+            elif isinstance(value, list):
+                refs.update(
+                    item
+                    for item in value
+                    if isinstance(item, str) and item
+                )
+        return sorted(refs)[-32:]
 
     def refresh(
         self,

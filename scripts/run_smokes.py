@@ -62,6 +62,7 @@ GATE_SMOKES = [
     "belief_read_purity_smoke.py",
     "belief_scope_retention_smoke.py",
     "belief_refresh_spec_smoke.py",
+    "evidence_graph_smoke.py",
     "probe_observation_loop_smoke.py",
     "conservatism_monitor_smoke.py",
     "epistemic_hygiene_smoke.py",
