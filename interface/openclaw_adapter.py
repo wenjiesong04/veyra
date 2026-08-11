@@ -1212,19 +1212,74 @@ class OpenClawAdapter(AgentAdapter):
                 runtime="openclaw",
                 base_url=self.gateway_url,
             )
-        status = str(capabilities.get("status", "unknown"))
-        configured = bool(self.gateway_url)
         observed_at = datetime.now(timezone.utc)
         capabilities = {
             **capabilities,
             "updated_at": observed_at.isoformat(),
             "ttl_seconds": 300,
         }
+        # Keep the last complete projection available to read-only status
+        # callers. This is process-local cache state, not a business-state
+        # write and never performs a gateway probe.
+        self._remember_capabilities(capabilities)
+        return self._connection_status_from_capabilities(
+            capabilities,
+            observed_at=observed_at,
+            read_only=False,
+        )
+
+    def connection_status_cached(self) -> dict[str, Any]:
+        """Return the last observed status without network or local writes.
+
+        Status GETs must not refresh the OpenClaw handshake: a fresh handshake
+        may rotate the local device token. An empty cache is deliberately
+        reported as unavailable rather than probing or creating device state.
+        """
+
+        with self._capabilities_cache_lock:
+            capabilities = copy.deepcopy(self._capabilities_cache)
+        if not capabilities:
+            capabilities = normalize_capabilities(
+                {
+                    "runtime": "openclaw",
+                    "status": "cached_unavailable",
+                    "connected": False,
+                    "protocol": "openclaw_gateway_ws",
+                    "features": self._phase4_capability_features(),
+                },
+                runtime="openclaw",
+                base_url=self.gateway_url,
+            )
+            return self._connection_status_from_capabilities(
+                capabilities,
+                observed_at=None,
+                read_only=True,
+            )
+        observed_at = self._parse_status_time(
+            capabilities.get("updated_at")
+        )
+        return self._connection_status_from_capabilities(
+            capabilities,
+            observed_at=observed_at,
+            read_only=True,
+        )
+
+    def _connection_status_from_capabilities(
+        self,
+        capabilities: dict[str, Any],
+        *,
+        observed_at: datetime | None,
+        read_only: bool,
+    ) -> dict[str, Any]:
+        status = str(capabilities.get("status", "unknown"))
+        configured = bool(self.gateway_url)
+        certification_now = datetime.now(timezone.utc)
+        certification_observed_at = observed_at
         certification = certify_agent_provider(
             runtime="openclaw",
             capabilities=capabilities,
-            observed_at=observed_at,
-            now=observed_at,
+            observed_at=certification_observed_at,
+            now=certification_now,
             ttl_seconds=300,
             trusted_native_adapter=True,
         )
@@ -1247,7 +1302,11 @@ class OpenClawAdapter(AgentAdapter):
                 if isinstance(capabilities.get("features"), dict)
                 else self._phase4_capability_features()
             ),
-            "auth_diagnostics": self._auth_diagnostics(),
+            "auth_diagnostics": (
+                self._auth_diagnostics_read_only()
+                if read_only
+                else self._auth_diagnostics()
+            ),
             "provider_certification": certification,
             "validation": {
                 "implemented": True,
@@ -1259,6 +1318,18 @@ class OpenClawAdapter(AgentAdapter):
             },
             "capabilities": capabilities,
         }
+
+    @staticmethod
+    def _parse_status_time(value: Any) -> datetime | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
     def _governed_dispatch_preflight(self) -> dict[str, Any]:
         """Require fresh scoped enforcement before any Agent prompt leaves Veyra."""
@@ -3221,6 +3292,34 @@ class OpenClawAdapter(AgentAdapter):
             "device_store_exists": self.device_store.exists(),
             "device_identity_loaded": bool(identity and identity.get("deviceId") and identity.get("privateKey")),
             "device_token_available": bool(identity and identity.get("token")),
+            "gateway_token_configured": bool(self.api_key),
+        }
+
+    def _auth_diagnostics_read_only(self) -> dict[str, Any]:
+        """Summarize auth state without chmod, mkdir, token refresh, or writes."""
+
+        exists = False
+        identity_loaded = False
+        token_available = False
+        try:
+            exists = self.device_store.exists() and not self.device_store.is_symlink()
+            if exists:
+                raw = json.loads(self.device_store.read_text(encoding="utf-8") or "{}")
+                if isinstance(raw, dict) and raw.get("version") == 1:
+                    public_key = raw.get("publicKey")
+                    private_key = raw.get("privateKey")
+                    identity_loaded = bool(public_key and private_key)
+                    tokens = raw.get("tokens")
+                    operator = tokens.get("operator") if isinstance(tokens, dict) else None
+                    token_available = bool(isinstance(operator, dict) and operator.get("token"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+        return {
+            "crypto_available": bool(_ensure_crypto_available()),
+            "device_store": str(self.device_store),
+            "device_store_exists": exists,
+            "device_identity_loaded": identity_loaded,
+            "device_token_available": token_available,
             "gateway_token_configured": bool(self.api_key),
         }
 

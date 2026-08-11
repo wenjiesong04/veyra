@@ -113,7 +113,9 @@ class ReadOnlyAgentCollaborationRuntime:
             counts = {}
             storage_status = "degraded"
             issue = "collaboration_state_invalid"
-        directory = self.capability_directory.snapshot()
+        # Status is a pure projection. Explicit runtime selection remains the
+        # only path allowed to perform a fresh provider observation.
+        directory = self.capability_directory.snapshot(read_only=True)
         eligible = list(directory.get("eligible_runtimes") or [])
         return {
             "schema_version": COLLABORATION_STATUS_SCHEMA,

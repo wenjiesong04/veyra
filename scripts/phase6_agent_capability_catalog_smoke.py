@@ -46,6 +46,11 @@ class FakeOpenClawAdapter(AgentAdapter):
     def __init__(self) -> None:
         self.sent: list[str] = []
         self.force_refreshes: list[bool] = []
+        self.cached_reads = 0
+
+    def connection_status_cached(self) -> dict[str, Any]:
+        self.cached_reads += 1
+        return self.connection_status(force_refresh=False)
 
     def connection_status(
         self, *, force_refresh: bool = False
@@ -274,6 +279,20 @@ def main() -> int:
             and all(native.force_refreshes),
             "native eligibility uses a fresh exact status observation",
             native.force_refreshes,
+        )
+
+        native.force_refreshes.clear()
+        readonly_snapshot = directory.snapshot(read_only=True)
+        expect(
+            readonly_snapshot["eligible_runtimes"] == ["openclaw"]
+            and native.cached_reads == 1
+            and native.force_refreshes == [False],
+            "status projection consumes cached capability state without refresh",
+            {
+                "snapshot": readonly_snapshot,
+                "cached_reads": native.cached_reads,
+                "force_refreshes": native.force_refreshes,
+            },
         )
 
         selection = directory.select_exact("openclaw")

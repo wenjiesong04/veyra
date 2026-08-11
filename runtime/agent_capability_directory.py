@@ -326,7 +326,14 @@ class AgentCapabilityDirectory:
             control_token=control_token,
         )
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, *, read_only: bool = False) -> dict[str, Any]:
+        """Project runtime eligibility.
+
+        The normal snapshot is an explicit fresh observation used by
+        selection. ``read_only`` is reserved for status GETs: it must consume
+        process/durable cache only and never invoke a provider handshake.
+        """
+
         config = self._config()
         selected = self._selected_runtime(config)
         names = sorted(
@@ -346,6 +353,7 @@ class AgentCapabilityDirectory:
                 runtime=name,
                 selected_runtime=selected,
                 config=config,
+                read_only=read_only,
             )
             for name in names
         ]
@@ -543,6 +551,7 @@ class AgentCapabilityDirectory:
         runtime: str,
         selected_runtime: str,
         config: dict[str, Any],
+        read_only: bool = False,
     ) -> dict[str, Any]:
         try:
             adapter = self.registry.get(runtime)
@@ -553,7 +562,11 @@ class AgentCapabilityDirectory:
                 "connected": False,
             }
         else:
-            status = self._fresh_status(runtime, adapter)
+            status = (
+                self._cached_status(runtime, adapter)
+                if read_only
+                else self._fresh_status(runtime, adapter)
+            )
         reasons = self._eligibility_reasons(
             runtime=runtime,
             adapter=adapter,
@@ -607,6 +620,48 @@ class AgentCapabilityDirectory:
             "provider_switch_allowed": False,
             "side_effect_dispatch_allowed": False,
             "tool_allowlist": [],
+        }
+
+    def _cached_status(
+        self,
+        runtime: str,
+        adapter: AgentAdapter,
+    ) -> dict[str, Any]:
+        """Read status without network calls or state-store writes."""
+
+        cached = getattr(adapter, "connection_status_cached", None)
+        if callable(cached):
+            try:
+                value = cached()
+            except Exception:
+                value = None
+            if isinstance(value, dict):
+                return value
+
+        # Adapters without a process-local cache can still expose the last
+        # registry projection. Never call their live connection_status from a
+        # status GET: a provider is allowed to refresh credentials there.
+        executor = self.state_store.read_json("executor_state.json")
+        rows = executor.get("agents") if isinstance(executor, dict) else None
+        value = rows.get(runtime) if isinstance(rows, dict) else None
+        if isinstance(value, dict):
+            return {
+                **value,
+                "status": str(value.get("status") or "cached"),
+                "connected": value.get("connected") is True,
+                "observation_source": "durable_executor_state",
+            }
+        return {
+            "runtime": runtime,
+            "status": "cached_unavailable",
+            "connected": False,
+            "features": {},
+            "provider_certification": {
+                "validated": False,
+                "certification_status": "unverified",
+                "freshness": {"status": "unknown", "age_seconds": None},
+                "issues": ["cached_observation_missing"],
+            },
         }
 
     def _eligibility_reasons(
