@@ -150,6 +150,7 @@ class StructuredObservationIngress:
         ).strip()
         self.component_health_snapshot = component_health_snapshot
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self.BACKGROUND_STATE_FILE = "component_health_background_state.json"
 
     def status(self) -> dict[str, Any]:
         """Pure aggregate readiness; no tenant event or evidence is exposed."""
@@ -228,8 +229,10 @@ class StructuredObservationIngress:
         command: StructuredObservationCommand,
         *,
         control_token: str,
+        _internal: bool = False,
     ) -> dict[str, Any]:
-        self._authorize(control_token)
+        if not _internal:
+            self._authorize(control_token)
         if not isinstance(command, StructuredObservationCommand):
             command = StructuredObservationCommand.model_validate(
                 command,
@@ -309,6 +312,9 @@ class StructuredObservationIngress:
         request: ComponentHealthObservationRequest,
         *,
         control_token: str,
+        _internal: bool = False,
+        _snapshot: dict[str, Any] | None = None,
+        _server_now: datetime | None = None,
     ) -> dict[str, Any]:
         """Publish a server-derived health observation under an exact owner.
 
@@ -318,7 +324,8 @@ class StructuredObservationIngress:
         impersonate another typed producer.
         """
 
-        self._authorize(control_token)
+        if not _internal:
+            self._authorize(control_token)
         if not isinstance(request, ComponentHealthObservationRequest):
             request = ComponentHealthObservationRequest.model_validate(
                 request,
@@ -328,12 +335,15 @@ class StructuredObservationIngress:
             raise StructuredObservationUnavailableError(
                 "component health producer is not configured"
             )
-        try:
-            snapshot = self.component_health_snapshot()
-        except Exception as exc:
-            raise StructuredObservationUnavailableError(
-                "component health snapshot is unavailable"
-            ) from exc
+        if _snapshot is not None:
+            snapshot = copy.deepcopy(_snapshot)
+        else:
+            try:
+                snapshot = self.component_health_snapshot()
+            except Exception as exc:
+                raise StructuredObservationUnavailableError(
+                    "component health snapshot is unavailable"
+                ) from exc
         if not isinstance(snapshot, dict):
             raise StructuredObservationUnavailableError(
                 "component health snapshot is invalid"
@@ -348,17 +358,12 @@ class StructuredObservationIngress:
             raise StructuredObservationUnavailableError(
                 "component health alerts are invalid"
             )
-        now = parse_aware_utc(request.occurred_at)
-        snapshot_digest = canonical_digest(
-            {
-                "status": status,
-                "alert_count": len(alerts),
-                "alerts": alerts,
-                "components": snapshot.get("components")
-                if isinstance(snapshot.get("components"), dict)
-                else {},
-            }
-        )
+        # The request timestamp is schema-validated for transport stability,
+        # but it is not trusted as observation time.  A replay reuses the
+        # durable first observation timestamp; a new observation uses the
+        # server-owned clock.
+        now = self._existing_component_health_time(request) or _server_now or self._now()
+        snapshot_digest = self._component_health_digest(snapshot)
         if status == "critical":
             state, severity, urgency, novelty, uncertainty = (
                 "degraded", "critical", "immediate", "changed", "high"
@@ -406,7 +411,149 @@ class StructuredObservationIngress:
             },
             strict=True,
         )
-        return self.submit(command, control_token=control_token)
+        return self.submit(
+            command,
+            control_token=control_token,
+            _internal=_internal,
+        )
+
+    def publish_component_health_background(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """Publish one deduplicated server-owned health snapshot.
+
+        This is intentionally an explicit in-process producer.  It is only
+        called when the operator opts in through the active-loop wiring and it
+        never sends notifications or changes authority.  Unchanged snapshots
+        are a pure no-op so a long-lived loop cannot flood EventInbox/Belief.
+        """
+
+        if not callable(self.component_health_snapshot):
+            raise StructuredObservationUnavailableError(
+                "component health producer is not configured"
+            )
+        try:
+            snapshot = self.component_health_snapshot()
+        except Exception as exc:
+            raise StructuredObservationUnavailableError(
+                "component health snapshot is unavailable"
+            ) from exc
+        if not isinstance(snapshot, dict):
+            raise StructuredObservationUnavailableError(
+                "component health snapshot is invalid"
+            )
+        status = str(snapshot.get("status") or "").strip().lower()
+        alerts = snapshot.get("alerts")
+        if status not in {"healthy", "degraded", "critical"} or not isinstance(alerts, list) or any(
+            not isinstance(item, dict) for item in alerts
+        ):
+            raise StructuredObservationUnavailableError(
+                "component health snapshot is outside the typed producer contract"
+            )
+        snapshot_digest = self._component_health_digest(snapshot)
+        previous = self.state_store.read_json(self.BACKGROUND_STATE_FILE)
+        if previous.get("snapshot_digest") == snapshot_digest:
+            return {
+                "status": "unchanged",
+                "producer_id": "component_health",
+                "snapshot_digest": snapshot_digest,
+                "event_id": previous.get("event_id"),
+                "authority": self._authority(),
+            }
+        now = self._now()
+        operation_id = f"component-health-background-{snapshot_digest[:32]}"
+        request = ComponentHealthObservationRequest.model_validate(
+            {
+                "schema_version": "veyra.component_health_observation.request.v1",
+                "operation_id": operation_id,
+                "user_id": user_id,
+                "workspace_id": workspace_id,
+                "session_id": session_id,
+                "expected_event_inbox_revision": int(
+                    self.status().get("event_inbox_revision") or 0
+                ),
+                # This is validated but ignored by submit_component_health;
+                # the server clock above is authoritative.
+                "occurred_at": canonical_utc(now),
+            },
+            strict=True,
+        )
+        result = self.submit_component_health(
+            request,
+            control_token="",
+            _internal=True,
+            _snapshot=snapshot,
+            _server_now=now,
+        )
+        if str(result.get("status") or "") in {"recorded", "observed", "replayed"}:
+            durable_time = self._existing_component_health_time(request) or now
+            self.state_store.mutate_json(
+                self.BACKGROUND_STATE_FILE,
+                lambda state: {
+                    **state,
+                    "schema_version": "veyra.component_health_background_state.v1",
+                    "snapshot_digest": snapshot_digest,
+                    "event_id": result.get("event_id"),
+                    "observed_at": canonical_utc(durable_time),
+                    "updated_at": canonical_utc(self._now()),
+                },
+            )
+        return {
+            **result,
+            "background": True,
+            "snapshot_digest": snapshot_digest,
+        }
+
+    @staticmethod
+    def _component_health_digest(snapshot: dict[str, Any]) -> str:
+        status = str(snapshot.get("status") or "").strip().lower()
+        alerts = snapshot.get("alerts") if isinstance(snapshot.get("alerts"), list) else []
+        return canonical_digest(
+            {
+                "status": status,
+                "alert_count": len(alerts),
+                "alerts": alerts,
+                "components": snapshot.get("components")
+                if isinstance(snapshot.get("components"), dict)
+                else {},
+            }
+        )
+
+    def _existing_component_health_time(
+        self,
+        request: ComponentHealthObservationRequest,
+    ) -> datetime | None:
+        """Find the durable first timestamp for an idempotent operation."""
+
+        inbox = self.state_store.read_json(EVENT_INBOX_FILE)
+        events = inbox.get("events") if isinstance(inbox, dict) else None
+        if not isinstance(events, dict):
+            return None
+        for record in events.values():
+            envelope = record.get("envelope") if isinstance(record, dict) else None
+            if not isinstance(envelope, dict):
+                continue
+            source = envelope.get("source") if isinstance(envelope.get("source"), dict) else {}
+            payload = envelope.get("payload") if isinstance(envelope.get("payload"), dict) else {}
+            if (
+                source.get("channel") != STRUCTURED_OBSERVATION_CHANNEL
+                or source.get("user_id") != request.user_id
+                or source.get("session_id") != request.session_id
+                or payload.get("producer_id") != "component_health"
+                or payload.get("operation_id") != request.operation_id
+                or payload.get("workspace_id") != request.workspace_id
+            ):
+                continue
+            raw = payload.get("valid_from") or envelope.get("occurred_at")
+            try:
+                return parse_aware_utc(raw) if isinstance(raw, str) else None
+            except (TypeError, ValueError):
+                return None
+        return None
 
     def _event(
         self,

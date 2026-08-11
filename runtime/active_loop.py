@@ -34,6 +34,7 @@ class ActiveRuntimeLoop:
         project_guardian_attention: Callable[..., Any] | None = None,
         case_recovery: Callable[..., Any] | None = None,
         cognitive_loop: Any | None = None,
+        component_health_producer: Callable[[], Any] | None = None,
     ) -> None:
         self.state_store = state_store
         self.runtime_entity = runtime_entity
@@ -50,6 +51,7 @@ class ActiveRuntimeLoop:
         self.project_guardian_attention = project_guardian_attention
         self.case_recovery = case_recovery
         self.cognitive_loop = cognitive_loop
+        self.component_health_producer = component_health_producer
         self.task_tracker = task_tracker
         self.adapter_resolver = adapter_resolver
         self.verifier = verifier
@@ -120,6 +122,10 @@ class ActiveRuntimeLoop:
         tick_id = f"tick_{uuid4().hex[:12]}"
         steps = [
             self._step("heartbeat", lambda: self._heartbeat()),
+            self._step(
+                "component_health",
+                lambda: self._component_health_tick(),
+            ),
             self._step("event_inbox", lambda: self._event_inbox_tick()),
             self._step(
                 "project_guardian_producers",
@@ -209,6 +215,12 @@ class ActiveRuntimeLoop:
     def _heartbeat(self) -> dict[str, Any]:
         self.runtime_entity.set_status(self.runtime_entity.lifecycle.status)
         return {"status": "success", "heartbeat": self.runtime_entity.lifecycle.last_heartbeat_at}
+
+    def _component_health_tick(self) -> dict[str, Any]:
+        if self.component_health_producer is None:
+            return {"status": "not_configured"}
+        result = self.component_health_producer()
+        return result if isinstance(result, dict) else {"status": "success"}
 
     def _retention_tick(self) -> dict[str, Any]:
         summary = self.retention_policy.summary()

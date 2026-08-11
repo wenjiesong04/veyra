@@ -56,11 +56,13 @@ def main() -> int:
             ],
             "components": {"agent": "stale"},
         }
+        server_now = datetime(2026, 8, 12, 3, 4, 5, tzinfo=timezone.utc)
         ingress = StructuredObservationIngress(
             state_store=store,
             event_awareness=awareness,
             control_token=TOKEN,
             component_health_snapshot=lambda: health,
+            clock=lambda: server_now,
         )
         app = FastAPI()
         app.include_router(build_structured_observations_router(ingress=ingress))
@@ -118,6 +120,12 @@ def main() -> int:
             "health facts and scope are server-owned and non-authorizing",
             observation,
         )
+        expect(
+            payload["valid_from"] == canonical_utc(server_now)
+            and payload["valid_from"] != request["occurred_at"],
+            "component health uses server-owned observation time",
+            payload,
+        )
         replay = client.post(
             "/awareness/structured-observations/component-health",
             headers=headers,
@@ -130,6 +138,27 @@ def main() -> int:
             "component health operation replay is idempotent",
             replay.json(),
         )
+
+        before_background_events = len(store.read_json("event_inbox.json")["events"])
+        background = ingress.publish_component_health_background(
+            user_id=USER,
+            workspace_id=WORKSPACE,
+            session_id=SESSION,
+        )
+        background_replay = ingress.publish_component_health_background(
+            user_id=USER,
+            workspace_id=WORKSPACE,
+            session_id=SESSION,
+        )
+        expect(
+            background.get("background") is True
+            and background.get("status") in {"recorded", "observed", "replayed"}
+            and background_replay.get("status") == "unchanged"
+            and len(store.read_json("event_inbox.json")["events"])
+            == before_background_events + 1,
+            "opt-in background producer deduplicates unchanged server health",
+            {"first": background, "second": background_replay},
+        )
         spoof = client.post(
             "/awareness/structured-observations/component-health",
             headers=headers,
@@ -140,7 +169,7 @@ def main() -> int:
             "component health route rejects caller-supplied facts",
             spoof.json(),
         )
-        print("Component health producer smoke passed: 5/5")
+        print("Component health producer smoke passed: 7/7")
     return 0
 
 

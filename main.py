@@ -234,6 +234,26 @@ structured_observation_ingress = StructuredObservationIngress(
     control_token=os.getenv("VEYRA_LOCAL_API_TOKEN") or "",
     component_health_snapshot=lambda: ops_monitor.health(),
 )
+
+
+def _component_health_background_tick() -> dict[str, Any]:
+    """Run the opt-in server-owned health producer from ActiveRuntimeLoop."""
+
+    if _env_bool("VEYRA_COMPONENT_HEALTH_BACKGROUND_ENABLED") is not True:
+        return {"status": "not_configured", "reason": "background_producer_disabled"}
+    scope = {
+        "user_id": os.getenv("VEYRA_COMPONENT_HEALTH_BACKGROUND_USER_ID", "").strip(),
+        "workspace_id": os.getenv("VEYRA_COMPONENT_HEALTH_BACKGROUND_WORKSPACE_ID", "").strip(),
+        "session_id": os.getenv("VEYRA_COMPONENT_HEALTH_BACKGROUND_SESSION_ID", "").strip(),
+    }
+    if not all(scope.values()):
+        return {
+            "status": "degraded",
+            "reason": "background_component_health_scope_missing",
+        }
+    return structured_observation_ingress.publish_component_health_background(**scope)
+
+
 feishu_adapter = FeishuAdapter(intake_gateway, state_store=state_store)
 feishu_ws_runner = FeishuWsRunner(state_store=state_store, adapter=feishu_adapter)
 console_dir = Path("ui/console")
@@ -430,6 +450,7 @@ active_loop = ActiveRuntimeLoop(
     project_guardian_attention=project_guardian_attention.run_once,
     case_recovery=awareness_loop.bounded_negotiation.recover_pending,
     cognitive_loop=read_only_cognitive_loop,
+    component_health_producer=_component_health_background_tick,
 )
 runtime_cron = Cron(state_store=state_store, active_loop=active_loop, commitment_push=commitment_push)
 agent_orchestrator = AgentOrchestrator(
