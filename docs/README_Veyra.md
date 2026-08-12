@@ -8,7 +8,7 @@
 >
 > 最近事实核验：2026-08-12
 >
-> 已提交应用代码基线：`cognitive-awakening @ 479b38d30934c0da1559f635b0f7e88001ed681c`。该 revision 增加 trusted workspace observation、删除 lifecycle 入口后不可达的伪实现，并清理确认无生产入口的空壳模块；本地自动化已完成，最终 docs SHA 的 live 与 Actions 证据仍必须在提交后独立核对。它不启用 P3，不迁移现有 state，也不扩大 Agent、Tool、Route、Risk、external delivery 或执行权限。实际任务 HEAD 与工作区必须用 Git 重新读取
+> 已提交应用代码基线：`cognitive-awakening @ 1020568ddaa3d29f46e534809a7773d53dc14c5c`。该 revision 包含 trusted workspace observation、不可达 lifecycle 代码与空壳清理，并补齐 observer 的 architecture/state inventory；本地自动化已完成，最终 docs SHA 的 live 与 Actions 证据仍必须在提交后独立核对。它不启用 P3，不迁移现有 state，也不扩大 Agent、Tool、Route、Risk、external delivery 或执行权限。实际任务 HEAD 与工作区必须用 Git 重新读取
 >
 > 运行态说明：正文 3.2 保留的最近一次 clean live 快照仍绑定 `5b80a26`，不能转移给当前 changeset。本文只记录稳定边界和最近证据入口，不再用每次 PID、短寿命告警数量或 status-only commit 追赶运行态；最终 clean restart、exact runtime SHA 和 GitHub Actions 在代码与文档收敛后一次核验。
 
@@ -369,11 +369,11 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 
 | 项 | 当前事实 |
 |---|---|
-| 工作分支 | `cognitive-awakening`；本轮应用代码 checkpoint 为 `479b38d30934c0da1559f635b0f7e88001ed681c`；最终 branch SHA 以本文提交后的 Git 实时值为准 |
+| 工作分支 | `cognitive-awakening`；本轮应用代码 checkpoint 为 `1020568ddaa3d29f46e534809a7773d53dc14c5c`；最终 branch SHA 以本文提交后的 Git 实时值为准 |
 | 远端分支 | push、exact-SHA Actions 与 PR 是独立发布证据，必须实时读取，不能从本表继承 |
 | 远端主线 | `origin/main @ 8a8a3d2` |
 | 本地主线 | `main @ 26d77fa`，落后 `origin/main`，不能直接作为新基线 |
-| 分支关系 | `479b38d` 相对 `origin/main` 为 ahead 48 / behind 0；本文提交会再推进 branch SHA，最终关系始终以 Git 实时复核为准 |
+| 分支关系 | `1020568` 相对 `origin/main` 为 ahead 50 / behind 0；本文提交会再推进 branch SHA，最终关系始终以 Git 实时复核为准 |
 | M1 状态 | `PARTIAL + AUTOMATED_VALIDATED + HISTORICAL BOUNDED LIVE`：typed observation → AttentionHypothesis → canonical interaction decision → record/shadow → owner-scoped advise → explicit feedback/calibration 已有窄闭环；新增 workspace observer 能把真实隔离 Git 变化与 exact-SHA CI failure 送到一条 record-only proposal；当前用户环境尚未配置该 observer，可信生产 lifecycle producer 仍不可用，长期 timing/usefulness 与非 happy-path live 样本也不足；权限、Route、Risk、外部交付均未扩大 |
 | P2 状态 | `PARTIAL + AUTOMATED_VALIDATED + HISTORICAL BOUNDED LIVE`：refresh-spec、claim-level CAS、当前时钟 TTL、owner-fair batch、EvidenceGraph bounded compaction/integrity、typed conflict receipt 与 Belief Economy 窄切片已验证；`next_refresh_at`/max staleness、不可刷新 claim 归档、owner-scoped graph projection、生产冲突仲裁与当前 revision 长时 live 仍未完成 |
 | 合并状态 | 尚未合入 `main`；按当前执行窗口保留在 `cognitive-awakening`，后续 PR/Actions/合并另行收口 |
@@ -396,6 +396,7 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 14. `b4a49ec`：收口 P1/P2 truth boundary；bridge 以 phase CAS 从 prepared/admitted 恢复并保留 exact Attention revision，non-say/silent decision 必须绑定 canonical durable surface；Belief refresh 使用 claim-level CAS、当前时钟 TTL 和同批不重复的 owner-fair 调度，重复 identity/损坏图在 probe 前 fail closed，历史 ownerless/conflicting tenant 行只读 quarantine；EvidenceGraph、公开 state、External scoped refresh 与 rollback projection 增加完整性、隔离和隐私对抗测试。
 15. `abb9a5d`：删除没有生产 import 的 `decision/`、`foresight/` 与部分 `execution/`、`guardian/`、`awareness/` 空壳，保留真实 `action_executor.py` 与 `review_queue.py`，并让 architecture inventory 指向真实实现。
 16. `479b38d`：新增 server-owned `TrustedWorkspaceObserver`，把隔离 Git 变化和可选 exact-SHA GitHub Actions failure 送入现有认知链；将状态校验、durable delivery 与业务决策拆成独立模块，增加正能力 lane，并删除 generic lifecycle 入口后的不可达推导代码。
+17. `1020568`：把 observer module、durable state 与 `read_all()` 补进 architecture/state inventory，并删除 lifecycle cleanup 后遗留的无调用 helper，避免实现与架构事实面再次分叉。
 
 本轮代码复核未发现需要回滚的确定性回归。`b4a49ec` 的 durable bridge、terminal surface binding、interaction ledger、refresh CAS、EvidenceGraph、Belief/External scope 和 public projection 均已通过定向与对抗 smoke，并保持 `policy_effect=none` 与 authority locks 关闭。`8feda55` 的隔离 Git snapshot 仍由上一 clean live revision 验证；未知、partial 或漂移 identity 继续整体 fail closed。
 
@@ -422,7 +423,7 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 
 ### 3.2 最近一次已记录运行态快照（历史，不可转移）
 
-下表绑定 2026-08-11 的 `5b80a26` 进程，只用于历史对照，不能证明 `479b38d` 或本文最终 SHA 的运行状态。开始新任务时必须重新读取当前 Git、PID、Python、`/health`、`/runtime` 与 scope 状态：
+下表绑定 2026-08-11 的 `5b80a26` 进程，只用于历史对照，不能证明 `1020568` 或本文最终 SHA 的运行状态。开始新任务时必须重新读取当前 Git、PID、Python、`/health`、`/runtime` 与 scope 状态：
 
 | 表面 | 观察结果 | 正确解释 |
 |---|---|---|
@@ -574,7 +575,7 @@ Hypothesis 已支持 `candidate / accumulating / confirmed / contradicted / expi
 
 ### 4.8 Runtime revision 已安全收口，但不是 loaded-code attestation
 
-`5b80a26` 的历史 clean restart 已证明启动快照 schema v2、full SHA、`dirty_flag=false`、GET 不运行 Git，以及 `/phase6/status` 使用 cached projection；该证据不能转移给 `479b38d`。本文最终 SHA 的 clean restart/runtime evidence 必须在提交后单独复核，并继续明确 `loaded_code_attested=false`；未知或 partial identity 仍必须整体降级。
+`5b80a26` 的历史 clean restart 已证明启动快照 schema v2、full SHA、`dirty_flag=false`、GET 不运行 Git，以及 `/phase6/status` 使用 cached projection；该证据不能转移给 `1020568`。本文最终 SHA 的 clean restart/runtime evidence 必须在提交后单独复核，并继续明确 `loaded_code_attested=false`；未知或 partial identity 仍必须整体降级。
 
 ---
 
@@ -584,7 +585,7 @@ Hypothesis 已支持 `candidate / accumulating / confirmed / contradicted / expi
 
 ### P0：当前 `cognitive-awakening` 分支的应用自动化检查点
 
-当前应用检查点已完成独立审阅、定向/对抗 smoke、`143/143` gate（`142` invariant + `1` cognitive capability）、OpenClaw plugin `32/32`、compileall、Web/Desktop build 和 9 Route `810/810` 非弱化验证。应用 revision 是 `479b38d30934c0da1559f635b0f7e88001ed681c`；最终 docs SHA 的 clean restart、runtime surfaces 与 exact-SHA Actions 必须在本文提交后执行，不能继承 `5b80a26` 的历史 live 证据。
+当前应用检查点已完成独立审阅、定向/对抗 smoke、`143/143` gate（`142` invariant + `1` cognitive capability）、OpenClaw plugin `32/32`、compileall、Web/Desktop build 和 9 Route `810/810` 非弱化验证；architecture inventory follow-up 又通过 architecture harness、state layout、runtime truth 与 event-driven awareness 定向检查。应用 revision 是 `1020568ddaa3d29f46e534809a7773d53dc14c5c`；最终 docs SHA 的 clean restart、runtime surfaces 与 exact-SHA Actions 必须在本文提交后执行，不能继承 `5b80a26` 的历史 live 证据。
 
 当前收口动作是提交本文、普通 push、核对 exact-SHA Actions，并对最终 clean HEAD 做 runtime/GET-purity/Belief quarantine/Phase 6 fail-closed 验收；本窗口不合并 `main`，也不开始 P3。本轮不因缺少 Feishu fresh nonce 阻塞 Console-only repair，但也不把 WebSocket connected 当作外部交付通过。
 

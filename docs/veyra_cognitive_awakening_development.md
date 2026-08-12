@@ -503,7 +503,7 @@ isolated Git / exact-SHA GitHub Actions observation
 
 测试现在区分两条 lane：大量 smoke 继续验证安全和治理不变量；`trusted_workspace_observer_smoke.py` 单独作为 cognitive capability smoke，要求真实临时 Git worktree 的 code change 能到达 exact-owner confirmed Attention 和一条 `record_only` proposal，同时验证 silent、重放、Goal/config 竞态、CI unknown→failure 和伪造入口。这个自动化正例证明链路具备能力，仍不证明当前用户 workspace 已配置、长期 usefulness 或外部主动交付。
 
-应用 revision `479b38d30934c0da1559f635b0f7e88001ed681c` 的本地检查为：`143/143` gate（`142` invariant + `1` capability）、9 Route `810/810`、OpenClaw plugin `32/32`、结构化观测控制面 `10/10`、compileall、Web build 与 Desktop frontend build 全部通过。observer 默认未配置，当前真实用户状态的历史 `0 candidate / overconservative` 不能用这组自动化结果改写。
+应用 revision `1020568ddaa3d29f46e534809a7773d53dc14c5c` 的本地检查为：`143/143` gate（`142` invariant + `1` capability）、9 Route `810/810`、OpenClaw plugin `32/32`、结构化观测控制面 `10/10`、compileall、Web build 与 Desktop frontend build 全部通过；后续 architecture/state inventory follow-up 也通过定向检查。observer 默认未配置，当前真实用户状态的历史 `0 candidate / overconservative` 不能用这组自动化结果改写。
 
 Attention lifecycle 仍明确保持 fail-closed：`attention_lifecycle_producer_unavailable`。原先在早退之后的 contradiction 推导代码不可达，已经删除；本轮对抗审查也否决了继续堆一套没有真实 domain caller 的大型 producer。后续只有在某个受信领域能提供独立、可核验的反证事实时，才实现对应的最小 producer 与 lifecycle admission，不能先造通用脚手架再把 fixture 当能力。
 
