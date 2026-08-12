@@ -60,6 +60,8 @@ SCENARIOS = (
     "attention_hypothesis_corrupt",
     "suggestion_outbox_populated",
     "suggestion_outbox_corrupt",
+    "trusted_workspace_observer_populated",
+    "trusted_workspace_observer_corrupt",
     "extension_generation_populated",
     "extension_generation_corrupt",
     "extension_dynamic_validation_populated",
@@ -89,6 +91,11 @@ PRIVATE_STATE_SCENARIOS: dict[str, tuple[str, str, str]] = {
         "suggestion_outbox.json",
         "proposals",
         "veyra.suggestion_outbox.v1",
+    ),
+    "trusted_workspace_observer": (
+        "trusted_workspace_observer_state.json",
+        "private_records",
+        "veyra.trusted_workspace_observer.v1",
     ),
     "extension_generation": (
         "phase6_extension_generation_state.json",
@@ -796,6 +803,7 @@ def main() -> int:
         and "phase6_extension_isolated_runner_state" not in public_state
         and "general_situation_state" not in public_state
         and "suggestion_outbox" not in public_state
+        and "trusted_workspace_observer_state" not in public_state
         and "phase6_extension_generation_state" not in public_state
         and "phase6_extension_dynamic_validation_state" not in public_state
         and "phase6_extension_release_state" not in public_state
@@ -875,11 +883,11 @@ def main() -> int:
                             "candidate": candidate.to_dict(),
                         }
     expect(
-        len(SCENARIOS) == 28
-        and comparisons == 9 * len(MODES) * len(SCENARIOS) == 756
+        len(SCENARIOS) == 30
+        and comparisons == 9 * len(MODES) * len(SCENARIOS) == 810
         and not failures,
         (
-            "756 isolated populated or corrupt collaboration, Situation, "
+            "810 isolated populated or corrupt collaboration, Situation, "
             "AttentionHypothesis, suggestion, extension lifecycle, "
             "governed-pipeline, and "
             "capability-gap states "

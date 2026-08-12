@@ -29,6 +29,7 @@ StructuredObservationProducer = Literal[
     "component_health",
     "local_operator",
     "task_runtime",
+    "workspace_observer",
 ]
 StructuredObservationAnchorKind = Literal[
     "goal",
@@ -253,6 +254,31 @@ class ComponentHealthObservationRequest(BaseModel):
         return value
 
 
+class TrustedWorkspaceObserverConfigRequest(BaseModel):
+    """Strict token-authenticated private observer binding request."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    schema_version: Literal["veyra.trusted_workspace_observer.config.v1"]
+    expected_state_revision: StrictInt = Field(ge=0, le=2_147_483_647)
+    mode: Literal["disabled", "record_only"]
+    user_id: str = Field(min_length=1, max_length=240)
+    session_id: str = Field(min_length=1, max_length=240)
+    workspace_id: str = Field(min_length=1, max_length=4096)
+    goal_id: str = Field(min_length=1, max_length=240)
+    github_repo_id: str | None = Field(default=None, max_length=240)
+    github_workflow_path: str | None = Field(default=None, max_length=512)
+    github_required_jobs: list[str] | None = Field(default=None, max_length=20)
+    github_expected_app_id: StrictInt | None = Field(default=None, ge=1)
+
+
+class TrustedWorkspaceObserverRunRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    schema_version: Literal["veyra.trusted_workspace_observer.run.v1"]
+    reason: str = Field(default="private_control", min_length=1, max_length=120)
+
+
 __all__ = [
     "STRUCTURED_OBSERVATION_CHANNEL",
     "STRUCTURED_OBSERVATION_COMMAND_SCHEMA",
@@ -261,6 +287,8 @@ __all__ = [
     "StructuredObservationAuthority",
     "StructuredObservationCommand",
     "ComponentHealthObservationRequest",
+    "TrustedWorkspaceObserverConfigRequest",
+    "TrustedWorkspaceObserverRunRequest",
     "StructuredObservationEvidence",
     "StructuredObservationFacts",
     "canonical_digest",

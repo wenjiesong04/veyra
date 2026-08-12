@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-GATE_SMOKES = [
+INVARIANT_SMOKES = [
     "agency_single_source_smoke.py",
     "runtime_config_honesty_smoke.py",
     "user_world_multitenant_smoke.py",
@@ -154,14 +154,24 @@ GATE_SMOKES = [
     "state_mutation_concurrency_smoke.py",
 ]
 
+# Positive product capability is reported separately from the much larger
+# invariant suite.  The full gate still runs every script exactly once; this
+# lane makes it impossible to mistake "nothing unsafe happened" for proof
+# that the cognitive input path can produce a useful record-only candidate.
+COGNITIVE_CAPABILITY_SMOKES = [
+    "trusted_workspace_observer_smoke.py",
+]
+
+GATE_SMOKES = [*INVARIANT_SMOKES, *COGNITIVE_CAPABILITY_SMOKES]
+
 SMOKE_TIMEOUT_OVERRIDES = {
     # This intentionally exercises eight sequential turns against the live
     # configured model and evidence providers.
     "runtime_e2e_dialogue_smoke.py": 360.0,
-    # This builds 1,512 isolated loops to compare all nine public Routes
-    # across three modes and 28 populated/corrupt private-state scenarios.
+    # This builds 1,620 isolated loops to compare all nine public Routes
+    # across three modes and 30 populated/corrupt private-state scenarios.
     # GitHub-hosted runners can exceed the generic 120-second script budget;
-    # keep the complete 756-comparison matrix and give only this smoke a
+    # keep the complete 810-comparison matrix and give only this smoke a
     # bounded, CI-tolerant allowance.
     "phase6_route_non_regression_smoke.py": 300.0,
 }
@@ -171,6 +181,8 @@ def smoke_files(group: str) -> list[Path]:
     scripts_dir = ROOT / "scripts"
     if group == "all":
         return sorted(path for path in scripts_dir.glob("*_smoke.py") if path.name != "run_smokes.py")
+    if group == "capability":
+        return [scripts_dir / name for name in COGNITIVE_CAPABILITY_SMOKES]
     if group != "gate":
         raise ValueError(f"unknown smoke group: {group}")
     return [scripts_dir / name for name in GATE_SMOKES]
@@ -178,7 +190,11 @@ def smoke_files(group: str) -> list[Path]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run Veyra smoke scripts with timeouts.")
-    parser.add_argument("--group", choices=["gate", "all"], default="gate")
+    parser.add_argument(
+        "--group",
+        choices=["gate", "capability", "all"],
+        default="gate",
+    )
     parser.add_argument("--all", action="store_true", help="Run every scripts/*_smoke.py file.")
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--list", action="store_true", help="List selected smoke scripts without running them.")
@@ -197,6 +213,7 @@ def main() -> int:
         return 0
 
     failures: list[tuple[Path, str]] = []
+    passed_names: set[str] = set()
     for index, path in enumerate(selected, start=1):
         label = str(path.relative_to(ROOT))
         timeout = max(args.timeout, SMOKE_TIMEOUT_OVERRIDES.get(path.name, 0.0))
@@ -222,7 +239,34 @@ def main() -> int:
             failures.append((path, f"exit {result.returncode}"))
             print(f"FAIL {label}: exit {result.returncode}", file=sys.stderr)
         else:
+            passed_names.add(path.name)
             print(f"PASS {label}")
+
+    if group == "gate":
+        invariant_passed = sum(
+            name in passed_names for name in INVARIANT_SMOKES
+        )
+        capability_passed = sum(
+            name in passed_names for name in COGNITIVE_CAPABILITY_SMOKES
+        )
+        invariant_state = (
+            "PASS"
+            if invariant_passed == len(INVARIANT_SMOKES)
+            else "FAIL"
+        )
+        capability_state = (
+            "PASS"
+            if capability_passed == len(COGNITIVE_CAPABILITY_SMOKES)
+            else "FAIL"
+        )
+        print(
+            f"Invariant summary: {invariant_state} "
+            f"{invariant_passed}/{len(INVARIANT_SMOKES)}"
+        )
+        print(
+            f"Cognitive capability summary: {capability_state} "
+            f"{capability_passed}/{len(COGNITIVE_CAPABILITY_SMOKES)}"
+        )
 
     if failures:
         print("\nSmoke failures:", file=sys.stderr)

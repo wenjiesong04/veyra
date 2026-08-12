@@ -151,6 +151,7 @@ from runtime.capability_gap_registry import CapabilityGapRegistry
 from runtime.structured_observation_ingress import (
     StructuredObservationIngress,
 )
+from runtime.trusted_workspace_observer import TrustedWorkspaceObserver
 from runtime.soak_runner import SoakRunner
 from runtime.state_refresh import StateRefresh
 from runtime.openclaw_tool_broker import (
@@ -233,6 +234,14 @@ structured_observation_ingress = StructuredObservationIngress(
     event_awareness=awareness_loop.event_awareness,
     control_token=os.getenv("VEYRA_LOCAL_API_TOKEN") or "",
     component_health_snapshot=lambda: ops_monitor.health(),
+)
+trusted_workspace_observer = TrustedWorkspaceObserver(
+    state_store=state_store,
+    publish_observation=(
+        structured_observation_ingress.issue_workspace_observer_publisher()
+    ),
+    ci_provider=GitHubActionsCIProvider(),
+    control_token=os.getenv("VEYRA_LOCAL_API_TOKEN") or "",
 )
 
 
@@ -451,6 +460,7 @@ active_loop = ActiveRuntimeLoop(
     case_recovery=awareness_loop.bounded_negotiation.recover_pending,
     cognitive_loop=read_only_cognitive_loop,
     component_health_producer=_component_health_background_tick,
+    workspace_observer=trusted_workspace_observer.run_once,
 )
 runtime_cron = Cron(state_store=state_store, active_loop=active_loop, commitment_push=commitment_push)
 agent_orchestrator = AgentOrchestrator(
@@ -1003,6 +1013,7 @@ app.include_router(
 app.include_router(
     build_structured_observations_router(
         ingress=structured_observation_ingress,
+        workspace_observer=trusted_workspace_observer,
     )
 )
 app.include_router(

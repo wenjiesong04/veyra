@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+from pathlib import Path
 from typing import Any, Callable
 
 from core.context_scope import tenant_scope_storage_key
@@ -75,6 +76,16 @@ PRODUCER_POLICIES: dict[str, dict[str, frozenset[str]]] = {
             {"change_signal", "progress_signal", "risk_signal"}
         ),
         "anchor_kinds": frozenset({"task", "goal"}),
+        "evidence_sources": frozenset(
+            {"derived_rule", "direct_tool_observation"}
+        ),
+    },
+    # Server-issued, read-only workspace observations.  HTTP never accepts
+    # this producer identity; TrustedWorkspaceObserver supplies a private
+    # object-identity capability to the in-process method below.
+    "workspace_observer": {
+        "fact_kinds": frozenset({"change_signal", "risk_signal"}),
+        "anchor_kinds": frozenset({"goal", "entity"}),
         "evidence_sources": frozenset(
             {"derived_rule", "direct_tool_observation"}
         ),
@@ -151,6 +162,8 @@ class StructuredObservationIngress:
         self.component_health_snapshot = component_health_snapshot
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.BACKGROUND_STATE_FILE = "component_health_background_state.json"
+        self._workspace_observer_capability = object()
+        self._workspace_observer_publisher_issued = False
 
     def status(self) -> dict[str, Any]:
         """Pure aggregate readiness; no tenant event or evidence is exposed."""
@@ -211,11 +224,10 @@ class StructuredObservationIngress:
             # future in-process bindings.  A network caller must never be able
             # to self-assert a component/runtime identity in the request body.
             "http_producer_allowlist": ["local_operator"],
-            "trusted_producer_capabilities": (
-                ["component_health"]
-                if callable(self.component_health_snapshot)
-                else []
-            ),
+            "trusted_producer_capabilities": [
+                *(["component_health"] if callable(self.component_health_snapshot) else []),
+                *(["workspace_observer"] if self._workspace_observer_publisher_issued else []),
+            ],
             "component_health_producer_configured": callable(
                 self.component_health_snapshot
             ),
@@ -230,6 +242,7 @@ class StructuredObservationIngress:
         *,
         control_token: str,
         _internal: bool = False,
+        _publisher_capability: object | None = None,
     ) -> dict[str, Any]:
         if not _internal:
             self._authorize(control_token)
@@ -238,6 +251,12 @@ class StructuredObservationIngress:
                 command,
                 strict=True,
             )
+        if command.producer_id == "workspace_observer" and (
+            _publisher_capability is not self._workspace_observer_capability
+        ):
+            raise StructuredObservationUnauthorizedError(
+                "workspace observer capability is required"
+            )
         user = normalize_scope_component(command.user_id, "user_id")
         workspace = normalize_scope_component(
             command.workspace_id,
@@ -245,13 +264,15 @@ class StructuredObservationIngress:
             max_chars=1024,
         )
         session = normalize_scope_component(command.session_id, "session_id")
-        self._validate_time_window(command)
         self._validate_producer_policy(command)
-        self._validate_workspace(workspace)
+        durable_workspace = self._validate_workspace(
+            workspace,
+            producer_id=command.producer_id,
+        )
         self._validate_durable_references(
             command,
             user_id=user,
-            workspace_id=workspace,
+            workspace_id=durable_workspace,
         )
         event = self._event(
             command,
@@ -283,6 +304,13 @@ class StructuredObservationIngress:
                     durable_event_status=str(existing.get("status") or "unknown"),
                 )
             else:
+                # Freshness governs first admission, not an exact immutable
+                # replay. A server-owned producer may be acknowledging a
+                # durable event after a long restart; rejecting that replay
+                # solely because its original validity window elapsed would
+                # strand its recovery outbox forever. Exact replay below is
+                # byte-bound and never creates new evidence.
+                self._validate_time_window(command)
                 if (
                     self._revision(before)
                     != command.expected_event_inbox_revision
@@ -306,6 +334,46 @@ class StructuredObservationIngress:
                     durable_event_status=durable_status,
                 )
         return selected
+
+    def issue_workspace_observer_publisher(
+        self,
+    ) -> Callable[[StructuredObservationCommand], dict[str, Any]]:
+        """Issue one in-process publisher for the server-owned workspace observer.
+
+        The capability is an object identity kept only in this process.  No
+        request field, bearer token, or serializable value can mint the
+        ``workspace_observer`` producer identity.
+        """
+
+        if self._workspace_observer_publisher_issued:
+            raise RuntimeError(
+                "workspace observer publisher capability was already issued"
+            )
+        self._workspace_observer_publisher_issued = True
+        capability = self._workspace_observer_capability
+
+        def publish(command: StructuredObservationCommand) -> dict[str, Any]:
+            if capability is not self._workspace_observer_capability:
+                raise StructuredObservationUnauthorizedError(
+                    "workspace observer capability is invalid"
+                )
+            if not isinstance(command, StructuredObservationCommand):
+                command = StructuredObservationCommand.model_validate(
+                    command,
+                    strict=True,
+                )
+            if command.producer_id != "workspace_observer":
+                raise StructuredObservationConflictError(
+                    "workspace observer publisher requires workspace_observer producer"
+                )
+            return self.submit(
+                command,
+                control_token="",
+                _internal=True,
+                _publisher_capability=capability,
+            )
+
+        return publish
 
     def submit_component_health(
         self,
@@ -686,17 +754,55 @@ class StructuredObservationIngress:
                 "structured observation producer policy rejected the command"
             )
 
-    def _validate_workspace(self, workspace_id: str) -> None:
+    def _validate_workspace(
+        self,
+        workspace_id: str,
+        *,
+        producer_id: str,
+    ) -> str:
+        """Bind an event-safe workspace ref to the server's current project.
+
+        Ordinary private producers retain the existing exact-path contract.
+        The in-process workspace observer instead persists only an opaque
+        digest.  Its object capability was already checked in ``submit``;
+        resolving that digest here lets Goal validation still use the exact
+        durable workspace without leaking a local path into EventInbox,
+        GeneralSituation, Attention, or Console projections.
+        """
+
         local_world = self.state_store.read_json("local_world.json")
         if local_world.get("_state_corrupt") is True:
             raise StructuredObservationUnavailableError(
                 "local workspace state is unavailable"
             )
         current = str(local_world.get("current_project") or "").strip()
-        if not current or current != workspace_id:
+        if not current:
             raise StructuredObservationConflictError(
                 "structured observation workspace is not current"
             )
+        expected = current
+        durable_current = current
+        if producer_id == "workspace_observer":
+            try:
+                current_path = Path(current).expanduser().resolve(strict=True)
+            except OSError as exc:
+                raise StructuredObservationUnavailableError(
+                    "local workspace state is unavailable"
+                ) from exc
+            if not current_path.is_dir():
+                raise StructuredObservationUnavailableError(
+                    "local workspace state is unavailable"
+                )
+            durable_current = str(current_path)
+            expected = (
+                "workspace:"
+                + hashlib.sha256(durable_current.encode("utf-8")).hexdigest()
+            )
+        if workspace_id != expected:
+            raise StructuredObservationConflictError(
+                "structured observation workspace is not current"
+            )
+        return durable_current
 
     def _validate_durable_references(
         self,
