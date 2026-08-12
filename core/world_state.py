@@ -1435,6 +1435,9 @@ class WorldStateStore:
             "context_binding_state": self.read_json("context_binding_state.json"),
             "cognitive_loop_state": self.read_json("cognitive_loop_state.json"),
             "attention_hypothesis_state": self.read_json("attention_hypothesis_state.json"),
+            "trusted_workspace_observer_state": self.read_json(
+                "trusted_workspace_observer_state.json"
+            ),
             "persona_state": self.read_json("persona_state.json"),
             "channel_state": self.read_json("channel_state.json"),
             "state_schema": self.read_json("state_schema.json"),

@@ -94,6 +94,7 @@ CORE_MODULES: list[dict[str, str]] = [
     {"id": "general_attention_scheduler", "path": "awareness/general_attention_scheduler.py", "status": "phase2_information_only"},
     {"id": "attention_hypothesis_runtime", "path": "runtime/attention_hypothesis_runtime.py", "status": "cognitive_awakening_record_only"},
     {"id": "suggestion_outbox", "path": "runtime/suggestion_outbox.py", "status": "phase2_console_information_only"},
+    {"id": "trusted_workspace_observer", "path": "runtime/trusted_workspace_observer.py", "status": "cognitive_awakening_record_only"},
     {"id": "project_guardian_attention", "path": "runtime/project_guardian_attention_runtime.py", "status": "phase2_shadow"},
     {"id": "autonomy_policy", "path": "core/autonomy_policy.py", "status": "phase5_technical_complete_domain_scoped"},
     {"id": "playbook_registry", "path": "runtime/playbook_registry.py", "status": "phase5_builtin_immutable"},
@@ -257,6 +258,13 @@ STATE_DEFINITIONS: list[dict[str, Any]] = [
         "owner": "Runtime.AttentionHypothesisRuntime",
         "purpose": "Durable exact-scope attention hypotheses with immutable evidence accumulation and non-factual deterministic readiness.",
         "freshness": "evidence_and_ruleset_backed",
+    },
+    {
+        "id": "trusted_workspace_observer_state",
+        "file": "state/runtime/trusted_workspace_observer_state.json",
+        "owner": "Runtime.TrustedWorkspaceObserver",
+        "purpose": "Exact-scope workspace binding, silent baseline, pending typed delivery, and last-run state for the record-only trusted workspace observer.",
+        "freshness": "revision_and_observation_backed",
     },
     {
         "id": "suggestion_outbox",

@@ -49,7 +49,6 @@ class ShadowAwarenessRuntime:
     ATTENTION_LIFECYCLE_SCHEMA_VERSION = (
         "veyra.attention_lifecycle_observation.v1"
     )
-    MAX_ATTENTION_LIFECYCLE_RECEIPT_AGE_SECONDS = 300
 
     def __init__(
         self,
@@ -244,20 +243,6 @@ class ShadowAwarenessRuntime:
             and value.get("kind") == "contradiction"
             and re.fullmatch(r"ahyp_[0-9a-f]{24}", str(value.get("target_hypothesis_id") or ""))
         )
-
-    @staticmethod
-    def _lifecycle_receipt_time(record: dict[str, Any]) -> str | None:
-        # Queue admission is server-owned.  Event envelope occurred_at and
-        # payload times are deliberately ignored for lifecycle authority.
-        for key in ("enqueued_at", "first_received_at", "last_received_at"):
-            value = record.get(key)
-            try:
-                selected = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-            except (TypeError, ValueError):
-                continue
-            if selected.tzinfo is not None and selected.utcoffset() is not None:
-                return selected.astimezone(timezone.utc).isoformat()
-        return None
 
     @staticmethod
     def _attention_lifecycle_authority() -> dict[str, bool]:
