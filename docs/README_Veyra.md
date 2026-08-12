@@ -8,9 +8,9 @@
 >
 > 最近事实核验：2026-08-12
 >
-> 已提交应用代码基线（最后一项运行代码提交）：`cognitive-awakening @ 5b80a266e1fa09609473bc3220f7e1de19c699bc`；该提交在 `refresh_spec.v1`、EvidenceGraph v1 与 Belief Economy 窄切片之后增加 support-only node retention/compaction，并保留 typed contradiction/supersede、冲突回执和容量 fail-closed。上一提交 `369fd62` 将 Phase 6 status projection 改为缓存/持久快照纯读，避免 GET 触发 OpenClaw 设备 token 更新。它们不改变 claim truth、Attention、authority、Route、Risk、provider 或 external delivery。本文后续的纯文档提交会推进 branch SHA，但不改变应用代码。实际任务 HEAD 与工作区必须用 Git 重新读取
+> 已提交应用代码基线（最后一项运行代码提交）：`cognitive-awakening @ b4a49ec1fea965458992baddd4adc9725c6c8a39`。该提交收口 P1/P2 的 bounded repair：CognitiveBrief bridge crash recovery 与 exact lineage、canonical interaction decision、claim-level refresh CAS、当前时钟 TTL、owner-fair batch、EvidenceGraph 容量/完整性、诚实 persistence receipt、exact-scope Belief/External Console 和 generic state privacy。它不启用 P3，不迁移现有 state，也不扩大 Agent、Tool、Route、Risk、external delivery 或执行权限。后续纯文档提交会推进 branch SHA，但不改变应用代码；实际任务 HEAD 与工作区必须用 Git 重新读取
 >
-> 运行态说明：本机 API 于 2026-08-11 19:05:17 UTC 以 PID `91916` 重启，使用 `/opt/anaconda3/envs/veyra/bin/python`（Python 3.11.15），并报告 `veyra.runtime_build_identity.v2 / 5b80a266e1fa09609473bc3220f7e1de19c699bc / dirty=false`。`started_at=2026-08-11T19:05:20.934116+00:00`、`captured_at=2026-08-11T19:05:21.495333+00:00`；后续纯文档 SHA 不等于进程已加载的应用代码 SHA。
+> 运行态说明：正文 3.2 保留的最近一次 clean live 快照仍绑定 `5b80a26`，不能转移给 `b4a49ec`。`b4a49ec` 已完成 142/142 gate 与本地构建验证；最终 clean restart、exact runtime SHA 和 GitHub Actions 必须在本文提交后另行复核，避免用一次新的 status-only 提交制造自引用验证循环。
 
 本文件是一个**可更新的活文档**。它同时回答五个问题：
 
@@ -369,13 +369,13 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 
 | 项 | 当前事实 |
 |---|---|
-| 工作分支 | `cognitive-awakening`；应用代码 HEAD `5b80a266e1fa09609473bc3220f7e1de19c699bc` 已 push；本次仅更新 Living Zone，最终 branch SHA 以提交后 Git 复核为准 |
-| 远端分支 | `origin/cognitive-awakening` 已包含该应用代码 HEAD；未 push 的代码差异为 0 |
+| 工作分支 | `cognitive-awakening`；本轮应用代码 checkpoint 为 `b4a49ec1fea965458992baddd4adc9725c6c8a39`；最终 branch SHA 以本文提交后的 Git 实时值为准 |
+| 远端分支 | push、exact-SHA Actions 与 PR 是独立发布证据，必须实时读取，不能从本表继承 |
 | 远端主线 | `origin/main @ 8a8a3d2` |
 | 本地主线 | `main @ 26d77fa`，落后 `origin/main`，不能直接作为新基线 |
-| 分支关系 | 应用代码 changeset 相对 `origin/main` 为 ahead 41 / behind 0；其后包含 docs-only Living Zone 提交，最终 branch ahead/behind 与 SHA 始终以 Git 实时复核为准 |
-| M1 状态 | `PARTIAL + AUTOMATED_VALIDATED + BOUNDED HAPPY-PATH LIVE`：typed observation → AttentionHypothesis → interaction decision → record/shadow → owner-scoped advise → explicit feedback/calibration 已有闭环，但长时间真实样本、bridge 全生命周期故障恢复和非 happy-path 仍不足；权限、Route、Risk、外部交付均未扩大 |
-| P2 状态 | `PARTIAL + AUTOMATED_VALIDATED + BOUNDED HAPPY-PATH LIVE`：refresh-spec、EvidenceGraph bounded frontier/node compaction、typed conflict/CAS 回执和 Belief Economy 窄切片已验证；claim-level CAS、TTL/background 调度、owner 公平归档、owner-scoped graph projection 与完整真实前后对照仍未完成 |
+| 分支关系 | `b4a49ec` 相对 `origin/main` 为 ahead 45 / behind 0；本文提交会再推进 branch SHA，最终关系始终以 Git 实时复核为准 |
+| M1 状态 | `PARTIAL + AUTOMATED_VALIDATED + HISTORICAL BOUNDED LIVE`：typed observation → AttentionHypothesis → canonical interaction decision → record/shadow → owner-scoped advise → explicit feedback/calibration 已有窄闭环；prepared/admitted crash recovery 与 exact revision replay 已自动化覆盖，但可信生产 lifecycle producer、非 happy-path 真实样本和长期 timing/usefulness 仍不足；权限、Route、Risk、外部交付均未扩大 |
+| P2 状态 | `PARTIAL + AUTOMATED_VALIDATED + HISTORICAL BOUNDED LIVE`：refresh-spec、claim-level CAS、当前时钟 TTL、owner-fair batch、EvidenceGraph bounded compaction/integrity、typed conflict receipt 与 Belief Economy 窄切片已验证；`next_refresh_at`/max staleness、不可刷新 claim 归档、owner-scoped graph projection、生产冲突仲裁与当前 revision 长时 live 仍未完成 |
 | 合并状态 | 尚未合入 `main`；按当前执行窗口保留在 `cognitive-awakening`，后续 PR/Actions/合并另行收口 |
 
 本轮垂直切片新增代码提交的目的：
@@ -393,24 +393,26 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 11. `e5f3709`、`5d953f5`：稳定 belief persistence receipt projection，并将 durable conflict retention 加入 gate。
 12. `369fd62`：将 Phase 6 status 改为缓存/持久 snapshot 纯读；显式 selection/dispatch 仍使用 fresh provider probe。
 13. `5b80a26`：增加 support-only EvidenceGraph node retention/compaction，跨 500 节点长时同值 observation 仍可写入；安全 contradiction/supersede 容量不足时保持 fail closed。
+14. `b4a49ec`：收口 P1/P2 truth boundary；bridge 以 phase CAS 从 prepared/admitted 恢复并保留 exact Attention revision，non-say/silent decision 必须绑定 canonical durable surface；Belief refresh 使用 claim-level CAS、当前时钟 TTL 和同批不重复的 owner-fair 调度，重复 identity/损坏图在 probe 前 fail closed，历史 ownerless/conflicting tenant 行只读 quarantine；EvidenceGraph、公开 state、External scoped refresh 与 rollback projection 增加完整性、隔离和隐私对抗测试。
 
-本轮代码复核未发现需要回滚的确定性回归。`8feda55` 的隔离 Git snapshot 现已由 `5b80a26` 进程重新验证：启动只捕获一次，GET 不运行 Git，schema v2 可用，dirty 为 false，`git_checked_on_request=false`；双轮 snapshot 漂移或 partial identity 仍整体 fail closed。新的 durable bridge、server-derived component-health producer、typed terminal lifecycle、interaction ledger、refresh spec、EvidenceGraph compaction、Belief persistence receipt 和 Belief Economy 均已通过定向 smoke，并保持 `policy_effect=none` 与 authority locks 关闭。
+本轮代码复核未发现需要回滚的确定性回归。`b4a49ec` 的 durable bridge、terminal surface binding、interaction ledger、refresh CAS、EvidenceGraph、Belief/External scope 和 public projection 均已通过定向与对抗 smoke，并保持 `policy_effect=none` 与 authority locks 关闭。`8feda55` 的隔离 Git snapshot 仍由上一 clean live revision 验证；未知、partial 或漂移 identity 继续整体 fail closed。
 
-2026-08-12 当前应用代码 `5b80a26` 的自动化结果：
+2026-08-12 应用代码 `b4a49ec` 的自动化结果：
 
 - 定向 runtime/认知/结构化观测 smoke：全部通过；AttentionHypothesis 为 `21/21`，typed lifecycle 为 `6/6`，component-health producer 为 `7/7`，interaction ledger 为 `3/3`，结构化观测控制面为 `10/10`，Phase 6 route matrix 为 `756/756`；
-- Python gate：`140/140`，通过；`evidence_graph_smoke.py` 已跨过 500 节点上限验证 node compaction，长时 1000 条同值 observation 全部可写、edges ≤1000、frontier ≤8；交替冲突保持原值并在安全容量不足时拒绝后续写入；
+- Python gate：`142/142`，通过；新增 `state_refresh_adversarial_smoke.py` 与 `evidence_graph_adversarial_smoke.py` 覆盖 claim CAS、重复 identity、图损坏、容量/partition、公平调度、诚实回执与 byte-purity；Phase 6 全部 9 Route 在 disabled/record_only/shadow 下的完整公开 output/status/risk 仍为 `756/756`；
 - OpenClaw governance plugin：`32/32`，通过；
 - Python compileall（临时 `PYTHONPYCACHEPREFIX`）：通过；
 - Web production build 与 Desktop frontend build：均通过，且构建未产生 tracked diff；
-- clean restart 与 live GET purity：通过；PID `91916` 使用 Conda Python 3.11.15 加载 `5b80a26`，关键 state bytes、Git HEAD/index/worktree 均未变化；`/health` 与 `/runtime` 的 runtime projection 完全一致且连续读取冻结；`/health`、`/runtime`、`/phase6/status` 等 11 个 GET 端点均未写 `state/local`，`openclaw_device.json` 也保持不变。当前 active loop 的 `stale_state` 因无 event probe 报 `degraded`，不再假报 refreshed success；component-health background step 默认 `not_configured`。
-- 真实本地正例：本轮 server-derived component-health producer、durable conflict receipt、bridge recovery、non-say stale surface rejection 均通过真实本地/受控运行验证；authority 全部为 false。真实反例：caller 自报 `component_health` + facts 以 HTTP `409` fail closed，EventInbox、Attention、Suggestion、Cognitive 和 Phase 6 authority 未变化；交替 conflicting observation 保留旧 Belief 值并在安全容量不足时拒绝新写入。
+- 非 gate 的 `scripts/p6_self_test.py` 仍在到达本轮 External API 断言前被既有 R5 fixture 阻断（fixture 期望 `block`，当前语义返回 `ask_user / semantic frame missing`）；本轮未用改预期掩盖该独立历史问题，也不把该脚本写成通过；
+- 本轮自动化验证不冒充 current-revision live：3.2 的 `5b80a26` clean runtime 证据只是历史基线；`b4a49ec` 及本文最终 SHA 的 restart/runtime/GET-purity 结果必须在提交后独立记录。
+- controlled 正反例：prepared/admitted crash recovery、terminal surface forgery、duplicate identity、corrupt EvidenceGraph/ExternalWorld、CAS race、cross-owner retention 与 rollback path redaction 全部通过；generic lifecycle caller 仍 fail closed，`ask` 保持 dormant，authority 全部为 false。
 
-这些结果只证明当前本地 changeset 与本机运行态；它们不等于 Feishu 外部交付验收。Feishu 当前仍是 `running / connected`、`last_event_after_start=false`，没有本进程 fresh inbound；按本阶段范围不阻塞 Console-only M1。GitHub Actions 是独立的 exact-SHA 外部证据，每次 push 后必须重新检查；`in_progress / pending / failure / cancelled` 都不能写成 green。本分支尚未合入 `main`。
+这些自动化结果不等于 current-revision live、Feishu 外部交付或 GitHub Actions 验收。Feishu fresh inbound 不作为本次 Console-only P1/P2 repair 的阻塞条件，但也不能把 WebSocket connected 当作外部交付通过。GitHub Actions 是独立的 exact-SHA 证据；`in_progress / pending / failure / cancelled` 都不能写成 green。本分支尚未合入 `main`。
 
-### 3.2 当前运行态快照
+### 3.2 最近一次已记录运行态快照（历史，不可转移）
 
-当前 API 使用正确的 Conda Python 3.11.15 运行，PID `91916` 于 2026-08-11 19:05:17 UTC 启动；`/runtime` 的 `started_at=2026-08-11T19:05:21.841149+00:00`、runtime identity `captured_at=2026-08-11T19:05:21.495333+00:00`。下表是 2026-08-11 19:06 UTC 左右的只读快照；开始新任务时必须重新读取：
+下表绑定 2026-08-11 的 `5b80a26` 进程，只用于历史对照，不能证明 `b4a49ec` 或本文最终 SHA 的运行状态。开始新任务时必须重新读取当前 Git、PID、Python、`/health`、`/runtime` 与 scope 状态：
 
 | 表面 | 观察结果 | 正确解释 |
 |---|---|---|
@@ -432,11 +434,11 @@ A4/A5 仍为 `not_certified`。Phase 6 的 promoted R0 pure-function 也不等�
 
 | 能力 | 诚实状态 | 当前边界与主要差距 |
 |---|---|---|
-| Event / WorldState / Belief | `IMPLEMENTED / PARTIAL` | 有原子状态、TTL、source trust、scope、stale/conflict；EvidenceGraph v1 已在同一 writer fence 内持久化 bounded provenance、typed value、entity refs、valid-time 和 typed relations，并对 support-only nodes 做 frontier/retention compaction；claim-level CAS、预算、公平归档与长期实体模型仍缺 |
+| Event / WorldState / Belief | `IMPLEMENTED / PARTIAL` | 有原子状态、TTL、source trust、scope、stale/conflict；EvidenceGraph v1 已在同一 writer fence 内持久化 bounded provenance、typed value、entity refs、valid-time 和 typed relations，并对 support-only nodes 做 frontier/retention compaction；claim-level CAS、当前时钟 TTL 和 owner-fair refresh batch 已实现，`next_refresh_at`、不可刷新 claim 归档、owner-scoped graph 与长期实体模型仍缺 |
 | Foreground Understanding / Attention | `IMPLEMENTED + AUTOMATED_VALIDATED` | Attention v2 不再从自由文本 substring 创建 focus；只接受结构化 ref、owner/session continuation 和严格验证后的 semantic frame；普通自然交互仍可能长期空 focus |
 | General Situation | `IMPLEMENTED + AUTOMATED_VALIDATED / INFORMATIONAL` | 能按 exact owner、结构化 anchor 和时间窗聚合至少两个不同事件；不声明因果；生产数据仍稀少 |
-| AttentionHypothesis | `IMPLEMENTED + AUTOMATED_VALIDATED / BOUNDED LIVE RECORD_ONLY` | 有 candidate→accumulating→confirmed→contradicted/expired/superseded 生命周期、typed terminal signal、不可复活、幂等、scope、observed-only evidence；CognitiveBrief bridge 有 durable recovery 与完整 binding 重验，authority 仍关闭；真实非 happy-path 样本仍不足 |
-| Suggestion / Interaction | `IMPLEMENTED + AUTOMATED_VALIDATED / BOUNDED LIVE RECORD_ONLY + ADVISE CONSOLE CANARY` | 有 `say / ask / wait / silent` 与 decision/delivery disposition；non-say 与 say 共用 writer-fence currentness 检查，owner-scoped feedback/calibration 已有受控样本；无外部交付、执行或权限影响，长期 timing/usefulness 样本不足 |
+| AttentionHypothesis | `IMPLEMENTED + AUTOMATED_VALIDATED / HISTORICAL BOUNDED LIVE RECORD_ONLY` | 有 candidate→accumulating→confirmed→contradicted/expired/superseded 生命周期、typed terminal signal、不可复活、幂等、scope、observed-only evidence；CognitiveBrief bridge 有 durable recovery 与完整 binding 重验，authority 仍关闭；真实非 happy-path 样本仍不足 |
+| Suggestion / Interaction | `IMPLEMENTED + AUTOMATED_VALIDATED / HISTORICAL BOUNDED LIVE RECORD_ONLY + ADVISE CONSOLE CANARY` | 有 canonical `say / wait / silent` 与 decision/delivery disposition；`ask` 仍 dormant，不能由 caller-crafted gap 启用；non-say 与 say 共用 current Attention/parent binding，owner-scoped feedback/calibration 已有受控样本；无外部交付、执行或权限影响，长期 timing/usefulness 样本不足 |
 | Background Cognitive Loop | `IMPLEMENTED / RECORD_ONLY / DESCRIPTIVE / DEGRADED` | 模型只看 server-prepared cached views，不能调用 Tool/Agent/Probe；当前 tick 对无 probe 的 stale event 明确 degraded，component-health background 默认未配置；不把模型调用当作用户价值 |
 | Owner/session isolation | `AUTOMATED_VALIDATED / INTERNAL LOGICAL ISOLATION` | ownerless、冲突和跨 scope 数据 fail closed；API principal 仍由 caller 声明，不是 auth-derived 多租户；operator diagnostics 和 native OpenClaw Memory 未形成敌对安全边界 |
 | Agent collaboration | `IMPLEMENTED / SCOPED / HISTORICAL_LIVE_VALIDATED` | Kimi/Moonshot + OpenClaw 的 primary→critic 只读协作已验证；其他 provider、自动选择、并行团队和 provider switch 未验证 |
@@ -534,15 +536,15 @@ Veyra 的治理合同是 provider-neutral，这是正确方向；但接口中立
 
 ### 4.2 CognitiveBrief 已安全进入 Hypothesis，但仍是只读桥
 
-`read_only_cognitive_loop.py` 的 brief 现在绑定 exact parent revision、evidence refs、attention bridge 和 replay digest；binding 以 prepared → admitted/committed 两阶段持久化，启动后可 reconcile，缺失或漂移时 fail closed。该桥只影响 observation/readiness 和建议资格检查，不产生 Route、Risk、Agent、Tool 或执行权。
+`read_only_cognitive_loop.py` 的 brief 现在绑定 exact parent revision、evidence refs、attention bridge 和 replay digest；binding 以 prepared → admitted → committed/rejected phase CAS 持久化，启动后可 reconcile，缺失、漂移或 revision 不一致时 fail closed。该桥只影响 observation/readiness 和建议资格检查，不产生 Route、Risk、Agent、Tool 或执行权。
 
-### 4.3 Hypothesis 和 Interaction M1 生命周期已闭环
+### 4.3 Hypothesis 和 Interaction M1 窄生命周期已实现，生产闭环仍部分
 
-Hypothesis 已支持 `candidate / accumulating / confirmed / contradicted / expired / superseded`；typed contradiction 会把目标假设终止且不可由普通 observation 复活，supersede 必须显式绑定 replacement。Suggestion 已有可审计的 `say / ask / wait / silent` 以及节流前 decision、节流后 delivery 分离，decision ledger 现在持久化 owner/session、hypothesis ref、assessment digest、mode epoch 和 delivery disposition。真实运行仍保持 record-only 默认，advise-only 只进入 exact owner Console。
+Hypothesis 已支持 `candidate / accumulating / confirmed / contradicted / expired / superseded`；typed contradiction 会把目标假设终止且不可由普通 observation 复活，supersede 必须显式绑定 replacement。Suggestion 已有可审计的 `say / wait / silent` 以及节流前 decision、节流后 delivery 分离，decision ledger 持久化 owner/session、canonical hypothesis ref、assessment digest、mode epoch 和 delivery disposition；`ask` 当前明确 dormant，不能由 caller-crafted `interaction_gap` 激活。真实运行仍保持 record-only 默认，advise-only 只进入 exact owner Console。
 
 ### 4.4 EvidenceGraph v1 已形成最小有界关系层
 
-`veyra.belief.evidence_graph.v1` 现在与 `belief_state.json` 的 claims 在同一原子 writer fence 内更新；节点保存 source/provenance、typed value digest、entity refs 和 valid-time，边只使用 typed `supports / contradicts / supersedes` 关系，并限制节点、边和 unresolved 数量。相同 typed value 的重叠 observation 只形成 support；不同 typed value 只有在 valid-time 重叠时形成 unresolved contradiction，unknown/invalid valid-time 不制造伪冲突；supersession 只能由同 scope 的显式 relation 建立。新 observation 只比较 identity frontier；旧 support-only nodes/edges 可安全 compaction，contradiction/supersedes 端点保留，安全关系容量不足时 fail closed。Belief writer 传播 `persisted / belief_value_persisted / persistence_status` 回执，刷新拒绝不会报告成成功。图损坏、关系目标缺失或跨 scope 时拒绝新增 claim，且不选择隐含赢家、不改变 Belief truth、Attention readiness、Route、Risk 或 authority。claim-level CAS、刷新预算、公平归档、跨实体推理和长期关系模型仍未完成。
+`veyra.belief.evidence_graph.v1` 现在与 `belief_state.json` 的 claims 在同一原子 writer fence 内更新；节点保存 source/provenance、typed value digest、entity refs 和 valid-time，边只使用 typed `supports / contradicts / supersedes` 关系，并限制节点、边和 unresolved 数量。相同 typed value 的重叠 observation 只形成 support；不同 typed value 只有在 valid-time 重叠时形成 unresolved contradiction，unknown/invalid valid-time 不制造伪冲突；supersession 只能由同 scope 的显式 relation 建立。新 observation 只比较 identity frontier；旧 support-only nodes/edges 可安全 compaction，contradiction/supersedes 端点保留，安全关系容量不足时 fail closed。Belief writer 传播 `persisted / belief_value_persisted / persistence_status` 回执；StateRefresh 以 claim revision/value digest 做 CAS，并在 probe 前拒绝 duplicate identity、损坏图和不可安全读取的状态。历史 ownerless/conflicting tenant 行只读 quarantine，不迁移、不删除、不静默选赢家。刷新预算、公平归档、跨实体推理和长期关系模型仍未完成。
 
 ### 4.5 Belief Economy 已有 typed priority 窄切片
 
@@ -558,7 +560,7 @@ Hypothesis 已支持 `candidate / accumulating / confirmed / contradicted / expi
 
 ### 4.8 Runtime revision 已安全收口，但不是 loaded-code attestation
 
-`5b80a26` 已完成 clean restart 和 live validation：启动快照为 schema v2、full SHA、`dirty_flag=false`，两轮一致，GET 不运行 Git；`captured_at >= started_at`，`source=startup_git_snapshot`，`loaded_code_attested=false`。同时 `/phase6/status` 已改为 cached/durable read-only projection，连续 11 个状态 GET 未改变 `state/local` 或 `openclaw_device.json`。这证明当前应用代码的启动观察安全且可复核，不等于进程以后会感知工作区变化，也不等于纯文档提交已加载；未知或 partial identity 仍必须整体降级。
+`5b80a26` 的历史 clean restart 已证明启动快照 schema v2、full SHA、`dirty_flag=false`、GET 不运行 Git，以及 `/phase6/status` 使用 cached projection；该证据不能转移给 `b4a49ec`。本文最终 SHA 的 clean restart/runtime evidence 必须在提交后单独复核，并继续明确 `loaded_code_attested=false`；未知或 partial identity 仍必须整体降级。
 
 ---
 
@@ -568,30 +570,30 @@ Hypothesis 已支持 `candidate / accumulating / confirmed / contradicted / expi
 
 ### P0：当前 `cognitive-awakening` 分支的本地收口状态
 
-应用代码 changeset 已完成审阅、定向 smoke、`140/140` gate、OpenClaw plugin `32/32`、compileall、Web/Desktop build、clean restart、runtime surface、真实 component-health 正反例、EvidenceGraph 长时 bounded soak 和 GET purity 验收。当前应用代码 revision 是 `5b80a266e1fa09609473bc3220f7e1de19c699bc`；文档提交前当前分支相对 `origin/main` ahead 41 / behind 0，仍留在 `cognitive-awakening`，尚未合入 main。
+应用代码 changeset 已完成审阅、定向/对抗 smoke、`142/142` gate、OpenClaw plugin `32/32`、compileall、Web/Desktop build和 9 Route `756/756` 非弱化验证。当前应用代码 revision 是 `b4a49ec1fea965458992baddd4adc9725c6c8a39`；该 checkpoint 相对 `origin/main` ahead 45 / behind 0，仍留在 `cognitive-awakening`，尚未合入 main。current-revision clean restart、runtime surfaces 和 exact-SHA Actions 必须在本文提交后执行，不能沿用 `5b80a26` 的历史 live 证据。
 
-当前收口动作是等待 exact SHA 的 GitHub Actions、记录本地 live/soak 证据并继续修复 P1/P2 的真实缺口；本窗口不合并 `main`，也不开始 P3。纯文档提交推进的 branch SHA 必须与运行进程的 application revision 分开记录；本轮不因缺少 Feishu fresh nonce 阻塞 M1，但也不把 WebSocket connected 当作外部交付通过。
+当前收口动作是提交本文、普通 push、核对 exact-SHA Actions，并对最终 clean HEAD 做 runtime/GET-purity/Belief quarantine/Phase 6 fail-closed 验收；本窗口不合并 `main`，也不开始 P3。本轮不因缺少 Feishu fresh nonce 阻塞 Console-only repair，但也不把 WebSocket connected 当作外部交付通过。
 
-### P1：Cognitive Awakening M1（`PARTIAL + AUTOMATED_VALIDATED + BOUNDED HAPPY-PATH LIVE`，Console-only、无权限扩大）
+### P1：Cognitive Awakening M1（`PARTIAL + AUTOMATED_VALIDATED + HISTORICAL BOUNDED LIVE`，Console-only、无权限扩大）
 
-已完成并有真实本地证据：
+已完成并有自动化与历史 bounded live 证据：
 
 1. 结构化 typed observation 进入 EventInbox、General Situation 和 exact owner/session/workspace 的 AttentionHypothesis；
 2. CognitiveBrief 绑定 parent/evidence/replay digest 后安全进入 Attention bridge；
 3. observed evidence 才能提升 readiness，inference/prediction 保持排除可见；
-4. Hypothesis 支持 `contradicted / expired` 终态；
-5. Interaction 支持 `say / ask / wait / silent` 和 decision/delivery disposition；
+4. Hypothesis 支持 `contradicted / expired` 终态，但 generic Event caller 不能伪造 trusted lifecycle signal；
+5. Interaction 支持 canonical `say / wait / silent` 和 decision/delivery disposition；`ask` 保持 dormant，等待可信生产信号；
 6. `record_only`、`shadow`、`advise_only` 三种模式均在真实本地运行，默认已恢复 `record_only`；
 7. advise-only 只在 owner-scoped Console Sandbox 展示，收到一条 exact-bound `useful` feedback；
 8. calibration 只形成描述性统计，`policy_effect=none`、support `insufficient_data`。
-9. CognitiveBrief bridge 以 durable binding 保证 parent/evidence/hypothesis 关联的原子提交，并在重启后只读 reconcile 未完成 binding；
+9. CognitiveBrief bridge 以 prepared → admitted → committed/rejected phase CAS 保证 parent/evidence/hypothesis 关联；prepared-before-Attention、admitted-before-commit、missing-cycle orphan 和 advanced Attention replay 均已有自动化恢复/拒绝证据；
 10. `component_health` producer 从服务端 health snapshot 生成 typed observation，HTTP caller 只能使用 `local_operator` 通道；
 11. typed contradiction/supersede 写入 lifecycle ledger，终态不可复活，替代关系必须显式且 owner-scoped；
 12. interaction-decision ledger 与建议状态同一 writer fence 持久化；状态 GET 不运行 Git、模型、Probe 或 provider，也不写业务 state。
 
-以上是已实现并验证的窄闭环，不等于完整 M1。仍需补齐 bridge prepared 状态的所有崩溃窗口、真实 producer lifecycle/background observation、非 happy-path interaction samples、长期 usefulness/timing 校准和完整真实场景验收；这些缺口不扩大权限，但在完成前 P1 只能写成 `PARTIAL`。Feishu fresh nonce 属于未来外部交付验证，本阶段不作为这批本地 P1/P2 修复的阻塞条件。
+以上是已实现并验证的窄闭环，不等于完整 M1。仍需可信生产 lifecycle producer、长时 background observation、非 happy-path interaction 真实样本、长期 usefulness/timing 校准和 current-revision live 验收；这些缺口不扩大权限，但在完成前 P1 只能写成 `PARTIAL`。Feishu fresh nonce 属于未来外部交付验证，本阶段不作为这批本地 P1/P2 repair 的阻塞条件。
 
-### P2：Belief Economy 与 EvidenceGraph v1（`PARTIAL + AUTOMATED_VALIDATED + BOUNDED HAPPY-PATH LIVE`）
+### P2：Belief Economy 与 EvidenceGraph v1（`PARTIAL + AUTOMATED_VALIDATED + HISTORICAL BOUNDED LIVE`）
 
 目标：让系统不只是保存 claim，而是知道什么值得刷新、证据怎样关联。
 
@@ -603,12 +605,15 @@ Hypothesis 已支持 `candidate / accumulating / confirmed / contradicted / expi
 - [x] Belief persistence 传播 `persisted / belief_value_persisted / persistence_status`，StateRefresh 不把冲突或拒绝报告为 refreshed success；Git clean→dirty 按 typed value 形成 contradiction；
 - [x] 只读状态 GET 使用缓存/持久 runtime projection；`/phase6/status` 不触发 provider handshake、设备 token 更新或其他 state 写入；
 - [x] 为 `importance × change_probability × decision_impact` 增加 `veyra.belief.economy.v1` typed contract；任一 unknown 时 `belief_value=null`，已知 value 只用于 bounded refresh ordering；
-- [ ] claim-level CAS 与 durable value digest 的完整 producer 接入；
+- [x] StateRefresh 以 claim revision、projection digest 和 typed value digest 做 claim-level CAS；并发新 observation 会令旧 probe receipt degraded，不能覆盖新值或更新本地 probe cache；legacy 缺失 revision 只读解释为 revision 0，不做迁移；
+- [x] 每次 refresh tick 使用当前时钟重新评估 TTL，并以同批 identity 去重、owner round-robin 做 bounded fair selection；重复 identity、损坏图和 malformed non-quarantinable state 在任何 probe/scheduler 写前 fail closed；
+- [x] generic `/state` 使用 `veyra.public_state.v2` aggregate allow-list；Belief/ExternalWorld 由 exact user/session scoped endpoint 提供，rollback log 只返回 public v1 脱敏字段；这些仍是 caller-declared logical scope，不是 auth-derived security principal；
+- [x] 当前历史 ownerless/conflicting tenant claim 以 read-only quarantine 暴露 typed degraded/count；有效分区仍可读/刷新，坏行不迁移、不删除、不获得 lifecycle 写入；
 - [ ] 让完整刷新预算把 importance、change probability 和 decision impact 与 `next_refresh_at`、max staleness 结合；任一 unknown 时不猜值；
-- [ ] 加入 owner 间稳定公平调度、不可刷新 claim 的归档/过期策略和 owner-scoped EvidenceGraph projection；
+- [ ] 加入跨 tick 长期公平指标、不可刷新 claim 的归档/过期策略和 owner-scoped EvidenceGraph projection；
 - [ ] 对冲突做生产 producer 接入的显式仲裁或保持 unresolved，不静默覆盖；当前仍主要由 smoke 覆盖，不能写成全链路完成。
 
-本轮修复检查点接受标准已满足：`140/140` gate、EvidenceGraph/Economy smoke、1000-observation compaction soak、重启后 live graph 快照、Belief/Phase 6 GET purity 和 owner cursor ordering 均通过；完整 Economy 的 stale 比例、有效 belief 覆盖、next-refresh 调度、公平归档、owner projection 和多样本 producer 前后对照仍待后续真实数据。Economy 不改变 claim 真假、Attention readiness 或执行权限。
+本轮自动化检查点接受标准已满足：`142/142` gate、EvidenceGraph/Economy 与两个 adversarial smoke、claim CAS/current-clock TTL、same-batch owner fairness、quarantine byte-purity、9 Route `756/756`、plugin/compile/frontend 均通过。current-revision clean live、完整 Economy 的 stale 比例、有效 belief 覆盖、`next_refresh_at`、公平归档、owner graph projection 和多样本 producer 前后对照仍待完成。Economy 不改变 claim 真假、Attention readiness 或执行权限。
 
 ### P3：长期用户模型与 Interaction Economics
 
@@ -941,24 +946,24 @@ Route 清单不再手工维护固定数量。当前路由事实以当前 revisio
 - [x] 完成隔离 Git snapshot 的 worktree 修复及定向 smoke；
 - [x] 独立只读 review 当前安全修复；未发现 hook/filter/GIT 环境或仓库 index 写入绕过，schema v2、SHA-256、split/linked worktree 和竞态测试已补齐；
 - [x] 按 Constitutional / Living Zone 更新本次真实 Living 快照并提交；
-- [x] 定向 runtime、认知、结构化观测、Belief refresh-spec、EvidenceGraph 和 Economy smoke 通过；`140/140` gate、plugin `32/32`、compileall、Web/Desktop frontend build 均通过；
-- [x] clean restart 最新应用代码 revision，核对 Python 3.11.15、PID `91916`、`build_revision=5b80a266e1fa09609473bc3220f7e1de19c699bc`、`dirty_flag=false` 和 GET 纯读；
-- [x] 重新做该应用代码 revision 的真实 component-health typed-observation 正例、伪造 producer fail-closed 反例、runtime surfaces 和 Phase 6 fail-closed 验收；
-- [x] 验证 durable bridge、typed contradiction/supersede、不可复活、persistent interaction-decision ledger 的定向 smoke 与重启后状态边界；
+- [x] 定向 runtime、认知、结构化观测、Belief refresh-spec/CAS、EvidenceGraph 和 Economy smoke 通过；`142/142` gate、plugin `32/32`、compileall、Web/Desktop frontend build 与 9 Route `756/756` 均通过；
+- [ ] clean restart 最终文档 SHA，核对 Conda Python 3.11.15、`build_revision`、`dirty_flag=false`、冻结 runtime projection 与业务 state GET 纯读；本文只保留 `5b80a26` 历史 live，不冒充当前证据；
+- [ ] 对最终 clean revision 复核 runtime surfaces、Belief quarantine、External scoped projection 和 Phase 6 fail-closed；自动化正反例已完成，current-revision live 待提交后执行；
+- [x] 验证 durable bridge、typed contradiction/supersede、不可复活、canonical interaction-decision ledger 的定向与 crash-recovery smoke；
 - [x] 完成 EvidenceGraph 1000-observation bounded soak：同值 observation 全部可写，frontier/node compaction 生效；冲突保留旧值，容量不足时 fail closed；
 - [x] `/phase6/status` 与其他 10 个状态 GET 的 state-file purity 复核通过，未触发 OpenClaw device token 写入；
 - [ ] Feishu fresh current-run 入站→处理→`provider_sent` 证据；该证据属于未来外部交付阶段，本次 Console-only M1 不阻塞；
 - [ ] GitHub Actions 对最终 docs SHA 通过（本次文档提交后重新触发并核对 exact SHA）；
-- [ ] P1/P2 剩余缺口完成长时真实 producer、claim-level CAS、TTL/next_refresh_at、公平归档和 owner-scoped graph projection；
+- [ ] P1/P2 剩余缺口完成可信生产 lifecycle、长时真实 producer、`next_refresh_at`/max staleness、公平归档和 owner-scoped graph projection；
 - [ ] P1/P2 真实验收完成后再通过 PR 合并 `cognitive-awakening -> main`；本窗口不合并 main，不开始 P3。
 
 ### P1/P2 修复检查点之后的下一开发切片（仍留在 cognitive-awakening）
 
 - [ ] trusted Git/test/CI typed observation producer（Project Guardian 保持 disabled；不在本切片启用后台 runner）；
-- [x] EvidenceGraph v1、valid-time unknown/invalid fail-closed 和 typed support/contradiction/supersede；`140/140` gate、live graph snapshot 与 Belief GET purity 已通过；
-- [x] Belief Economy v1 typed 三因子校验、unknown/null fail-closed、已知 value ordering 和持久 cursor owner rotation；`140/140` gate 与 live GET purity 已通过；
+- [x] EvidenceGraph v1、valid-time unknown/invalid fail-closed、typed support/contradiction/supersede、bounded partition/compaction 与 tamper checks；`142/142` gate 和 Belief GET purity 已通过；
+- [x] Belief Economy v1 typed 三因子、claim-level CAS、current-clock TTL、same-batch owner fairness 与 honest persistence receipt；`142/142` gate 已通过；
 - [ ] 多真实样本下的 usefulness / timing / evidence 校准；
-- [ ] claim-level CAS、完整刷新预算（importance/change probability/decision impact/next_refresh_at）、公平性和不可刷新 claim 归档；
+- [ ] 完整刷新预算（importance/change probability/decision impact/next_refresh_at/max staleness）、长期公平指标和不可刷新 claim 归档；
 - [ ] owner-scoped EvidenceGraph projection 与长期 retention/compaction 观测；
 - [ ] 保持 external delivery、Agent、Tool、Route、Risk 和 authority 全部不变。
 
