@@ -148,6 +148,11 @@ class TrustedWorkspaceObserver:
                 goal_id=selected_goal,
             )
         selected_workspace = self._workspace(workspace_id)
+        current_workspace = self._workspace_from_local_world()
+        if selected_workspace != current_workspace:
+            raise TrustedWorkspaceObserverConflict(
+                "workspace must match the current local project"
+            )
         # Validate the durable observer document before doing any probe or
         # CAS work.  A malformed mode/binding must fail closed rather than be
         # interpreted as a fresh configuration.

@@ -140,7 +140,20 @@ def build_structured_observations_router(
                     command.github_required_jobs,
                     command.github_expected_app_id,
                 )
-                if any(value is not None for value in ci_fields):
+                selected_mode = str(command.mode or "").strip().lower()
+                if selected_mode == "disabled" and any(
+                    value is not None for value in ci_fields
+                ):
+                    # A disabled observer is deliberately a no-probe path.
+                    # Reject provider fields before bind_ci_policy can perform
+                    # any network identity reads (and before configure can
+                    # resolve a workspace, Git snapshot, or Goal).
+                    raise ValueError(
+                        "GitHub CI fields are not allowed when observer is disabled"
+                    )
+                if selected_mode != "disabled" and any(
+                    value is not None for value in ci_fields
+                ):
                     if not all(value is not None for value in ci_fields):
                         raise ValueError("GitHub CI fields must be configured together")
                     ci_binding = workspace_observer.bind_ci_policy(

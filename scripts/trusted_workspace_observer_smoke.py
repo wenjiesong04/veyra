@@ -61,6 +61,17 @@ class FakeCI:
         }
 
 
+class NoBindCI:
+    """Provider that fails the smoke if a disabled route tries to bind CI."""
+
+    def __init__(self) -> None:
+        self.bind_calls = 0
+
+    def bind_policy(self, **_kwargs):
+        self.bind_calls += 1
+        raise AssertionError("disabled observer attempted a CI bind")
+
+
 def expect(condition: bool, label: str) -> None:
     if not condition:
         raise AssertionError(label)
@@ -178,6 +189,27 @@ def main() -> int:
             )
         )
         with TestClient(api) as client:
+            route_revision = int(
+                store.read_json("trusted_workspace_observer_state.json").get("_state_revision")
+                or 0
+            )
+            route_configured = client.post(
+                "/awareness/structured-observations/workspace/configure",
+                headers={"x-veyra-token": TOKEN},
+                json={
+                    "schema_version": "veyra.trusted_workspace_observer.config.v1",
+                    "expected_state_revision": route_revision,
+                    "mode": "record_only",
+                    "user_id": "smoke-owner",
+                    "session_id": "smoke-session",
+                    "workspace_id": str(workspace),
+                    "goal_id": "goal-smoke",
+                },
+            )
+            expect(
+                route_configured.status_code == 200,
+                "workspace configure route accepts exact binding",
+            )
             status_response = client.get(
                 "/awareness/structured-observations/workspace/status"
             )
@@ -311,6 +343,49 @@ def main() -> int:
         disabled_store, _disabled_awareness, _disabled_ingress, disabled_observer = build_runtime(
             root / "disabled-state", workspace
         )
+        no_bind_ci = NoBindCI()
+        disabled_observer.ci_provider = no_bind_ci
+        disabled_route_api = FastAPI()
+        disabled_route_api.include_router(
+            build_structured_observations_router(
+                ingress=_disabled_ingress,
+                workspace_observer=disabled_observer,
+            )
+        )
+        disabled_route_revision = int(
+            disabled_store.read_json("trusted_workspace_observer_state.json").get("_state_revision")
+            or 0
+        )
+        with TestClient(disabled_route_api) as client:
+            disabled_with_ci = client.post(
+                "/awareness/structured-observations/workspace/configure",
+                headers={"x-veyra-token": TOKEN},
+                json={
+                    "schema_version": "veyra.trusted_workspace_observer.config.v1",
+                    "expected_state_revision": disabled_route_revision,
+                    "mode": "disabled",
+                    "user_id": "smoke-owner",
+                    "session_id": "disabled-session",
+                    "workspace_id": str(root / "does-not-exist"),
+                    "goal_id": "missing-goal",
+                    "github_repo_id": "veyra-smoke/fixture",
+                    "github_workflow_path": ".github/workflows/gate.yml",
+                    "github_required_jobs": ["gate"],
+                    "github_expected_app_id": 3,
+                },
+            )
+            expect(
+                disabled_with_ci.status_code == 422
+                and no_bind_ci.bind_calls == 0
+                and int(
+                    disabled_store.read_json("trusted_workspace_observer_state.json").get(
+                        "_state_revision"
+                    )
+                    or 0
+                )
+                == disabled_route_revision,
+                "disabled route rejects CI fields before any provider or workspace probe",
+            )
         (workspace / "app.py").write_text("dirty while disabling\n", encoding="utf-8")
         disabled_revision = int(
             disabled_store.read_json("trusted_workspace_observer_state.json").get("_state_revision") or 0
@@ -329,6 +404,37 @@ def main() -> int:
             and disabled_observer.run_once(reason="disabled_dirty")["status"] == "disabled",
             "disabled configuration succeeds without Git/Goal/workspace probing",
         )
+        mismatch_workspace = root / "mismatch-workspace"
+        mismatch_workspace.mkdir()
+        mismatch_revision = int(
+            disabled_store.read_json("trusted_workspace_observer_state.json").get("_state_revision")
+            or 0
+        )
+        with TestClient(disabled_route_api) as client:
+            mismatched_record_only = client.post(
+                "/awareness/structured-observations/workspace/configure",
+                headers={"x-veyra-token": TOKEN},
+                json={
+                    "schema_version": "veyra.trusted_workspace_observer.config.v1",
+                    "expected_state_revision": mismatch_revision,
+                    "mode": "record_only",
+                    "user_id": "smoke-owner",
+                    "session_id": "mismatch-session",
+                    "workspace_id": str(mismatch_workspace),
+                    "goal_id": "missing-goal",
+                },
+            )
+            expect(
+                mismatched_record_only.status_code == 409
+                and int(
+                    disabled_store.read_json("trusted_workspace_observer_state.json").get(
+                        "_state_revision"
+                    )
+                    or 0
+                )
+                == mismatch_revision,
+                "record-only route rejects workspace outside local_world.current_project",
+            )
         git(workspace, "restore", "app.py")
 
         # A generic HTTP-shaped command cannot impersonate the in-process
