@@ -476,3 +476,37 @@ Belief Value = importance × change_probability × decision_impact
 这个场景的成功不是“系统成功生成了一段聪明文字”，而是：真实信号被正确累积、建议理由可核查、用户反馈被准确记录，并且安全与权限边界全程没有变化。
 
 在此之前，对 Phase Cognitive Awakening 最诚实的状态仍是：**实现切片进行中，用户价值验证 pending。**
+
+## 10. 2026-08-12 trusted input 实现检查点
+
+本节是对上面历史计划的实现补充，不改写阶段开始时的基线。
+
+已经形成第一条 production-shaped、默认不扩权的输入路径：
+
+```text
+isolated Git / exact-SHA GitHub Actions observation
+→ server-owned workspace_observer capability
+→ StructuredObservationIngress / EventInbox
+→ GeneralSituation / GeneralAttention
+→ confirmed AttentionHypothesis
+→ record_only SuggestionOutbox
+```
+
+它有这些边界：
+
+- 只观察 `local_world.current_project` 精确绑定的一个 Git workspace，不接受任意命令、测试日志、路径或自由文本 fact；
+- 配置必须绑定 exact owner/session/workspace、唯一 active Goal、Git origin/ref，以及可选的 GitHub Actions workflow/required jobs/app identity；
+- 第一轮只建立 baseline；unchanged、docs-only、重复 observation 和 CI success 保持 silent；
+- 非文档 dirty change 先形成 `change_signal`，超过 grace 且仍未验证时才形成 `risk_signal`；clean 新 SHA 只有 exact-SHA CI failure 才同时形成 change/risk，CI unknown 不推进 baseline；
+- producer 通过进程内 object capability 进入既有认知链，HTTP caller 不能自报 `workspace_observer`；
+- 默认 `not_configured / disabled`，Project Guardian 继续 disabled，external delivery、Agent、Tool、Route、Risk、Grant 和 execution authority 全部不变。
+
+测试现在区分两条 lane：大量 smoke 继续验证安全和治理不变量；`trusted_workspace_observer_smoke.py` 单独作为 cognitive capability smoke，要求真实临时 Git worktree 的 code change 能到达 exact-owner confirmed Attention 和一条 `record_only` proposal，同时验证 silent、重放、Goal/config 竞态、CI unknown→failure 和伪造入口。这个自动化正例证明链路具备能力，仍不证明当前用户 workspace 已配置、长期 usefulness 或外部主动交付。
+
+应用 revision `479b38d30934c0da1559f635b0f7e88001ed681c` 的本地检查为：`143/143` gate（`142` invariant + `1` capability）、9 Route `810/810`、OpenClaw plugin `32/32`、结构化观测控制面 `10/10`、compileall、Web build 与 Desktop frontend build 全部通过。observer 默认未配置，当前真实用户状态的历史 `0 candidate / overconservative` 不能用这组自动化结果改写。
+
+Attention lifecycle 仍明确保持 fail-closed：`attention_lifecycle_producer_unavailable`。原先在早退之后的 contradiction 推导代码不可达，已经删除；本轮对抗审查也否决了继续堆一套没有真实 domain caller 的大型 producer。后续只有在某个受信领域能提供独立、可核验的反证事实时，才实现对应的最小 producer 与 lifecycle admission，不能先造通用脚手架再把 fixture 当能力。
+
+下一项产品验证不是继续增加安全模块，而是由用户显式选择 active Goal 和 owner/session，配置 workspace observer，在真实项目中收集 bounded shadow/record-only 样本，并记录 candidate rate、证据质量、timing 与显式 feedback。当前历史 `0 candidate / overconservative` 仍是问题基线，不能被一个自动化正例抹掉。
+
+实现结构上，workspace observer 已拆为 service、纯 state codec 与 durable delivery outbox；这比把全部状态机留在一个 1400 行文件更可审阅，但 service 仍约 1070 行，属于后续机械拆分债务。隔离 Git observation 的持久输出与文件读取有预算，Git status 的 2 MiB 检查仍是在子进程返回后执行，因此不能宣称拥有操作系统级流式资源硬限。
