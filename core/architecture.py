@@ -9,8 +9,14 @@ ARCHITECTURE_BLOCKS: list[dict[str, Any]] = [
     {
         "id": "core",
         "name": "Veyra Core",
-        "role": "Awareness, active runtime loop, state, attention, model-assisted reasoning, decision, risk governance, verification, and patch generation.",
-        "paths": ["core/", "awareness/", "decision/", "foresight/", "guardian/"],
+        "role": "Awareness, active runtime loop, state, attention, model-assisted reasoning, decision, foresight, risk governance, and verification.",
+        "paths": [
+            "core/",
+            "awareness/",
+            "runtime/",
+            "guardian/review_queue.py",
+            "execution/action_executor.py",
+        ],
         "status": "implemented",
         "validation_state": "local_self_tested",
     },

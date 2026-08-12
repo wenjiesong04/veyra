@@ -23,7 +23,7 @@ jobs:
         working-directory: apps/openclaw/veyra-governance
         run: npm test
       - name: Compile Python modules
-        run: python3 -m compileall awareness core decision execution foresight guardian interface memory_bridge probes rollback_audit routers runtime skills tool_proxy main.py cli.py desktop_backend.py scripts
+        run: python3 -m compileall awareness core execution guardian interface memory_bridge probes rollback_audit routers runtime skills tool_proxy main.py cli.py desktop_backend.py scripts
 
   frontend:
     runs-on: ubuntu-latest
