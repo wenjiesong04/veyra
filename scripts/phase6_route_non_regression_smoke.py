@@ -802,11 +802,8 @@ def main() -> int:
         and "phase6_extension_deployment_state" not in public_state
         and "phase6_extension_pipeline_state" not in public_state
         and "phase6_capability_gap_state" not in public_state
-        and public_state.get("local_world", {}).get(
-            "current_project"
-        )
-        == "public-safe",
-        "generic state projection omits the private Phase 6 graph",
+        and "current_project" not in (public_state.get("local_world") or {}),
+        "generic state projection omits the private Phase 6 graph and project identifier",
         public_state,
     )
     expect(

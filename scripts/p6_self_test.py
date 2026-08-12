@@ -952,9 +952,23 @@ def main() -> int:
                 "reason": "p6_self_test",
             },
         )
-        expect(watch.status_code == 200 and watch.json()["watchlist"], "external watchlist endpoint", watch.text)
+        expect(
+            watch.status_code == 200
+            and watch.json().get("schema_version")
+            == "veyra.external_watchlist_write.v1"
+            and watch.json().get("item", {}).get("target") == "localhost",
+            "external watchlist endpoint",
+            watch.text,
+        )
         external_refresh = client.post("/external/refresh?limit=1")
-        expect(external_refresh.status_code == 200 and external_refresh.json()["refreshed"], "external refresh endpoint", external_refresh.text)
+        expect(
+            external_refresh.status_code == 200
+            and external_refresh.json().get("schema_version")
+            == "veyra.external_refresh.aggregate.v1"
+            and external_refresh.json().get("refreshed_count", 0) > 0,
+            "external refresh endpoint",
+            external_refresh.text,
+        )
 
         red_team = client.get("/ops/safety/red-team").json()
         retention = client.get("/ops/retention").json()

@@ -35,6 +35,7 @@ from runtime.suggestion_outbox import (  # noqa: E402
 from runtime.attention_hypothesis_runtime import AttentionHypothesisRuntime  # noqa: E402
 from scripts.attention_hypothesis_smoke import (  # noqa: E402
     CONFIRMING_VALUES,
+    LOW_VALUES,
     MutableClock,
     assessment_for,
     parent_for,
@@ -423,31 +424,121 @@ def interaction_disposition_case() -> None:
         store = WorldStateStore(Path(tmp) / "state")
         clock = MutableClock(NOW)
         outbox = SuggestionOutbox(store, clock=clock)
-        parent = {
-            "user_id": USER,
-            "session_scope_keys": [tenant_scope_storage_key(USER, SESSION)],
-            "general_situation_id": "gsit-interaction-disposition",
-            "parent_revision": 1,
-        }
-        base = {
-            "general_situation_id": parent["general_situation_id"],
-            "parent_revision": 1,
-            "authority": outbox._authority_boundary(),
-            "eligible": False,
-        }
-        cases = (
-            ("candidate", "wait", "attention_evidence_accumulating"),
-            ("accumulating", "wait", "attention_evidence_accumulating"),
-            ("contradicted", "silent", "attention_hypothesis_contradicted"),
-            ("expired", "silent", "attention_hypothesis_expired"),
+        attention = AttentionHypothesisRuntime(store, clock=clock)
+
+        def persisted_surface(
+            index: int,
+            *,
+            user_id: str = USER,
+            session_id: str = SESSION,
+            accumulating: bool = False,
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            general_id = f"gsit-interaction-disposition-{index}"
+            parent = parent_for(
+                user_id=user_id,
+                session_id=session_id,
+                revision=1,
+                child_count=2,
+                clock=clock,
+                anchor=f"goal:interaction-{index}",
+                general_id=general_id,
+            )
+            persist_parent(store, parent)
+            first_assessment = assessment_for(
+                parent,
+                values=LOW_VALUES,
+                store=store,
+                clock=clock,
+            )
+            first = attention.observe(parent, first_assessment)
+            if not accumulating:
+                selected_parent = parent
+                selected = first
+            else:
+                selected_parent = parent_for(
+                    user_id=user_id,
+                    session_id=session_id,
+                    revision=2,
+                    child_count=3,
+                    clock=clock,
+                    anchor=f"goal:interaction-{index}",
+                    general_id=general_id,
+                )
+                second_assessment = assessment_for(
+                    selected_parent,
+                    values=LOW_VALUES,
+                    store=store,
+                    clock=clock,
+                )
+                selected = attention.observe(
+                    selected_parent,
+                    second_assessment,
+                )
+            surface = selected.get("surface_assessment")
+            expect(
+                selected.get("status") in {"candidate", "accumulating"}
+                and isinstance(surface, dict)
+                and isinstance(surface.get("attention_hypothesis_ref"), dict),
+                f"{general_id} persists a current {selected.get('status')} binding",
+                selected,
+            )
+            return selected_parent, copy.deepcopy(surface)
+
+        candidate_parent, candidate_surface = persisted_surface(1)
+        accumulating_parent, accumulating_surface = persisted_surface(
+            2,
+            accumulating=True,
         )
-        for hypothesis_status, expected_decision, expected_reason in cases:
+        ask_parent, ask_surface = persisted_surface(3)
+        ask_surface["interaction_gap"] = {
+            "kind": "owner_question",
+            "gap_id": "gap_interaction_missing_input",
+            "answerable": True,
+        }
+        silent_parent, silent_surface = persisted_surface(4)
+        silent_surface["hypothesis_status"] = candidate_surface["hypothesis_status"]
+        silent_surface["status"] = "awaiting_evidence"
+        silent_surface["eligible"] = False
+        positive_cases = (
+            (
+                "candidate",
+                candidate_parent,
+                candidate_surface,
+                "wait",
+                "attention_evidence_accumulating",
+            ),
+            (
+                "accumulating",
+                accumulating_parent,
+                accumulating_surface,
+                "wait",
+                "attention_evidence_accumulating",
+            ),
+            (
+                "owner_question_dormant",
+                ask_parent,
+                ask_surface,
+                "wait",
+                "attention_evidence_accumulating",
+            ),
+            (
+                "noneligible_caller_override_dormant",
+                silent_parent,
+                silent_surface,
+                "wait",
+                "attention_evidence_accumulating",
+            ),
+        )
+        for (
+            label,
+            parent,
+            surface,
+            expected_decision,
+            expected_reason,
+        ) in positive_cases:
             result = outbox.consider(
                 parent,
-                {
-                    **base,
-                    "hypothesis_status": hypothesis_status,
-                },
+                surface,
                 user_id=USER,
                 session_id=SESSION,
             )
@@ -456,32 +547,130 @@ def interaction_disposition_case() -> None:
                 and result.get("decision_disposition") == expected_decision
                 and result.get("delivery_disposition") == "none"
                 and result.get("reason") == expected_reason
-                and result.get("proposal") is None,
-                f"{hypothesis_status} produces {expected_decision} without delivery",
+                and result.get("proposal") is None
+                and isinstance(result.get("interaction_decision"), dict)
+                and result["interaction_decision"].get(
+                    "attention_hypothesis_ref"
+                )
+                == surface.get("attention_hypothesis_ref"),
+                f"{label} produces {expected_decision} with a persisted exact binding",
                 result,
             )
-        ask = outbox.consider(
-            parent,
-            {
-                **base,
-                "hypothesis_status": "confirmed",
-                "interaction_gap": {
-                    "kind": "owner_question",
-                    "gap_id": "gap_interaction_missing_input",
-                    "answerable": True,
-                },
-            },
-            user_id=USER,
-            session_id=SESSION,
+
+        ledger_path = store.path_for(SuggestionOutbox.STATE_FILE)
+        ledger = store.read_json(SuggestionOutbox.STATE_FILE)
+        decisions = ledger.get("interaction_decisions") or {}
+        hypothesis_ref = candidate_surface["attention_hypothesis_ref"]
+        general_state = store.read_json("general_situation_state.json")
+        attention_state = store.read_json("attention_hypothesis_state.json")
+        persisted_parent = (
+            general_state.get("general_situations", {})
+            .get(candidate_parent["general_situation_id"])
+        )
+        persisted_hypothesis = (
+            attention_state.get("hypotheses", {})
+            .get(hypothesis_ref["hypothesis_id"])
         )
         expect(
-            ask.get("status") == "not_proposed"
-            and ask.get("decision_disposition") == "ask"
-            and ask.get("delivery_disposition") == "none"
-            and ask.get("reason") == "structured_owner_question_pending",
-            "typed owner gap produces ask without an external prompt",
-            ask,
+            ledger.get("interaction_decision_count") == 4
+            and len(decisions) == 4
+            and isinstance(persisted_parent, dict)
+            and persisted_parent.get("user_id") == USER
+            and tenant_scope_storage_key(USER, SESSION)
+            in set(persisted_parent.get("session_scope_keys") or [])
+            and persisted_parent.get("parent_revision")
+            == candidate_parent.get("parent_revision")
+            and isinstance(persisted_hypothesis, dict)
+            and persisted_hypothesis.get("user_id") == USER
+            and tenant_scope_storage_key(USER, SESSION)
+            in set(persisted_hypothesis.get("session_scope_keys") or [])
+            and AttentionHypothesisRuntime._parent_binding(persisted_parent)
+            == persisted_hypothesis.get("parent_binding")
+            and all(
+                item.get("attention_hypothesis_ref") is not None
+                and item.get("user_id") == USER
+                and item.get("session_id") == SESSION
+                for item in decisions.values()
+            ),
+            "positive decisions are parent-derived and exact-owner/session scoped",
+            {
+                "decision_count": ledger.get("interaction_decision_count"),
+                "parent": persisted_parent,
+                "hypothesis": persisted_hypothesis,
+            },
         )
+
+        _, foreign_owner_surface = persisted_surface(
+            5,
+            user_id="foreign-owner",
+        )
+        _, foreign_session_surface = persisted_surface(
+            6,
+            session_id="foreign-session",
+        )
+        missing_surface = copy.deepcopy(candidate_surface)
+        missing_surface.pop("attention_hypothesis_ref", None)
+        stale_surface = copy.deepcopy(candidate_surface)
+        stale_surface["attention_hypothesis_ref"]["hypothesis_revision"] += 1
+        cross_owner_surface = copy.deepcopy(candidate_surface)
+        cross_owner_surface["attention_hypothesis_ref"] = copy.deepcopy(
+            foreign_owner_surface["attention_hypothesis_ref"]
+        )
+        cross_session_surface = copy.deepcopy(candidate_surface)
+        cross_session_surface["attention_hypothesis_ref"] = copy.deepcopy(
+            foreign_session_surface["attention_hypothesis_ref"]
+        )
+        rejection_cases = (
+            (
+                "missing binding",
+                missing_surface,
+                "current_attention_hypothesis_required",
+            ),
+            (
+                "stale binding",
+                stale_surface,
+                "attention_hypothesis_binding_not_current",
+            ),
+            (
+                "cross-owner binding",
+                cross_owner_surface,
+                "attention_hypothesis_binding_not_current",
+            ),
+            (
+                "cross-session binding",
+                cross_session_surface,
+                "attention_hypothesis_binding_not_current",
+            ),
+        )
+        for label, forged_surface, expected_reason in rejection_cases:
+            before = ledger_path.read_bytes()
+            before_count = int(
+                store.read_json(SuggestionOutbox.STATE_FILE).get(
+                    "interaction_decision_count"
+                )
+                or 0
+            )
+            rejected = outbox.consider(
+                candidate_parent,
+                forged_surface,
+                user_id=USER,
+                session_id=SESSION,
+            )
+            expect(
+                rejected.get("status") == "fail_closed"
+                and rejected.get("reason") == expected_reason
+                and rejected.get("interaction_decision") is None
+                and before == ledger_path.read_bytes()
+                and int(
+                    store.read_json(SuggestionOutbox.STATE_FILE).get(
+                        "interaction_decision_count"
+                    )
+                    or 0
+                )
+                == before_count,
+                f"{label} fails closed without ledger mutation",
+                rejected,
+            )
 
 
 def pipeline_fail_closed_projection_case() -> None:
@@ -608,6 +797,14 @@ def main() -> int:
         stale_wait_surface["eligible"] = False
         stale_wait_surface["status"] = "not_eligible"
         stale_wait_surface["hypothesis_status"] = "candidate"
+        stale_ledger_path = store.path_for(SuggestionOutbox.STATE_FILE)
+        stale_ledger_before = stale_ledger_path.read_bytes()
+        stale_decision_count_before = int(
+            store.read_json(SuggestionOutbox.STATE_FILE).get(
+                "interaction_decision_count"
+            )
+            or 0
+        )
         stale_wait = outbox.consider(
             parent,
             stale_wait_surface,
@@ -619,9 +816,14 @@ def main() -> int:
             and stale_wait.get("reason") == "attention_hypothesis_binding_not_current"
             and stale_wait.get("decision_disposition") == "wait"
             and stale_wait.get("delivery_disposition") == "suppressed"
+            and stale_wait.get("interaction_decision") is None
             and store.read_json(SuggestionOutbox.STATE_FILE).get("proposal_count") == 0
-            and store.read_json(SuggestionOutbox.STATE_FILE).get("interaction_decision_count", 0) >= 1,
-            "non-say decisions reject a stale Attention surface inside the writer fence",
+            and store.read_json(SuggestionOutbox.STATE_FILE).get(
+                "interaction_decision_count", 0
+            )
+            == stale_decision_count_before
+            and stale_ledger_before == stale_ledger_path.read_bytes(),
+            "non-say decisions reject a stale Attention surface without ledger mutation",
             stale_wait,
         )
         surfaced = outbox.consider(

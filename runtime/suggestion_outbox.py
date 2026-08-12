@@ -396,11 +396,23 @@ class SuggestionOutbox:
             if committed_config.get("status") == "fail_closed":
                 result = committed_config
                 return current
+            commit_now = self._now()
             if (
                 committed_config.get("mode") != mode
                 or committed_config.get("mode_epoch")
                 != config.get("mode_epoch")
             ):
+                attention_issue = self._current_attention_binding_issue(
+                    general_situation=general_situation,
+                    assessment=assessment,
+                    attention_hypothesis_ref=attention_hypothesis_ref,
+                    user_id=user,
+                    scope_key=scope_key,
+                    now=commit_now,
+                )
+                if attention_issue is not None:
+                    result = self._closed(attention_issue)
+                    return current
                 decision_record = self._decision_record(
                     general_situation=general_situation,
                     assessment=assessment,
@@ -413,7 +425,7 @@ class SuggestionOutbox:
                     delivery_disposition="suppressed",
                     reason="suggestion_mode_changed_before_commit",
                     proposal_id=None,
-                    now=self._now(),
+                    now=commit_now,
                 )
                 persisted_decision = self._record_decision_in_state(
                     current, decision_record
@@ -438,7 +450,6 @@ class SuggestionOutbox:
             # The writer transaction may have waited behind another commit.  All
             # freshness and budget decisions must therefore use a time sampled
             # after both the durable outbox read and the mode/epoch re-check.
-            commit_now = self._now()
             attention_issue = self._current_attention_binding_issue(
                 general_situation=general_situation,
                 assessment=assessment,
@@ -694,6 +705,26 @@ class SuggestionOutbox:
                 committed_mode != str(output.get("mode") or self.DEFAULT_MODE)
                 or committed_epoch != mode_epoch
             ):
+                commit_now = self._now()
+                attention_issue = self._current_attention_binding_issue(
+                    general_situation=general_situation,
+                    assessment=assessment,
+                    attention_hypothesis_ref=attention_hypothesis_ref,
+                    user_id=user_id,
+                    scope_key=tenant_scope_storage_key(user_id, session_id),
+                    now=commit_now,
+                    require_confirmed=False,
+                )
+                if attention_issue is not None:
+                    result = {
+                        **copy.deepcopy(output),
+                        "status": "fail_closed",
+                        "reason": attention_issue,
+                        "delivery_disposition": "suppressed",
+                        "interaction_decision": None,
+                        "authority": self._authority_boundary(),
+                    }
+                    return current
                 suppressed = self._decision_record(
                     general_situation=general_situation,
                     assessment=assessment,
@@ -708,7 +739,7 @@ class SuggestionOutbox:
                     delivery_disposition="suppressed",
                     reason="suggestion_mode_changed_before_commit",
                     proposal_id=proposal_id,
-                    now=self._now(),
+                    now=commit_now,
                 )
                 selected = self._record_decision_in_state(current, suppressed)
                 result = {
@@ -721,46 +752,37 @@ class SuggestionOutbox:
                     "authority": self._authority_boundary(),
                 }
                 return current
-            if (
-                str(output.get("decision_disposition") or "silent") != "say"
-                and isinstance(attention_hypothesis_ref, dict)
-            ):
-                attention_issue = self._current_attention_binding_issue(
-                    general_situation=general_situation,
-                    assessment=assessment,
-                    attention_hypothesis_ref=attention_hypothesis_ref,
-                    user_id=user_id,
-                    scope_key=tenant_scope_storage_key(user_id, session_id),
-                    now=self._now(),
-                    require_confirmed=False,
-                )
-                if attention_issue is not None:
-                    rejected = self._decision_record(
-                        general_situation=general_situation,
-                        assessment=assessment,
-                        attention_hypothesis_ref=attention_hypothesis_ref,
-                        user_id=user_id,
-                        session_id=session_id,
-                        mode=committed_mode,
-                        mode_epoch=committed_epoch,
-                        decision_disposition=str(
-                            output.get("decision_disposition") or "silent"
-                        ),
-                        delivery_disposition="suppressed",
-                        reason=attention_issue,
-                        proposal_id=proposal_id,
-                        now=self._now(),
-                    )
-                    selected = self._record_decision_in_state(current, rejected)
-                    result = {
-                        **copy.deepcopy(output),
-                        "status": "fail_closed",
-                        "reason": attention_issue,
-                        "delivery_disposition": "suppressed",
-                        "interaction_decision": self._public_decision(selected),
-                        "authority": self._authority_boundary(),
-                    }
-                    return current
+            decision_disposition = str(
+                output.get("decision_disposition") or "silent"
+            )
+            # Every non-say disposition is a durable review of the exact
+            # current owner Situation/Attention binding.  A missing or forged
+            # reference is rejected before the decision ledger can record it;
+            # otherwise an unbound ``wait``/``silent`` row could outlive the
+            # evidence it claims to review.
+            attention_issue = self._current_attention_binding_issue(
+                general_situation=general_situation,
+                assessment=assessment,
+                attention_hypothesis_ref=attention_hypothesis_ref,
+                user_id=user_id,
+                scope_key=tenant_scope_storage_key(user_id, session_id),
+                now=self._now(),
+                require_confirmed=False,
+            )
+            if attention_issue is not None:
+                # No-ref and stale/forged bindings are rejected before a
+                # durable decision exists.  The caller receives an
+                # owner-scoped fail-closed result, but the decision ledger
+                # remains free of an unreviewable claim.
+                result = {
+                    **copy.deepcopy(output),
+                    "status": "fail_closed",
+                    "reason": attention_issue,
+                    "delivery_disposition": "suppressed",
+                    "interaction_decision": None,
+                    "authority": self._authority_boundary(),
+                }
+                return current
             selected = self._record_decision_in_state(current, record)
             result = {
                 **copy.deepcopy(output),
@@ -795,23 +817,23 @@ class SuggestionOutbox:
             "veyra.interaction_decision.assessment_binding.v1",
             assessment.get("assessment_binding") or {},
         )
-        identity = {
-            "user_id": user_id,
-            "session_id": session_id,
-            "general_situation_id": general_situation.get("general_situation_id"),
-            "parent_revision": parent_revision,
-            "attention_hypothesis_ref": copy.deepcopy(attention_hypothesis_ref),
-            "assessment_binding_digest": assessment_binding_digest,
-            "mode": mode,
-            "mode_epoch": self._nonnegative_int(mode_epoch),
-            "decision_disposition": decision_disposition,
-            "delivery_disposition": delivery_disposition,
-            "reason": reason,
-            "proposal_id": proposal_id,
-        }
-        decision_id = "idec_" + stable_digest(
-            "veyra.interaction_decision.identity.v1", identity
-        )[:24]
+        identity = self._decision_identity(
+            user_id=user_id,
+            session_id=session_id,
+            general_situation_id=str(
+                general_situation.get("general_situation_id") or ""
+            ),
+            parent_revision=parent_revision,
+            attention_hypothesis_ref=attention_hypothesis_ref,
+            assessment_binding_digest=assessment_binding_digest,
+            mode=mode,
+            mode_epoch=self._nonnegative_int(mode_epoch),
+            decision_disposition=decision_disposition,
+            delivery_disposition=delivery_disposition,
+            reason=reason,
+            proposal_id=proposal_id,
+        )
+        decision_id = self.decision_id_for_identity(identity)
         return {
             "schema_version": self.DECISION_SCHEMA_VERSION,
             "decision_id": decision_id,
@@ -834,13 +856,94 @@ class SuggestionOutbox:
             "authority": self._authority_boundary(),
         }
 
+    @staticmethod
+    def _decision_identity(
+        *,
+        user_id: str,
+        session_id: str,
+        general_situation_id: str,
+        parent_revision: int,
+        attention_hypothesis_ref: dict[str, Any] | None,
+        assessment_binding_digest: str,
+        mode: str,
+        mode_epoch: int,
+        decision_disposition: str,
+        delivery_disposition: str,
+        reason: str,
+        proposal_id: str | None,
+    ) -> dict[str, Any]:
+        """Return the immutable interaction-decision identity payload."""
+
+        return {
+            "user_id": user_id,
+            "session_id": session_id,
+            "general_situation_id": general_situation_id,
+            "parent_revision": parent_revision,
+            "attention_hypothesis_ref": copy.deepcopy(attention_hypothesis_ref),
+            "assessment_binding_digest": assessment_binding_digest,
+            "mode": mode,
+            "mode_epoch": mode_epoch,
+            "decision_disposition": decision_disposition,
+            "delivery_disposition": delivery_disposition,
+            "reason": reason,
+            "proposal_id": proposal_id,
+        }
+
+    @staticmethod
+    def decision_id_for_identity(identity: dict[str, Any]) -> str:
+        if not isinstance(identity, dict):
+            raise TypeError("interaction decision identity must be a mapping")
+        return "idec_" + stable_digest(
+            "veyra.interaction_decision.identity.v1", identity
+        )[:24]
+
+    @classmethod
+    def decision_id_for(cls, record: dict[str, Any]) -> str:
+        """Recompute an interaction decision ID from immutable semantics."""
+
+        if not isinstance(record, dict):
+            raise TypeError("interaction decision must be a mapping")
+        identity = cls._decision_identity(
+            user_id=str(record.get("user_id") or ""),
+            session_id=str(record.get("session_id") or ""),
+            general_situation_id=str(record.get("general_situation_id") or ""),
+            parent_revision=cls._nonnegative_int(record.get("parent_revision")),
+            attention_hypothesis_ref=copy.deepcopy(
+                record.get("attention_hypothesis_ref")
+            ),
+            assessment_binding_digest=str(
+                record.get("assessment_binding_digest") or ""
+            ),
+            mode=str(record.get("mode") or ""),
+            mode_epoch=cls._nonnegative_int(record.get("mode_epoch")),
+            decision_disposition=str(
+                record.get("decision_disposition") or ""
+            ),
+            delivery_disposition=str(
+                record.get("delivery_disposition") or ""
+            ),
+            reason=str(record.get("reason") or ""),
+            proposal_id=(
+                str(record.get("proposal_id"))
+                if record.get("proposal_id") is not None
+                else None
+            ),
+        )
+        return cls.decision_id_for_identity(identity)
+
+    interaction_decision_id_for = decision_id_for
+
     def _record_decision_in_state(
         self,
         state: dict[str, Any],
         record: dict[str, Any],
     ) -> dict[str, Any]:
-        decisions = self._records(state.get("interaction_decisions"))
         decision_id = str(record.get("decision_id") or "")
+        if not self._valid_decision_record(decision_id, record):
+            raise SuggestionOutboxConflict(
+                "interaction decision record failed immutable identity validation"
+            )
+        decisions = self._records(state.get("interaction_decisions"))
         existing = decisions.get(decision_id)
         if existing is not None:
             if not self._valid_decision_record(decision_id, existing):
@@ -977,6 +1080,48 @@ class SuggestionOutbox:
             "state_revision": self._nonnegative_int(state.get("_state_revision")),
             "authority": self._authority_boundary(),
         }
+
+    def list_decisions(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Pure exact-owner review of typed interaction decisions."""
+
+        user, session, _scope_key = self._owner(user_id, session_id)
+        selected_limit = max(0, min(int(limit), 500))
+        state = self.state_store.read_json(self.STATE_FILE)
+        if not self._healthy(state):
+            return {**self._closed("suggestion_outbox_state_corrupt"), "items": [], "count": 0}
+        decisions = self._records(state.get("interaction_decisions"))
+        visible = [
+            item
+            for item in decisions.values()
+            if str(item.get("user_id") or "") == user
+            and str(item.get("session_id") or "") == session
+        ]
+        visible.sort(
+            key=lambda item: (
+                str(item.get("updated_at") or ""),
+                str(item.get("decision_id") or ""),
+            ),
+            reverse=True,
+        )
+        return {
+            "status": "success",
+            "count": min(len(visible), selected_limit),
+            "decision_count": len(visible),
+            "items": [copy.deepcopy(item) for item in visible[:selected_limit]],
+            "state_revision": self._nonnegative_int(state.get("_state_revision")),
+            "authority": self._authority_boundary(),
+        }
+
+    # ``review_decisions`` is intentionally an alias rather than a second
+    # implementation so any future owner-scoped API keeps the same pure read
+    # and validation boundary.
+    review_decisions = list_decisions
 
     def acknowledge(
         self,
@@ -1205,17 +1350,14 @@ class SuggestionOutbox:
 
     @classmethod
     def _interaction_decision(cls, assessment: dict[str, Any]) -> tuple[str, str]:
-        """Choose a typed interaction disposition without adding authority."""
+        """Choose a typed interaction disposition without adding authority.
 
-        gap = assessment.get("interaction_gap")
-        if (
-            isinstance(gap, dict)
-            and gap.get("kind") == "owner_question"
-            and gap.get("answerable") is True
-            and isinstance(gap.get("gap_id"), str)
-            and gap.get("gap_id", "").startswith("gap_")
-        ):
-            return "ask", "structured_owner_question_pending"
+        ``ask`` remains part of the persisted enum for compatibility, but no
+        current producer is trusted to issue an owner-question lifecycle.  In
+        particular, caller-supplied ``interaction_gap`` fields are treated as
+        untrusted context and can never manufacture an ``ask`` decision.
+        """
+
         hypothesis_status = str(assessment.get("hypothesis_status") or "")
         if (
             assessment.get("status") == "eligible"
@@ -1344,7 +1486,9 @@ class SuggestionOutbox:
         if not isinstance(record, dict):
             return "attention_hypothesis_not_found"
         expires_at = self._aware_time(record.get("expires_at"))
-        if expires_at is None or expires_at <= now:
+        if expires_at is None:
+            return "attention_hypothesis_expired"
+        if expires_at <= now and record.get("status") not in {"expired", "contradicted"}:
             return "attention_hypothesis_expired"
         if (
             record.get("user_id") != user_id
@@ -1357,16 +1501,30 @@ class SuggestionOutbox:
             != attention_hypothesis_ref.get("hypothesis_revision")
             or record.get("ruleset_version")
             != attention_hypothesis_ref.get("ruleset_version")
+            or str(assessment.get("hypothesis_status") or "")
+            != str(record.get("status") or "")
+            or assessment.get("status")
+            != ("eligible" if record.get("status") == "confirmed" else "awaiting_evidence")
+            or assessment.get("eligible")
+            is not (record.get("status") == "confirmed")
             or (require_confirmed and record.get("status") != "confirmed")
-            or (
-                assessment.get("hypothesis_status") is not None
-                and str(assessment.get("hypothesis_status") or "")
-                != str(record.get("status") or "")
-            )
             or record.get("general_attention_scorer_version")
             != assessment.get("upstream_scorer_version")
         ):
             return "attention_hypothesis_binding_not_current"
+        # A durable contradiction or expiry is itself the canonical terminal
+        # Attention decision. Its lifecycle marker intentionally changes the
+        # record digest, so replaying the pre-terminal evidence generation
+        # would incorrectly turn the required silent result into a stale
+        # binding failure. Parent/owner/revision checks above still bind this
+        # terminal result exactly; superseded records remain fail-closed.
+        if not require_confirmed and record.get("status") in {"contradicted", "expired"}:
+            if not self._terminal_surface_matches_record(
+                assessment,
+                record=record,
+            ):
+                return "attention_hypothesis_surface_not_current"
+            return None
         canonical = self._canonical_attention_evaluation(
             current_parent,
             record=record,
@@ -1383,6 +1541,34 @@ class SuggestionOutbox:
         ):
             return "attention_hypothesis_surface_not_current"
         return None
+
+    @staticmethod
+    def _terminal_surface_matches_record(
+        surface: dict[str, Any],
+        *,
+        record: dict[str, Any],
+    ) -> bool:
+        """Bind silent terminal decisions to the durable lifecycle row."""
+
+        readiness = record.get("attention_readiness")
+        return bool(
+            surface.get("general_situation_id")
+            == record.get("general_situation_id")
+            and surface.get("parent_revision") == record.get("parent_revision")
+            and surface.get("upstream_scorer_version")
+            == record.get("general_attention_scorer_version")
+            and surface.get("components") == record.get("components")
+            and surface.get("unknowns") == record.get("unknowns")
+            and surface.get("evidence")
+            == copy.deepcopy(record.get("current_evidence_refs") or [])
+            and surface.get("attention_readiness") == readiness
+            and surface.get("evidence_diversity")
+            == record.get("evidence_diversity")
+            and surface.get("assessment_binding")
+            == record.get("assessment_binding")
+            and isinstance(readiness, dict)
+            and surface.get("score") == readiness.get("value")
+        )
 
     @classmethod
     def _current_proposal_integrity(cls, proposal: dict[str, Any]) -> bool:
@@ -2289,29 +2475,27 @@ class SuggestionOutbox:
             or value.get("authority") != cls._authority_boundary()
             or cls._aware_time(value.get("created_at")) is None
             or cls._aware_time(value.get("updated_at")) is None
+            or value.get("decision_id") != cls.decision_id_for(value)
         ):
             return False
         ref = value.get("attention_hypothesis_ref")
         if (
-            ref is not None
-            and (
-                not isinstance(ref, dict)
-                or set(ref)
-                != {
-                    "hypothesis_id",
-                    "hypothesis_revision",
-                    "ruleset_version",
-                    "readiness_semantics",
-                }
-                or not str(ref.get("hypothesis_id") or "").startswith("ahyp_")
-                or isinstance(ref.get("hypothesis_revision"), bool)
-                or not isinstance(ref.get("hypothesis_revision"), int)
-                or ref.get("hypothesis_revision") < 1
-                or ref.get("ruleset_version")
-                != cls.ATTENTION_HYPOTHESIS_RULESET_VERSION
-                or ref.get("readiness_semantics")
-                != cls.ATTENTION_READINESS_SEMANTICS
-            )
+            not isinstance(ref, dict)
+            or set(ref)
+            != {
+                "hypothesis_id",
+                "hypothesis_revision",
+                "ruleset_version",
+                "readiness_semantics",
+            }
+            or not str(ref.get("hypothesis_id") or "").startswith("ahyp_")
+            or isinstance(ref.get("hypothesis_revision"), bool)
+            or not isinstance(ref.get("hypothesis_revision"), int)
+            or ref.get("hypothesis_revision") < 1
+            or ref.get("ruleset_version")
+            != cls.ATTENTION_HYPOTHESIS_RULESET_VERSION
+            or ref.get("readiness_semantics")
+            != cls.ATTENTION_READINESS_SEMANTICS
             or not isinstance(value.get("assessment_binding_digest"), str)
             or not re.fullmatch(r"[0-9a-f]{64}", value["assessment_binding_digest"])
         ):

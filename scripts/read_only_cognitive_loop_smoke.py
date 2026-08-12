@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 
 from core.world_state import WorldStateStore  # noqa: E402
 from core.context_scope import tenant_scope_storage_key  # noqa: E402
+from awareness.general_attention_scheduler import GeneralAttentionScheduler  # noqa: E402
 from interface.cognitive_brief_contract import CognitiveBrief  # noqa: E402
 from runtime.attention_hypothesis_runtime import AttentionHypothesisRuntime  # noqa: E402
 from scripts.attention_hypothesis_smoke import (  # noqa: E402
@@ -504,6 +505,39 @@ def test_cognitive_brief_attention_bridge() -> None:
         assert binding.get("general_situation_id") == "gsit-brief-bridge"
         assert binding.get("parent_revision") == 1
 
+        # A later terminal lifecycle revision is valid Attention history, but
+        # it is not the revision this bridge committed. Replay must therefore
+        # keep the exact bridge receipt and omit the newer child rather than
+        # presenting revision 2 as if it were the bound revision 1.
+        attention_runtime = AttentionHypothesisRuntime(store)
+        current_assessment = GeneralAttentionScheduler(store).assess(parent)
+        current_hypothesis = admitted["attention_hypothesis"]
+        terminal = attention_runtime.observe(
+            parent,
+            current_assessment,
+            lifecycle_signal={
+                "schema_version": AttentionHypothesisRuntime.LIFECYCLE_SIGNAL_SCHEMA_VERSION,
+                "signal_id": "als_bridge_revision_advanced",
+                "kind": "contradiction",
+                "target_hypothesis_id": binding["hypothesis_id"],
+                "target_hypothesis_revision": binding["hypothesis_revision"],
+                "evidence_id": "evidence:bridge_revision_advanced",
+                "reason_code": "direct_counter_observation",
+                "producer_id": "local_operator",
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        terminal_replay = runtime._public_bridge(  # noqa: SLF001
+            binding,
+            admitted=None,
+        )
+        assert current_hypothesis["hypothesis_revision"] == 1
+        assert terminal.get("status") == "contradicted", terminal
+        assert terminal["hypothesis"]["hypothesis_revision"] == 2
+        assert terminal_replay.get("status") == "committed", terminal_replay
+        assert terminal_replay.get("hypothesis_revision") == 1
+        assert terminal_replay.get("attention_hypothesis") is None
+
         # Simulate a process crash after the durable prepared phase but before
         # Attention admission.  Active-loop reconciliation must retry the
         # exact cycle binding rather than leave the row pending forever.
@@ -640,9 +674,196 @@ def test_cognitive_brief_attention_bridge() -> None:
         assert rejected_binding.get("status") == "rejected", rejected_binding
         assert rejected_binding.get("rejection_reason"), rejected_binding
 
+        # If a process crashes after admission and the cycle is no longer
+        # recoverable, reconciliation must close admitted rev2 as rejected
+        # rev3 while retaining the already-bound hypothesis revision.
+        admitted_orphan = {
+            **recovered_binding,
+            "status": "admitted",
+            "phase_revision": 2,
+            "committed_at": None,
+            "rejection_reason": None,
+        }
+
+        def orphan_bridge(state: dict[str, Any]) -> dict[str, Any]:
+            continuity = (
+                state.get("continuity")
+                if isinstance(state.get("continuity"), dict)
+                else {}
+            )
+            state["scopes"] = {}
+            state["scope_count"] = 0
+            state["bridge_bindings"] = {
+                admitted_orphan["binding_id"]: admitted_orphan
+            }
+            state["bridge_binding_count"] = 1
+            state["metrics"] = runtime._metrics({}, continuity)  # noqa: SLF001
+            return state
+
+        store.mutate_json("cognitive_loop_state.json", orphan_bridge)
+        runtime._reconcile_attention_bridges()  # noqa: SLF001
+        orphan_rejected = store.read_json("cognitive_loop_state.json")[
+            "bridge_bindings"
+        ][admitted_orphan["binding_id"]]
+        assert orphan_rejected.get("status") == "rejected", orphan_rejected
+        assert orphan_rejected.get("phase_revision") == 3, orphan_rejected
+        assert (
+            orphan_rejected.get("hypothesis_revision")
+            == admitted_orphan.get("hypothesis_revision")
+        ), orphan_rejected
+
+
+def test_admitted_bridge_crash_recovery() -> None:
+    """A crash after durable admission resumes with only the commit CAS."""
+
+    with tempfile.TemporaryDirectory(prefix="veyra-admitted-bridge-crash-") as tmp:
+        clock = MutableClock(
+            datetime(2026, 8, 11, 11, 0, tzinfo=timezone.utc)
+        )
+        store = WorldStateStore(tmp)
+        parent = parent_for(
+            user_id="admitted-crash-user",
+            session_id="admitted-crash-session",
+            revision=1,
+            child_count=2,
+            clock=clock,
+            anchor="goal:admitted-crash",
+            general_id="gsit-admitted-crash",
+        )
+        persist_parent(store, parent)
+        assessment_for(
+            parent,
+            values=CONFIRMING_VALUES,
+            store=store,
+            clock=clock,
+        )
+        runtime = ReadOnlyCognitiveLoopRuntime(
+            state_store=store,
+            reasoning=FakeReasoning(FakeClient()),
+        )
+        projection_payload = {
+            "attention_parent": {
+                "general_situation_id": parent["general_situation_id"],
+                "parent_revision": parent["parent_revision"],
+            }
+        }
+        projection_ref = runtime._projection_ref(  # noqa: SLF001
+            "situation_graph",
+            projection_payload,
+        )
+        created_at = clock().isoformat()
+        cycle = {
+            "candidate_recorded": True,
+            "user_id": "admitted-crash-user",
+            "session_id": "admitted-crash-session",
+            "cycle_id": "cog_dadadadadadadada",
+            "world_digest": "d" * 64,
+            "status": "observed",
+            "reason": "smoke",
+            "mode": "record_only",
+            "created_at": created_at,
+            "selected_opportunity_tokens": ["cogview_admitted_crash"],
+            "selected_kinds": ["situation_graph"],
+            "evidence_refs": [projection_ref],
+            "selected_observations": [
+                {
+                    "kind": "situation_graph",
+                    "evidence_refs": [projection_ref],
+                    "payload": projection_payload,
+                }
+            ],
+            "brief": {
+                "material_changes": [
+                    {
+                        "kind": "structured_situation_change",
+                        "evidence_refs": [projection_ref],
+                    }
+                ]
+            },
+            "baseline": False,
+            "model_calls": 0,
+            "epistemic_status": "hypothesis",
+            "is_fact": False,
+            "authority": False,
+            "external_delivery": False,
+            "agent_execution": False,
+            "tool_execution": False,
+            "route_change_allowed": False,
+            "risk_change_allowed": False,
+        }
+        scope_key = tenant_scope_storage_key(
+            cycle["user_id"],
+            cycle["session_id"],
+        )
+
+        def seed_cycle(state: dict[str, Any]) -> dict[str, Any]:
+            state["scopes"] = {
+                scope_key: {
+                    "user_id": cycle["user_id"],
+                    "session_id": cycle["session_id"],
+                    "cycles": [cycle],
+                    "cycle_count": 1,
+                    "last_cycle_id": cycle["cycle_id"],
+                    "last_model_at": created_at,
+                    "last_checked_at": created_at,
+                    "updated_at": created_at,
+                    "last_world_digest": cycle["world_digest"],
+                    "last_brief": cycle["brief"],
+                }
+            }
+            state["scope_count"] = 1
+            state["metrics"] = runtime._metrics(  # noqa: SLF001
+                state["scopes"],
+                state.get("continuity") or {},
+            )
+            return state
+
+        store.mutate_json("cognitive_loop_state.json", seed_cycle)
+        persist_bridge = runtime._persist_bridge_binding  # noqa: SLF001
+
+        def crash_after_admitted(
+            binding: dict[str, Any],
+            **kwargs: Any,
+        ) -> None:
+            persist_bridge(binding, **kwargs)
+            if binding.get("status") == "admitted":
+                raise RuntimeError("simulated crash before bridge commit")
+
+        runtime._persist_bridge_binding = crash_after_admitted  # type: ignore[method-assign]  # noqa: SLF001
+        interrupted = runtime._bridge_candidate_to_attention(cycle)  # noqa: SLF001
+        runtime._persist_bridge_binding = persist_bridge  # type: ignore[method-assign]  # noqa: SLF001
+        assert interrupted.get("status") == "rejected", interrupted
+        assert interrupted.get("reason") == "attention_bridge_persistence_rejected"
+
+        interrupted_state = store.read_json("cognitive_loop_state.json")
+        admitted = next(iter(interrupted_state["bridge_bindings"].values()))
+        assert admitted.get("status") == "admitted", admitted
+        assert admitted.get("phase_revision") == 2, admitted
+        assert admitted.get("hypothesis_revision") == 1, admitted
+        attention_before = store.read_json(AttentionHypothesisRuntime.STATE_FILE)
+        hypothesis_before = attention_before["hypotheses"][admitted["hypothesis_id"]]
+        assert hypothesis_before.get("hypothesis_revision") == 1
+
+        runtime._reconcile_attention_bridges()  # noqa: SLF001
+        recovered_state = store.read_json("cognitive_loop_state.json")
+        committed = recovered_state["bridge_bindings"][admitted["binding_id"]]
+        assert committed.get("status") == "committed", committed
+        assert committed.get("phase_revision") == 3, committed
+        assert committed.get("hypothesis_revision") == 1, committed
+        assert committed.get("rejection_reason") is None, committed
+        assert committed.get("committed_at"), committed
+        assert (
+            store.read_json(AttentionHypothesisRuntime.STATE_FILE)
+            == attention_before
+        ), "admitted recovery must not rewrite the durable Attention row"
+        recovered_cycle = recovered_state["scopes"][scope_key]["cycles"][-1]
+        assert recovered_cycle["attention_bridge"]["binding_status"] == "committed"
+        assert recovered_cycle["attention_bridge"]["phase_revision"] == 3
+
 
 def main() -> int:
     test_cognitive_brief_attention_bridge()
+    test_admitted_bridge_crash_recovery()
     with tempfile.TemporaryDirectory(prefix="veyra-cognitive-loop-") as tmp:
         store = WorldStateStore(tmp)
         cognitive_config = store.read_json("ops_config.json")["cognitive_loop"]

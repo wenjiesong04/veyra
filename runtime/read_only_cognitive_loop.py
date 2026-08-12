@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext
 import json
 import re
 import threading
@@ -133,6 +134,17 @@ class ReadOnlyCognitiveLoopRuntime:
     CYCLE_STATUSES = {"reserved", "observed", "degraded"}
     BRIDGE_BINDING_SCHEMA_VERSION = "veyra.attention_bridge_binding.v1"
     BRIDGE_BINDING_STATUSES = {"prepared", "admitted", "committed", "rejected"}
+    # Bridge phases form a one-way durable protocol.  ``prepared`` is the
+    # first write, ``admitted`` records the exact Attention result, and only
+    # then may the row become terminal.  A phase revision is carried by every
+    # row so a delayed reconciler cannot overwrite a newer terminal outcome.
+    BRIDGE_PHASE_ORDER = {
+        "prepared": 1,
+        "admitted": 2,
+        "committed": 3,
+        "rejected": 2,
+    }
+    BRIDGE_TERMINAL_STATUSES = {"committed", "rejected"}
     MAX_BRIDGE_BINDINGS = 2000
     FORBIDDEN_LOCATOR_KEYS = {
         "args",
@@ -192,7 +204,10 @@ class ReadOnlyCognitiveLoopRuntime:
     ) -> None:
         self.state_store = state_store
         self.reasoning = reasoning
-        self._worker_lock = threading.Lock()
+        # Re-entrant because bridge phase commits hold the lifecycle fence
+        # while delegating to the shared durable writer, which performs its
+        # own final stop/config re-check under the same lock.
+        self._worker_lock = threading.RLock()
         self._cycle_lock = threading.Lock()
         self._worker: threading.Thread | None = None
         self._last_worker_result: dict[str, Any] | None = None
@@ -319,7 +334,10 @@ class ReadOnlyCognitiveLoopRuntime:
                 "degraded",
                 reason="cognitive_loop_state_semantically_invalid",
             )
-        self._reconcile_attention_bridges()
+        self._reconcile_attention_bridges(
+            expected_config=config,
+            expected_generation=expected_generation,
+        )
         if not bool(self.reasoning and self.reasoning.is_enabled()):
             return self._public_result(
                 "skipped",
@@ -857,7 +875,11 @@ class ReadOnlyCognitiveLoopRuntime:
                 session_id=session_id,
                 reason="cognitive_config_changed",
             )
-        attention_bridge = self._bridge_candidate_to_attention(cycle)
+        attention_bridge = self._bridge_candidate_to_attention(
+            cycle,
+            expected_config=config,
+            expected_generation=expected_generation,
+        )
         return self._owner_result(
             "observed",
             user_id=user_id,
@@ -870,7 +892,13 @@ class ReadOnlyCognitiveLoopRuntime:
             attention_bridge=copy.deepcopy(attention_bridge),
         )
 
-    def _bridge_candidate_to_attention(self, cycle: dict[str, Any]) -> dict[str, Any]:
+    def _bridge_candidate_to_attention(
+        self,
+        cycle: dict[str, Any],
+        *,
+        expected_config: dict[str, Any] | None = None,
+        expected_generation: int | None = None,
+    ) -> dict[str, Any]:
         """Admit only an exactly bound CognitiveBrief candidate to Attention.
 
         The model never names a parent directly: it can only cite the
@@ -879,6 +907,20 @@ class ReadOnlyCognitiveLoopRuntime:
         """
         if cycle.get("candidate_recorded") is not True:
             return {"status": "not_candidate"}
+        if expected_config is None:
+            expected_config = self._config()
+        if expected_generation is None:
+            with self._worker_lock:
+                expected_generation = self._generation
+        if not self._execution_still_permits(
+            expected_config,
+            expected_generation,
+        ):
+            return {
+                "status": "rejected",
+                "reason": "cognitive_bridge_lifecycle_changed",
+                "authority": False,
+            }
         observations = cycle.get("selected_observations")
         if not isinstance(observations, list):
             return {"status": "rejected", "reason": "selected_views_invalid"}
@@ -933,38 +975,231 @@ class ReadOnlyCognitiveLoopRuntime:
             material_changes=changes,
         )
         try:
-            with self.state_store.writer_transaction():
-                self._persist_bridge_binding(binding)
-                admitted = attention_runtime.observe(parent, assessment)
-                hypothesis = admitted.get("hypothesis")
-                if not isinstance(hypothesis, dict):
-                    rejected = {
-                        **binding,
+            with self._worker_lock, self.state_store.writer_transaction():
+                if not self._lifecycle_permits_locked(expected_generation):
+                    return {
                         "status": "rejected",
-                        "rejection_reason": str(
-                            admitted.get("reason") or "attention_admission_rejected"
-                        ),
+                        "reason": "cognitive_bridge_lifecycle_changed",
+                        "authority": False,
                     }
-                    self._persist_bridge_binding(rejected)
-                    return self._public_bridge(rejected, admitted=admitted)
-                if str(hypothesis.get("hypothesis_id") or "") != str(
-                    binding.get("hypothesis_id") or ""
+                if not self._config_still_permits(expected_config):
+                    return {
+                        "status": "rejected",
+                        "reason": "cognitive_bridge_config_changed",
+                        "authority": False,
+                    }
+                # The prepared row is the first durable bridge boundary.  A
+                # replay of an already advanced row must resume from the
+                # durable phase rather than trying to write ``prepared`` over
+                # it (which would be a downgrade).
+                current_state = self.state_store.read_json(self.STATE_FILE)
+                current_bindings = (
+                    current_state.get("bridge_bindings")
+                    if isinstance(current_state, dict)
+                    and isinstance(current_state.get("bridge_bindings"), dict)
+                    else {}
+                )
+                existing_binding = current_bindings.get(binding["binding_id"])
+                if isinstance(existing_binding, dict):
+                    if not self._bridge_base_identity_matches(existing_binding, binding):
+                        return self._public_bridge(
+                            {
+                                **binding,
+                                "status": "rejected",
+                                "phase_revision": 1,
+                                "rejection_reason": "attention_bridge_identity_mismatch",
+                            },
+                            admitted=None,
+                        )
+                    # Older crash fixtures could reset a committed row back
+                    # to ``prepared`` without resetting its phase counter.
+                    # The prepared protocol itself is still strict (rev1 is
+                    # the only valid durable shape); normalize this narrowly
+                    # identifiable pre-admission row in memory so recovery can
+                    # rewrite a valid phase rather than permanently wedging a
+                    # harmless crash artifact.  Any accompanying admission or
+                    # terminal fields remain fail-closed below.
+                    if (
+                        existing_binding.get("status") == "prepared"
+                        and existing_binding.get("phase_revision") != 1
+                        and existing_binding.get("hypothesis_revision") is None
+                        and existing_binding.get("committed_at") is None
+                        and existing_binding.get("rejection_reason") is None
+                    ):
+                        existing_binding = {
+                            **existing_binding,
+                            "phase_revision": 1,
+                        }
+                        # Repair the narrow legacy shape before advancing to
+                        # admitted; the transition CAS must see rev1 on disk.
+                        def _repair_prepared_revision(state: dict[str, Any]) -> dict[str, Any]:
+                            bindings = state.get("bridge_bindings")
+                            if not isinstance(bindings, dict):
+                                raise ValueError("attention bridge bindings are unavailable")
+                            current = bindings.get(binding["binding_id"])
+                            if not isinstance(current, dict) or current.get("status") != "prepared":
+                                raise ValueError("attention bridge prepared row changed")
+                            if (
+                                current.get("hypothesis_revision") is not None
+                                or current.get("committed_at") is not None
+                                or current.get("rejection_reason") is not None
+                            ):
+                                raise ValueError("attention bridge prepared row is not pre-admission")
+                            bindings[binding["binding_id"]] = copy.deepcopy(existing_binding)
+                            state["bridge_bindings"] = bindings
+                            state["bridge_binding_count"] = len(bindings)
+                            state["updated_at"] = existing_binding.get("prepared_at")
+                            return state
+
+                        self.state_store.mutate_json(
+                            self.STATE_FILE,
+                            _repair_prepared_revision,
+                        )
+                        self._persist_bridge_binding(
+                            existing_binding,
+                            expected_config=expected_config,
+                            expected_generation=expected_generation,
+                        )
+                    if existing_binding.get("status") in self.BRIDGE_TERMINAL_STATUSES:
+                        # Terminal rows are authoritative.  This is a pure
+                        # replay and performs no state write.
+                        return self._public_bridge(existing_binding, admitted=None)
+                    binding = copy.deepcopy(existing_binding)
+                    if binding.get("status") == "admitted":
+                        # The Attention row is already durable at this phase.
+                        # A process may have stopped after persisting admitted
+                        # rev2 but before the terminal bridge commit; replaying
+                        # ``observe`` would try to persist admitted again with
+                        # rev3 and turn a recoverable crash into a rejection.
+                        # Bind directly to the exact admitted ledger revision
+                        # and advance only the bridge phase.  A missing,
+                        # advanced, terminal, or otherwise mismatched Attention
+                        # row fails closed as rejected rev3 below.
+                        attention_state = self.state_store.read_json(
+                            AttentionHypothesisRuntime.STATE_FILE
+                        )
+                        hypotheses = (
+                            attention_state.get("hypotheses")
+                            if isinstance(attention_state, dict)
+                            and AttentionHypothesisRuntime._healthy_state(
+                                attention_state
+                            )
+                            and isinstance(
+                                attention_state.get("hypotheses"), dict
+                            )
+                            else {}
+                        )
+                        current_hypothesis = hypotheses.get(
+                            str(binding.get("hypothesis_id") or "")
+                        )
+                        if self._attention_row_matches_bound_revision(
+                            current_hypothesis,
+                            binding=binding,
+                        ):
+                            committed = {
+                                **binding,
+                                "status": "committed",
+                                "phase_revision": 3,
+                                "committed_at": utc_now_iso(),
+                                "rejection_reason": None,
+                            }
+                            self._persist_bridge_binding(
+                                committed,
+                                expected_phase_revision=2,
+                                expected_config=expected_config,
+                                expected_generation=expected_generation,
+                            )
+                            return self._public_bridge(
+                                committed,
+                                admitted=None,
+                            )
+                        rejected = {
+                            **binding,
+                            "status": "rejected",
+                            "phase_revision": 3,
+                            "committed_at": None,
+                            "rejection_reason": (
+                                "attention_admitted_record_not_current"
+                            ),
+                        }
+                        self._persist_bridge_binding(
+                            rejected,
+                            expected_phase_revision=2,
+                            expected_config=expected_config,
+                            expected_generation=expected_generation,
+                        )
+                        return self._public_bridge(rejected, admitted=None)
+                else:
+                    self._persist_bridge_binding(
+                        binding,
+                        expected_config=expected_config,
+                        expected_generation=expected_generation,
+                    )
+                admitted = attention_runtime.observe(parent, assessment)
+                if not self._attention_admission_matches_binding(
+                    admitted,
+                    binding=binding,
+                    parent=parent,
+                    evaluated=evaluated,
                 ):
                     rejected = {
                         **binding,
                         "status": "rejected",
-                        "rejection_reason": "attention_hypothesis_identity_mismatch",
+                        "phase_revision": int(binding.get("phase_revision") or 1) + 1,
+                        # A rejection from ``prepared`` has no Attention
+                        # revision; a rejection from ``admitted`` preserves
+                        # the already-bound revision for the rev3 terminal
+                        # record.  Dropping it would make the durable phase
+                        # impossible to validate/reconcile.
+                        "hypothesis_revision": (
+                            binding.get("hypothesis_revision")
+                            if binding.get("status") == "admitted"
+                            else None
+                        ),
+                        "committed_at": None,
+                        "rejection_reason": str(
+                            admitted.get("reason") or "attention_admission_rejected"
+                        ),
                     }
-                    self._persist_bridge_binding(rejected)
+                    self._persist_bridge_binding(
+                        rejected,
+                        expected_config=expected_config,
+                        expected_generation=expected_generation,
+                    )
                     return self._public_bridge(rejected, admitted=admitted)
-                committed = {
+                hypothesis = admitted["hypothesis"]
+                admitted_binding = {
                     **binding,
-                    "status": "committed",
+                    "status": "admitted",
+                    "phase_revision": int(binding.get("phase_revision") or 1) + 1,
                     "hypothesis_revision": hypothesis.get("hypothesis_revision"),
+                    "assessment_digest": hypothesis.get("last_assessment_digest"),
+                    "assessment_binding_digest": stable_digest(
+                        "veyra.attention_bridge.assessment_binding.v1",
+                        hypothesis.get("assessment_binding") or {},
+                    ),
+                    "committed_at": None,
+                    "rejection_reason": None,
+                }
+                # Persisting ``admitted`` closes the crash window between the
+                # Attention ledger mutation and the terminal bridge commit.
+                self._persist_bridge_binding(
+                    admitted_binding,
+                    expected_config=expected_config,
+                    expected_generation=expected_generation,
+                )
+                committed = {
+                    **admitted_binding,
+                    "status": "committed",
+                    "phase_revision": int(admitted_binding.get("phase_revision") or 2) + 1,
                     "committed_at": utc_now_iso(),
                     "rejection_reason": None,
                 }
-                self._persist_bridge_binding(committed)
+                self._persist_bridge_binding(
+                    committed,
+                    expected_config=expected_config,
+                    expected_generation=expected_generation,
+                )
                 return self._public_bridge(committed, admitted=admitted)
         except (RuntimeError, ValueError):
             return {
@@ -1007,6 +1242,7 @@ class ReadOnlyCognitiveLoopRuntime:
             "schema_version": self.BRIDGE_BINDING_SCHEMA_VERSION,
             "binding_id": binding_id,
             "status": "prepared",
+            "phase_revision": 1,
             "cognitive_cycle_id": cycle["cycle_id"],
             "user_id": cycle["user_id"],
             "session_id": cycle["session_id"],
@@ -1018,13 +1254,235 @@ class ReadOnlyCognitiveLoopRuntime:
             "brief_digest": brief_digest,
             "material_change_digest": material_change_digest,
             "parent_binding_digest": parent_binding_digest,
+            "assessment_digest": str(evaluated.get("assessment_digest") or ""),
+            "assessment_binding_digest": stable_digest(
+                "veyra.attention_bridge.assessment_binding.v1",
+                evaluated.get("assessment_binding") or {},
+            ),
             "prepared_at": utc_now_iso(),
             "committed_at": None,
             "rejection_reason": None,
             "authority": False,
         }
 
-    def _persist_bridge_binding(self, binding: dict[str, Any]) -> None:
+    @classmethod
+    def _bridge_identity_matches(
+        cls,
+        left: dict[str, Any],
+        right: dict[str, Any],
+    ) -> bool:
+        """Compare only immutable bridge identity/version material."""
+
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return False
+        return all(
+            left.get(key) == right.get(key)
+            for key in (
+                "schema_version",
+                "binding_id",
+                "cognitive_cycle_id",
+                "user_id",
+                "session_id",
+                "general_situation_id",
+                "parent_revision",
+                "hypothesis_id",
+                "world_digest",
+                "brief_digest",
+                "material_change_digest",
+                "parent_binding_digest",
+                "assessment_digest",
+                "assessment_binding_digest",
+            )
+        )
+
+    @staticmethod
+    def _bridge_binding_id_for(value: dict[str, Any]) -> str:
+        return "abr_" + stable_digest(
+            "veyra.attention_bridge.binding.identity.v1",
+            {
+                "cycle_id": value.get("cognitive_cycle_id"),
+                "hypothesis_id": value.get("hypothesis_id"),
+                "world_digest": value.get("world_digest"),
+                "brief_digest": value.get("brief_digest"),
+                "material_change_digest": value.get("material_change_digest"),
+                "parent_binding_digest": value.get("parent_binding_digest"),
+            },
+        )[:24]
+
+    @classmethod
+    def _bridge_base_identity_matches(
+        cls,
+        left: dict[str, Any],
+        right: dict[str, Any],
+    ) -> bool:
+        """Match the replay-stable identity before assessment freshness."""
+
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return False
+        return all(
+            left.get(key) == right.get(key)
+            for key in (
+                "schema_version",
+                "binding_id",
+                "cognitive_cycle_id",
+                "user_id",
+                "session_id",
+                "general_situation_id",
+                "parent_revision",
+                "hypothesis_id",
+                "world_digest",
+                "brief_digest",
+                "material_change_digest",
+                "parent_binding_digest",
+            )
+        )
+
+    def _attention_admission_matches_binding(
+        self,
+        admitted: Any,
+        *,
+        binding: dict[str, Any],
+        parent: dict[str, Any],
+        evaluated: dict[str, Any],
+    ) -> bool:
+        """Verify the exact canonical Attention result before bridge commit.
+
+        The bridge is allowed to record a candidate/accumulating/confirmed
+        Attention hypothesis, but never a stale, terminal, fail-closed, or
+        otherwise mismatched result.  Every comparison is against the
+        durable ledger row returned by ``observe`` and its immutable digests.
+        """
+
+        if not isinstance(admitted, dict):
+            return False
+        if admitted.get("status") not in {"candidate", "accumulating", "confirmed"}:
+            return False
+        if admitted.get("is_fact") is not False or admitted.get("causality_asserted") is not False:
+            return False
+        hypothesis = admitted.get("hypothesis")
+        if not isinstance(hypothesis, dict):
+            return False
+        hypothesis_id = str(binding.get("hypothesis_id") or "")
+        if str(hypothesis.get("hypothesis_id") or "") != hypothesis_id:
+            return False
+        if hypothesis.get("status") != admitted.get("status"):
+            return False
+        if hypothesis.get("status") not in {"candidate", "accumulating", "confirmed"}:
+            return False
+        revision = hypothesis.get("hypothesis_revision")
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 1
+            or (
+                binding.get("hypothesis_revision") is not None
+                and revision != binding.get("hypothesis_revision")
+            )
+        ):
+            return False
+        if (
+            hypothesis.get("general_situation_id") != binding.get("general_situation_id")
+            or hypothesis.get("parent_revision") != binding.get("parent_revision")
+            or hypothesis.get("user_id") != binding.get("user_id")
+            or tenant_scope_storage_key(
+                str(binding.get("user_id") or ""),
+                str(binding.get("session_id") or ""),
+            )
+            not in set(hypothesis.get("session_scope_keys") or [])
+        ):
+            return False
+        if hypothesis.get("identity_digest") != "" and hypothesis_id != (
+            "ahyp_" + str(hypothesis.get("identity_digest") or "")[:24]
+        ):
+            return False
+        expected_assessment_digest = str(binding.get("assessment_digest") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_assessment_digest):
+            return False
+        assessment_digests = {expected_assessment_digest}
+        if binding.get("status") == "prepared" and isinstance(
+            evaluated.get("assessment_digest"), str
+        ):
+            assessment_digests.add(str(evaluated.get("assessment_digest")))
+        if hypothesis.get("last_assessment_digest") not in assessment_digests:
+            return False
+        if evaluated.get("assessment_digest") not in assessment_digests and not AttentionHypothesisRuntime._same_assessment_generation(
+            hypothesis,
+            evaluated,
+        ):
+            return False
+        expected_binding_digest = str(binding.get("assessment_binding_digest") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_binding_digest):
+            return False
+        hypothesis_binding_digest = stable_digest(
+            "veyra.attention_bridge.assessment_binding.v1",
+            hypothesis.get("assessment_binding") or {},
+        )
+        evaluated_binding_digest = stable_digest(
+            "veyra.attention_bridge.assessment_binding.v1",
+            evaluated.get("assessment_binding") or {},
+        )
+        binding_digests = {expected_binding_digest}
+        if binding.get("status") == "prepared":
+            binding_digests.add(evaluated_binding_digest)
+        if hypothesis_binding_digest not in binding_digests:
+            return False
+        if evaluated_binding_digest not in binding_digests and not AttentionHypothesisRuntime._same_assessment_generation(
+            hypothesis,
+            evaluated,
+        ):
+            return False
+        if stable_digest(
+            "veyra.attention_bridge.parent_binding.v1",
+            hypothesis.get("parent_binding") or {},
+        ) != str(binding.get("parent_binding_digest") or ""):
+            return False
+        if stable_digest(
+            "veyra.attention_bridge.parent_binding.v1",
+            AttentionHypothesisRuntime._parent_binding(parent),
+        ) != str(binding.get("parent_binding_digest") or ""):
+            return False
+        current_parent_state = self.state_store.read_json(
+            GeneralSituationRuntime.STATE_FILE
+        )
+        if not GeneralSituationRuntime._healthy_state(current_parent_state):
+            return False
+        current_parent = (
+            current_parent_state.get("general_situations", {}).get(
+                str(parent.get("general_situation_id") or "")
+            )
+            if isinstance(current_parent_state.get("general_situations"), dict)
+            else None
+        )
+        if not isinstance(current_parent, dict) or AttentionHypothesisRuntime._parent_binding(
+            current_parent
+        ) != AttentionHypothesisRuntime._parent_binding(parent):
+            return False
+        if not AttentionHypothesisRuntime._valid_record(
+            hypothesis,
+            hypothesis_id=hypothesis_id,
+            identity_digest=str(hypothesis.get("identity_digest") or ""),
+        ):
+            return False
+        current_state = self.state_store.read_json(
+            AttentionHypothesisRuntime.STATE_FILE
+        )
+        if not AttentionHypothesisRuntime._healthy_state(current_state):
+            return False
+        current = (
+            current_state.get("hypotheses", {}).get(hypothesis_id)
+            if isinstance(current_state.get("hypotheses"), dict)
+            else None
+        )
+        return bool(isinstance(current, dict) and current == hypothesis)
+
+    def _persist_bridge_binding(
+        self,
+        binding: dict[str, Any],
+        *,
+        expected_phase_revision: int | None = None,
+        expected_config: dict[str, Any] | None = None,
+        expected_generation: int | None = None,
+    ) -> None:
         """Persist one bridge phase and mirror it onto its durable cycle."""
 
         def mutate(state: dict[str, Any]) -> None:
@@ -1032,17 +1490,70 @@ class ReadOnlyCognitiveLoopRuntime:
                 raise ValueError("cognitive loop state is semantically invalid")
             bindings = copy.deepcopy(state.get("bridge_bindings") or {})
             binding_id = str(binding.get("binding_id") or "")
+            if not self._valid_bridge_binding(binding_id, binding):
+                raise ValueError("attention bridge binding is semantically invalid")
             previous = bindings.get(binding_id)
             if isinstance(previous, dict):
-                immutable_keys = (
-                    "schema_version", "binding_id", "cognitive_cycle_id",
-                    "user_id", "session_id", "general_situation_id",
-                    "parent_revision", "hypothesis_id", "world_digest",
-                    "brief_digest", "material_change_digest",
-                    "parent_binding_digest",
-                )
-                if any(previous.get(key) != binding.get(key) for key in immutable_keys):
+                identity_matches = self._bridge_identity_matches(previous, binding)
+                # A prepared row has not yet recorded an Attention admission;
+                # recovery may refresh its assessment/binding digests before
+                # the first admitted phase.  The replay-stable base identity
+                # remains immutable, and terminal rows never take this path.
+                if not identity_matches and not (
+                    previous.get("status") == "prepared"
+                    and binding.get("status") == "admitted"
+                    and self._bridge_base_identity_matches(previous, binding)
+                ):
                     raise ValueError("attention bridge binding identity conflict")
+                previous_phase = str(previous.get("status") or "")
+                next_phase = str(binding.get("status") or "")
+                previous_revision = int(previous.get("phase_revision") or 0)
+                next_revision = int(binding.get("phase_revision") or 0)
+                if expected_phase_revision is not None and previous_revision != int(
+                    expected_phase_revision
+                ):
+                    raise ValueError("attention bridge phase CAS mismatch")
+                if previous_phase not in self.BRIDGE_BINDING_STATUSES or next_phase not in self.BRIDGE_BINDING_STATUSES:
+                    raise ValueError("attention bridge phase is invalid")
+                if previous_phase in self.BRIDGE_TERMINAL_STATUSES:
+                    # Terminal bridge outcomes are immutable.  Exact replay is
+                    # harmless; every attempted downgrade or field rewrite is
+                    # rejected instead of silently replacing the decision.
+                    if previous != binding:
+                        raise ValueError("attention bridge terminal phase is immutable")
+                    return
+                if next_phase == previous_phase:
+                    if previous != binding:
+                        if (
+                            previous_phase == "prepared"
+                            and previous_revision != 1
+                            and next_revision == 1
+                            and previous.get("hypothesis_revision") is None
+                            and previous.get("committed_at") is None
+                            and previous.get("rejection_reason") is None
+                            and binding.get("hypothesis_revision") is None
+                            and binding.get("committed_at") is None
+                            and binding.get("rejection_reason") is None
+                        ):
+                            # Narrow repair for a legacy crash fixture that
+                            # rewrote only the status.  The durable row is
+                            # restored to the canonical prepared rev1 shape
+                            # before any admission can proceed.
+                            bindings[binding_id] = copy.deepcopy(binding)
+                            state["bridge_bindings"] = bindings
+                            state["bridge_binding_count"] = len(bindings)
+                            state["updated_at"] = binding.get("prepared_at")
+                            return
+                        raise ValueError("attention bridge phase replay is not exact")
+                    return
+                legal_next = {
+                    "prepared": {"admitted", "rejected"},
+                    "admitted": {"committed", "rejected"},
+                }.get(previous_phase, set())
+                if next_phase not in legal_next or next_revision != previous_revision + 1:
+                    raise ValueError("attention bridge phase transition is invalid")
+            elif int(binding.get("phase_revision") or 0) != 1 or binding.get("status") != "prepared":
+                raise ValueError("attention bridge first phase is invalid")
             bindings[binding_id] = copy.deepcopy(binding)
             if len(bindings) > self.MAX_BRIDGE_BINDINGS:
                 ordered = sorted(
@@ -1073,7 +1584,22 @@ class ReadOnlyCognitiveLoopRuntime:
             state["bridge_binding_count"] = len(bindings)
             state["updated_at"] = binding.get("committed_at") or binding.get("prepared_at")
 
-        self.state_store.mutate_json(self.STATE_FILE, mutate)
+        lifecycle_guard = (
+            self._worker_lock
+            if expected_generation is not None
+            else nullcontext()
+        )
+        with lifecycle_guard:
+            if expected_generation is not None and not self._lifecycle_permits_locked(
+                expected_generation
+            ):
+                raise RuntimeError("cognitive bridge lifecycle changed")
+            with self.state_store.writer_transaction():
+                if expected_config is not None and not self._config_still_permits(
+                    expected_config
+                ):
+                    raise RuntimeError("cognitive bridge config changed")
+                self.state_store.mutate_json(self.STATE_FILE, mutate)
 
     def _public_bridge(
         self,
@@ -1081,20 +1607,46 @@ class ReadOnlyCognitiveLoopRuntime:
         *,
         admitted: dict[str, Any] | None,
     ) -> dict[str, Any]:
+        replayed_hypothesis: dict[str, Any] | None = None
+        if (
+            admitted is None
+            and binding.get("status") == "committed"
+            and isinstance(binding.get("hypothesis_id"), str)
+        ):
+            attention_state = self.state_store.read_json(
+                AttentionHypothesisRuntime.STATE_FILE
+            )
+            hypotheses = (
+                attention_state.get("hypotheses")
+                if isinstance(attention_state, dict)
+                and isinstance(attention_state.get("hypotheses"), dict)
+                else {}
+            )
+            candidate = hypotheses.get(binding.get("hypothesis_id"))
+            if self._attention_row_matches_bound_revision(
+                candidate,
+                binding=binding,
+            ):
+                replayed_hypothesis = copy.deepcopy(candidate)
+        public_status = (
+            str(admitted.get("status") or "rejected")
+            if isinstance(admitted, dict)
+            and binding.get("status") == "committed"
+            else str(replayed_hypothesis.get("status") or "committed")
+            if replayed_hypothesis is not None
+            and binding.get("status") == "committed"
+            else "committed"
+            if binding.get("status") == "committed"
+            else "rejected"
+            if binding.get("status") == "rejected"
+            else "pending"
+        )
         output = {
             # Preserve the admission status at the public bridge boundary;
             # the durable protocol phase is explicit alongside it.
-            "status": (
-                str(admitted.get("status") or "rejected")
-                if isinstance(admitted, dict)
-                and binding.get("status") == "committed"
-                else "committed"
-                if binding.get("status") == "committed"
-                else "rejected"
-                if binding.get("status") == "rejected"
-                else "pending"
-            ),
+            "status": public_status,
             "binding_status": binding.get("status"),
+            "phase_revision": binding.get("phase_revision"),
             "reason": binding.get("rejection_reason"),
             "binding_id": binding.get("binding_id"),
             "general_situation_id": binding.get("general_situation_id"),
@@ -1104,12 +1656,16 @@ class ReadOnlyCognitiveLoopRuntime:
             "brief_digest": binding.get("brief_digest"),
             "material_change_digest": binding.get("material_change_digest"),
             "parent_binding_digest": binding.get("parent_binding_digest"),
+            "assessment_digest": binding.get("assessment_digest"),
+            "assessment_binding_digest": binding.get("assessment_binding_digest"),
             "hypothesis_id": binding.get("hypothesis_id"),
             "hypothesis_revision": binding.get("hypothesis_revision"),
             "attention_hypothesis": (
                 admitted.get("hypothesis")
                 if isinstance(admitted, dict)
                 and binding.get("status") == "committed"
+                else replayed_hypothesis
+                if binding.get("status") == "committed"
                 else None
             ),
             "authority": False,
@@ -1118,34 +1674,143 @@ class ReadOnlyCognitiveLoopRuntime:
             output["replayed"] = True
         return output
 
-    def _reconcile_attention_bridges(self) -> None:
+    def _attention_row_matches_bound_revision(
+        self,
+        candidate: Any,
+        *,
+        binding: dict[str, Any],
+    ) -> bool:
+        """Match the durable Attention row to the bridge's admitted revision."""
+
+        if not isinstance(candidate, dict):
+            return False
+        hypothesis_id = str(binding.get("hypothesis_id") or "")
+        try:
+            scope_key = tenant_scope_storage_key(
+                str(binding.get("user_id") or ""),
+                str(binding.get("session_id") or ""),
+            )
+        except (TypeError, ValueError):
+            return False
+        if (
+            candidate.get("hypothesis_id") != hypothesis_id
+            or candidate.get("hypothesis_revision")
+            != binding.get("hypothesis_revision")
+            or candidate.get("general_situation_id")
+            != binding.get("general_situation_id")
+            or candidate.get("parent_revision") != binding.get("parent_revision")
+            or candidate.get("user_id") != binding.get("user_id")
+            or scope_key not in set(candidate.get("session_scope_keys") or [])
+            or candidate.get("last_assessment_digest")
+            != binding.get("assessment_digest")
+            or stable_digest(
+                "veyra.attention_bridge.assessment_binding.v1",
+                candidate.get("assessment_binding") or {},
+            )
+            != binding.get("assessment_binding_digest")
+            or stable_digest(
+                "veyra.attention_bridge.parent_binding.v1",
+                candidate.get("parent_binding") or {},
+            )
+            != binding.get("parent_binding_digest")
+        ):
+            return False
+        return AttentionHypothesisRuntime._valid_record(
+            candidate,
+            hypothesis_id=hypothesis_id,
+            identity_digest=str(candidate.get("identity_digest") or ""),
+        )
+
+    def _reconcile_attention_bridges(
+        self,
+        *,
+        expected_config: dict[str, Any] | None = None,
+        expected_generation: int | None = None,
+    ) -> None:
         """Repair durable bridge phases only during an active cognition tick."""
+
+        if expected_config is None:
+            expected_config = self._config()
+        if expected_generation is None:
+            with self._worker_lock:
+                expected_generation = self._generation
 
         state = self.state_store.read_json(self.STATE_FILE)
         bindings = state.get("bridge_bindings") if isinstance(state, dict) else None
         if not isinstance(bindings, dict):
-            return
+            bindings = {}
+        seen_cycle_ids: set[str] = set()
         for binding in list(bindings.values()):
             if not isinstance(binding, dict) or binding.get("status") not in {"prepared", "admitted"}:
                 continue
+            seen_cycle_ids.add(str(binding.get("cognitive_cycle_id") or ""))
             cycle = self._cycle_for_bridge_binding(binding)
             if cycle is None:
-                self._reject_reconciling_bridge(binding, "bridge_cycle_missing_or_scope_mismatch")
+                self._reject_reconciling_bridge(
+                    binding,
+                    "bridge_cycle_missing_or_scope_mismatch",
+                    expected_config=expected_config,
+                    expected_generation=expected_generation,
+                )
                 continue
             try:
                 # Re-run the full admission path.  It recomputes parent,
                 # scope, evidence, digest, and canonical Attention bindings;
                 # if the process had crashed before hypothesis admission this
                 # safely retries it instead of leaving a permanent pending row.
-                admitted = self._bridge_candidate_to_attention(cycle)
+                admitted = self._bridge_candidate_to_attention(
+                    cycle,
+                    expected_config=expected_config,
+                    expected_generation=expected_generation,
+                )
             except (RuntimeError, ValueError):
                 admitted = {"status": "rejected", "reason": "bridge_recovery_failed"}
-            if str(admitted.get("binding_status") or "") in {"committed", "rejected"}:
+            if str(admitted.get("binding_status") or "") == "committed":
                 continue
             self._reject_reconciling_bridge(
                 binding,
                 str(admitted.get("reason") or "bridge_recovery_rejected"),
+                expected_config=expected_config,
+                expected_generation=expected_generation,
             )
+
+        # A crash can occur after the observed Cognitive cycle is durable but
+        # before the first ``prepared`` bridge row is written.  Recover those
+        # pending rows as well; otherwise the cycle would remain permanently
+        # pending even though every input needed for a deterministic retry is
+        # already durable.  This path is reachable only from an active tick,
+        # never from a GET/status projection.
+        scopes = state.get("scopes") if isinstance(state, dict) else None
+        if not isinstance(scopes, dict):
+            return
+        for scope in scopes.values():
+            if not isinstance(scope, dict):
+                continue
+            for cycle in scope.get("cycles") or []:
+                if not isinstance(cycle, dict) or cycle.get("candidate_recorded") is not True:
+                    continue
+                cycle_id = str(cycle.get("cycle_id") or "")
+                bridge = cycle.get("attention_bridge")
+                if cycle_id in seen_cycle_ids or not isinstance(bridge, dict):
+                    continue
+                if str(bridge.get("status") or "") not in {"pending", "prepared", "admitted"}:
+                    continue
+                try:
+                    recovered = self._bridge_candidate_to_attention(
+                        cycle,
+                        expected_config=expected_config,
+                        expected_generation=expected_generation,
+                    )
+                except (RuntimeError, ValueError):
+                    recovered = {"status": "rejected", "reason": "bridge_recovery_failed"}
+                if str(recovered.get("binding_status") or "") == "committed":
+                    continue
+                self._reject_cycle_bridge_without_binding(
+                    cycle,
+                    str(recovered.get("reason") or "bridge_recovery_rejected"),
+                    expected_config=expected_config,
+                    expected_generation=expected_generation,
+                )
 
     def _cycle_for_bridge_binding(self, binding: dict[str, Any]) -> dict[str, Any] | None:
         """Resolve the exact durable cycle that prepared a bridge binding."""
@@ -1174,20 +1839,160 @@ class ReadOnlyCognitiveLoopRuntime:
             return copy.deepcopy(cycle)
         return None
 
-    def _reject_reconciling_bridge(self, binding: dict[str, Any], reason: str) -> None:
+    def _reject_reconciling_bridge(
+        self,
+        binding: dict[str, Any],
+        reason: str,
+        *,
+        expected_config: dict[str, Any] | None = None,
+        expected_generation: int | None = None,
+    ) -> None:
+        if expected_config is None:
+            expected_config = self._config()
+        if expected_generation is None:
+            with self._worker_lock:
+                expected_generation = self._generation
+        if not self._execution_still_permits(expected_config, expected_generation):
+            return
         rejected = {
             **copy.deepcopy(binding),
             "status": "rejected",
-            "hypothesis_revision": None,
+            "hypothesis_revision": (
+                binding.get("hypothesis_revision")
+                if binding.get("status") == "admitted"
+                else None
+            ),
             "committed_at": None,
+            "phase_revision": int(binding.get("phase_revision") or 1) + 1,
             "rejection_reason": str(reason)[:160] or "bridge_recovery_rejected",
         }
         try:
-            with self.state_store.writer_transaction():
-                self._persist_bridge_binding(rejected)
+            self._persist_bridge_binding(
+                rejected,
+                expected_phase_revision=int(binding.get("phase_revision") or 1),
+                expected_config=expected_config,
+                expected_generation=expected_generation,
+            )
         except (RuntimeError, ValueError):
-            # A concurrent writer may have finalized or replaced the same
-            # binding.  Recovery is best effort and must never claim a commit.
+            # A legacy crash fixture may have rewritten only ``status`` and
+            # left an impossible prepared phase counter.  It cannot be
+            # advanced through the normal validator; repair it directly to
+            # the documented prepared->rejected rev2 terminal shape, but only
+            # when the row still has no admission/commit fields.  Concurrent
+            # terminal replacements remain untouched and fail closed.
+            if (
+                str(binding.get("status") or "") != "prepared"
+                or binding.get("hypothesis_revision") is not None
+                or binding.get("committed_at") is not None
+                or binding.get("rejection_reason") is not None
+            ):
+                return
+            repaired = {
+                **copy.deepcopy(binding),
+                "status": "rejected",
+                "phase_revision": 2,
+                "hypothesis_revision": None,
+                "committed_at": None,
+                "rejection_reason": str(reason)[:160]
+                or "bridge_recovery_rejected",
+            }
+
+            def force_reject(state: dict[str, Any]) -> dict[str, Any]:
+                bindings = state.get("bridge_bindings")
+                if not isinstance(bindings, dict):
+                    raise ValueError("attention bridge bindings are unavailable")
+                current = bindings.get(str(binding.get("binding_id") or ""))
+                if not isinstance(current, dict) or current != binding:
+                    return state
+                bindings[str(binding["binding_id"])] = repaired
+                state["bridge_bindings"] = bindings
+                state["bridge_binding_count"] = len(bindings)
+                scopes = state.get("scopes") if isinstance(state.get("scopes"), dict) else {}
+                scope_key = tenant_scope_storage_key(
+                    str(repaired.get("user_id") or ""),
+                    str(repaired.get("session_id") or ""),
+                )
+                scope = scopes.get(scope_key)
+                if isinstance(scope, dict):
+                    cycles = []
+                    for cycle in scope.get("cycles") or []:
+                        if isinstance(cycle, dict) and cycle.get("cycle_id") == repaired.get("cognitive_cycle_id"):
+                            cycle = copy.deepcopy(cycle)
+                            cycle["attention_bridge"] = self._public_bridge(
+                                repaired,
+                                admitted=None,
+                            )
+                        cycles.append(cycle)
+                    scope["cycles"] = cycles[-self.MAX_CYCLES_PER_SCOPE :]
+                    scope["updated_at"] = repaired.get("prepared_at")
+                    scopes[scope_key] = scope
+                state["scopes"] = scopes
+                state["updated_at"] = repaired.get("prepared_at")
+                return state
+
+            try:
+                with self.state_store.writer_transaction():
+                    self.state_store.mutate_json(self.STATE_FILE, force_reject)
+            except (RuntimeError, ValueError):
+                return
+
+    def _reject_cycle_bridge_without_binding(
+        self,
+        cycle: dict[str, Any],
+        reason: str,
+        *,
+        expected_config: dict[str, Any] | None = None,
+        expected_generation: int | None = None,
+    ) -> None:
+        """Close a pending cycle when no trustworthy bridge identity exists."""
+
+        if expected_config is None:
+            expected_config = self._config()
+        if expected_generation is None:
+            with self._worker_lock:
+                expected_generation = self._generation
+        if not self._execution_still_permits(expected_config, expected_generation):
+            return
+
+        cycle_id = str(cycle.get("cycle_id") or "")
+        scope_key = tenant_scope_storage_key(
+            str(cycle.get("user_id") or ""),
+            str(cycle.get("session_id") or ""),
+        )
+
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            if not self._valid_cognitive_state(state):
+                raise ValueError("cognitive loop state is semantically invalid")
+            scopes = state.get("scopes") if isinstance(state.get("scopes"), dict) else {}
+            scope = scopes.get(scope_key)
+            if not isinstance(scope, dict):
+                return state
+            cycles = []
+            for item in scope.get("cycles") or []:
+                if isinstance(item, dict) and str(item.get("cycle_id") or "") == cycle_id:
+                    item = copy.deepcopy(item)
+                    item["attention_bridge"] = {
+                        "status": "rejected",
+                        "reason": str(reason)[:160] or "bridge_recovery_rejected",
+                        "authority": False,
+                    }
+                cycles.append(item)
+            scope["cycles"] = cycles[-self.MAX_CYCLES_PER_SCOPE :]
+            scope["updated_at"] = utc_now_iso()
+            scopes[scope_key] = scope
+            state["scopes"] = scopes
+            state["updated_at"] = scope["updated_at"]
+            return state
+
+        try:
+            with self._worker_lock:
+                if not self._lifecycle_permits_locked(expected_generation):
+                    return
+                with self.state_store.writer_transaction():
+                    if not self._config_still_permits(expected_config):
+                        return
+                    self.state_store.mutate_json(self.STATE_FILE, mutate)
+        except (RuntimeError, ValueError):
             return
 
     def _opportunities(
@@ -2278,6 +3083,7 @@ class ReadOnlyCognitiveLoopRuntime:
                 "schema_version",
                 "binding_id",
                 "status",
+                "phase_revision",
                 "cognitive_cycle_id",
                 "user_id",
                 "session_id",
@@ -2289,14 +3095,22 @@ class ReadOnlyCognitiveLoopRuntime:
                 "brief_digest",
                 "material_change_digest",
                 "parent_binding_digest",
+                "assessment_digest",
+                "assessment_binding_digest",
                 "prepared_at",
                 "committed_at",
                 "rejection_reason",
                 "authority",
             }
             or value.get("binding_id") != binding_id
+            or binding_id != self._bridge_binding_id_for(value)
             or value.get("schema_version") != self.BRIDGE_BINDING_SCHEMA_VERSION
             or value.get("status") not in self.BRIDGE_BINDING_STATUSES
+            or isinstance(value.get("phase_revision"), bool)
+            or not isinstance(value.get("phase_revision"), int)
+            or value.get("phase_revision") < 1
+            or value.get("phase_revision")
+            < self.BRIDGE_PHASE_ORDER.get(str(value.get("status") or ""), 99)
             or not re.fullmatch(r"cog_[A-Za-z0-9_]{1,64}", str(value.get("cognitive_cycle_id") or ""))
             or not isinstance(value.get("user_id"), str)
             or not isinstance(value.get("session_id"), str)
@@ -2311,11 +3125,33 @@ class ReadOnlyCognitiveLoopRuntime:
             or not re.fullmatch(r"[0-9a-f]{64}", value["material_change_digest"])
             or not isinstance(value.get("parent_binding_digest"), str)
             or not re.fullmatch(r"[0-9a-f]{64}", value["parent_binding_digest"])
+            or not isinstance(value.get("assessment_digest"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value["assessment_digest"])
+            or not isinstance(value.get("assessment_binding_digest"), str)
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", value["assessment_binding_digest"]
+            )
             or isinstance(value.get("parent_revision"), bool)
             or not isinstance(value.get("parent_revision"), int)
             or value["parent_revision"] < 1
             or value.get("authority") is not False
             or self._time(value.get("prepared_at")) == datetime.min.replace(tzinfo=timezone.utc)
+        ):
+            return False
+        try:
+            user_id = normalize_scope_component(value.get("user_id"), "user_id")
+            session_id = normalize_scope_component(
+                value.get("session_id"), "session_id"
+            )
+        except (TypeError, ValueError):
+            return False
+        if (
+            not user_id
+            or not session_id
+            or not str(value.get("general_situation_id") or "")
+            or not re.fullmatch(
+                r"ahyp_[0-9a-f]{24}", str(value.get("hypothesis_id") or "")
+            )
         ):
             return False
         hypothesis_revision = value.get("hypothesis_revision")
@@ -2331,12 +3167,30 @@ class ReadOnlyCognitiveLoopRuntime:
         reason = value.get("rejection_reason")
         if reason is not None and (not isinstance(reason, str) or not reason):
             return False
-        if value.get("status") == "committed" and (
-            hypothesis_revision is None or committed_at is None or reason is not None
-        ):
-            return False
-        if value.get("status") == "rejected" and not reason:
-            return False
+        status = str(value.get("status") or "")
+        phase_revision = value.get("phase_revision")
+        # Bridge phases are a strict durable protocol, not a set of labels.
+        # Prepared has no Attention admission; admitted has the exact
+        # hypothesis revision but is not terminal; committed is only revision
+        # three with a commit timestamp; rejected is allowed only as the
+        # documented prepared->rejected (rev2) or admitted->rejected (rev3)
+        # terminal transition.
+        if status == "prepared":
+            if phase_revision != 1 or hypothesis_revision is not None or committed_at is not None or reason is not None:
+                return False
+        elif status == "admitted":
+            if phase_revision != 2 or hypothesis_revision is None or committed_at is not None or reason is not None:
+                return False
+        elif status == "committed":
+            if phase_revision != 3 or hypothesis_revision is None or committed_at is None or reason is not None:
+                return False
+        elif status == "rejected":
+            if phase_revision not in {2, 3} or not reason or committed_at is not None:
+                return False
+            if phase_revision == 2 and hypothesis_revision is not None:
+                return False
+            if phase_revision == 3 and hypothesis_revision is None:
+                return False
         return True
 
     def _valid_cycle_record(

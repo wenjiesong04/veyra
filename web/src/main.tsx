@@ -339,6 +339,8 @@ function App() {
   const [cognitiveLoopStatus, setCognitiveLoopStatus] = useState<Record<string, JsonValue> | null>(null);
   const [generalSituations, setGeneralSituations] = useState<ScopedCollection>({});
   const [attentionHypotheses, setAttentionHypotheses] = useState<ScopedCollection>({});
+  const [beliefStatus, setBeliefStatus] = useState<Record<string, JsonValue> | null>(null);
+  const [externalScope, setExternalScope] = useState<Record<string, JsonValue> | null>(null);
   const [suggestionStatus, setSuggestionStatus] = useState<Record<string, JsonValue> | null>(null);
   const [suggestionInbox, setSuggestionInbox] = useState<ScopedCollection>({});
   const [suggestionFeedback, setSuggestionFeedback] = useState<ScopedCollection>({});
@@ -382,6 +384,8 @@ function App() {
       fetchJson<Record<string, JsonValue>>("/awareness/cognitive-loop/status"),
       fetchJson<ScopedCollection>(`/awareness/general-situations?${query}&limit=50`),
       fetchJson<ScopedCollection>(`/awareness/attention-hypotheses?${query}&limit=50`),
+      fetchJson<Record<string, JsonValue>>(`/belief/status?${query}&limit=50`),
+      fetchJson<Record<string, JsonValue>>(`/external/watchlist?${query}&limit=50`),
       fetchJson<Record<string, JsonValue>>("/awareness/suggestions/status"),
       fetchJson<ScopedCollection>(`/awareness/suggestions/inbox?${query}&limit=50`),
       fetchJson<ScopedCollection>(`/awareness/suggestions/feedback?${query}&active_only=true&limit=100`),
@@ -392,6 +396,8 @@ function App() {
       cognitiveLoopResult,
       situationResult,
       hypothesisResult,
+      beliefResult,
+      externalResult,
       suggestionStatusResult,
       inboxResult,
       feedbackResult,
@@ -401,6 +407,8 @@ function App() {
     setCognitiveLoopStatus(cognitiveLoopResult.status === "fulfilled" ? cognitiveLoopResult.value : null);
     setGeneralSituations(situationResult.status === "fulfilled" ? situationResult.value : {});
     setAttentionHypotheses(hypothesisResult.status === "fulfilled" ? hypothesisResult.value : {});
+    setBeliefStatus(beliefResult.status === "fulfilled" ? beliefResult.value : null);
+    setExternalScope(externalResult.status === "fulfilled" ? externalResult.value : null);
     setSuggestionStatus(suggestionStatusResult.status === "fulfilled" ? suggestionStatusResult.value : null);
     setSuggestionInbox(inboxResult.status === "fulfilled" ? inboxResult.value : {});
     setSuggestionFeedback(feedbackResult.status === "fulfilled" ? feedbackResult.value : {});
@@ -410,6 +418,8 @@ function App() {
       cognitiveLoopResult.status === "rejected" ? "cognitive loop" : null,
       situationResult.status === "rejected" ? "general situations" : null,
       hypothesisResult.status === "rejected" ? "attention hypotheses" : null,
+      beliefResult.status === "rejected" ? "belief status" : null,
+      externalResult.status === "rejected" ? "external world" : null,
       suggestionStatusResult.status === "rejected" ? "suggestion status" : null,
       inboxResult.status === "rejected" ? "suggestion inbox" : null,
       feedbackResult.status === "rejected" ? "suggestion feedback" : null,
@@ -1151,7 +1161,7 @@ function App() {
     setLoading(true);
     setError(null);
     try {
-      const response = await fetchJson<Record<string, JsonValue>>("/external/refresh?limit=5", { method: "POST" });
+      const response = await fetchJson<Record<string, JsonValue>>(`/external/refresh?limit=5&${ownerQuery(ownerScope)}`, { method: "POST" });
       setResult(response as MessageResult);
       await refresh();
     } catch (caught) {
@@ -1293,11 +1303,13 @@ function App() {
     }
   };
 
-  const latestClaims = useMemo(() => state?.belief_state.claims?.slice(-5).reverse() ?? [], [state]);
+  const latestClaims = useMemo(() => jsonItems(beliefStatus?.newest).slice(-5).reverse(), [beliefStatus]);
   const focus = Array.isArray(scopedAttention?.focus) ? scopedAttention.focus.map(String) : [];
   const situationItems = jsonItems(generalSituations.items);
   const hypothesisItems = jsonItems(attentionHypotheses.items);
   const hypothesisStatusCounts = asRecord(attentionHypotheses.status_counts);
+  const beliefSummary = asRecord(beliefStatus?.summary);
+  const beliefRefreshable = jsonItems(beliefStatus?.refreshable);
   const cognitiveLoopMetrics = asRecord(cognitiveLoopStatus?.metrics);
   const suggestionItems = jsonItems(suggestionInbox.items);
   const suggestionFeedbackItems = jsonItems(suggestionFeedback.items);
@@ -1314,7 +1326,15 @@ function App() {
   const scopeChanged = ownerScope.userId !== ownerUserDraft.trim() || ownerScope.sessionId !== ownerSessionDraft.trim();
   const currentRisk = String(state?.risk_state.current_risk ?? "R0");
   const connected = agentStatus?.connected === true ? "connected" : String(agentStatus?.status ?? "unconfigured");
-  const snapshots = Array.isArray(state?.rollback_state?.snapshots) ? (state.rollback_state.snapshots as Array<Record<string, JsonValue>>) : [];
+  const snapshots = useMemo(() => {
+    const byId = new Map<string, Record<string, JsonValue>>();
+    rollbackLogs.items.forEach((entry) => {
+      const snapshot = asRecord(asRecord(entry).snapshot);
+      const snapshotId = String(snapshot.snapshot_id ?? "");
+      if (snapshotId) byId.set(snapshotId, snapshot);
+    });
+    return Array.from(byId.values());
+  }, [rollbackLogs]);
   const memoryItems = Array.isArray(memorySummary?.summary) ? (memorySummary.summary as Array<Record<string, JsonValue>>) : [];
   const agents = asRecord(agentRegistry?.agents);
   const selectedAgent = String(agentRegistry?.selected_agent ?? runtime?.identity.selected_agent ?? "openclaw");
@@ -1328,8 +1348,8 @@ function App() {
   const executionStatusCounts = statusCounts(executionLogs.items);
   const policyDecisionCounts = statusCounts(policyLogs.items, "decision");
   const auditItems = Array.isArray(auditJournal?.items) ? (auditJournal.items as Array<Record<string, JsonValue>>) : [];
-  const externalWatchlist = Array.isArray(state?.external_world?.watchlist) ? (state.external_world.watchlist as Array<JsonValue>) : [];
-  const externalSummaries = Array.isArray(state?.external_world?.summaries) ? (state.external_world.summaries as Array<Record<string, JsonValue>>) : [];
+  const externalWatchlist = jsonItems(externalScope?.watchlist);
+  const externalSummaries = jsonItems(externalScope?.summaries);
   const coreModelConfigured = coreModelStatus?.configured === true ? "configured" : String(coreModelStatus?.status ?? "unconfigured");
   const opsStatus = String(opsHealth?.status ?? "unknown");
   const deploymentStatus = String(deploymentReadiness?.status ?? "unknown");
@@ -1568,6 +1588,39 @@ function App() {
               </div>
             ) : null}
           </div>
+        </Section>
+      </section>
+
+      <section className={`workspaceGrid workbenchPane ${activeSection === "awareness" ? "active" : ""}`}>
+        <Section
+          title="Belief Console"
+          icon={<Database size={18} />}
+          action={<StatusPill value={beliefStatus ? String(beliefStatus.status ?? "unknown") : "unavailable"} />}
+        >
+          {beliefStatus ? (
+            <div className="situationSummary">
+              <Metric label="Fresh" value={String(beliefSummary.fresh ?? 0)} />
+              <Metric label="Stale" value={String(beliefSummary.stale ?? 0)} />
+              <Metric label="Conflict" value={String(beliefSummary.conflict ?? 0)} />
+              <Metric label="Refreshable" value={String(beliefRefreshable.length)} />
+            </div>
+          ) : (
+            <div className="emptyState">
+              <AlertTriangle size={18} />
+              Belief status is unavailable for this exact owner/session scope.
+            </div>
+          )}
+          {beliefStatus ? (
+            <div className="evidenceRefs">
+              <span>Refreshable claims (next_action = refresh_probe)</span>
+              {beliefRefreshable.slice(0, 8).map((claim, index) => (
+                <code key={`${String(claim.key ?? index)}`}>
+                  {String(claim.key ?? "claim")} · {String(claim.status ?? "unknown")}
+                </code>
+              ))}
+              {!beliefRefreshable.length ? <small>No refreshable Belief claim exists for this scope.</small> : null}
+            </div>
+          ) : null}
         </Section>
       </section>
 
@@ -2004,7 +2057,7 @@ function App() {
             </div>
             <div>
               <span>Executor</span>
-              <strong>{String(state?.executor_state.selected_agent ?? "unknown")}</strong>
+              <strong>{selectedAgent}</strong>
             </div>
           </div>
         </Section>
@@ -2250,7 +2303,7 @@ function App() {
               return (
                 <div className="dataTableRow" key={id || index}>
                   <code>{id || "-"}</code>
-                  <span>{String(snapshot.source ?? "-")}</span>
+                  <span>{String(snapshot.source_scope ?? "workspace-scoped")}</span>
                   <StatusPill value={String(snapshot.status ?? "unknown")} />
                   <div className="inlineActions">
                     <button className="iconButton smallIconButton" onClick={() => viewSnapshotDiff(id)} disabled={loading || !canRestore} title="View diff" aria-label="View snapshot diff">

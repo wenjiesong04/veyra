@@ -43,6 +43,7 @@ from interface.event_schema import (  # noqa: E402
 )
 from routers.debug_audit import build_debug_audit_router  # noqa: E402
 from runtime.active_loop import ActiveRuntimeLoop  # noqa: E402
+from runtime.external_world_refresh import ExternalWorldRefresh  # noqa: E402
 from runtime.retention_policy import RetentionPolicy  # noqa: E402
 
 
@@ -2839,6 +2840,107 @@ def test_scoped_debug_api(base: Path) -> None:
             {"trace_id": f"rt_{user_id}"},
         )
 
+    loop.state_store.patch_json(
+        "external_world.json",
+        {
+            "watchlist": [
+                {
+                    "user_id": "user-a",
+                    "session_id": "user-a-session",
+                    "target": "USER_A_WATCH_TARGET",
+                    "reason": "owner_watch",
+                    "enabled": True,
+                },
+                {
+                    "user_id": "user-b",
+                    "session_id": "user-b-session",
+                    "target": "USER_B_PRIVATE_WATCH_TARGET",
+                    "reason": "peer_watch",
+                    "enabled": True,
+                },
+            ],
+            "summaries": [
+                {
+                    "user_id": "user-b",
+                    "session_id": "user-b-session",
+                    "target": "USER_B_PRIVATE_WATCH_TARGET",
+                    "status": "success",
+                    "summary": "USER_B_PRIVATE_SUMMARY",
+                },
+                *[
+                    {
+                        "user_id": "user-a",
+                        "session_id": "user-a-session",
+                        "target": f"USER_A_FILLER_{index}",
+                        "status": "success",
+                        "summary": f"USER_A_FILLER_SUMMARY_{index}",
+                    }
+                    for index in range(99)
+                ],
+                {
+                    "user_id": "user-a",
+                    "session_id": "user-a-session",
+                    "target": "USER_A_WATCH_TARGET",
+                    "status": "success",
+                    "summary": "USER_A_SCOPED_SUMMARY",
+                },
+            ],
+        },
+    )
+    loop.state_store.patch_json(
+        "risk_state.json",
+        {"current_risk": "R5"},
+    )
+    loop.state_store.patch_json(
+        "task_state.json",
+        {"current_task": {"status": "blocked"}},
+    )
+    loop.state_store.append_jsonl(
+        "rollback_log.jsonl",
+        {
+            "action": "snapshot",
+            "snapshot": {
+                "snapshot_id": "snap_public_projection_fixture",
+                "status": "created",
+                "source": "/PRIVATE/ABSOLUTE/SOURCE.txt",
+                "source_relative": "PRIVATE/RELATIVE/SOURCE.txt",
+                "snapshot": "/PRIVATE/ARTIFACT/snapshot.bin",
+                "source_checksum": "PRIVATE_CHECKSUM",
+                "source_identity": {"inode": 42},
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "rollback_mode": "restore",
+            },
+        },
+    )
+
+    external_refresh = ExternalWorldRefresh(
+        loop.state_store,
+        reasoning=loop.core_reasoning,
+    )
+    external_probe_calls: list[str] = []
+    goal_sync_calls: list[bool] = []
+
+    def offline_external_probe(target: str) -> dict[str, Any]:
+        external_probe_calls.append(target)
+        return {
+            "status": "success",
+            "target": target,
+            "observed_at": "2026-01-01T00:00:00+00:00",
+            "summary": "SCOPED_REFRESH_RESULT",
+        }
+
+    external_refresh._probe_target = offline_external_probe  # type: ignore[method-assign]
+    external_refresh.reasoning.external_world_assist = (  # type: ignore[method-assign]
+        lambda **kwargs: {"status": "skipped"}
+    )
+    original_goal_sync = external_refresh._sync_goal_watchlist
+
+    def record_goal_sync(external_state: dict[str, Any]) -> None:
+        goal_sync_calls.append(True)
+        original_goal_sync(external_state)
+
+    external_refresh._sync_goal_watchlist = record_goal_sync  # type: ignore[method-assign]
+
     app = FastAPI()
     app.include_router(
         build_debug_audit_router(
@@ -2846,6 +2948,7 @@ def test_scoped_debug_api(base: Path) -> None:
                 "state_store": loop.state_store,
                 "awareness_loop": loop,
                 "agency_core": HealthyRuntimeDependency(),
+                "external_world_refresh": external_refresh,
             }
         )
     )
@@ -2866,6 +2969,37 @@ def test_scoped_debug_api(base: Path) -> None:
         params={"user_id": "user-b"},
     )
     inbox = client.get("/events/inbox", params={"user_id": "user-a"})
+    external = client.get(
+        "/external/watchlist",
+        params={"user_id": "user-a", "session_id": "user-a-session"},
+    )
+    scoped_refresh = client.post(
+        "/external/refresh",
+        params={
+            "limit": 1,
+            "user_id": "user-a",
+            "session_id": "user-a-session",
+        },
+    )
+    external_after_refresh = loop.state_store.read_json("external_world.json")
+    rollback_log = client.get("/logs/rollback", params={"limit": 20})
+    public_task_statuses: dict[str, str] = {}
+    for expected_status in ("needs_action_proposal", "needs_user_input"):
+        loop.state_store.patch_json(
+            "task_state.json",
+            {"current_task": {"status": expected_status}},
+        )
+        public_task_statuses[expected_status] = str(
+            client.get("/state")
+            .json()
+            .get("task_state", {})
+            .get("current_task", {})
+            .get("status")
+        )
+    loop.state_store.patch_json(
+        "task_state.json",
+        {"current_task": {"status": "blocked"}},
+    )
     public_state = client.get("/state")
     mode_status = client.get("/events/awareness/status")
     invalid_mode = client.post(
@@ -2883,7 +3017,41 @@ def test_scoped_debug_api(base: Path) -> None:
         and cross_tenant.status_code == 404
         and inbox.status_code == 200
         and inbox.json().get("stats", {}).get("total") == 1
+        and external.status_code == 200
+        and external.json().get("watchlist_count") == 1
+        and "USER_A_WATCH_TARGET" in str(external.json())
+        and "USER_A_SCOPED_SUMMARY" in str(external.json())
+        and "USER_B_PRIVATE" not in str(external.json())
+        and scoped_refresh.status_code == 200
+        and scoped_refresh.json().get("schema_version")
+        == "veyra.external_refresh.scoped.v1"
+        and scoped_refresh.json().get("status") == "success"
+        and external_probe_calls == ["USER_A_WATCH_TARGET"]
+        and not goal_sync_calls
+        and "USER_B_PRIVATE_WATCH_TARGET" in str(
+            external_after_refresh.get("watchlist")
+        )
+        and "USER_B_PRIVATE_SUMMARY" in str(
+            external_after_refresh.get("summaries")
+        )
+        and rollback_log.status_code == 200
+        and rollback_log.json().get("schema_version")
+        == "veyra.rollback_log.public.v1"
+        and "snap_public_projection_fixture" in str(rollback_log.json())
+        and "PRIVATE" not in str(rollback_log.json())
+        and "source_identity" not in str(rollback_log.json())
+        and public_task_statuses
+        == {
+            "needs_action_proposal": "needs_action_proposal",
+            "needs_user_input": "needs_user_input",
+        }
         and public_state.status_code == 200
+        and public_state.json().get("schema_version") == "veyra.public_state.v2"
+        and public_state.json().get("risk_state", {}).get("current_risk") == "R5"
+        and public_state.json().get("task_state", {}).get("current_task", {}).get("status")
+        == "blocked"
+        and "USER_A_WATCH_TARGET" not in str(public_state.json())
+        and "USER_B_PRIVATE" not in str(public_state.json())
         and "event_inbox" not in public_state.json()
         and "situation_state" not in public_state.json()
         and "agent_memory" not in public_state.json()
@@ -2900,6 +3068,40 @@ def test_scoped_debug_api(base: Path) -> None:
             "situations": user_a.json(),
             "inbox": inbox.json(),
             "state_keys": sorted(public_state.json()),
+        },
+    )
+
+    external_path = loop.state_store.path_for("external_world.json")
+    external_path.write_text("{not-json", encoding="utf-8")
+    corrupt_bytes = external_path.read_bytes()
+    probe_count_before_corrupt = len(external_probe_calls)
+    corrupt_get = client.get(
+        "/external/watchlist",
+        params={"user_id": "user-a", "session_id": "user-a-session"},
+    )
+    corrupt_refresh = client.post(
+        "/external/refresh",
+        params={
+            "limit": 1,
+            "user_id": "user-a",
+            "session_id": "user-a-session",
+        },
+    )
+    expect(
+        corrupt_get.status_code == 200
+        and corrupt_get.json().get("status") == "degraded"
+        and corrupt_get.json().get("reason")
+        == "external_world_integrity_invalid"
+        and corrupt_refresh.status_code == 200
+        and corrupt_refresh.json().get("status") == "degraded"
+        and corrupt_refresh.json().get("reason")
+        == "external_world_integrity_invalid"
+        and len(external_probe_calls) == probe_count_before_corrupt
+        and external_path.read_bytes() == corrupt_bytes,
+        "corrupt ExternalWorld reads and scoped refreshes fail closed and byte-pure",
+        {
+            "get": corrupt_get.json(),
+            "refresh": corrupt_refresh.json(),
         },
     )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
@@ -7,8 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
 from core.definitions import RiskLevel, lifecycle_statuses, operational_modes, risk_catalog
+from core.context_scope import item_visible_to_scope
 from core.learning_record import LearningRecordValidationError
-from core.model_client import redact_sensitive
 from interface.event_schema import utc_now_iso
 from memory_bridge.scope import normalize_scope_component
 from runtime.project_guardian_producers import ProjectGuardianGoalConflict
@@ -205,15 +206,72 @@ class ProjectGuardianAttentionDismissalRequest(BaseModel):
     dismissed: bool
 
 
+_PUBLIC_STATUS_VALUES = frozenset(
+    {
+        "unknown",
+        "success",
+        "fresh",
+        "stale",
+        "expired",
+        "conflict",
+        "degraded",
+        "healthy",
+        "available",
+        "offline",
+        "configured",
+        "unconfigured",
+        "disabled",
+        "enabled",
+        "idle",
+        "running",
+        "stopped",
+        "pending",
+        "complete",
+        "completed",
+        "recorded",
+        "shadow",
+        "record_only",
+        "accepted",
+        "failed",
+        "skipped",
+        "active",
+        "blocked",
+        "cancelled",
+        "critical",
+        "error",
+        "needs_confirmation",
+        "needs_action_proposal",
+        "needs_more_probe",
+        "needs_user_input",
+        "ok",
+        "partially_success",
+        "paused",
+        "pending_confirmation",
+        "ready",
+        "snapshot_stale",
+        "unavailable",
+        "validation_pending",
+        "verified_failed",
+        "verified_success",
+        "warning",
+    }
+)
+
+
+def _public_status(value: Any, default: str = "unknown") -> str:
+    selected = str(value or default).strip().lower()
+    return selected if selected in _PUBLIC_STATUS_VALUES else default
+
+
 def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
     router = APIRouter()
 
     @router.get("/state")
     async def state() -> dict[str, Any]:
         payload = _public_state(deps["state_store"].read_all())
-        payload["agency"] = deps["agency_core"].state()
-        if "commitment_core" in deps:
-            payload["commitments"] = deps["commitment_core"].list_commitments()
+        payload["agency"] = _public_agency_projection(
+            deps["agency_core"].state()
+        )
         return payload
 
     @router.get("/state/health")
@@ -371,7 +429,17 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
 
     @router.get("/logs/rollback")
     async def rollback_logs(limit: int = 100) -> dict[str, Any]:
-        return {"items": deps["state_store"].read_jsonl("rollback_log.jsonl", limit=limit)}
+        return {
+            "schema_version": "veyra.rollback_log.public.v1",
+            "items": [
+                _public_rollback_log_item(item)
+                for item in deps["state_store"].read_jsonl(
+                    "rollback_log.jsonl",
+                    limit=max(0, min(int(limit), 500)),
+                )
+                if isinstance(item, dict)
+            ],
+        }
 
     @router.get("/logs/memory")
     async def memory_logs(
@@ -525,11 +593,103 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
 
     @router.post("/state/refresh-stale")
     async def refresh_stale_state() -> dict[str, Any]:
-        return deps["state_refresh"].refresh_stale()
+        return _public_refresh_result(deps["state_refresh"].refresh_stale())
 
     @router.post("/external/refresh")
-    async def refresh_external_world(limit: int = 10) -> dict[str, Any]:
-        return deps["external_world_refresh"].refresh_watchlist(limit=limit)
+    async def refresh_external_world(
+        limit: int = 10,
+        user_id: str | None = Query(default=None, min_length=1, max_length=240),
+        session_id: str | None = Query(default=None, min_length=1, max_length=240),
+    ) -> dict[str, Any]:
+        scope = _belief_scope(user_id, session_id)
+        result = deps["external_world_refresh"].refresh_watchlist(
+            limit=max(0, min(int(limit), 100)),
+            user_id=scope[0] if scope else None,
+            session_id=scope[1] if scope else None,
+        )
+        reason = _public_external_failure_reason(result.get("reason"))
+        if scope is None:
+            response = {
+                "schema_version": "veyra.external_refresh.aggregate.v1",
+                "status": _public_status(result.get("status")),
+                "refreshed_count": len(result.get("refreshed") or []),
+                "skipped_count": len(result.get("skipped") or []),
+                "summary_count": max(0, int(result.get("summary_count") or 0)),
+                "scope_status": "aggregate_only",
+            }
+            if reason is not None:
+                response["reason"] = reason
+            return response
+        response = {
+            "schema_version": "veyra.external_refresh.scoped.v1",
+            "status": _public_status(result.get("status")),
+            "refreshed": [
+                _public_external_item(item, summary=True)
+                for item in (result.get("refreshed") or [])
+                if isinstance(item, dict)
+            ],
+            "skipped": [
+                _public_external_item(item)
+                for item in (result.get("skipped") or [])
+                if isinstance(item, dict)
+            ],
+            "summary_count": max(0, int(result.get("summary_count") or 0)),
+            "scope": {"user_id": scope[0], "session_id": scope[1]},
+        }
+        if reason is not None:
+            response["reason"] = reason
+        return response
+
+    @router.get("/external/watchlist")
+    async def external_watchlist(
+        user_id: str = Query(min_length=1, max_length=240),
+        session_id: str = Query(min_length=1, max_length=240),
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        scope = _belief_scope(user_id, session_id)
+        assert scope is not None
+        selected_limit = max(0, min(int(limit), 100))
+        external = deps["state_store"].read_json("external_world.json")
+        if external.get("_state_corrupt"):
+            return {
+                "schema_version": "veyra.external_watchlist.scoped.v1",
+                "status": "degraded",
+                "reason": "external_world_integrity_invalid",
+                "watchlist": [],
+                "summaries": [],
+                "watchlist_count": 0,
+                "summary_count": 0,
+                "scope": {"user_id": scope[0], "session_id": scope[1]},
+            }
+        watchlist = [
+            _public_external_item(item)
+            for item in (external.get("watchlist") or [])
+            if isinstance(item, dict)
+            and item_visible_to_scope(
+                item,
+                user_id=scope[0],
+                session_id=scope[1],
+            )
+        ]
+        summaries = [
+            _public_external_item(item, summary=True)
+            for item in (external.get("summaries") or [])
+            if isinstance(item, dict)
+            and item_visible_to_scope(
+                item,
+                user_id=scope[0],
+                session_id=scope[1],
+            )
+        ]
+        return {
+            "schema_version": "veyra.external_watchlist.scoped.v1",
+            "status": "success",
+            "watchlist": watchlist[-selected_limit:] if selected_limit else [],
+            "summaries": summaries[-selected_limit:] if selected_limit else [],
+            "watchlist_count": len(watchlist),
+            "summary_count": len(summaries),
+            "scope": {"user_id": scope[0], "session_id": scope[1]},
+        }
 
     @router.post("/external/watchlist")
     async def add_external_watch(request: ExternalWatchRequest) -> dict[str, Any]:
@@ -570,7 +730,13 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
             else:
                 watchlist.append(item)
 
-        return state_store.mutate_json("external_world.json", update_watchlist)
+        state_store.mutate_json("external_world.json", update_watchlist)
+        return {
+            "schema_version": "veyra.external_watchlist_write.v1",
+            "status": "success",
+            "item": _public_external_item(item),
+            "scope": {"user_id": user_scope, "session_id": session_scope},
+        }
 
     @router.get("/agency/intentions")
     async def agency_intentions() -> dict[str, Any]:
@@ -581,12 +747,83 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
         return {"status": "success", **deps["state_store"].read_json("persona_state.json")}
 
     @router.get("/belief/status")
-    async def belief_status(limit: int = 50) -> dict[str, Any]:
-        return deps["awareness_loop"].belief.ttl_report(limit=limit)
+    async def belief_status(
+        limit: int = 50,
+        user_id: str | None = Query(default=None, min_length=1, max_length=240),
+        session_id: str | None = Query(default=None, min_length=1, max_length=240),
+    ) -> dict[str, Any]:
+        belief = deps["awareness_loop"].belief
+        selected_limit = max(0, min(int(limit), 500))
+        scope = _belief_scope(user_id, session_id)
+        if scope is None:
+            # Unauthenticated/broad reads expose only aggregate freshness; raw
+            # claims, evidence refs, probes and CAS receipts remain private.
+            report = belief.ttl_report(limit=selected_limit)
+            return _public_belief_aggregate(report)
+        snapshot = belief._snapshot()  # noqa: SLF001 - scoped integrity gate
+        if snapshot.get("_state_corrupt"):
+            return {
+                "status": "degraded",
+                "reason": "belief_state_integrity_invalid",
+                "summary": belief.summary_from_claims([]),
+                "refreshable": [],
+                "oldest": [],
+                "newest": [],
+                "scope": {"user_id": scope[0], "session_id": scope[1]},
+            }
+        claims = _scoped_belief_claims(belief, *scope)
+        ranked = belief._rank_claims(claims)  # noqa: SLF001 - scoped projection
+        refreshable = [
+            claim
+            for claim in ranked
+            if claim.get("next_action") == "refresh_probe"
+        ]
+        return {
+            "schema_version": "veyra.belief.scoped_status.v1",
+            "status": "success",
+            "summary": belief.summary_from_claims(claims),
+            "refreshable": refreshable[-selected_limit:] if selected_limit else [],
+            "oldest": ranked[:selected_limit],
+            "newest": ranked[-selected_limit:] if selected_limit else [],
+            "scope": {"user_id": scope[0], "session_id": scope[1]},
+        }
 
     @router.get("/belief/stale")
-    async def belief_stale(limit: int = 50) -> dict[str, Any]:
-        return deps["awareness_loop"].belief.stale_report(limit=limit)
+    async def belief_stale(
+        limit: int = 50,
+        user_id: str | None = Query(default=None, min_length=1, max_length=240),
+        session_id: str | None = Query(default=None, min_length=1, max_length=240),
+    ) -> dict[str, Any]:
+        belief = deps["awareness_loop"].belief
+        selected_limit = max(0, min(int(limit), 500))
+        scope = _belief_scope(user_id, session_id)
+        if scope is None:
+            report = belief.stale_report(limit=selected_limit)
+            return _public_belief_aggregate(report, stale=True)
+        snapshot = belief._snapshot()  # noqa: SLF001 - scoped integrity gate
+        if snapshot.get("_state_corrupt"):
+            return {
+                "status": "degraded",
+                "reason": "belief_state_integrity_invalid",
+                "summary": belief.summary_from_claims([]),
+                "items": [],
+                "next_action": None,
+                "scope": {"user_id": scope[0], "session_id": scope[1]},
+            }
+        claims = _scoped_belief_claims(belief, *scope)
+        stale = [
+            claim
+            for claim in belief._rank_claims(claims)  # noqa: SLF001
+            if claim.get("next_action") == "refresh_probe"
+        ]
+        return {
+            "schema_version": "veyra.belief.scoped_stale.v1",
+            "status": "success",
+            "summary": belief.summary_from_claims(claims),
+            "items": stale[-selected_limit:] if selected_limit else [],
+            "next_action": "refresh_probe" if stale else None,
+            "scope": {"user_id": scope[0], "session_id": scope[1]},
+        }
 
     @router.get("/attention/active")
     async def attention_active(
@@ -1006,6 +1243,22 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @router.get("/awareness/suggestions/decisions")
+    async def general_suggestion_decisions(
+        user_id: str = Query(min_length=1, max_length=240),
+        session_id: str = Query(min_length=1, max_length=240),
+        limit: int = Query(default=100, ge=0, le=500),
+    ) -> dict[str, Any]:
+        outbox = deps["awareness_loop"].event_awareness.suggestion_outbox
+        try:
+            return outbox.list_decisions(
+                user_id=user_id,
+                session_id=session_id,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @router.post("/awareness/suggestions/config")
     async def general_suggestion_config(
         request: GeneralSuggestionModeRequest,
@@ -1158,7 +1411,13 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
             expire_after_seconds=payload.expire_after_seconds,
             prune_expired_after_seconds=payload.prune_expired_after_seconds,
         )
-        return {"status": "success", **result}
+        aggregate = _public_belief_aggregate(result)
+        aggregate["claims"] = [
+            {"status": _public_status(item.get("status"))}
+            for item in (result.get("claims") or [])
+            if isinstance(item, dict)
+        ]
+        return aggregate
 
     @router.get("/rollback/diff")
     async def rollback_diff(full: bool = False) -> Any:
@@ -1168,104 +1427,470 @@ def build_debug_audit_router(deps: dict[str, Any]) -> APIRouter:
 
 
 def _public_state(payload: dict[str, Any]) -> dict[str, Any]:
-    public = redact_sensitive(payload)
-    # Event, situation, AttentionHypothesis, Memory, Durable Case, Guardian,
-    # Phase 6 collaboration, and ExtensionSpec projections are tenant-scoped. Memory,
-    # Durable Case, collaboration, and extension documents also carry private
-    # bindings or user content, so they must only be exposed through
-    # owner-scoped projections.
-    # The generic state endpoint has no authenticated tenant identity, so it
-    # must not expose any of these collections.
-    public.pop("event_inbox", None)
-    public.pop("situation_state", None)
-    public.pop("general_situation_state", None)
-    public.pop("suggestion_outbox", None)
-    public.pop("context_binding_state", None)
-    public.pop("cognitive_loop_state", None)
-    public.pop("attention_hypothesis_state", None)
-    attention_state = (
-        public.get("attention_state")
-        if isinstance(public.get("attention_state"), dict)
-        else {}
-    )
-    # The persisted v2 state is a private owner/session map. Keep the legacy
-    # console shape without exposing any tenant scope; callers that need real
-    # focus data must use the explicitly scoped debug endpoint.
-    public["attention_state"] = {
-        "schema_version": attention_state.get("schema_version")
-        or "veyra.attention_state.v2",
-        "source": attention_state.get("source") or "attention_core",
-        "scope_status": "owner_scope_required",
-        "focus": [],
-        "ignored_noise": ["owner_scope_required"],
+    """Return the unauthenticated aggregate state contract.
+
+    ``read_all`` is intentionally broad because internal callers need the
+    complete durable state graph.  That document is not a public projection:
+    it contains owner/session items, target identifiers, commitments,
+    evidence, receipts, and runtime bindings.  Build the response from an
+    explicit allow-list instead of redacting a copy; a newly added private
+    state field must not become public by default.
+    """
+
+    source = payload if isinstance(payload, dict) else {}
+
+    def record(name: str) -> dict[str, Any]:
+        value = source.get(name)
+        return value if isinstance(value, dict) else {}
+
+    def status(value: dict[str, Any]) -> str:
+        return _public_status(value.get("status"))
+
+    def bounded_timestamp(selected: Any) -> str | None:
+        if not isinstance(selected, str) or len(selected) > 80:
+            return None
+        try:
+            datetime.fromisoformat(selected.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return selected
+
+    def timestamp(value: dict[str, Any]) -> str | None:
+        return bounded_timestamp(value.get("updated_at"))
+
+    def bounded_schema(selected: Any) -> str | int | None:
+        if isinstance(selected, int) and not isinstance(selected, bool):
+            return selected
+        if (
+            isinstance(selected, str)
+            and len(selected) <= 120
+            and selected.startswith("veyra.")
+            and all(char.isalnum() or char in "._-" for char in selected)
+        ):
+            return selected
+        return None
+
+    def count(value: Any, fallback: Any = 0) -> int:
+        if isinstance(value, (list, tuple, dict)):
+            return len(value)
+        try:
+            return max(0, int(fallback or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    def aggregate(
+        name: str,
+        *,
+        arrays: tuple[str, ...] = (),
+        counts: tuple[tuple[str, str], ...] = (),
+        schema: bool = False,
+    ) -> dict[str, Any]:
+        value = record(name)
+        output: dict[str, Any] = {
+            "scope_status": "aggregate_only",
+            "status": status(value),
+        }
+        if schema:
+            schema_value = bounded_schema(value.get("schema_version"))
+            if schema_value is not None:
+                output["schema_version"] = schema_value
+        updated = timestamp(value)
+        if updated is not None:
+            output["updated_at"] = updated
+        for field in arrays:
+            output[field] = []
+        for field, count_key in counts:
+            output[count_key] = count(value.get(field), value.get(count_key))
+        return output
+
+    raw_belief = record("belief_state")
+    raw_summary = raw_belief.get("summary") if isinstance(raw_belief.get("summary"), dict) else {}
+    belief_summary: dict[str, Any] = {}
+    for key in ("fresh", "stale", "expired", "conflict", "total", "refreshable"):
+        try:
+            belief_summary[key] = max(0, int(raw_summary.get(key) or 0))
+        except (TypeError, ValueError, OverflowError):
+            belief_summary[key] = 0
+
+    public: dict[str, Any] = {
+        "schema_version": "veyra.public_state.v2",
+        "user_world": aggregate("user_world"),
+        "user_goals": aggregate(
+            "user_goals", arrays=("goals",), counts=(("goals", "goal_count"),)
+        ),
+        "user_commitments": aggregate(
+            "user_commitments",
+            arrays=("commitments",),
+            counts=(("commitments", "commitment_count"),),
+        ),
+        "proactive_intents": aggregate(
+            "proactive_intents", arrays=("intents",), counts=(("intents", "intent_count"),)
+        ),
+        "proactive_authorizations": aggregate(
+            "proactive_authorizations",
+            arrays=("authorizations",),
+            counts=(("authorizations", "authorization_count"),),
+        ),
+        "belief_state": {
+            "scope_status": "owner_scope_required",
+            "status": status(raw_belief),
+            "summary": belief_summary,
+        },
     }
-    public.pop("agent_memory", None)
-    public.pop("durable_case_state", None)
-    public.pop("phase6_collaboration_state", None)
-    public.pop("phase6_extension_spec_state", None)
-    public.pop("phase6_extension_artifact_state", None)
-    public.pop("phase6_extension_source_check_state", None)
-    public.pop("phase6_extension_isolated_runner_state", None)
-    public.pop("phase6_extension_generation_state", None)
-    public.pop("phase6_extension_dynamic_validation_state", None)
-    public.pop("phase6_extension_release_state", None)
-    public.pop("phase6_extension_deployment_state", None)
-    public.pop("phase6_extension_pipeline_state", None)
-    public.pop("phase6_capability_gap_state", None)
-    public.pop("project_guardian_state", None)
-    public.pop("project_guardian_signal_state", None)
-    public.pop("project_guardian_producer_state", None)
-    public.pop("project_guardian_attention_state", None)
-    # The durable playbook record contains target/incident/operation bindings.
-    # Expose only the deliberately compact self-heal status endpoint.
-    public.pop("self_heal_state", None)
-    private_task_state = (
-        payload.get("task_state")
-        if isinstance(payload.get("task_state"), dict)
-        else {}
+    if timestamp(raw_belief) is not None:
+        public["belief_state"]["updated_at"] = timestamp(raw_belief)
+
+    raw_local = record("local_world")
+    raw_probes = raw_local.get("probes") if isinstance(raw_local.get("probes"), dict) else {}
+    raw_scoped_probes = raw_local.get("scoped_probes") if isinstance(raw_local.get("scoped_probes"), dict) else {}
+    public["local_world"] = {
+        "scope_status": "owner_scope_required",
+        "status": status(raw_local),
+        "last_probe_at": bounded_timestamp(raw_local.get("last_probe_at")),
+        "probe_count": len(raw_probes),
+        "scoped_probe_owner_count": len(raw_scoped_probes),
+    }
+    public["external_world"] = aggregate(
+        "external_world",
+        arrays=("watchlist", "summaries", "knowledge_items", "push_candidates"),
+        counts=(
+            ("watchlist", "watchlist_count"),
+            ("summaries", "summary_count"),
+            ("knowledge_items", "knowledge_item_count"),
+            ("push_candidates", "push_candidate_count"),
+        ),
     )
-    pending_tasks = (
-        private_task_state.get("pending_agent_tasks")
-        if isinstance(
-            private_task_state.get("pending_agent_tasks"), list
-        )
-        else []
-    )
-    archived_contexts = (
-        private_task_state.get("agent_task_contexts")
-        if isinstance(
-            private_task_state.get("agent_task_contexts"), dict
-        )
-        else {}
-    )
-    current_task = (
-        private_task_state.get("current_task")
-        if isinstance(private_task_state.get("current_task"), dict)
-        else {}
-    )
-    # The task ledger now carries private Agent run/session and Case bindings.
-    # `/state` has no tenant identity, so expose health-like aggregates only.
+    public["executor_state"] = aggregate("executor_state")
+    risk = record("risk_state")
+    current_risk = str(risk.get("current_risk") or "R0")
+    public["risk_state"] = {
+        "scope_status": "aggregate_only",
+        "status": status(risk),
+        "current_risk": current_risk if current_risk in {"R0", "R1", "R2", "R3", "R4", "R5"} else "unknown",
+        "signal_count": count(risk.get("signals")),
+        "assessment_count": count(risk.get("assessments")),
+    }
+    public["risk_policy"] = aggregate("risk_policy", schema=True)
+
+    task = record("task_state")
+    current_task = task.get("current_task") if isinstance(task.get("current_task"), dict) else None
     public["task_state"] = {
-        "pending_agent_task_count": len(pending_tasks),
-        "archived_agent_task_context_count": len(archived_contexts),
+        "scope_status": "owner_scope_required",
+        "status": status(task),
+        "pending_agent_task_count": count(task.get("pending_agent_tasks")),
+        "history_count": count(task.get("history")),
         "current_task": (
-            {
-                key: current_task.get(key)
-                for key in ("route", "status")
-                if key in current_task
-            }
+            {"status": _public_status(current_task.get("status"))}
             if current_task
             else None
         ),
     }
-    agent_config = public.get("agent_config") if isinstance(public.get("agent_config"), dict) else {}
-    if isinstance(agent_config, dict):
-        core_model = agent_config.get("core_model") if isinstance(agent_config.get("core_model"), dict) else {}
-        if isinstance(core_model, dict):
-            original = payload.get("agent_config", {}).get("core_model", {}) if isinstance(payload.get("agent_config"), dict) else {}
-            core_model["api_key_set"] = bool(original.get("api_key")) if isinstance(original, dict) else False
-            core_model["api_key"] = "<redacted>" if core_model.get("api_key") else ""
+
+    attention_state = record("attention_state")
+    attention_schema = bounded_schema(attention_state.get("schema_version"))
+    if not isinstance(attention_schema, str):
+        attention_schema = "veyra.attention_state.v2"
+    public["attention_state"] = {
+        "schema_version": attention_schema,
+        "source": "attention_core",
+        "scope_status": "owner_scope_required",
+        "focus": [],
+        "ignored_noise": ["owner_scope_required"],
+    }
+    public["channel_state"] = aggregate(
+        "channel_state",
+        arrays=("inbox", "outbox"),
+        counts=(("inbox", "inbox_count"), ("outbox", "outbox_count")),
+        schema=True,
+    )
+    public["persona_state"] = aggregate(
+        "persona_state", arrays=("active_modes",), counts=(("active_modes", "active_mode_count"),)
+    )
+    public["review_queue"] = aggregate(
+        "review_queue", arrays=("items",), counts=(("items", "item_count"),)
+    )
+    public["rollback_state"] = aggregate(
+        "rollback_state", arrays=("snapshots",), counts=(("snapshots", "snapshot_count"),)
+    )
+    public["replay_runtime_state"] = aggregate(
+        "replay_runtime_state", arrays=("jobs",), counts=(("jobs", "job_count"),)
+    )
+    public["ops_soak_state"] = aggregate(
+        "ops_soak_state", arrays=("runs",), counts=(("runs", "run_count"),)
+    )
+    public["ops_runtime_matrix"] = aggregate(
+        "ops_runtime_matrix", arrays=("runtimes",), counts=(("runtimes", "runtime_count"),)
+    )
+    public["active_loop_state"] = aggregate("active_loop_state")
+    public["runtime_cron_state"] = aggregate(
+        "runtime_cron_state", arrays=("jobs",), counts=(("jobs", "job_count"),)
+    )
+    public["self_improvement_proposals"] = aggregate(
+        "self_improvement_proposals", arrays=("proposals",), counts=(("proposals", "proposal_count"),)
+    )
+    public["state_change_proposals"] = aggregate(
+        "state_change_proposals", arrays=("proposals",), counts=(("proposals", "proposal_count"),), schema=True
+    )
+    public["feishu_ws_state"] = aggregate("feishu_ws_state")
+    public["state_schema"] = aggregate("state_schema", schema=True)
+    public["ops_config"] = aggregate("ops_config")
+
+    # Keep the existing core-model status shape without returning raw config,
+    # agent registries, local URLs, or credential material.
+    agent_config = record("agent_config")
+    core_model = agent_config.get("core_model") if isinstance(agent_config.get("core_model"), dict) else {}
+    decision_mode = str(core_model.get("decision_mode") or "auto")
+    public["agent_config"] = {
+        "scope_status": "aggregate_only",
+        "status": status(agent_config),
+        "core_model": {
+            "enabled": bool(core_model.get("enabled")),
+            "configured": bool(core_model.get("configured")),
+            "decision_mode": decision_mode if decision_mode in {"auto", "always"} else "auto",
+            "api_key_set": bool(core_model.get("api_key")),
+            "api_key": "",
+        },
+        "agent_count": count(agent_config.get("agents")),
+    }
+
+    raw_refresh = record("state_refresh_state")
+    refresh_summary: dict[str, Any] = {"scope_status": "owner_scope_required"}
+    try:
+        refresh_summary["cursor"] = max(0, int(raw_refresh.get("cursor") or 0))
+    except (TypeError, ValueError, OverflowError):
+        refresh_summary["cursor"] = 0
+    refresh_updated_at = bounded_timestamp(raw_refresh.get("updated_at"))
+    if refresh_updated_at is not None:
+        refresh_summary["updated_at"] = refresh_updated_at
+    for key in (
+        "supported_count", "unsupported_count", "malformed_count", "selected_count",
+        "refreshed_count", "failed_count", "skipped_count",
+    ):
+        try:
+            refresh_summary[key] = max(0, int(raw_refresh.get(key) or 0))
+        except (TypeError, ValueError, OverflowError):
+            refresh_summary[key] = 0
+    public["state_refresh_state"] = refresh_summary
     return public
+
+
+def _public_agency_projection(value: Any) -> dict[str, Any]:
+    """Expose only aggregate Agency health on the unauthenticated state route."""
+
+    agency = value if isinstance(value, dict) else {}
+    goals = agency.get("goals") if isinstance(agency.get("goals"), dict) else {}
+    commitments = agency.get("active_commitments")
+    triggers = agency.get("triggers")
+    intentions = agency.get("intentions")
+    return {
+        "scope_status": "owner_scope_required",
+        "config_status": _public_status(agency.get("config_status")),
+        "goal_count": len(goals),
+        "active_commitment_count": len(commitments) if isinstance(commitments, list) else 0,
+        "trigger_count": len(triggers) if isinstance(triggers, list) else 0,
+        "intention_count": len(intentions) if isinstance(intentions, list) else 0,
+    }
+
+
+def _public_refresh_result(value: Any) -> dict[str, Any]:
+    """Return aggregate refresh outcomes without claim/probe/receipt payloads."""
+
+    result = value if isinstance(value, dict) else {}
+
+    def _count(raw: Any) -> int:
+        try:
+            return max(0, int(raw or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    output: dict[str, Any] = {
+        "status": _public_status(result.get("status"), default="degraded"),
+        "refreshed": [
+            {"status": "accepted"}
+            for item in (result.get("refreshed") or [])
+            if isinstance(item, dict)
+        ],
+        "failed": [
+            {"status": "failed"}
+            for item in (result.get("failed") or [])
+            if isinstance(item, dict)
+        ],
+        "skipped": [
+            {"status": "skipped"}
+            for item in (result.get("skipped") or [])
+            if isinstance(item, dict)
+        ],
+        "refreshed_count": _count(result.get("refreshed_count")),
+        "selected_count": _count(result.get("selected_count")),
+        "remaining_stale": _count(result.get("remaining_stale")),
+        "unsupported_stale": _count(result.get("unsupported_stale")),
+        "malformed_count": len(result.get("malformed") or [])
+        if isinstance(result.get("malformed"), list)
+        else _count(result.get("malformed_count")),
+    }
+    cursor = result.get("cursor")
+    if isinstance(cursor, dict):
+        output["cursor"] = {
+            "before": _count(cursor.get("before")),
+            "after": _count(cursor.get("after")),
+        }
+    return output
+
+
+def _public_belief_aggregate(value: Any, *, stale: bool = False) -> dict[str, Any]:
+    """Sanitize broad Belief status/stale reports to counts/status-only rows."""
+
+    report = value if isinstance(value, dict) else {}
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    aggregate_summary: dict[str, int] = {}
+    for key in ("fresh", "stale", "expired", "conflict", "total", "refreshable"):
+        try:
+            aggregate_summary[key] = max(0, int(summary.get(key) or 0))
+        except (TypeError, ValueError):
+            aggregate_summary[key] = 0
+    output: dict[str, Any] = {
+        "schema_version": "veyra.belief.aggregate_status.v1",
+        "status": _public_status(report.get("status"), default="success"),
+        "summary": aggregate_summary,
+        "scope_status": "aggregate_only",
+    }
+    if report.get("reason") == "belief_claims_quarantined":
+        output["reason"] = "belief_claims_quarantined"
+        try:
+            output["quarantined_claim_count"] = max(
+                0,
+                int(report.get("quarantined_claim_count") or 0),
+            )
+        except (TypeError, ValueError, OverflowError):
+            output["quarantined_claim_count"] = 0
+    if stale:
+        output["items"] = [
+            {"status": _public_status(item.get("status"))}
+            for item in (report.get("items") or [])
+            if isinstance(item, dict)
+        ]
+        output["next_action"] = (
+            "refresh_probe" if report.get("next_action") else None
+        )
+    else:
+        output["refreshable_count"] = len(report.get("refreshable") or [])
+        output["oldest_count"] = len(report.get("oldest") or [])
+        output["newest_count"] = len(report.get("newest") or [])
+    return output
+
+
+def _belief_scope(
+    user_id: str | None,
+    session_id: str | None,
+) -> tuple[str, str] | None:
+    if user_id is None and session_id is None:
+        return None
+    if user_id is None or session_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail="user_id and session_id must be supplied together",
+        )
+    try:
+        return (
+            normalize_scope_component(user_id, "user_id"),
+            normalize_scope_component(session_id, "session_id"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _public_external_item(
+    value: Any,
+    *,
+    summary: bool = False,
+) -> dict[str, Any]:
+    """Project one exact-owner ExternalWorld row without probe internals."""
+
+    item = value if isinstance(value, dict) else {}
+
+    def text(field: str, limit: int) -> str | None:
+        selected = item.get(field)
+        if not isinstance(selected, str):
+            return None
+        selected = selected.strip()
+        return selected[:limit] if selected else None
+
+    output: dict[str, Any] = {
+        "target": text("target", 500),
+        "kind": text("kind", 80),
+        "status": _public_status(item.get("status")),
+    }
+    if not summary:
+        output.update(
+            {
+                "reason": text("reason", 240),
+                "enabled": item.get("enabled") is not False,
+            }
+        )
+    else:
+        output.update(
+            {
+                "summary": text("summary", 1200),
+                "observed_at": text("observed_at", 80),
+                "watch_recommendation": text("watch_recommendation", 80),
+            }
+        )
+    return output
+
+
+def _public_external_failure_reason(value: Any) -> str | None:
+    selected = str(value or "").strip().lower()
+    if selected in {
+        "external_refresh_scope_incomplete",
+        "external_world_integrity_invalid",
+    }:
+        return selected
+    return None
+
+
+def _public_rollback_log_item(value: Any) -> dict[str, Any]:
+    """Project rollback audit rows without filesystem or integrity internals."""
+
+    item = value if isinstance(value, dict) else {}
+    action = str(item.get("action") or "unknown").strip().lower()
+    if action not in {"snapshot", "restore"}:
+        action = "unknown"
+    output: dict[str, Any] = {"action": action}
+    timestamp = item.get("timestamp")
+    if isinstance(timestamp, str) and len(timestamp) <= 80:
+        output["timestamp"] = timestamp
+
+    record_key = "snapshot" if action == "snapshot" else "result"
+    record = item.get(record_key)
+    if not isinstance(record, dict):
+        return output
+    snapshot_id = str(record.get("snapshot_id") or "").strip()
+    status = str(record.get("status") or "unknown").strip().lower()
+    if status not in {"blocked", "created", "restored", "tombstone"}:
+        status = "unknown"
+    projected: dict[str, Any] = {
+        "snapshot_id": snapshot_id[:80] if snapshot_id.startswith("snap_") else "",
+        "status": status,
+        "source_scope": "workspace_scoped",
+    }
+    created_at = record.get("created_at") or record.get("restored_at")
+    if isinstance(created_at, str) and len(created_at) <= 80:
+        projected["observed_at"] = created_at
+    rollback_mode = str(record.get("rollback_mode") or "").strip().lower()
+    if rollback_mode in {"delete_created_file", "none", "restore"}:
+        projected["rollback_mode"] = rollback_mode
+    output[record_key] = projected
+    return output
+
+
+def _scoped_belief_claims(belief: Any, user_id: str, session_id: str) -> list[dict[str, Any]]:
+    snapshot = belief._snapshot()  # noqa: SLF001 - route-owned read projection
+    claims = snapshot.get("claims") if isinstance(snapshot.get("claims"), list) else []
+    return [
+        item
+        for item in claims
+        if item_visible_to_scope(item, user_id=user_id, session_id=session_id)
+    ]
 
 
 def _public_suggestion_feedback_record(value: Any) -> dict[str, Any]:

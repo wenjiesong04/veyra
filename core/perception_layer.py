@@ -73,42 +73,12 @@ class PerceptionLayer:
                 }
         observation = dict(enriched)
         model_interpretation = observation.pop("model_interpretation", None)
-
-        def update_local_world(local_world: dict[str, Any]) -> dict[str, Any]:
-            if scope_metadata.get("scope_kind") == OPERATOR_GLOBAL_SCOPE:
-                probes = local_world.setdefault("probes", {})
-                if not isinstance(probes, dict):
-                    probes = {}
-                    local_world["probes"] = probes
-                probes[probe_name] = observation
-            elif (
-                scope_metadata.get("scope_kind") == TENANT_SCOPE
-                and scope_metadata.get("user_id")
-                and scope_metadata.get("session_id")
-                and not scope_metadata.get("scope_status")
-            ):
-                scoped_probes = local_world.setdefault(
-                    "scoped_probes",
-                    {},
-                )
-                if not isinstance(scoped_probes, dict):
-                    scoped_probes = {}
-                    local_world["scoped_probes"] = scoped_probes
-                scope_key = tenant_scope_storage_key(
-                    scope_metadata["user_id"],
-                    scope_metadata["session_id"],
-                )
-                scope_bucket = (
-                    scoped_probes.get(scope_key)
-                    if isinstance(scoped_probes.get(scope_key), dict)
-                    else {}
-                )
-                scope_bucket[probe_name] = observation
-                scoped_probes[scope_key] = scope_bucket
-            local_world["last_probe_at"] = observed_at
-            return local_world
-
-        self.state_store.mutate_json("local_world.json", update_local_world)
+        # The refresh CAS envelope is an in-flight writer binding only.  It
+        # must not enter the durable local probe cache or any public state
+        # projection; `_claims_from_probe` still receives it from `enriched`
+        # below so BeliefCore can enforce the writer-side check.
+        observation = self._strip_refresh_cas(observation)
+        refresh_cas_present = isinstance(probe_result.get("refresh_cas"), dict)
 
         claims = self._claims_from_probe(enriched) + self._claims_from_model(enriched, model_assist)
         for claim in claims:
@@ -129,25 +99,82 @@ class PerceptionLayer:
             item
             for item in persistence_results
             if item.get("belief_value_persisted") is True
+            and item.get("persistence_status") in {"accepted", "accepted_with_conflict"}
         ]
         conflicted = [
             item
             for item in persistence_results
             if item.get("persistence_status") == "conflict"
         ]
+        nonauthoritative = [
+            item
+            for item in persistence_results
+            if item.get("persistence_status") in {"duplicate", "superseded"}
+        ]
         rejected = [
             item
             for item in persistence_results
             if item.get("persisted") is not True
         ]
+        cas_rejected = any(
+            isinstance(item, dict) and item.get("cas_rejected") is True
+            for item in persistence_results
+        )
         if not claims:
             persistence_status = "no_observation"
         elif rejected:
             persistence_status = "partial" if accepted else "rejected"
         elif conflicted:
             persistence_status = "partial" if accepted else "conflict"
+        elif nonauthoritative:
+            persistence_status = "partial" if accepted else "duplicate"
         else:
             persistence_status = "accepted"
+
+        # A stale refresh carries a claim-level CAS envelope.  Only an
+        # accepted durable Belief value may update the probe cache; a losing
+        # refresh must leave a newer local observation byte-for-byte intact.
+        # Non-refresh observations retain the historical cache behaviour,
+        # including diagnostic/non-observation probe results.
+        should_write_local = not refresh_cas_present or (
+            bool(accepted) and not cas_rejected
+        )
+        if should_write_local:
+            def update_local_world(local_world: dict[str, Any]) -> dict[str, Any]:
+                if scope_metadata.get("scope_kind") == OPERATOR_GLOBAL_SCOPE:
+                    probes = local_world.setdefault("probes", {})
+                    if not isinstance(probes, dict):
+                        probes = {}
+                        local_world["probes"] = probes
+                    probes[probe_name] = self._strip_refresh_cas(observation)
+                elif (
+                    scope_metadata.get("scope_kind") == TENANT_SCOPE
+                    and scope_metadata.get("user_id")
+                    and scope_metadata.get("session_id")
+                    and not scope_metadata.get("scope_status")
+                ):
+                    scoped_probes = local_world.setdefault(
+                        "scoped_probes",
+                        {},
+                    )
+                    if not isinstance(scoped_probes, dict):
+                        scoped_probes = {}
+                        local_world["scoped_probes"] = scoped_probes
+                    scope_key = tenant_scope_storage_key(
+                        scope_metadata["user_id"],
+                        scope_metadata["session_id"],
+                    )
+                    scope_bucket = (
+                        scoped_probes.get(scope_key)
+                        if isinstance(scoped_probes.get(scope_key), dict)
+                        else {}
+                    )
+                    scope_bucket[probe_name] = self._strip_refresh_cas(observation)
+                    scoped_probes[scope_key] = scope_bucket
+                local_world["last_probe_at"] = observed_at
+                return local_world
+
+            self.state_store.mutate_json("local_world.json", update_local_world)
         local_path = (
             "local_world.probes"
             if scope_metadata.get("scope_kind") == OPERATOR_GLOBAL_SCOPE
@@ -158,8 +185,11 @@ class PerceptionLayer:
             else "local_world.not_persisted"
         )
         result = {
-            local_path: {probe_name: enriched},
-            "belief.claims": claims,
+            local_path: {probe_name: self._strip_refresh_cas(observation)},
+            "belief.claims": [
+                self._strip_refresh_cas(claim)
+                for claim in claims
+            ],
             "belief_persistence": {
                 "status": persistence_status,
                 "results": persistence_receipts,
@@ -171,7 +201,23 @@ class PerceptionLayer:
         }
         if model_interpretation:
             result["model_interpretation"] = model_interpretation
-        return result
+        return self._strip_refresh_cas(result)
+
+    @classmethod
+    def _strip_refresh_cas(cls, value: Any) -> Any:
+        """Recursively remove the private in-flight refresh CAS envelope."""
+
+        if isinstance(value, dict):
+            return {
+                key: cls._strip_refresh_cas(item)
+                for key, item in value.items()
+                if key not in {"refresh_cas", BeliefCore._REFRESH_CAS_KEY, "cas"}
+            }
+        if isinstance(value, list):
+            return [cls._strip_refresh_cas(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._strip_refresh_cas(item) for item in value)
+        return value
 
     @staticmethod
     def _persistence_receipt(item: dict[str, Any]) -> dict[str, Any]:
@@ -187,16 +233,22 @@ class PerceptionLayer:
             "evidence_value_digest",
             "evidence_graph_error",
             "belief_economy_error",
+            "cas_rejected",
+            "cas",
         ):
             value = item.get(key)
             if value is not None:
                 receipt[key] = value
-        return receipt
+        return PerceptionLayer._strip_refresh_cas(receipt)
 
     def _claims_from_probe(self, probe_result: dict[str, Any]) -> list[dict[str, Any]]:
         explicit = probe_result.get("claims")
         if isinstance(explicit, list) and explicit:
-            return [self._normalize_claim(probe_result, claim) for claim in explicit if isinstance(claim, dict)]
+            return [
+                self._normalize_claim(probe_result, claim)
+                for claim in explicit
+                if isinstance(claim, dict)
+            ]
 
         if str(probe_result.get("status") or "") in _NON_OBSERVATION_STATUSES:
             return []
@@ -234,8 +286,15 @@ class PerceptionLayer:
             key = f"{probe_name}:{probe_result.get('target') or 'default'}:status"
             claim = summary
 
-        return [
-            make_claim(
+        # A stale refresh binds a pre-probe claim identity.  Probe adapters do
+        # not all echo the original key (for example a port adapter may omit
+        # its parsed port), so preserve the server-provided key rather than
+        # manufacturing a new identity that can never pass CAS.
+        refresh_cas = probe_result.get("refresh_cas")
+        if isinstance(refresh_cas, dict) and refresh_cas.get("claim_key"):
+            key = str(refresh_cas["claim_key"])
+
+        claim = make_claim(
                 key=key,
                 claim=claim,
                 source=probe_name,
@@ -246,12 +305,28 @@ class PerceptionLayer:
                 claim_kind="observed",
                 refresh_spec=self._refresh_spec_for_probe(probe_result),
             )
-        ]
+        if isinstance(refresh_cas, dict):
+            # Private CAS metadata is consumed by BeliefCore and stripped
+            # before durable persistence.  It binds only this probe claim;
+            # model-derived claims intentionally do not inherit it.
+            claim[BeliefCore._REFRESH_CAS_KEY] = dict(refresh_cas)
+        return [claim]
 
     def _normalize_claim(self, probe_result: dict[str, Any], claim: dict[str, Any]) -> dict[str, Any]:
         probe_name = str(probe_result.get("probe") or "unknown")
-        return make_claim(
-            key=str(claim.get("key") or claim.get("claim") or f"{probe_name}:claim"),
+        refresh_cas = probe_result.get("refresh_cas")
+        bound_key = (
+            str(refresh_cas.get("claim_key"))
+            if isinstance(refresh_cas, dict) and refresh_cas.get("claim_key")
+            else None
+        )
+        normalized = make_claim(
+            key=str(
+                claim.get("key")
+                or claim.get("claim")
+                or bound_key
+                or f"{probe_name}:claim"
+            ),
             claim=str(claim.get("claim") or probe_result.get("summary") or ""),
             source=str(claim.get("source") or probe_name),
             confidence=float(claim.get("confidence") or probe_result.get("confidence") or 0.75),
@@ -265,6 +340,9 @@ class PerceptionLayer:
                 else self._refresh_spec_for_probe(probe_result)
             ),
         )
+        if isinstance(refresh_cas, dict):
+            normalized[BeliefCore._REFRESH_CAS_KEY] = dict(refresh_cas)
+        return normalized
 
     def _refresh_spec_for_probe(
         self,
@@ -301,7 +379,7 @@ class PerceptionLayer:
         return None
 
     def _compact_evidence(self, probe_result: dict[str, Any]) -> dict[str, Any]:
-        skipped = {"claims", "details"}
+        skipped = {"claims", "details", "refresh_cas"}
         return {key: value for key, value in probe_result.items() if key not in skipped}
 
     def _detect_anomaly(self, probe_result: dict[str, Any]) -> dict[str, str] | None:

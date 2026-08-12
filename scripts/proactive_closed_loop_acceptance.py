@@ -206,7 +206,14 @@ def main() -> int:
         store.mutate_json("external_world.json", install_authorized_learning_watch)
 
         external = client.post("/external/refresh", params={"limit": 5})
-        expect(external.status_code == 200 and external.json().get("refreshed"), "authorized external search refreshed", external.text)
+        expect(
+            external.status_code == 200
+            and external.json().get("schema_version")
+            == "veyra.external_refresh.aggregate.v1"
+            and external.json().get("refreshed_count", 0) > 0,
+            "authorized external search refreshed",
+            external.text,
+        )
         external_state = store.read_json("external_world.json")
         expect(external_state.get("knowledge_items") and external_state.get("push_candidates"), "external knowledge and candidates recorded", external_state)
 

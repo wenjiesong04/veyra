@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from uuid import uuid4
@@ -10,6 +11,7 @@ from uuid import uuid4
 from awareness.general_attention_scheduler import GeneralAttentionScheduler
 from awareness.project_guardian import ProjectGuardianEvaluator
 from core.situation_evaluator import SituationEvaluator
+from core.context_scope import tenant_scope_storage_key
 from core.world_state import WorldStateStore
 from interface.agent_contract import NON_TERMINAL_STATUSES
 from interface.event_schema import (
@@ -28,6 +30,8 @@ from runtime.project_guardian import ProjectGuardianRuntime
 from runtime.project_guardian_github_ci import GitHubActionsCIProvider
 from runtime.project_guardian_signal_ledger import ProjectGuardianSignalLedger
 from runtime.suggestion_outbox import SuggestionOutbox
+from interface.general_situation_contract import stable_digest
+from memory_bridge.scope import normalize_scope_component
 
 
 VERIFIED_RESULT_STATUSES = {"verified_failed", "verified_success"}
@@ -42,6 +46,10 @@ class ShadowAwarenessRuntime:
     """
 
     MODES = {"disabled", "record_only", "shadow"}
+    ATTENTION_LIFECYCLE_SCHEMA_VERSION = (
+        "veyra.attention_lifecycle_observation.v1"
+    )
+    MAX_ATTENTION_LIFECYCLE_RECEIPT_AGE_SECONDS = 300
 
     def __init__(
         self,
@@ -160,6 +168,376 @@ class ShadowAwarenessRuntime:
                         "reason": "stale_project_guardian_mode_epoch",
                     }
             return self.event_inbox.enqueue(event)
+
+    def derive_attention_lifecycle_from_event(
+        self,
+        event_id: str | VeyraEvent,
+        *,
+        target_hypothesis_id: str | None = None,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Apply a trusted typed Attention lifecycle signal from a receipt.
+
+        The caller supplies only the durable EventInbox identity (and may
+        repeat the owner/target for an exact-scope check).  Producer identity,
+        evidence identity, and observation time are derived from the durable
+        receipt itself.  Free text, caller timestamps, and caller-reported
+        producer/evidence values are never used.
+        """
+
+        selected_event_id = (
+            event_id.event_id if isinstance(event_id, VeyraEvent) else str(event_id or "")
+        ).strip()
+        if not selected_event_id or len(selected_event_id) > 240:
+            return self._attention_lifecycle_rejected(
+                "attention_lifecycle_event_id_invalid"
+            )
+        # There is currently no independently issued, durable lifecycle
+        # producer capability.  A generic EventInbox receipt (including a
+        # structured-observation/component-health payload or a local-operator
+        # HTTP submission) is evidence to review, never an Attention lifecycle
+        # command.  Keep this boundary fail-closed until a dedicated producer
+        # can attest its receipt without caller-controlled fields.  In
+        # particular, do not synthesize a contradiction signal here: doing so
+        # would mutate the hypothesis revision from an untrusted event.
+        return self._attention_lifecycle_rejected(
+            "attention_lifecycle_producer_unavailable",
+            event_id=selected_event_id,
+        )
+        try:
+            with self.state_store.writer_transaction():
+                inbox_record = self.event_inbox.get_record(selected_event_id)
+                if not isinstance(inbox_record, dict):
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_receipt_missing"
+                    )
+                # A queued/pending envelope is only an intent.  Lifecycle
+                # authority may be derived from a receipt while the trusted
+                # consumer owns it, or after that consumer has durably
+                # completed it; arbitrary inbox insertion must remain
+                # dormant and fail closed.
+                if inbox_record.get("status") not in {"claimed", "completed"}:
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_receipt_not_durable"
+                    )
+                envelope = inbox_record.get("envelope")
+                source = envelope.get("source") if isinstance(envelope, dict) else None
+                payload = envelope.get("payload") if isinstance(envelope, dict) else None
+                marker = payload.get("attention_lifecycle") if isinstance(payload, dict) else None
+                if not self._valid_attention_lifecycle_marker(marker):
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_marker_invalid"
+                    )
+                if marker.get("kind") != "contradiction":
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_kind_unsupported"
+                    )
+                if not isinstance(source, dict) or not isinstance(payload, dict):
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_receipt_shape_invalid"
+                    )
+                owner = str(source.get("user_id") or "")
+                session = str(source.get("session_id") or "")
+                try:
+                    owner = normalize_scope_component(owner, "user_id")
+                    session = normalize_scope_component(session, "session_id")
+                except (TypeError, ValueError):
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_owner_invalid"
+                    )
+                if (
+                    user_id is not None and str(user_id) != owner
+                ) or (
+                    session_id is not None and str(session_id) != session
+                ):
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_owner_mismatch"
+                    )
+                if (
+                    str(envelope.get("type") or "") != EventType.OBSERVATION.value
+                    or source.get("channel") != "structured_observation"
+                    or payload.get("schema_version")
+                    != "veyra.structured_observation.event.v1"
+                ):
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_source_not_typed_observation"
+                    )
+                authority = payload.get("authority")
+                expected_authority_keys = {
+                    "route_change",
+                    "agent_dispatch",
+                    "tool_call",
+                    "capability_grant",
+                    "external_delivery",
+                    "execution",
+                    "fact_certification",
+                }
+                if (
+                    not isinstance(authority, dict)
+                    or set(authority) != expected_authority_keys
+                    or any(value is not False for value in authority.values())
+                ):
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_authority_invalid"
+                    )
+                observation = payload.get("observation")
+                if not isinstance(observation, dict) or (
+                    observation.get("schema_version")
+                    != "veyra.structured_observation.fact.v1"
+                    or observation.get("epistemic_status") != "observed"
+                    or observation.get("is_fact") is not True
+                ):
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_evidence_not_observed_fact"
+                    )
+                trusted_producers = {
+                    "component_health",
+                    "commitment_runtime",
+                    "task_runtime",
+                }
+                producer_id = str(observation.get("producer_id") or "")
+                producer_receipt_id = str(
+                    observation.get("producer_receipt_id") or ""
+                )
+                if (
+                    producer_id not in trusted_producers
+                    or not producer_receipt_id
+                    or payload.get("producer_id") != producer_id
+                    or payload.get("producer_receipt_id") != producer_receipt_id
+                ):
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_producer_not_trusted"
+                    )
+                receipt_digest = str(inbox_record.get("immutable_fingerprint") or "")
+                if not re.fullmatch(r"[0-9a-f]{64}", receipt_digest):
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_receipt_invalid"
+                    )
+                if EventInbox._immutable_fingerprint(envelope) != receipt_digest:
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_receipt_tampered"
+                    )
+                observed_at = self._lifecycle_receipt_time(inbox_record)
+                if observed_at is None:
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_receipt_time_invalid"
+                    )
+                try:
+                    receipt_time = datetime.fromisoformat(
+                        observed_at.replace("Z", "+00:00")
+                    )
+                    now_time = datetime.now(timezone.utc)
+                    receipt_age = (now_time - receipt_time).total_seconds()
+                except (TypeError, ValueError):
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_receipt_time_invalid"
+                    )
+                if (
+                    receipt_age < -5
+                    or receipt_age > self.MAX_ATTENTION_LIFECYCLE_RECEIPT_AGE_SECONDS
+                ):
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_receipt_not_fresh"
+                    )
+                marker_target = str(marker.get("target_hypothesis_id") or "")
+                if target_hypothesis_id is not None and str(target_hypothesis_id) != marker_target:
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_target_mismatch"
+                    )
+                attention_state = self.state_store.read_json(
+                    AttentionHypothesisRuntime.STATE_FILE
+                )
+                if not AttentionHypothesisRuntime._healthy_state(attention_state):
+                    return self._attention_lifecycle_rejected(
+                        "attention_hypothesis_state_corrupt"
+                    )
+                target = (
+                    attention_state.get("hypotheses", {}).get(marker_target)
+                    if isinstance(attention_state.get("hypotheses"), dict)
+                    else None
+                )
+                if not isinstance(target, dict):
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_target_missing"
+                    )
+                owner_scope = tenant_scope_storage_key(owner, session)
+                if (
+                    target.get("user_id") != owner
+                    or owner_scope not in set(target.get("session_scope_keys") or [])
+                    or target.get("status") in AttentionHypothesisRuntime.TERMINAL_STATUSES
+                ):
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_target_not_current"
+                    )
+                parent_state = self.state_store.read_json(
+                    GeneralSituationRuntime.STATE_FILE
+                )
+                if not GeneralSituationRuntime._healthy_state(parent_state):
+                    return self._attention_lifecycle_rejected(
+                        "general_situation_state_corrupt"
+                    )
+                parent = (
+                    parent_state.get("general_situations", {}).get(
+                        str(target.get("general_situation_id") or "")
+                    )
+                    if isinstance(parent_state.get("general_situations"), dict)
+                    else None
+                )
+                if not isinstance(parent, dict) or (
+                    parent.get("parent_revision") != target.get("parent_revision")
+                    or parent.get("user_id") != owner
+                    or owner_scope not in set(parent.get("session_scope_keys") or [])
+                ):
+                    return self._attention_lifecycle_rejected(
+                        "attention_lifecycle_parent_not_current"
+                    )
+                # The EventInbox receipt itself is the authoritative
+                # owner-scoped evidence binding.  It need not already be one
+                # of the hypothesis child streams: a later typed counter
+                # observation is precisely what can contradict that stream.
+                # Owner/session and current-parent checks above prevent a
+                # receipt from crossing tenants or sessions.
+                assessment = self.general_attention.assess(parent)
+                signal = {
+                    "schema_version": AttentionHypothesisRuntime.LIFECYCLE_SIGNAL_SCHEMA_VERSION,
+                    "signal_id": "als_" + stable_digest(
+                        "veyra.attention_lifecycle.receipt.v1",
+                        {
+                            "event_id": selected_event_id,
+                            "receipt_digest": receipt_digest,
+                            "target_hypothesis_id": marker_target,
+                        },
+                    )[:24],
+                    "kind": "contradiction",
+                    "target_hypothesis_id": marker_target,
+                    "target_hypothesis_revision": target.get("hypothesis_revision"),
+                    "evidence_id": "event_inbox:" + selected_event_id + ":" + receipt_digest[:32],
+                    "reason_code": "direct_counter_observation",
+                    "producer_id": "event_inbox",
+                    "observed_at": observed_at,
+                }
+                result = self.attention_hypotheses.observe(
+                    parent,
+                    assessment,
+                    lifecycle_signal=signal,
+                )
+                if result.get("status") not in {"contradicted"}:
+                    return self._attention_lifecycle_rejected(
+                        str(result.get("reason") or "attention_lifecycle_admission_rejected"),
+                        receipt_digest=receipt_digest,
+                        event_id=selected_event_id,
+                    )
+                return {
+                    "status": "contradicted",
+                    "event_id": selected_event_id,
+                    "receipt_digest": receipt_digest,
+                    "signal": copy.deepcopy(signal),
+                    "hypothesis": copy.deepcopy(result.get("hypothesis")),
+                    "authority": self._attention_lifecycle_authority(),
+                }
+        except Exception as exc:
+            return self._attention_lifecycle_rejected(
+                f"attention_lifecycle_{type(exc).__name__}",
+                event_id=selected_event_id,
+            )
+
+    # Production callers and focused controls use both names; they share the
+    # same trusted receipt implementation and therefore cannot diverge.
+    def record_attention_contradiction(
+        self,
+        event: VeyraEvent | dict[str, Any] | None = None,
+        *,
+        event_id: str | None = None,
+        target_hypothesis_id: str | None = None,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        selected_id = event_id
+        if selected_id is None and isinstance(event, VeyraEvent):
+            selected_id = event.event_id
+        elif selected_id is None and isinstance(event, dict):
+            selected_id = str(event.get("event_id") or "")
+        return self.derive_attention_lifecycle_from_event(
+            selected_id or "",
+            target_hypothesis_id=target_hypothesis_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
+
+    def contradict_attention_from_event(
+        self,
+        event: VeyraEvent | dict[str, Any] | None = None,
+        *,
+        event_id: str | None = None,
+        target_hypothesis_id: str | None = None,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self.record_attention_contradiction(
+            event,
+            event_id=event_id,
+            target_hypothesis_id=target_hypothesis_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
+
+    @classmethod
+    def _valid_attention_lifecycle_marker(cls, value: Any) -> bool:
+        return bool(
+            isinstance(value, dict)
+            and set(value) == {"schema_version", "kind", "target_hypothesis_id"}
+            and value.get("schema_version") == cls.ATTENTION_LIFECYCLE_SCHEMA_VERSION
+            and value.get("kind") == "contradiction"
+            and re.fullmatch(r"ahyp_[0-9a-f]{24}", str(value.get("target_hypothesis_id") or ""))
+        )
+
+    @staticmethod
+    def _lifecycle_receipt_time(record: dict[str, Any]) -> str | None:
+        # Queue admission is server-owned.  Event envelope occurred_at and
+        # payload times are deliberately ignored for lifecycle authority.
+        for key in ("enqueued_at", "first_received_at", "last_received_at"):
+            value = record.get(key)
+            try:
+                selected = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                continue
+            if selected.tzinfo is not None and selected.utcoffset() is not None:
+                return selected.astimezone(timezone.utc).isoformat()
+        return None
+
+    @staticmethod
+    def _attention_lifecycle_authority() -> dict[str, bool]:
+        return {
+            "execution_allowed": False,
+            "tool_allowed": False,
+            "agent_allowed": False,
+            "capability_grant_allowed": False,
+            "route_change_allowed": False,
+            "risk_change_allowed": False,
+            "state_change_allowed": False,
+            "notification_allowed": False,
+            "external_delivery_allowed": False,
+        }
+
+    @classmethod
+    def _attention_lifecycle_rejected(
+        cls,
+        reason: str,
+        *,
+        receipt_digest: str | None = None,
+        event_id: str | None = None,
+    ) -> dict[str, Any]:
+        output: dict[str, Any] = {
+            "status": "fail_closed",
+            "reason": str(reason)[:160],
+            "authority": cls._attention_lifecycle_authority(),
+        }
+        if receipt_digest:
+            output["receipt_digest"] = receipt_digest
+        if event_id:
+            output["event_id"] = event_id
+        return output
 
     def issue_project_guardian_git_publisher(
         self,
@@ -1874,6 +2252,40 @@ class ShadowAwarenessRuntime:
                             }
                         )
                         continue
+                    if self._has_attention_lifecycle_marker(event):
+                        lifecycle = self.derive_attention_lifecycle_from_event(
+                            event_id=event_id,
+                        )
+                        lifecycle_status = str(lifecycle.get("status") or "fail_closed")
+                        self.event_inbox.complete(
+                            event_id,
+                            consumer_id,
+                            {
+                                "status": (
+                                    "attention_contradicted"
+                                    if lifecycle_status == "contradicted"
+                                    else "attention_lifecycle_rejected"
+                                ),
+                                "reason": lifecycle.get("reason"),
+                                "receipt_digest": lifecycle.get("receipt_digest"),
+                            },
+                        )
+                        target_item = {
+                            "event_id": event_id,
+                            "situation_id": None,
+                            "status": (
+                                "attention_contradicted"
+                                if lifecycle_status == "contradicted"
+                                else "attention_lifecycle_rejected"
+                            ),
+                            "reason": lifecycle.get("reason"),
+                            "authority": self._attention_lifecycle_authority(),
+                        }
+                        if lifecycle_status == "contradicted":
+                            processed.append(target_item)
+                        else:
+                            suppressed.append(target_item)
+                        continue
                     if self._is_project_guardian_event(event):
                         binding = ProjectGuardianRuntime.validate_projection_event(
                             event
@@ -2466,6 +2878,13 @@ class ShadowAwarenessRuntime:
         # or suppressed instead of falling through to generic Situation
         # projection.
         return str(event.source.channel or "") == "project_guardian_signal"
+
+    @classmethod
+    def _has_attention_lifecycle_marker(cls, event: VeyraEvent) -> bool:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        return cls._valid_attention_lifecycle_marker(
+            payload.get("attention_lifecycle")
+        )
 
     @staticmethod
     def _active_release_goal(

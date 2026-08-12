@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 from core.context_scope import (
     OPERATOR_GLOBAL_SCOPE,
+    item_visible_to_scope,
     probe_scope_metadata,
 )
 from core.model_client import redact_sensitive
@@ -27,12 +28,49 @@ class ExternalWorldRefresh:
         self.perception = PerceptionLayer(state_store, reasoning=self.reasoning)
         self.search_probe = search_probe or SearchProbe()
 
-    def refresh_watchlist(self, limit: int = 10) -> dict[str, Any]:
+    def refresh_watchlist(
+        self,
+        limit: int = 10,
+        *,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
         external = self.state_store.read_json("external_world.json")
-        self._sync_goal_watchlist(external)
+        if external.get("_state_corrupt"):
+            return {
+                "status": "degraded",
+                "reason": "external_world_integrity_invalid",
+                "refreshed": [],
+                "skipped": [],
+                "summary_count": 0,
+            }
+        scoped = bool(user_id is not None or session_id is not None)
+        if scoped and (not user_id or not session_id):
+            return {
+                "status": "degraded",
+                "reason": "external_refresh_scope_incomplete",
+                "refreshed": [],
+                "skipped": [],
+                "summary_count": 0,
+            }
+        # Goal discovery is an operator-wide maintenance operation.  An exact
+        # owner/session refresh must not import or compact another owner's
+        # watch targets as an incidental side effect.
+        if not scoped:
+            self._sync_goal_watchlist(external)
         watchlist = external.get("watchlist", [])
         if not isinstance(watchlist, list):
             watchlist = []
+        if scoped:
+            watchlist = [
+                item
+                for item in watchlist
+                if item_visible_to_scope(
+                    item,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+            ]
         refreshed: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         for raw_item in watchlist[:limit]:
@@ -102,28 +140,165 @@ class ExternalWorldRefresh:
                     }
                 )
         summary_count = 0
+        integrity_invalid = False
 
         def merge_refresh(current: dict[str, Any]) -> dict[str, Any]:
-            nonlocal summary_count
-            self._sync_goal_watchlist(current)
+            nonlocal integrity_invalid, summary_count
+            if current.get("_state_corrupt"):
+                # A concurrent integrity failure must not be converted into a
+                # valid-looking document by this refresh.
+                integrity_invalid = True
+                return current
             summaries = current.get("summaries") if isinstance(current.get("summaries"), list) else []
-            current["summaries"] = [*summaries, *refreshed][-100:]
-            current["knowledge_items"] = self._merge_knowledge_items(
-                current.get("knowledge_items", []) if isinstance(current.get("knowledge_items"), list) else [],
-                refreshed,
+            knowledge_items = (
+                current.get("knowledge_items", [])
+                if isinstance(current.get("knowledge_items"), list)
+                else []
             )
-            current["push_candidates"] = self._merge_push_candidates(
-                current.get("push_candidates", []) if isinstance(current.get("push_candidates"), list) else [],
-                refreshed,
+            push_candidates = (
+                current.get("push_candidates", [])
+                if isinstance(current.get("push_candidates"), list)
+                else []
             )
-            current_watchlist = current.get("watchlist") if isinstance(current.get("watchlist"), list) else []
-            current["watchlist"] = current_watchlist[-100:]
+            if scoped:
+                assert user_id is not None and session_id is not None
+                current["summaries"] = self._merge_scoped_partition(
+                    summaries,
+                    refreshed,
+                    user_id=user_id,
+                    session_id=session_id,
+                    limit=100,
+                )
+                current["knowledge_items"] = self._merge_scoped_knowledge_items(
+                    knowledge_items,
+                    refreshed,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+                current["push_candidates"] = self._merge_scoped_push_candidates(
+                    push_candidates,
+                    refreshed,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+                # A scoped refresh reads the watchlist but never performs
+                # operator-wide discovery or retention on that shared list.
+            else:
+                self._sync_goal_watchlist(current)
+                current["summaries"] = [*summaries, *refreshed][-100:]
+                current["knowledge_items"] = self._merge_knowledge_items(
+                    knowledge_items,
+                    refreshed,
+                )
+                current["push_candidates"] = self._merge_push_candidates(
+                    push_candidates,
+                    refreshed,
+                )
+                current_watchlist = (
+                    current.get("watchlist")
+                    if isinstance(current.get("watchlist"), list)
+                    else []
+                )
+                current["watchlist"] = current_watchlist[-100:]
             current["last_refresh_at"] = utc_now_iso()
-            summary_count = len(current["summaries"])
+            if scoped:
+                summary_count = sum(
+                    1
+                    for item in current["summaries"]
+                    if item_visible_to_scope(
+                        item,
+                        user_id=str(user_id or ""),
+                        session_id=str(session_id or ""),
+                    )
+                )
+            else:
+                summary_count = len(current["summaries"])
             return current
 
         self.state_store.mutate_json("external_world.json", merge_refresh)
+        if integrity_invalid:
+            return {
+                "status": "degraded",
+                "reason": "external_world_integrity_invalid",
+                "refreshed": [],
+                "skipped": [],
+                "summary_count": 0,
+            }
         return {"status": "success", "refreshed": refreshed, "skipped": skipped, "summary_count": summary_count}
+
+    @staticmethod
+    def _scope_partition(
+        items: list[Any],
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> tuple[list[Any], list[Any]]:
+        """Split one shared collection without deleting other-owner rows."""
+
+        visible: list[Any] = []
+        preserved: list[Any] = []
+        for item in items:
+            if item_visible_to_scope(
+                item,
+                user_id=user_id,
+                session_id=session_id,
+            ):
+                visible.append(item)
+            else:
+                preserved.append(item)
+        return preserved, visible
+
+    def _merge_scoped_partition(
+        self,
+        existing: list[Any],
+        additions: list[dict[str, Any]],
+        *,
+        user_id: str,
+        session_id: str,
+        limit: int,
+    ) -> list[Any]:
+        preserved, visible = self._scope_partition(
+            existing,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        return [*preserved, *[*visible, *additions][-limit:]]
+
+    def _merge_scoped_knowledge_items(
+        self,
+        existing: list[Any],
+        refreshed: list[dict[str, Any]],
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> list[dict[str, Any]]:
+        preserved, visible = self._scope_partition(
+            existing,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        return [
+            *(item for item in preserved if isinstance(item, dict)),
+            *self._merge_knowledge_items(visible, refreshed),
+        ]
+
+    def _merge_scoped_push_candidates(
+        self,
+        existing: list[Any],
+        refreshed: list[dict[str, Any]],
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> list[dict[str, Any]]:
+        preserved, visible = self._scope_partition(
+            existing,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        return [
+            *(item for item in preserved if isinstance(item, dict)),
+            *self._merge_push_candidates(visible, refreshed),
+        ]
 
     def _sync_goal_watchlist(self, external: dict[str, Any]) -> None:
         watchlist = external.setdefault("watchlist", [])

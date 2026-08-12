@@ -45,6 +45,10 @@ class AttentionHypothesisRuntime:
     LIFECYCLE_PRODUCERS = {
         "component_health",
         "commitment_runtime",
+        # Server-derived receipt producer.  This value is never accepted
+        # from a caller; ShadowAwarenessRuntime derives it from a durable
+        # EventInbox record before constructing the lifecycle signal.
+        "event_inbox",
         "local_operator",
         "task_runtime",
     }
@@ -1585,7 +1589,7 @@ class AttentionHypothesisRuntime:
         status = str(record.get("status") or "candidate")
         surface_evaluated = evaluated
         current_readiness = evaluated.get("attention_readiness")
-        if (
+        if status in self.TERMINAL_STATUSES or (
             replayed
             and status == "confirmed"
             and isinstance(current_readiness, dict)
