@@ -272,6 +272,7 @@ class StructuredObservationIngress:
         self._validate_durable_references(
             command,
             user_id=user,
+            session_id=session,
             workspace_id=durable_workspace,
         )
         event = self._event(
@@ -489,8 +490,8 @@ class StructuredObservationIngress:
         self,
         *,
         user_id: str,
-        workspace_id: str,
         session_id: str,
+        workspace_id: str,
     ) -> dict[str, Any]:
         """Publish one deduplicated server-owned health snapshot.
 
@@ -628,8 +629,8 @@ class StructuredObservationIngress:
         command: StructuredObservationCommand,
         *,
         user_id: str,
-        workspace_id: str,
         session_id: str,
+        workspace_id: str,
     ) -> VeyraEvent:
         command_digest = command.command_digest()
         event_id = "sob_" + hashlib.sha256(
@@ -809,6 +810,7 @@ class StructuredObservationIngress:
         command: StructuredObservationCommand,
         *,
         user_id: str,
+        session_id: str,
         workspace_id: str,
     ) -> None:
         goal_ids = {
@@ -840,6 +842,7 @@ class StructuredObservationIngress:
                     and str(item.get("status") or "").strip().lower()
                     == "active"
                     and self._workspace_matches(item, workspace_id)
+                    and self._goal_session_matches(item, session_id)
                 ]
                 if len(matches) != 1:
                     raise StructuredObservationConflictError(
@@ -878,9 +881,30 @@ class StructuredObservationIngress:
     def _workspace_matches(record: dict[str, Any], workspace_id: str) -> bool:
         scope = record.get("scope") if isinstance(record.get("scope"), dict) else {}
         bound = str(
-            record.get("workspace_id") or scope.get("workspace_id") or ""
+            record.get("workspace_ref")
+            or record.get("workspace_id")
+            or scope.get("workspace_id")
+            or ""
         ).strip()
-        return not bound or bound == workspace_id
+        opaque = (
+            "workspace:"
+            + hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()
+        )
+        return not bound or bound in {workspace_id, opaque}
+
+    @staticmethod
+    def _goal_session_matches(record: dict[str, Any], session_id: str) -> bool:
+        """Require exact session only for the session-bound workspace Goal."""
+
+        if (
+            str(record.get("schema_version") or "")
+            != "veyra.workspace_goal.v1"
+            or str(record.get("kind") or "") != "workspace_observation"
+            or str(record.get("source") or "") != "workspace_goal_control"
+        ):
+            return True
+        scope = record.get("scope") if isinstance(record.get("scope"), dict) else {}
+        return str(record.get("session_id") or scope.get("session_id") or "") == session_id
 
     def _validate_time_window(
         self,

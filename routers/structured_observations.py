@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from starlette.concurrency import run_in_threadpool
 
 from interface.structured_observation import (
@@ -10,6 +10,13 @@ from interface.structured_observation import (
     StructuredObservationCommand,
     TrustedWorkspaceObserverConfigRequest,
     TrustedWorkspaceObserverRunRequest,
+    WorkspaceGoalControlRequest,
+)
+from runtime.workspace_goal_control import (
+    WorkspaceGoalConflict,
+    WorkspaceGoalControl,
+    WorkspaceGoalError,
+    WorkspaceGoalUnauthorized,
 )
 from routers.private_control_plane import PrivateControlPlaneRoute
 from runtime.structured_observation_ingress import (
@@ -62,10 +69,23 @@ def _raise_ingress_error(exc: Exception) -> None:
     raise exc
 
 
+def _raise_goal_error(exc: Exception) -> None:
+    if isinstance(exc, WorkspaceGoalUnauthorized):
+        raise HTTPException(status_code=401, detail="valid Veyra control token required") from exc
+    if isinstance(exc, WorkspaceGoalConflict):
+        raise HTTPException(status_code=409, detail="workspace Goal request conflicts with current state") from exc
+    if isinstance(exc, WorkspaceGoalError):
+        raise HTTPException(status_code=409, detail="workspace Goal request was rejected") from exc
+    if isinstance(exc, (TypeError, ValueError)):
+        raise HTTPException(status_code=422, detail="invalid workspace Goal request") from exc
+    raise exc
+
+
 def build_structured_observations_router(
     *,
     ingress: StructuredObservationIngress,
     workspace_observer: TrustedWorkspaceObserver | None = None,
+    workspace_goal_control: WorkspaceGoalControl | None = None,
 ) -> APIRouter:
     router = APIRouter(
         prefix="/awareness/structured-observations",
@@ -199,6 +219,49 @@ def build_structured_observations_router(
             if isinstance(exc, TrustedWorkspaceObserverError):
                 raise HTTPException(status_code=409, detail="workspace observer run rejected") from exc
             raise
+
+    @router.post("/workspace/goals")
+    async def create_workspace_goal(
+        request: Request,
+        command: WorkspaceGoalControlRequest,
+    ) -> dict[str, Any]:
+        if workspace_goal_control is None:
+            raise HTTPException(status_code=503, detail="workspace Goal control is unavailable")
+        try:
+            return await run_in_threadpool(
+                workspace_goal_control.create,
+                control_token=_control_token(request),
+                operation_id=command.operation_id,
+                expected_state_revision=command.expected_state_revision,
+                user_id=command.user_id,
+                session_id=command.session_id,
+                workspace_id=command.workspace_id,
+                title=command.title,
+                description=command.description,
+                priority=command.priority,
+            )
+        except Exception as exc:
+            _raise_goal_error(exc)
+            raise AssertionError("unreachable")
+
+    @router.get("/workspace/goals")
+    async def list_workspace_goals(
+        request: Request,
+        user_id: str = Query(min_length=1, max_length=240),
+        session_id: str = Query(min_length=1, max_length=240),
+    ) -> dict[str, Any]:
+        if workspace_goal_control is None:
+            raise HTTPException(status_code=503, detail="workspace Goal control is unavailable")
+        try:
+            return await run_in_threadpool(
+                workspace_goal_control.list_scope,
+                control_token=_control_token(request),
+                user_id=user_id,
+                session_id=session_id,
+            )
+        except Exception as exc:
+            _raise_goal_error(exc)
+            raise AssertionError("unreachable")
 
     return router
 

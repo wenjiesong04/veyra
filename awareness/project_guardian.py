@@ -5,6 +5,12 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from core.goal_store_policy import (
+    PROJECT_RELEASE_GOAL_KIND,
+    PROJECT_RELEASE_GOAL_SCHEMA,
+    PROJECT_RELEASE_GOAL_SOURCE,
+)
+
 
 class ProjectGuardianEvaluator:
     """Pure, deterministic qualification for one read-only release-risk candidate.
@@ -20,9 +26,9 @@ class ProjectGuardianEvaluator:
     CANDIDATE_SCHEMA = "veyra.project_guardian_candidate.v1"
     CANDIDATE_KIND = "project_release_risk"
     EVALUATOR_RULESET_VERSION = "veyra.project_guardian_ruleset.v1"
-    GOAL_KIND = "project_release"
-    GOAL_SCHEMA = "veyra.project_guardian_release_goal.v1"
-    GOAL_SOURCE = "project_guardian_release_goal_registry"
+    GOAL_KIND = PROJECT_RELEASE_GOAL_KIND
+    GOAL_SCHEMA = PROJECT_RELEASE_GOAL_SCHEMA
+    GOAL_SOURCE = PROJECT_RELEASE_GOAL_SOURCE
     SIGNAL_CHANNEL = "project_guardian_signal"
     SIGNAL_COMPONENTS = {
         "git_dirty": "git_probe",

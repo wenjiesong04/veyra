@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from awareness.project_guardian import ProjectGuardianEvaluator
 from core.world_state import WorldStateStore
+from core.goal_store_policy import goal_records, retain_shared_goals
 from interface.event_schema import utc_now_iso
 from runtime.project_guardian_github_ci import (
     GitHubActionsCIProvider,
@@ -411,11 +412,7 @@ class ProjectGuardianProducerRuntime:
         def mutate(state: dict[str, Any]) -> None:
             nonlocal updated
             self._require_healthy(state, "user_goals.json")
-            goals = (
-                state.get("goals")
-                if isinstance(state.get("goals"), list)
-                else []
-            )
+            goals = goal_records(state.get("goals"))
             for index, raw in enumerate(goals):
                 if not isinstance(raw, dict):
                     continue
@@ -493,7 +490,11 @@ class ProjectGuardianProducerRuntime:
                         updated_at=transition_time.isoformat(),
                     )
                 goals[index] = replacement
-                state["goals"] = goals
+                retained = retain_shared_goals(
+                    goals,
+                    touched_goal_id=selected_goal,
+                )
+                state["goals"] = retained
                 state["updated_at"] = replacement["updated_at"]
                 updated = replacement
                 return
@@ -1363,17 +1364,14 @@ class ProjectGuardianProducerRuntime:
     ) -> None:
         def update(state: dict[str, Any]) -> None:
             self._require_healthy(state, "user_goals.json")
-            goals = (
-                state.get("goals")
-                if isinstance(state.get("goals"), list)
-                else []
-            )
+            goals = goal_records(state.get("goals"))
             release_goals = [
                 item
                 for item in goals
                 if isinstance(item, dict)
                 and str(item.get("kind") or "")
                 == ProjectGuardianEvaluator.GOAL_KIND
+                and str(item.get("status") or "") in {"active", "paused"}
             ]
             if existing is None and len(release_goals) >= self.MAX_RELEASE_GOALS:
                 raise RuntimeError(
@@ -1400,7 +1398,11 @@ class ProjectGuardianProducerRuntime:
                     break
             if not replaced:
                 goals.append(copy.deepcopy(goal))
-            state["goals"] = goals
+            retained = retain_shared_goals(
+                goals,
+                touched_goal_id=str(goal.get("goal_id") or ""),
+            )
+            state["goals"] = retained
             state["updated_at"] = utc_now_iso()
 
         self.state_store.mutate_json("user_goals.json", update)

@@ -102,7 +102,13 @@ def setup_repo(root: Path) -> Path:
     return root.resolve()
 
 
-def build_runtime(state_root: Path, workspace: Path, *, clock=None):
+def build_runtime(
+    state_root: Path,
+    workspace: Path,
+    *,
+    clock=None,
+    goal_session_id: str = "smoke-session",
+):
     store = WorldStateStore(state_root)
     workspace_text = str(workspace)
     store.mutate_json(
@@ -117,6 +123,7 @@ def build_runtime(state_root: Path, workspace: Path, *, clock=None):
                 {
                     "goal_id": "goal-smoke",
                     "user_id": "smoke-owner",
+                    "session_id": goal_session_id,
                     "workspace_id": workspace_text,
                     "status": "active",
                     "goal_priority": 0.9,
@@ -341,7 +348,7 @@ def main() -> int:
         package.unlink()
         git(workspace, "restore", "pkg/a.py")
         disabled_store, _disabled_awareness, _disabled_ingress, disabled_observer = build_runtime(
-            root / "disabled-state", workspace
+            root / "disabled-state", workspace, goal_session_id="disabled-session"
         )
         no_bind_ci = NoBindCI()
         disabled_observer.ci_provider = no_bind_ci
@@ -518,6 +525,7 @@ def main() -> int:
                     {
                         "goal_id": "goal-smoke",
                         "user_id": "smoke-owner",
+                        "session_id": "crash-session",
                         "workspace_id": str(workspace),
                         "status": "active",
                         "goal_priority": 0.9,
@@ -594,7 +602,7 @@ def main() -> int:
         # Pre-ingress crash with an expired, missing event rotates the pending
         # delivery epoch instead of retrying a forever-invalid command.
         pre_store, pre_awareness, pre_ingress, pre_base = build_runtime(
-            root / "pre-ingress-state", workspace
+            root / "pre-ingress-state", workspace, goal_session_id="pre-ingress"
         )
         pre_revision = int(pre_store.read_json("trusted_workspace_observer_state.json").get("_state_revision") or 0)
         pre_base.configure(
@@ -687,7 +695,7 @@ def main() -> int:
 
         git(workspace, "restore", "README.md")
         race_store, race_awareness, race_ingress, race_observer = build_runtime(
-            root / "race-state", workspace
+            root / "race-state", workspace, goal_session_id="race-session"
         )
         race_revision = int(
             race_store.read_json("trusted_workspace_observer_state.json").get("_state_revision")
@@ -743,7 +751,7 @@ def main() -> int:
         # that nothing was published.
         post_root = root / "post-publish-race-state"
         post_store, _post_awareness, post_ingress, post_observer = build_runtime(
-            post_root, workspace
+            post_root, workspace, goal_session_id="post-race-session"
         )
         post_revision = int(
             post_store.read_json("trusted_workspace_observer_state.json").get("_state_revision")
@@ -815,7 +823,7 @@ def main() -> int:
         expect(drift["status"] == "degraded", "Goal digest/priority drift fails closed")
 
         corrupt_store, _corrupt_awareness, _corrupt_ingress, corrupt_observer = build_runtime(
-            root / "corrupt-state", workspace
+            root / "corrupt-state", workspace, goal_session_id="smoke-session"
         )
         corrupt_store.mutate_json(
             "trusted_workspace_observer_state.json",
@@ -831,7 +839,9 @@ def main() -> int:
         # exact-SHA failure produces the pair of change+risk events.
         ci_root = root / "ci-state"
         git(workspace, "restore", "README.md")
-        ci_store, ci_awareness, ci_ingress, ci_observer = build_runtime(ci_root, workspace)
+        ci_store, ci_awareness, ci_ingress, ci_observer = build_runtime(
+            ci_root, workspace, goal_session_id="ci-session"
+        )
         fake_ci = FakeCI()
         ci_observer.ci_provider = fake_ci
         ci_revision = int(ci_store.read_json("trusted_workspace_observer_state.json").get("_state_revision") or 0)
@@ -893,7 +903,9 @@ def main() -> int:
             "same-SHA CI duplicate probe is silent",
         )
 
-        bad_ci = build_runtime(root / "bad-ci-state", workspace)[3]
+        bad_ci = build_runtime(
+            root / "bad-ci-state", workspace, goal_session_id="bad-ci"
+        )[3]
         git(workspace, "remote", "set-url", "origin", "git@evil.invalid:veyra-smoke/fixture.git")
         try:
             bad_ci.configure(

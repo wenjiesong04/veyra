@@ -31,6 +31,8 @@ INVARIANT_SMOKES = [
     "suggestion_sandbox_smoke.py",
     "interaction_decision_ledger_smoke.py",
     "structured_observation_control_plane_smoke.py",
+    "goal_store_policy_smoke.py",
+    "workspace_goal_control_smoke.py",
     "component_health_producer_smoke.py",
     "strategic_discussion_boundary_smoke.py",
     "final_route_projection_smoke.py",

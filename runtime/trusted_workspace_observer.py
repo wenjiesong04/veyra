@@ -164,6 +164,7 @@ class TrustedWorkspaceObserver:
             )
         goal = self._active_goal(
             user_id=selected_user,
+            session_id=selected_session,
             workspace_id=selected_workspace,
             goal_id=selected_goal,
         )
@@ -390,6 +391,7 @@ class TrustedWorkspaceObserver:
             self._validate_binding(binding, workspace, snapshot)
             goal = self._active_goal(
                 user_id=str(binding["user_id"]),
+                session_id=str(binding["session_id"]),
                 workspace_id=workspace,
                 goal_id=str(binding["goal_id"]),
             )
@@ -777,6 +779,7 @@ class TrustedWorkspaceObserver:
             raise TrustedWorkspaceObserverConflict("workspace changed during run")
         goal = self._active_goal(
             user_id=str(binding["user_id"]),
+            session_id=str(binding["session_id"]),
             workspace_id=workspace,
             goal_id=str(binding["goal_id"]),
         )
@@ -846,7 +849,14 @@ class TrustedWorkspaceObserver:
             raise TrustedWorkspaceObserverConflict("CI provider origin is not canonical GitHub")
         return copy.deepcopy(validated)
 
-    def _active_goal(self, *, user_id: str, workspace_id: str, goal_id: str) -> dict[str, Any] | None:
+    def _active_goal(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        workspace_id: str,
+        goal_id: str,
+    ) -> dict[str, Any] | None:
         state = self.state_store.read_json("user_goals.json")
         goals = state.get("goals") if isinstance(state.get("goals"), list) else []
         matches: list[dict[str, Any]] = []
@@ -854,12 +864,19 @@ class TrustedWorkspaceObserver:
             if not isinstance(raw, dict) or str(raw.get("goal_id") or "") != goal_id:
                 continue
             scope = raw.get("scope") if isinstance(raw.get("scope"), dict) else {}
-            bound_workspace = str(raw.get("workspace_id") or scope.get("workspace_id") or "")
+            bound_workspace = str(
+                raw.get("workspace_ref")
+                or raw.get("workspace_id")
+                or scope.get("workspace_id")
+                or ""
+            )
             priority = raw.get("goal_priority", raw.get("priority"))
             if (
                 str(raw.get("user_id") or "") == user_id
+                and str(raw.get("session_id") or scope.get("session_id") or "") == session_id
                 and str(raw.get("status") or "").lower() == "active"
-                and bound_workspace == workspace_id
+                and bound_workspace
+                in {workspace_id, self._workspace_ref_value(workspace_id)}
                 and isinstance(priority, (int, float))
                 and not isinstance(priority, bool)
                 and 0.0 <= float(priority) <= 1.0
@@ -1027,6 +1044,10 @@ class TrustedWorkspaceObserver:
     @staticmethod
     def _workspace_digest(value: str) -> str:
         return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _workspace_ref_value(cls, value: str) -> str:
+        return "workspace:" + cls._workspace_digest(value)
 
     @staticmethod
     def _scope(value: str, name: str) -> str:

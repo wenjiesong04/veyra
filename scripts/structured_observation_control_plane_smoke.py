@@ -217,6 +217,8 @@ def main() -> int:
                 ("/awareness/structured-observations/workspace/status", "GET"),
                 ("/awareness/structured-observations/workspace/configure", "POST"),
                 ("/awareness/structured-observations/workspace/run-once", "POST"),
+                ("/awareness/structured-observations/workspace/goals", "GET"),
+                ("/awareness/structured-observations/workspace/goals", "POST"),
             },
             "structured ingress exposes aggregate status and bounded private typed producers",
             paths,

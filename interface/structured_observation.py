@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import re
+import unicodedata
 from typing import Any, Literal
 
 from pydantic import (
@@ -23,6 +24,7 @@ STRUCTURED_OBSERVATION_EVENT_SCHEMA = (
     "veyra.structured_observation.event.v1"
 )
 STRUCTURED_OBSERVATION_CHANNEL = "structured_observation"
+WORKSPACE_GOAL_SCHEMA = "veyra.workspace_goal.create.v1"
 
 StructuredObservationProducer = Literal[
     "commitment_runtime",
@@ -63,6 +65,7 @@ StructuredObservationEvidenceSource = Literal[
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,239}$")
+_WORKSPACE_GOAL_OPERATION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,239}$")
 
 
 def parse_aware_utc(value: str) -> datetime:
@@ -279,6 +282,53 @@ class TrustedWorkspaceObserverRunRequest(BaseModel):
     reason: str = Field(default="private_control", min_length=1, max_length=120)
 
 
+class WorkspaceGoalControlRequest(BaseModel):
+    """Strict, token-protected command for one scoped workspace Goal."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    schema_version: Literal[WORKSPACE_GOAL_SCHEMA]
+    operation_id: str = Field(min_length=1, max_length=240)
+    expected_state_revision: StrictInt = Field(ge=0, le=2_147_483_647)
+    user_id: str = Field(min_length=1, max_length=240)
+    session_id: str = Field(min_length=1, max_length=240)
+    workspace_id: str = Field(min_length=1, max_length=4096)
+    title: str = Field(min_length=1, max_length=160)
+    description: str | None = Field(default=None, max_length=1000)
+    priority: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("operation_id")
+    @classmethod
+    def validate_operation_id(cls, value: str) -> str:
+        if not _WORKSPACE_GOAL_OPERATION.fullmatch(value):
+            raise ValueError("workspace goal operation identifier is invalid")
+        return value
+
+    @field_validator("user_id", "session_id", "workspace_id")
+    @classmethod
+    def validate_scope_text(cls, value: str, info: Any) -> str:
+        if not value.strip() or any(
+            unicodedata.category(char) in {"Cc", "Cs"} for char in value
+        ):
+            raise ValueError(f"workspace goal {info.field_name} is invalid")
+        return value
+
+    @field_validator("title", "description")
+    @classmethod
+    def validate_goal_text(cls, value: str | None, info: Any) -> str | None:
+        if value is not None and any(ord(char) < 32 for char in value):
+            raise ValueError(f"workspace goal {info.field_name} is invalid")
+        return value
+
+    @field_validator("priority")
+    @classmethod
+    def validate_finite_priority(cls, value: float) -> float:
+        import math
+
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError("workspace goal priority must be finite in [0, 1]")
+        return value
+
 __all__ = [
     "STRUCTURED_OBSERVATION_CHANNEL",
     "STRUCTURED_OBSERVATION_COMMAND_SCHEMA",
@@ -289,6 +339,8 @@ __all__ = [
     "ComponentHealthObservationRequest",
     "TrustedWorkspaceObserverConfigRequest",
     "TrustedWorkspaceObserverRunRequest",
+    "WORKSPACE_GOAL_SCHEMA",
+    "WorkspaceGoalControlRequest",
     "StructuredObservationEvidence",
     "StructuredObservationFacts",
     "canonical_digest",

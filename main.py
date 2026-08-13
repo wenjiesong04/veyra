@@ -152,6 +152,7 @@ from runtime.structured_observation_ingress import (
     StructuredObservationIngress,
 )
 from runtime.trusted_workspace_observer import TrustedWorkspaceObserver
+from runtime.workspace_goal_control import WorkspaceGoalControl
 from runtime.soak_runner import SoakRunner
 from runtime.state_refresh import StateRefresh
 from runtime.openclaw_tool_broker import (
@@ -241,6 +242,10 @@ trusted_workspace_observer = TrustedWorkspaceObserver(
         structured_observation_ingress.issue_workspace_observer_publisher()
     ),
     ci_provider=GitHubActionsCIProvider(),
+    control_token=os.getenv("VEYRA_LOCAL_API_TOKEN") or "",
+)
+workspace_goal_control = WorkspaceGoalControl(
+    state_store,
     control_token=os.getenv("VEYRA_LOCAL_API_TOKEN") or "",
 )
 
@@ -1014,6 +1019,7 @@ app.include_router(
     build_structured_observations_router(
         ingress=structured_observation_ingress,
         workspace_observer=trusted_workspace_observer,
+        workspace_goal_control=workspace_goal_control,
     )
 )
 app.include_router(

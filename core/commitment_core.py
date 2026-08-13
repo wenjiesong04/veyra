@@ -11,6 +11,11 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from core.definitions import RiskLevel
+from core.goal_store_policy import (
+    MAX_SHARED_GOALS,
+    goal_records,
+    retain_shared_goals,
+)
 from core.context_scope import exact_owner_visible, owner_scope
 from core.proactive_authorization import AuthorizationPolicy
 from core.proactive_intent import ProactiveIntent, WatchlistDraft
@@ -59,7 +64,7 @@ class CommitmentCore:
     GOAL_STATE_FILE = "user_goals.json"
     SEMANTIC_CHANGE_SET_FILE = "semantic_change_sets.json"
     MAX_COMMITMENTS = 200
-    MAX_GOALS = 100
+    MAX_GOALS = MAX_SHARED_GOALS
     MAX_HISTORY = 50
     PUSH_COOLDOWN_SECONDS = 60
 
@@ -2192,7 +2197,7 @@ class CommitmentCore:
 
         def upsert_goal(state: dict[str, Any]) -> dict[str, Any]:
             nonlocal updated
-            goals = state.get("goals") if isinstance(state.get("goals"), list) else []
+            goals = goal_records(state.get("goals"))
             for index, goal in enumerate(goals):
                 if not isinstance(goal, dict):
                     continue
@@ -2208,7 +2213,12 @@ class CommitmentCore:
                     **payload,
                 }
                 goals.append(updated)
-            state["goals"] = [goal for goal in goals if isinstance(goal, dict)][-self.MAX_GOALS :]
+            retained = retain_shared_goals(
+                goals,
+                maximum=self.MAX_GOALS,
+                touched_goal_id=str((updated or {}).get("goal_id") or ""),
+            )
+            state["goals"] = retained
             state["updated_at"] = now
             return state
 
@@ -2220,12 +2230,17 @@ class CommitmentCore:
         if not goal_id:
             return
         def replace_goal(state: dict[str, Any]) -> dict[str, Any]:
-            goals = state.get("goals") if isinstance(state.get("goals"), list) else []
+            goals = goal_records(state.get("goals"))
             for index, goal in enumerate(goals):
                 if isinstance(goal, dict) and goal.get("goal_id") == goal_id:
                     replacement = {**updated_goal, "updated_at": utc_now_iso()}
                     goals[index] = replacement
-                    state["goals"] = goals[-self.MAX_GOALS :]
+                    retained = retain_shared_goals(
+                        goals,
+                        maximum=self.MAX_GOALS,
+                        touched_goal_id=str(goal_id),
+                    )
+                    state["goals"] = retained
                     state["updated_at"] = utc_now_iso()
                     break
             return state
@@ -2268,8 +2283,8 @@ class CommitmentCore:
             return
 
         def sync_permission(state: dict[str, Any]) -> dict[str, Any]:
-            goals = state.get("goals") if isinstance(state.get("goals"), list) else []
-            for goal in goals:
+            goals = goal_records(state.get("goals"))
+            for index, goal in enumerate(goals):
                 if not isinstance(goal, dict) or goal.get("goal_id") != goal_id:
                     continue
                 goal_owner_state, goal_user, _ = owner_scope(goal)
@@ -2292,7 +2307,12 @@ class CommitmentCore:
                     else:
                         permissions["proactive_push"] = "pending_confirmation"
                 goal["updated_at"] = utc_now_iso()
-                state["goals"] = goals[-self.MAX_GOALS :]
+                retained = retain_shared_goals(
+                    goals,
+                    maximum=self.MAX_GOALS,
+                    touched_goal_id=str(goal_id),
+                )
+                state["goals"] = retained
                 state["updated_at"] = utc_now_iso()
                 break
             return state
@@ -2664,9 +2684,6 @@ class CommitmentCore:
 
     def _read_goal_state(self) -> dict[str, Any]:
         return self.state_store.read_json(self.GOAL_STATE_FILE) or {"goals": [], "updated_at": None}
-
-    def _write_goal_state(self, state: dict[str, Any]) -> None:
-        self.state_store.write_json(self.GOAL_STATE_FILE, state)
 
     def _sync_user_world(self, commitment: dict[str, Any]) -> None:
         if commitment.get("status") not in {"active", "pending_confirmation"}:
