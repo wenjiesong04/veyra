@@ -503,10 +503,21 @@ isolated Git / exact-SHA GitHub Actions observation
 
 测试现在区分两条 lane：大量 smoke 继续验证安全和治理不变量；`trusted_workspace_observer_smoke.py` 单独作为 cognitive capability smoke，要求真实临时 Git worktree 的 code change 能到达 exact-owner confirmed Attention 和一条 `record_only` proposal，同时验证 silent、重放、Goal/config 竞态、CI unknown→failure 和伪造入口。这个自动化正例证明链路具备能力，仍不证明当前用户 workspace 已配置、长期 usefulness 或外部主动交付。
 
-应用 revision `42dcdda10b0789caf6532c443eae61ee87c52f63` 的本地检查为：`143/143` gate（`142` invariant + `1` capability）、9 Route `810/810`、OpenClaw plugin `32/32`、结构化观测控制面 `10/10`、compileall、Web build 与 Desktop frontend build 全部通过；后续 architecture/state inventory 与 disabled/current-workspace 配置边界也通过定向检查。observer 默认未配置，当前真实用户状态的历史 `0 candidate / overconservative` 不能用这组自动化结果改写。
+该时点的 `42dcdda` / `143/143` 数字是历史自动化 checkpoint，不继承给后续 revision。2026-08-13 应用 revision `6776f97a730a1f3be998bcbfbb28a9033bac0285` 已通过 `146/146` gate（`145` invariant + `1` capability）、9 Route `810/810`、OpenClaw plugin `32/32`、compileall、Web build 与 Desktop frontend build。这些是 application-revision 证据，不是本文 docs SHA 的 live/Actions 证据。
 
 Attention lifecycle 仍明确保持 fail-closed：`attention_lifecycle_producer_unavailable`。原先在早退之后的 contradiction 推导代码不可达，已经删除；本轮对抗审查也否决了继续堆一套没有真实 domain caller 的大型 producer。后续只有在某个受信领域能提供独立、可核验的反证事实时，才实现对应的最小 producer 与 lifecycle admission，不能先造通用脚手架再把 fixture 当能力。
 
-下一项产品验证不是继续增加安全模块，而是由用户显式选择 active Goal 和 owner/session，配置 workspace observer，在真实项目中收集 bounded shadow/record-only 样本，并记录 candidate rate、证据质量、timing 与显式 feedback。当前历史 `0 candidate / overconservative` 仍是问题基线，不能被一个自动化正例抹掉。
+下一项产品验证不是继续增加安全模块。2026-08-13 已经通过私有 Workspace Goal 控制面创建 exact owner/session/opaque-workspace 的长期 Goal，并配置 `record_only` observer。同一 producer 在两个不同时间窗的真实代码变化已经进入 EventInbox → GeneralSituation → confirmed Attention → 一条 exact-owner suggestion。这是 production-shaped bounded live，不是多源 corroboration，也不是长期 usefulness。generic CognitiveBrief 的历史 `223 cycles / 445 model calls / 0 brief candidates / overconservative` 仍是问题基线；其 `candidate_count` 不包括 event-driven path，需要独立的可观测指标。
 
 实现结构上，workspace observer 已拆为 service、纯 state codec 与 durable delivery outbox；这比把全部状态机留在一个 1400 行文件更可审阅，但 service 仍约 1070 行，属于后续机械拆分债务。隔离 Git observation 的持久输出与文件读取有预算，Git status 的 2 MiB 检查仍是在子进程返回后执行，因此不能宣称拥有操作系统级流式资源硬限。
+
+## 11. 2026-08-13 Workspace Goal 与 bounded refresh addendum
+
+这一轮增加两个受控的产品切片，不改变上面的 North Star 和 authority 边界：
+
+1. `404c247` 提供私有 Workspace Goal create/list 控制面，以 token、CAS、幂等 operation 和 exact owner/session/opaque workspace scope 建立 durable Goal。observer 只能绑定该 exact-scope Goal；API identity 仍是 caller-declared local logical principal，不是 auth-derived 多租户安全。
+2. `6776f97` 将 Belief refresh 拆为纯 scheduler、无 state-I/O 的 execution boundary 和 StateRefresh facade。它实现 injected-clock `next_refresh_at`/max-staleness、lifecycle 义务、known/unknown value ordering、bounded owner fairness、exact durable pre-probe CAS、legacy TTL、economy spoof fail-closed、bounded unsupported disposition、cadence-less conflict suppression、limit-0 purity、strict v2 health 和 public receipt redaction。
+
+自动化证据为 `146/146` gate、9 Route `810/810`、plugin `32/32`、compileall 和 Web/Desktop build。current bounded live 证明：不可刷新 event 只留一个 bounded marker，已持久的 cadence-less conflict 在同 revision 不重复 probe，GET 不改写业务 state，公开回执不泄露 claim/target/CAS/private ledger。但生产 state 的 8 条 claim 中 Economy metadata 仍是 `0/8`，因此不能宣称真实 `next_refresh_at`/max-staleness 前后效果已验证。P2 整体仍是 `PARTIAL`。
+
+下一个窄切片是为一个注册的可信 producer 提供 server-owned Economy policy，然后用长时窗比较 stale coverage、fairness、timing 和真实 feedback；之后再接第二个独立可核验 domain producer。不进入 P3，不开启 external delivery、Agent、Tool、Route、Risk 或 execution authority。
