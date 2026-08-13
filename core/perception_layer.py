@@ -211,7 +211,12 @@ class PerceptionLayer:
             return {
                 key: cls._strip_refresh_cas(item)
                 for key, item in value.items()
-                if key not in {"refresh_cas", BeliefCore._REFRESH_CAS_KEY, "cas"}
+                if key not in {
+                    "refresh_cas",
+                    BeliefCore._REFRESH_CAS_KEY,
+                    "_refresh_economy",
+                    "cas",
+                }
             }
         if isinstance(value, list):
             return [cls._strip_refresh_cas(item) for item in value]
@@ -294,6 +299,9 @@ class PerceptionLayer:
         if isinstance(refresh_cas, dict) and refresh_cas.get("claim_key"):
             key = str(refresh_cas["claim_key"])
 
+        economy = probe_result.get("economy")
+        if not isinstance(economy, dict):
+            economy = probe_result.get("_refresh_economy")
         claim = make_claim(
                 key=key,
                 claim=claim,
@@ -304,7 +312,8 @@ class PerceptionLayer:
                 evidence=evidence,
                 claim_kind="observed",
                 refresh_spec=self._refresh_spec_for_probe(probe_result),
-            )
+                economy=economy if isinstance(economy, dict) else None,
+        )
         if isinstance(refresh_cas, dict):
             # Private CAS metadata is consumed by BeliefCore and stripped
             # before durable persistence.  It binds only this probe claim;
@@ -320,6 +329,11 @@ class PerceptionLayer:
             if isinstance(refresh_cas, dict) and refresh_cas.get("claim_key")
             else None
         )
+        economy = claim.get("economy")
+        if not isinstance(economy, dict):
+            economy = probe_result.get("economy")
+        if not isinstance(economy, dict):
+            economy = probe_result.get("_refresh_economy")
         normalized = make_claim(
             key=str(
                 claim.get("key")
@@ -339,6 +353,7 @@ class PerceptionLayer:
                 if claim.get("refresh_spec") is not None
                 else self._refresh_spec_for_probe(probe_result)
             ),
+            economy=economy if isinstance(economy, dict) else None,
         )
         if isinstance(refresh_cas, dict):
             normalized[BeliefCore._REFRESH_CAS_KEY] = dict(refresh_cas)

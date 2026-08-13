@@ -19,6 +19,7 @@ ECONOMY_STATUS_COMPLETE = "complete"
 _SOURCE = re.compile(r"^[a-z][a-z0-9_.:/-]{1,119}$")
 _REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,239}$")
 _FACTOR_KEYS = ("importance", "change_probability", "decision_impact")
+_LIFECYCLE_STATUSES = frozenset({"fresh", "stale", "expired", "conflict"})
 
 
 class BeliefEconomyError(ValueError):
@@ -193,6 +194,135 @@ def economy_value(value: Any) -> float | None:
     return float(selected) if isinstance(selected, (int, float)) else None
 
 
+def evaluate_refresh_schedule(
+    claim: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Evaluate refresh eligibility without mutating the claim.
+
+    The evaluator is deliberately clock-injected and side-effect free.  A
+    future ``next_refresh_at`` can make a *fresh* claim ineligible, but it can
+    never postpone a current-clock TTL/lifecycle failure.  ``max_staleness``
+    is an independent hard deadline and wins over every ordinary due state.
+    Invalid fields remain explicit and are never coerced into a schedule.
+    """
+
+    if not isinstance(claim, dict):
+        return {"valid": False, "reason": "claim_not_object", "eligible": False}
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    try:
+        evaluated = _refresh_status_projection(claim, current)
+    except (TypeError, ValueError, OverflowError):
+        return {"valid": False, "reason": "lifecycle_invalid", "eligible": False}
+    status = str(evaluated.get("status") or "")
+    if status not in _LIFECYCLE_STATUSES:
+        return {
+            "valid": False,
+            "reason": "lifecycle_unknown",
+            "status": status,
+            "eligible": False,
+        }
+    # Hard deadlines are producer contracts anchored to observed_at only;
+    # updated_at is intentionally not a fallback because it is mutable
+    # bookkeeping and would silently extend an overdue observation.
+    observed_at = _parse_time(str(claim.get("observed_at") or ""))
+    if observed_at is None:
+        return {
+            "valid": False,
+            "reason": "observed_at_invalid",
+            "status": status,
+            "eligible": False,
+        }
+    economy = claim.get("economy")
+    economy_valid = True
+    normalized_economy: dict[str, Any] | None = None
+    if economy is not None:
+        try:
+            normalized_economy = validate_economy(economy)
+        except BeliefEconomyError:
+            economy_valid = False
+    next_refresh_at = (
+        _parse_time(str(normalized_economy.get("next_refresh_at")))
+        if normalized_economy and normalized_economy.get("next_refresh_at")
+        else None
+    )
+    max_staleness = (
+        normalized_economy.get("max_staleness_seconds")
+        if normalized_economy
+        else None
+    )
+    hard_deadline = (
+        observed_at.timestamp() + float(max_staleness)
+        if isinstance(max_staleness, int) and not isinstance(max_staleness, bool)
+        else None
+    )
+    deadline_at = (
+        datetime.fromtimestamp(hard_deadline, tz=timezone.utc)
+        if hard_deadline is not None
+        else None
+    )
+    hard_overdue = deadline_at is not None and current >= deadline_at
+    ordinary_due = next_refresh_at is not None and current >= next_refresh_at
+    lifecycle_due = status in {"stale", "expired", "conflict"}
+    if hard_overdue:
+        tier = "hard_overdue"
+        tier_rank = 0
+    elif lifecycle_due:
+        tier = "lifecycle"
+        tier_rank = 1
+    elif status == "fresh" and ordinary_due:
+        tier = "ordinary_due"
+        tier_rank = 2
+    else:
+        tier = "not_due"
+        tier_rank = 3
+    return {
+        "valid": economy_valid,
+        "reason": None if economy_valid else "economy_invalid",
+        "status": status,
+        "eligible": tier != "not_due",
+        "tier": tier,
+        "tier_rank": tier_rank,
+        "ordinary_due": ordinary_due,
+        "lifecycle_due": lifecycle_due,
+        "hard_overdue": hard_overdue,
+        "observed_at": _canonical_time(observed_at),
+        "age_seconds": max(0, int((current - observed_at).total_seconds())),
+        "next_refresh_at": _canonical_time(next_refresh_at) if next_refresh_at else None,
+        "hard_deadline": _canonical_time(deadline_at) if deadline_at else None,
+        "economy_value": economy_value(normalized_economy),
+        "economy_known": economy_value(normalized_economy) is not None,
+    }
+
+
+def _refresh_status_projection(claim: dict[str, Any], now: datetime) -> dict[str, Any]:
+    """Current-clock lifecycle projection kept local to the pure evaluator."""
+
+    updated = dict(claim)
+    status = str(updated.get("status") or "")
+    if status == "conflict":
+        return updated
+    expires_at = _parse_time(str(updated.get("expires_at") or ""))
+    if expires_at is None:
+        observed = _parse_time(str(updated.get("observed_at") or updated.get("updated_at") or ""))
+        ttl = updated.get("ttl_seconds")
+        if observed is None or isinstance(ttl, bool) or not isinstance(ttl, int):
+            raise ValueError("claim lifecycle is invalid")
+        expires_at = observed.timestamp() + float(ttl)
+        expires_at = datetime.fromtimestamp(expires_at, tz=timezone.utc)
+    # A claim is stale as soon as its TTL boundary is reached.  This is
+    # intentionally independent from a producer-supplied future next_due.
+    if now >= expires_at:
+        updated["status"] = "stale"
+    elif status not in _LIFECYCLE_STATUSES:
+        raise ValueError("claim lifecycle is invalid")
+    return updated
+
+
 def _factor_value(value: Any, key: str) -> float | None:
     if value is None:
         return None
@@ -226,6 +356,7 @@ __all__ = [
     "ECONOMY_STATUS_COMPLETE",
     "ECONOMY_STATUS_UNKNOWN",
     "economy_value",
+    "evaluate_refresh_schedule",
     "make_economy",
     "unknown_economy",
     "validate_economy",

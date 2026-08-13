@@ -68,6 +68,7 @@ INVARIANT_SMOKES = [
     "evidence_graph_smoke.py",
     "evidence_graph_adversarial_smoke.py",
     "belief_economy_smoke.py",
+    "belief_refresh_scheduler_smoke.py",
     "probe_observation_loop_smoke.py",
     "conservatism_monitor_smoke.py",
     "epistemic_hygiene_smoke.py",

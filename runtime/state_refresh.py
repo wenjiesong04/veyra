@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from bisect import bisect_right
+import copy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from awareness.belief_core import BeliefCore
-from awareness.belief_economy import economy_value
+from awareness.belief_economy import economy_value, evaluate_refresh_schedule
 from awareness.claim_schema import claim_identity_key, refresh_claim_status
 from core.perception_layer import PerceptionLayer
 from core.reasoning_core import CoreReasoning
@@ -17,6 +17,23 @@ from awareness.refresh_spec import (
     validate_refresh_spec,
 )
 from interface.event_schema import utc_now_iso
+from runtime.belief_refresh_scheduler import (
+    MAX_CONSUMED_DUE,
+    MAX_CONFLICT_RETRY,
+    MAX_UNREFRESHABLE,
+    SCHEDULER_SCHEMA_VERSION,
+    merge_bounded_ledger,
+    schedule_marker,
+    select_fair,
+    unrefreshable_entry,
+    unrefreshable_marker,
+    validate_bounded_ledger,
+    validate_refresh_state,
+)
+from runtime.belief_refresh_execution import (
+    RefreshExecutionContext,
+    execute_refresh_batch,
+)
 from probes.git_probe import GitProbe
 from probes.hermes_probe import HermesProbe
 from probes.mcp_probe import McpProbe
@@ -31,8 +48,6 @@ from probes.web_probe import WebProbe
 
 class StateRefresh:
     """Refreshes stale belief claims through known read-only probes."""
-
-    MAX_OWNER_SCHEDULER_OWNERS = 256
 
     def __init__(self, state_store: WorldStateStore, reasoning: CoreReasoning | None = None, *, model_assist_enabled: bool = True) -> None:
         self.state_store = state_store
@@ -57,7 +72,7 @@ class StateRefresh:
             "web_probe": WebProbe(),
         }
 
-    def refresh_stale(self, limit: int = 20) -> dict[str, Any]:
+    def refresh_stale(self, limit: int = 20, *, now: datetime | None = None) -> dict[str, Any]:
         belief_state = self.state_store.read_json("belief_state.json")
         readable_belief, quarantined_claim_count = BeliefCore._readable_projection(
             belief_state
@@ -105,8 +120,12 @@ class StateRefresh:
                     "detail": "claims must be a list",
                 }
             )
-        now = datetime.now(timezone.utc)
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None or now.utcoffset() is None:
+            now = now.replace(tzinfo=timezone.utc)
+        now = now.astimezone(timezone.utc)
         stale: list[dict[str, Any]] = []
+        schedule_malformed: list[dict[str, Any]] = []
         for claim in raw_claims:
             if not isinstance(claim, dict):
                 malformed.append(
@@ -126,6 +145,7 @@ class StateRefresh:
                 continue
             try:
                 evaluated = refresh_claim_status(claim, now=now)
+                schedule = evaluate_refresh_schedule(claim, now=now)
             except (TypeError, ValueError, OverflowError) as exc:
                 malformed.append(
                     {
@@ -135,185 +155,258 @@ class StateRefresh:
                     }
                 )
                 continue
-            # Evaluate expiry against the current clock before selection.  A
-            # claim still durably marked ``fresh`` therefore becomes eligible
-            # as soon as its TTL elapses, without a GET-side lifecycle write.
+            # Legacy unsupported rows historically carried only status and
+            # next_action. Preserve their terminal skip semantics without
+            # inventing an age/deadline; the pure evaluator itself remains
+            # strict for new callers.
             if (
-                evaluated.get("status") in {"stale", "expired", "conflict"}
-                and evaluated.get("next_action") == "refresh_probe"
+                not schedule.get("valid")
+                and schedule.get("reason") in {"observed_at_invalid", "lifecycle_invalid"}
+                and str(claim.get("status") or "") in {"stale", "expired", "conflict"}
+                and not claim.get("economy")
             ):
-                stale.append(evaluated)
-        try:
-            limit = max(1, int(limit))
-        except (TypeError, ValueError):
-            limit = 20
-        supported = [claim for claim in stale if str(claim.get("source") or "") in self.probes]
-        unsupported = [claim for claim in stale if str(claim.get("source") or "") not in self.probes]
-        selected, cursor_before, cursor_after = self._select_fair_batch(supported, limit=limit)
-        refreshed: list[dict[str, Any]] = []
-        failed: list[dict[str, Any]] = []
-        unresolvable: list[dict[str, Any]] = []
-        for claim in selected:
-            current_claim = self._current_claim(claim)
-            if current_claim is None:
-                failed.append(
+                schedule = {
+                    "valid": True,
+                    "eligible": True,
+                    "tier": "lifecycle",
+                    "tier_rank": 1,
+                    "hard_overdue": False,
+                    "economy_value": None,
+                    "economy_known": False,
+                    "age_seconds": 0,
+                }
+            if not schedule.get("valid"):
+                schedule_malformed.append(
                     {
                         "claim": claim.get("key") or claim.get("claim"),
-                        "reason": "refresh_cas_claim_missing_before_probe",
+                        "reason": str(schedule.get("reason") or "schedule_invalid"),
                     }
                 )
                 continue
-            source = str(current_claim.get("source") or "")
-            probe = self.probes.get(source)
-            if probe is None:
-                continue
-            target = self._target_for_claim(current_claim)
-            if target is None:
-                # Fail closed: a probe that needs a target must not run without
-                # one. Guessing a target from the claim's own prose made failed
-                # observations reproduce themselves once per tick.
-                unresolvable.append(
-                    {
-                        "claim": current_claim.get("key") or current_claim.get("claim"),
-                        "source": source,
-                        "reason": "no_resolvable_refresh_target",
-                    }
-                )
-                continue
-            refresh_cas = self._refresh_cas_binding(current_claim)
-            try:
-                raw = probe.run(target)
-            except Exception as exc:  # pragma: no cover - probe-specific failures
-                failed.append(
-                    {
-                        "claim": current_claim.get("key") or current_claim.get("claim"),
-                        "source": source,
-                        "reason": "probe_error",
-                        "detail": str(exc),
-                    }
-                )
-                continue
-            if not isinstance(raw, dict):
-                failed.append(
-                    {
-                        "claim": current_claim.get("key") or current_claim.get("claim"),
-                        "source": source,
-                        "reason": "probe_result_malformed",
-                    }
-                )
-                continue
-            scope_fields = (
-                "scope_kind",
-                "tenant_derived",
-                "user_id",
-                "session_id",
-            )
-            # Scope belongs to the exact durable claim selected before the
-            # probe. Remove any adapter-provided scope envelope first (even
-            # when the durable claim is operator-global and therefore has no
-            # owner fields), then copy only fields actually present on that
-            # claim. This prevents a probe echo from creating or leaking a
-            # different owner/session binding.
-            raw = {
-                key: value
-                for key, value in raw.items()
-                if key not in scope_fields
+            # Current-clock TTL/lifecycle failures are always eligible, even
+            # when a producer supplied a future next_refresh_at.
+            if schedule.get("eligible"):
+                evaluated["_refresh_schedule"] = schedule
+                # Keep the exact durable row observed during admission. The
+                # lifecycle evaluator adds runtime-only fields (such as
+                # stale_since/next_action), so its projection is not a CAS
+                # representation. This private copy never enters a receipt
+                # or persistence payload.
+                evaluated["_refresh_original_claim"] = copy.deepcopy(claim)
+                stale.append(evaluated)
+        try:
+            limit = max(0, int(limit))
+        except (TypeError, ValueError):
+            limit = 20
+        # A batch containing only malformed schedule/economy claims must not
+        # reserve a cursor or rewrite scheduler state. This keeps the
+        # fail-closed admission boundary byte-pure while allowing a mixed
+        # batch to continue with independently valid claims below.
+        if schedule_malformed and not stale:
+            return {
+                "status": "degraded",
+                "refreshed": [],
+                "failed": [],
+                "skipped": [],
+                "malformed": malformed + schedule_malformed,
+                "remaining_stale": 0,
+                "unsupported_stale": 0,
+                "selected_count": 0,
+                "refreshed_count": 0,
+                "cursor": {"before": 0, "after": 0},
             }
-            raw.update(
+        if limit == 0:
+            # Strict zero-budget contract: do not read/mutate scheduler state,
+            # dispatch probes, archive, consume, or advance any cursor.
+            unsupported_stale = sum(
+                1
+                for item in stale
+                if str(item.get("source") or "") not in self.probes
+            )
+            return {
+                "status": "idle" if not stale else "skipped",
+                "refreshed": [],
+                "failed": [],
+                "skipped": [],
+                "malformed": malformed + schedule_malformed,
+                "remaining_stale": len(stale),
+                "unsupported_stale": unsupported_stale,
+                "selected_count": 0,
+                "refreshed_count": 0,
+                "cursor": {"before": 0, "after": 0},
+            }
+        supported = [claim for claim in stale if str(claim.get("source") or "") in self.probes]
+        unsupported = [claim for claim in stale if str(claim.get("source") or "") not in self.probes]
+        refresh_state = self.state_store.read_json("state_refresh_state.json")
+        state_error = validate_refresh_state(refresh_state)
+        if state_error:
+            return {
+                "status": "degraded",
+                "reason": state_error,
+                "refreshed": [],
+                "failed": [{"reason": state_error}],
+                "skipped": [],
+                "malformed": [],
+                "remaining_stale": len(stale),
+                "unsupported_stale": len(unsupported),
+                "selected_count": 0,
+                "refreshed_count": 0,
+                "cursor": {"before": 0, "after": 0},
+            }
+        ledger_error = (
+            validate_bounded_ledger(refresh_state.get("consumed_due"), limit=MAX_CONSUMED_DUE)
+            or validate_bounded_ledger(refresh_state.get("unrefreshable"), limit=MAX_UNREFRESHABLE)
+            or validate_bounded_ledger(refresh_state.get("conflict_retry"), limit=MAX_CONFLICT_RETRY)
+        )
+        if ledger_error:
+            return {
+                "status": "degraded",
+                "reason": ledger_error,
+                "refreshed": [],
+                "failed": [{"reason": ledger_error}],
+                "skipped": [],
+                "malformed": [],
+                "remaining_stale": len(stale),
+                "unsupported_stale": 0,
+                "selected_count": 0,
+                "refreshed_count": 0,
+                "cursor": {"before": 0, "after": 0},
+            }
+        archived_markers = {
+            str(item.get("marker"))
+            for item in (refresh_state.get("unrefreshable") or [])
+            if isinstance(item, dict) and item.get("marker")
+        }
+        consumed_markers = {
+            str(item.get("marker"))
+            for item in (refresh_state.get("consumed_due") or [])
+            if isinstance(item, dict) and item.get("marker")
+        }
+        conflict_markers = {
+            str(item.get("marker"))
+            for item in (refresh_state.get("conflict_retry") or [])
+            if isinstance(item, dict) and item.get("marker")
+        }
+        archived_skipped: list[dict[str, Any]] = []
+        selectable: list[dict[str, Any]] = []
+        pre_archived: list[dict[str, Any]] = []
+        pre_failed: list[dict[str, Any]] = []
+        conflict_retry: list[dict[str, Any]] = []
+        unsupported_hard_pending: list[dict[str, Any]] = []
+        unsupported_conflict_pending: list[dict[str, Any]] = []
+        unsupported_ordinary_pending: list[dict[str, Any]] = []
+        for claim in stale:
+            schedule = claim.get("_refresh_schedule") or {}
+            durable_claim = claim.get("_refresh_original_claim")
+            if not isinstance(durable_claim, dict):
+                durable_claim = claim
+            marker = unrefreshable_marker(durable_claim)
+            if not schedule.get("hard_overdue") and marker in archived_markers:
+                archived_skipped.append(
+                    {
+                        "claim": claim.get("key") or claim.get("claim"),
+                        "source": claim.get("source"),
+                        "reason": "unrefreshable_archived",
+                    }
+                )
+                continue
+            consumed_marker = schedule_marker(claim)
+            if not schedule.get("hard_overdue") and consumed_marker in consumed_markers:
+                archived_skipped.append(
+                    {
+                        "claim": claim.get("key") or claim.get("claim"),
+                        "source": claim.get("source"),
+                        "reason": "due_already_consumed",
+                    }
+                )
+                continue
+            if (
+                str(claim.get("status") or "") == "conflict"
+                and not schedule.get("next_refresh_at")
+                and not schedule.get("hard_overdue")
+                and marker in conflict_markers
+            ):
+                archived_skipped.append(
+                    {
+                        "claim": claim.get("key") or claim.get("claim"),
+                        "source": claim.get("source"),
+                        "reason": "conflict_retry_suppressed",
+                    }
+                )
+                continue
+            if str(claim.get("source") or "") not in self.probes:
+                if schedule.get("hard_overdue"):
+                    unsupported_hard_pending.append(claim)
+                elif str(claim.get("status") or "") == "conflict":
+                    unsupported_conflict_pending.append(claim)
+                elif str(claim.get("status") or "") != "conflict":
+                    unsupported_ordinary_pending.append(claim)
+                continue
+            selectable.append(claim)
+        # Unsupported obligations still consume the same bounded batch budget
+        # as probes. Hard markers have precedence; ordinary dispositions are
+        # admitted only with remaining capacity.
+        unsupported_hard_pending.sort(key=lambda item: (item.get("_refresh_schedule") or {}).get("tier_rank", 3))
+        for claim in unsupported_hard_pending[:limit]:
+            pre_failed.append(
                 {
-                    key: current_claim.get(key)
-                    for key in scope_fields
-                    if key in current_claim
+                    "claim": claim.get("key") or claim.get("claim"),
+                    "source": claim.get("source"),
+                    "reason": "hard_overdue_unrefreshable",
                 }
             )
-            raw.update(
-                {
-                    "refresh_mode": "stale_claim",
-                    "refresh_cas": refresh_cas,
-                }
+        remaining_budget = max(0, limit - len(pre_failed))
+        selected, cursor_before, cursor_after = self._select_fair_batch(selectable, limit=remaining_budget)
+        disposition_budget = max(0, remaining_budget - len(selected))
+        for claim in unsupported_conflict_pending[:disposition_budget]:
+            pre_archived.append(
+                unrefreshable_entry(
+                    claim,
+                    reason="unsupported_conflict_needs_review",
+                    now=now,
+                )
             )
-            try:
-                patch = self.perception.interpret_probe_result(raw)
-            except Exception as exc:  # pragma: no cover - adapter-specific failures
-                failed.append(
-                    {
-                        "claim": current_claim.get("key") or current_claim.get("claim"),
-                        "probe_result": PerceptionLayer._strip_refresh_cas(raw),
-                        "reason": "persistence_error",
-                        # Exception text can echo adapter arguments or a
-                        # private CAS envelope; expose only its stable type.
-                        "detail": type(exc).__name__,
-                    }
+        disposition_budget = max(0, disposition_budget - len(unsupported_conflict_pending[:disposition_budget]))
+        for claim in unsupported_ordinary_pending[:disposition_budget]:
+            pre_archived.append(
+                unrefreshable_entry(
+                    claim,
+                    reason="unsupported_source",
+                    now=now,
                 )
-                continue
-            receipt_raw = {
-                key: value
-                for key, value in raw.items()
-                if key != "refresh_cas"
-            }
-            # Adapters and persistence exceptions may nest the in-flight CAS
-            # envelope below another field. Refresh receipts are public
-            # diagnostic output, so strip the private transport recursively
-            # before retaining either success or failure evidence.
-            receipt_raw = PerceptionLayer._strip_refresh_cas(receipt_raw)
-            persistence = patch.get("belief_persistence") if isinstance(patch, dict) else None
-            persistence_status = (
-                str(persistence.get("status") or "")
-                if isinstance(persistence, dict)
-                else ""
             )
-            entry = {
-                "claim": current_claim.get("key") or current_claim.get("claim"),
-                "probe_result": receipt_raw,
-                "state_patch": PerceptionLayer._strip_refresh_cas(patch),
-            }
-            if persistence is None:
-                # Keep compatibility with bounded test doubles and older
-                # perception adapters, which returned an explicit accepted
-                # status without the detailed persistence envelope.
-                if isinstance(patch, dict) and patch.get("status") in {"accepted", "success"}:
-                    refreshed.append(entry)
-                else:
-                    failed.append(
-                        {
-                            **entry,
-                            "reason": f"belief_persistence_{patch.get('status') if isinstance(patch, dict) else 'malformed'}",
-                        }
-                    )
-            elif self._valid_persistence_receipt(persistence):
-                refreshed.append(entry)
-            else:
-                # A probe can be successful while its observation is
-                # conflicted or rejected.  It must not be counted as a
-                # successful refresh until the Belief value is accepted.
-                receipt_statuses = {
-                    str(item.get("persistence_status") or "")
-                    for item in (persistence.get("results") or [])
-                    if isinstance(item, dict)
-                }
-                failure_status = (
-                    "cas_rejected"
-                    if "cas_rejected" in receipt_statuses
-                    else persistence_status or "malformed"
-                )
-                failed.append(
-                    {
-                        **entry,
-                        "reason": f"belief_persistence_{failure_status}",
-                    }
-                )
+        execution = execute_refresh_batch(
+            RefreshExecutionContext(
+                selected=selected,
+                now=now,
+                probes=self.probes,
+                current_claim=self._current_claim,
+                target_for_claim=self._target_for_claim,
+                refresh_cas_binding=self._refresh_cas_binding,
+                interpret_probe_result=self.perception.interpret_probe_result,
+                valid_persistence_receipt=self._valid_persistence_receipt,
+            )
+        )
+        refreshed = execution.refreshed
+        failed = list(pre_failed) + execution.failed
+        unresolvable = execution.unresolvable
+        consumed = execution.consumed
+        unrefreshable = list(pre_archived) + execution.unrefreshable
+        conflict_retry = execution.conflict_retry
+        admitted_unsupported = pre_archived
         skipped = [
             {
-                "claim": claim.get("key") or claim.get("claim"),
-                "source": claim.get("source"),
-                "reason": f"no probe for source {claim.get('source')}",
+                "claim": item.get("identity"),
+                "source": "unsupported",
+                "reason": str(item.get("reason") or "unsupported_source"),
             }
-            for claim in unsupported[:limit]
-        ] + unresolvable
-        skipped_items = skipped + malformed
+            for item in admitted_unsupported
+        ] + unresolvable + archived_skipped
+        skipped_items = skipped + malformed + schedule_malformed
         def record_refresh_batch(state: dict[str, Any]) -> None:
             state.update(
                 {
+                    "schema_version": SCHEDULER_SCHEMA_VERSION,
                     "updated_at": utc_now_iso(),
                     "supported_count": len(supported),
                     "unsupported_count": len(unsupported),
@@ -328,8 +421,69 @@ class StateRefresh:
                     ],
                 }
             )
+            # Upgrade sparse v1 defaults in the same mutation that first
+            # records a v2 ledger. Unsupported-only/empty batches otherwise
+            # leave required owner fields absent and fail their next tick.
+            if not isinstance(state.get("owner_offsets"), dict):
+                state["owner_offsets"] = {}
+            state.setdefault("owner_count", 0)
+            state["owner_scheduler_version"] = 2
+            state.setdefault("last_owner", "")
+            consumed_items, consumed_blocked = merge_bounded_ledger(
+                state.get("consumed_due"), consumed, limit=MAX_CONSUMED_DUE
+            )
+            archived_items, archive_blocked = merge_bounded_ledger(
+                state.get("unrefreshable"), unrefreshable, limit=MAX_UNREFRESHABLE
+            )
+            conflict_items, conflict_blocked = merge_bounded_ledger(
+                state.get("conflict_retry"), conflict_retry, limit=MAX_CONFLICT_RETRY
+            )
+            # Capacity pressure is observable and fail-closed. Existing hard
+            # markers are never silently discarded by this bounded ledger.
+            state["consumed_due"] = consumed_items
+            state["unrefreshable"] = archived_items
+            state["ledger_capacity"] = {
+                "consumed_due_blocked": consumed_blocked,
+                "unrefreshable_blocked": archive_blocked,
+                "conflict_retry_blocked": conflict_blocked,
+            }
+            state["conflict_retry"] = conflict_items
+            state_error = validate_refresh_state(state)
+            ledger_error = (
+                validate_bounded_ledger(state.get("consumed_due"), limit=MAX_CONSUMED_DUE)
+                or validate_bounded_ledger(state.get("unrefreshable"), limit=MAX_UNREFRESHABLE)
+                or validate_bounded_ledger(state.get("conflict_retry"), limit=MAX_CONFLICT_RETRY)
+            )
+            if state_error or ledger_error:
+                raise ValueError(state_error or ledger_error)
 
-        self.state_store.mutate_json("state_refresh_state.json", record_refresh_batch)
+        try:
+            persisted_refresh_state = self.state_store.mutate_json(
+                "state_refresh_state.json", record_refresh_batch
+            )
+        except ValueError as exc:
+            return {
+                "status": "degraded",
+                "reason": "bounded_ledger_invalid",
+                "refreshed": [],
+                "failed": [{"reason": "bounded_ledger_invalid", "detail": type(exc).__name__}],
+                "skipped": [],
+                "malformed": malformed + schedule_malformed,
+                "remaining_stale": len(stale),
+                "unsupported_stale": len(unsupported),
+                "selected_count": len(selected),
+                "refreshed_count": 0,
+                "cursor": {"before": cursor_before, "after": cursor_after},
+            }
+        malformed = malformed + schedule_malformed
+        persisted_capacity = persisted_refresh_state.get("ledger_capacity") or {}
+        capacity_blocked = any(
+            int(value or 0) > 0
+            for value in persisted_capacity.values()
+            if isinstance(value, (int, float))
+        )
+        if capacity_blocked:
+            failed.append({"reason": "bounded_ledger_capacity_blocked"})
         if failed or malformed:
             status = "degraded"
         elif refreshed:
@@ -433,166 +587,60 @@ class StateRefresh:
                 },
             )
             return [], 0, 0
-        ordered = sorted(claims, key=self._refresh_sort_key)
-        # A corrupted/legacy document can contain the same exact identity more
-        # than once.  Reserve at most one occurrence per refresh batch so a
-        # duplicate row cannot consume the owner's fair slot twice.
-        unique: list[dict[str, Any]] = []
-        seen: set[tuple[Any, ...]] = set()
-        for claim in ordered:
-            identity = claim_identity_key(claim)
-            marker: tuple[Any, ...]
-            if identity is not None:
-                marker = ("identity", *identity)
-            else:
-                marker = (
-                    "fallback",
-                    self._owner_key(claim),
-                    str(claim.get("key") or claim.get("claim") or ""),
-                )
-            if marker in seen:
+        normalized_claims: list[dict[str, Any]] = []
+        for claim in claims:
+            if isinstance(claim.get("_refresh_schedule"), dict):
+                normalized_claims.append(claim)
                 continue
-            seen.add(marker)
-            unique.append(claim)
-        ordered = unique
-        count = min(limit, len(ordered))
-        groups: dict[str, list[dict[str, Any]]] = {}
-        for claim in ordered:
-            groups.setdefault(self._owner_key(claim), []).append(claim)
-        owner_keys = sorted(groups)
+            # Compatibility for direct callers and legacy fixtures that invoke
+            # the selection helper without a prior evaluator pass.
+            value = economy_value(claim.get("economy"))
+            status = str(claim.get("status") or "")
+            normalized_claims.append(
+                {
+                    **claim,
+                    "_refresh_schedule": {
+                        "tier_rank": 1 if status in {"stale", "expired", "conflict"} else 2,
+                        "economy_value": value,
+                        "economy_known": value is not None,
+                        "age_seconds": 0,
+                        "hard_overdue": status in {"expired", "conflict"},
+                        "next_refresh_at": None,
+                        "hard_deadline": None,
+                    },
+                }
+            )
+        claims = normalized_claims
+        # Pure tiered scheduler: hard overdue > lifecycle > ordinary due, and
+        # owner round-robin is restarted within each tier.  Keep the legacy
+        # cursor fields in the receipt for compatibility with existing route
+        # projections, but do not let that flat cursor override tier order.
         selected: list[dict[str, Any]] = []
         cursor_before = 0
         cursor_after = 0
 
-        def reserve_batch(state: dict[str, Any]) -> None:
-            nonlocal cursor_before, cursor_after
+        def reserve_tiered(state: dict[str, Any]) -> None:
+            nonlocal selected, cursor_before, cursor_after
             try:
-                legacy_cursor = int(state.get("cursor") or 0) % len(ordered)
+                cursor_before = int(state.get("cursor") or 0)
             except (TypeError, ValueError):
-                legacy_cursor = 0
-            offsets = state.get("owner_offsets")
-            if not isinstance(offsets, dict):
-                offsets = {}
-            offsets = {
-                str(key): value
-                for key, value in offsets.items()
-                if str(key) in groups
-            }
-            last_owner = str(state.get("last_owner") or "")
-            if last_owner:
-                owner_start = bisect_right(owner_keys, last_owner) % len(owner_keys)
-            else:
-                owner_start = 0
-
-            # Preserve the old flat cursor for a single owner.  It keeps
-            # existing callers' cursor evidence stable while the owner-level
-            # round-robin below prevents list churn from starving partitions.
-            if len(owner_keys) == 1:
-                owner = owner_keys[0]
-                try:
-                    cursor_before = int(offsets.get(owner, legacy_cursor)) % len(ordered)
-                except (TypeError, ValueError):
-                    cursor_before = legacy_cursor
-                offset = cursor_before % len(groups[owner])
-                for _ in range(count):
-                    selected.append(groups[owner][offset])
-                    offset = (offset + 1) % len(groups[owner])
-                offsets[owner] = offset
-                cursor_after = (cursor_before + count) % len(ordered)
-                last_owner = owner
-            else:
-                cursor_before = legacy_cursor
-                selected_markers: set[tuple[Any, ...]] = set()
-                rounds = 0
-                while len(selected) < count and rounds < count + len(owner_keys):
-                    progressed = False
-                    for step in range(len(owner_keys)):
-                        owner = owner_keys[(owner_start + step) % len(owner_keys)]
-                        values = groups[owner]
-                        try:
-                            offset = int(offsets.get(owner, 0)) % len(values)
-                        except (TypeError, ValueError):
-                            offset = 0
-                        # A small owner partition must not be selected again
-                        # merely because the requested batch is larger than
-                        # that partition.  Walk its bounded slice until an
-                        # identity not already reserved by this batch is
-                        # found; if every row is already selected, leave the
-                        # owner for the next refresh tick.
-                        candidate = None
-                        for _ in range(len(values)):
-                            value = values[offset]
-                            identity = claim_identity_key(value)
-                            marker = (
-                                ("identity", *identity)
-                                if identity is not None
-                                else (
-                                    "fallback",
-                                    owner,
-                                    str(value.get("key") or value.get("claim") or ""),
-                                )
-                            )
-                            if marker not in selected_markers:
-                                candidate = (value, marker, offset)
-                                break
-                            offset = (offset + 1) % len(values)
-                        if candidate is None:
-                            continue
-                        value, marker, selected_offset = candidate
-                        selected.append(value)
-                        selected_markers.add(marker)
-                        offsets[owner] = (selected_offset + 1) % len(values)
-                        last_owner = owner
-                        progressed = True
-                        if len(selected) >= count:
-                            break
-                    if not progressed:
-                        break
-                    rounds += 1
-                if selected:
-                    last_index = ordered.index(selected[-1])
-                    cursor_after = (last_index + 1) % len(ordered)
-                else:
-                    cursor_after = cursor_before
-
-            # Scheduler state is bounded even if malformed state contains an
-            # unbounded stream of owner keys.  Current owners remain eligible;
-            # deterministic lexical order chooses the retained tail if needed.
-            if len(offsets) > self.MAX_OWNER_SCHEDULER_OWNERS:
-                keep = sorted(offsets)[-self.MAX_OWNER_SCHEDULER_OWNERS :]
-                offsets = {key: offsets[key] for key in keep}
+                cursor_before = 0
+            selected, offsets, last_owner = select_fair(
+                claims,
+                limit=limit,
+                owner_cursor=state.get("owner_offsets") if isinstance(state.get("owner_offsets"), dict) else {},
+                last_owner=str(state.get("last_owner") or ""),
+            )
+            cursor_after = (cursor_before + len(selected)) % max(1, len(claims))
             state["cursor"] = cursor_after
             state["last_owner"] = last_owner
             state["owner_offsets"] = offsets
-            state["owner_count"] = len(owner_keys)
-            state["owner_scheduler_version"] = 1
+            state["owner_count"] = len({self._owner_key(claim) for claim in claims})
+            state["owner_scheduler_version"] = 2
             state["updated_at"] = utc_now_iso()
 
-        self.state_store.mutate_json("state_refresh_state.json", reserve_batch)
+        self.state_store.mutate_json("state_refresh_state.json", reserve_tiered)
         return selected, cursor_before, cursor_after
-
-    @staticmethod
-    def _status_priority(claim: dict[str, Any]) -> int:
-        # Hard stale/expired/conflict obligations are ordered before a merely
-        # old claim.  The caller already filters to refreshable claims, but a
-        # deterministic rank keeps malformed status values fail-closed.
-        return {
-            "expired": 0,
-            "conflict": 1,
-            "stale": 2,
-        }.get(str(claim.get("status") or ""), 3)
-
-    @classmethod
-    def _refresh_sort_key(cls, claim: dict[str, Any]) -> tuple[Any, ...]:
-        value = economy_value(claim.get("economy"))
-        return (
-            cls._status_priority(claim),
-            0 if value is not None else 1,
-            -float(value or 0.0),
-            str(claim.get("updated_at") or claim.get("observed_at") or ""),
-            cls._owner_key(claim),
-            str(claim.get("key") or claim.get("claim") or ""),
-        )
 
     @staticmethod
     def _owner_key(claim: dict[str, Any]) -> str:

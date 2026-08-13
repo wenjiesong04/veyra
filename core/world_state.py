@@ -1533,6 +1533,34 @@ class WorldStateStore:
                 "age_seconds": None,
                 "next_action": "repair_state_json",
             }
+        if name == "state_refresh_state.json":
+            from runtime.belief_refresh_scheduler import (
+                MAX_CONFLICT_RETRY,
+                MAX_CONSUMED_DUE,
+                MAX_UNREFRESHABLE,
+                validate_bounded_ledger,
+                validate_refresh_state,
+            )
+
+            integrity_error = (
+                validate_refresh_state(payload)
+                or validate_bounded_ledger(payload.get("consumed_due"), limit=MAX_CONSUMED_DUE)
+                or validate_bounded_ledger(payload.get("unrefreshable"), limit=MAX_UNREFRESHABLE)
+                or validate_bounded_ledger(payload.get("conflict_retry"), limit=MAX_CONFLICT_RETRY)
+            )
+            if integrity_error:
+                return {
+                    "name": name,
+                    "path": self.relative_path_for(name),
+                    "source": metadata["source"],
+                    "status": "invalid",
+                    "health_status": "invalid",
+                    "confidence": 0.0,
+                    "ttl_seconds": metadata["ttl_seconds"],
+                    "age_seconds": None,
+                    "reason": integrity_error,
+                    "next_action": "repair_state_json",
+                }
         updated_at = str(payload.get("updated_at") or "")
         age_seconds = self._age_seconds(updated_at)
         ttl_seconds = int(payload.get("ttl_seconds") or metadata["ttl_seconds"])
