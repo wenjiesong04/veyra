@@ -1,9 +1,12 @@
 # Veyra Project OS
 
-> Status: `PROPOSED FOR CANONICAL ADOPTION`
+> Status: `CURRENT / CANONICAL LIVING TRUTH`
 >
-> 本目录是一套分层的项目文档系统。它不自动取代现有的
-> [`docs/README_Veyra.md`](../README_Veyra.md)；在项目负责人明确采纳并完成链接迁移前，后者仍是 canonical hub。
+> 本目录自 2026-08-14 起承载 current/task Living truth：
+> [`status/current.md`](status/current.md) 是当前状态，
+> [`tasks/CURRENT.md`](tasks/CURRENT.md) 是当前执行窗口唯一任务。
+> [`docs/README_Veyra.md`](../README_Veyra.md) 保留为 canonical 入口，负责链接和 dated checkpoint；
+> 它不再复制本目录的高频状态快照。
 
 ## 项目宪章
 
@@ -56,6 +59,7 @@ Agent 与 Veyra 的长期边界是：
 | [definition_of_done.md](definition_of_done.md) | 稳定 | 什么才算真正完成？ |
 | [status/current.md](status/current.md) | 高频更新 | 当前代码、运行态和证据是什么？ |
 | [tasks/CURRENT.md](tasks/CURRENT.md) | 每个切片更新 | 当前窗口唯一允许完成什么？ |
+| [../README_Veyra.md](../README_Veyra.md) | canonical 入口 | 项目链接、稳定手册和 dated checkpoint |
 | [adr/README.md](adr/README.md) | 追加式 | 为什么做出重要架构决定？ |
 | [documentation_policy.md](documentation_policy.md) | 稳定 | 这些文档如何维护和迁移？ |
 

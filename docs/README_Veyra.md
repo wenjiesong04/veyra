@@ -4,13 +4,13 @@
 >
 > 文档角色：Veyra 的 canonical project hub（项目总入口）
 >
-> 文档最近维护：2026-08-13
+> 文档最近维护：2026-08-14
 >
-> 最近事实核验：2026-08-13
+> 最近事实核验：2026-08-14
 >
-> 当前应用代码基线：`cognitive-awakening @ 6776f97a730a1f3be998bcbfbb28a9033bac0285`。这是 application revision，不是本文档提交后的 docs SHA；因此本文不宣称 docs exact-SHA live 或 Actions 通过。该 revision 保持 trusted workspace observation、P2 bounded refresh 与 disabled/current-workspace 边界，不启用 P3，不迁移现有 state，也不扩大 Agent、Tool、Route、Risk、external delivery 或执行权限。实际任务 HEAD 与工作区必须用 Git 重新读取
+> 当前应用/文档证据基线：`cognitive-awakening @ e5fcf80ad3e1e6e54f3602603bdf941e5aa8fd37`。这是 revision evidence，不是对未来工作树的永久承诺；exact-SHA Actions 与 push 仍须独立核验。该 revision 保持 local-first Product Preview、trusted workspace observation、P2 bounded refresh 与 disabled/current-workspace 边界，不启用 P3，不迁移现有 state，也不扩大 Agent、Tool、Route、Risk、external delivery 或执行权限。实际任务 HEAD 与工作区必须用 Git 重新读取
 >
-> 运行态说明：本文保留 `5b80a26` 的历史快照，同时另行记录 `6776f97` 的 current bounded live 证据；两者都不能自动转移给本文提交后的 docs SHA。本文不再用每次 PID、短寿命告警数量或 status-only commit 追赶运行态；最终 clean restart、exact runtime SHA 和 GitHub Actions 在代码与文档收敛后一次核验。
+> 运行态说明：本文保留 `5b80a26`、`6776f97` 的历史快照；`e5fcf80` 的 current bounded live、Product Preview 和 clean package 证据以 dated checkpoint 与 Project OS 为准。它们都不能自动转移到未来 docs SHA。本文不再用每次 PID、短寿命告警数量或 status-only commit 追赶运行态；exact runtime SHA 和 GitHub Actions 仍按最终 revision 独立核验。
 
 本文件是一个**可更新的活文档**。它同时回答五个问题：
 
@@ -19,6 +19,24 @@
 3. 哪些能力仍只是目标，不能按已完成宣传；
 4. 下一步按什么顺序开发和验收；
 5. 后续 Codex、Cursor、Terra 或其他开发者应怎样安全地修改、测试、提交和交接。
+
+> **2026-08-14 dated checkpoint:** V0-001 `Local Product Preview` is
+> `LOCAL_VALIDATED / OWNER_ACCEPTANCE_PENDING`. Project OS now owns the
+> current/task Living truth in [`status/current.md`](veyra_project_os/status/current.md)
+> and [`tasks/CURRENT.md`](veyra_project_os/tasks/CURRENT.md). The latest
+> evidence is `148/148` gate (`145` invariant + `1` cognitive + `2` product
+> capability), OpenClaw `32/32`, Route `810/810`, Web/Desktop/browser/390×844,
+> real SSE lifecycle, GET purity, and a clean ad-hoc arm64 `.app` package with
+> Mach-O/Python 3.11.15/PyInstaller 6.22.0, strict codesign and normalized
+> sidecar comparison. Final branch push and exact-SHA Actions are external
+> handoff evidence and must be checked against the final SHA; this is not
+> Developer ID, notarized, DMG or public-release evidence. P1/P2 remain
+> `PARTIAL`, user usefulness is unvalidated, and the next planned slice is
+> `LC-001 — Real non-code Situation`.
+
+The sections below dated 2026-08-13 are retained as historical context. For
+current status, task scope, release evidence and known degraded conditions,
+follow the Project OS links above rather than copying those historical counts.
 
 一句话结论：
 
@@ -895,7 +913,7 @@ Last known blockers:
 
 | 文档 | 角色 |
 |---|---|
-| `docs/README_Veyra.md` | 唯一项目总入口：理念、当前真值、路线图、开发和 Git 规范 |
+| `docs/README_Veyra.md` | 唯一项目总入口：稳定理念、工程手册、dated checkpoint 与 Project OS 导航；不复制高频 current truth |
 | `README.md` | GitHub 首页和本地快速安装/运行入口；不重复维护完整路线图 |
 | `docs/veyra_proactive_cognitive_architecture.md` | 目标架构、阶段设计和历史验收台账；不是实时运行真值 |
 | `docs/veyra_cognitive_awakening_development.md` | 当前认知纵向切片的详细设计/接受标准；基线数字是阶段开始时快照 |
@@ -903,6 +921,9 @@ Last known blockers:
 | `docs/commitment_acceptance.md` | Commitment 专项验收合同 |
 | `docs/desktop_release.md` | Desktop 打包说明 |
 | `docs/local_release_checklist.md` | 本地发布检查表 |
+| `docs/veyra_project_os/README.md` | Current/task Living truth 导航 |
+| `docs/veyra_project_os/status/current.md` | 当前 revision、发布证据和 known degraded |
+| `docs/veyra_project_os/tasks/CURRENT.md` | 当前唯一执行窗口与 V0-001 状态 |
 
 旧的 `development_status.md`、`implementation_progress.md`、手工 Route inventory 和 2026-07-31 capability baseline 已被本文件吸收后移除。历史内容仍可通过 Git history 恢复，不能再被后续窗口当作 current truth。
 

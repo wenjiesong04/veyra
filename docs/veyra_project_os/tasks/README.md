@@ -14,7 +14,12 @@
 - 声明 Authority Delta；
 - 区分 automated/live/user evidence；
 - 使用 [`../definition_of_done.md`](../definition_of_done.md)；
-- 完成后归档为 `LC-NNN-title.md`，再创建新的 CURRENT。
+- 只有在证据闭合、状态达到 `COMPLETED` 后才归档；`CURRENT.md` 中的稳定任务
+  ID 必须保留在归档文件名中。`LC-NNN-title.md` 只适用于稳定 ID 本身为
+  `LC-NNN` 的 Living Context 任务，不把 `V0-001` 重新编号成 `LC-001`。
+- 归档后再创建新的 `CURRENT.md`。如果当前任务仍是
+  `LOCAL_VALIDATED / OWNER_ACCEPTANCE_PENDING`，它继续留在 `CURRENT.md`；
+  Handoff 中提到的下一条 `LC-001` 只是计划，不得提前替换当前任务。
 
 ## 任务不能包含
 

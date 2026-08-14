@@ -2,6 +2,50 @@
 
 This release target is local-first: users clone Veyra from GitHub, configure their own local model, OpenClaw, and optional Feishu app, and keep runtime data under their local `state/` directory.
 
+## Veyra 0.1 Product Preview acceptance (2026-08-14)
+
+The supported preview boundary is loopback/Tauri on Apple Silicon macOS. It is
+not a public release, Developer ID/notarized build, DMG, Windows/Linux package,
+or externally delivering Agent product.
+
+### Product contract
+
+- `/product/context`, `/product/today`, `/product/matters` and `/product/status`
+  are versioned, pure-read, exact-owner/session projections.
+- Today is the default surface; Matters consumes stable `{status,count,items}`
+  sections; Status shows evidence/readiness without turning implementation into
+  live or production proof.
+- `record_only` suggestion previews are visible only when current and exact
+  owner-bound; delivery is `none` and authority remains false. `ask` and
+  external delivery remain unsupported/dormant.
+- Conversation uses real SSE lifecycle phases, not fabricated token streaming;
+  duplicate, rejected and failed outcomes remain typed.
+- Browser acceptance includes the default Today/Matters/Status/Settings flow,
+  390×844 readability, no horizontal overflow, shared local-history sanitizing,
+  and an Advanced link for the legacy console.
+
+### Local Apple Silicon package evidence
+
+On clean revision `e5fcf80`, `scripts/build_desktop.sh package` exited `0`.
+The local app is ad hoc (`ad_hoc_not_notarized_local_preview`) and passed:
+
+- arm64 Mach-O sidecar smoke with Python `3.11.15` and PyInstaller `6.22.0`;
+- strict `codesign --verify --deep --strict`;
+- normalized source/package sidecar byte comparison.
+
+App tree SHA-256 is
+`c62ac2a0c69865278ecc4096ac69105442e985c0aec0ee5b3c5f3ae0666abeca`;
+sidecar SHA-256 is
+`a996f308d0c18443238c646c143f1966b66d8944b1ed707dc46be33264c95501`.
+Final branch push and exact-SHA Actions are external handoff evidence and must
+be checked against the final revision. Public-release evidence remains out of
+scope for this preview.
+
+For a dirty development tree, use the separate `sidecar` and `sidecar-smoke`
+commands; package defaults to clean and accepts `--allow-dirty` only for local
+development verification. Do not install dependencies implicitly or claim
+notarization from an ad-hoc signature.
+
 ## Release Boundary
 
 - Do not commit `.env`, `state/`, runtime logs, snapshots, OpenClaw device files, Feishu credentials, or user commitments.

@@ -2,80 +2,52 @@
 
 > Evidence snapshot date: 2026-08-14 (Asia/Shanghai)
 >
-> 本页是高频 Living Zone，不是 North Star。执行窗口必须重新核验；历史 live 不能自动继承到新 revision。
+> 本页是 Project OS 的 current Living truth，不是 North Star。历史 live 不能自动继承到新 revision；提交、推送和 exact-SHA Actions 仍需独立核验。
 
-## Git 与共享工作区
+## Current revision and worktree
 
-- Branch base last checked: `cognitive-awakening @ da53ef8c5501bcd1704e808ebc1c461f6fdcc2b0`；
-- `origin/cognitive-awakening` 在检查时与本地 HEAD 对齐；
-- 当前共享工作树存在另一执行窗口正在进行的前端重构；不得 reset、stash、覆盖或把其改动混入本文档提交；
-- 本目录为 side-conversation 新增文档，尚未被 canonical README 正式采纳。
+- Final application evidence revision: `e5fcf80ad3e1e6e54f3602603bdf941e5aa8fd37` (`e5fcf80`)；Product Preview code slice is in its parent feature changeset `80ff937`.
+- `runtime v2` clean-start evidence is bound to `e5fcf80`: Python 3.11.15, `dirty_flag=false`, exact build identity, and business-state GETs remained byte-pure. This is revision-scoped evidence, not a claim that the shared worktree is currently clean.
+- A clean final package on `e5fcf80` is validated. Push and exact-SHA GitHub Actions remain `PENDING`.
 
-## 最近已验证的工程基线
+## V0-001 — Local Product Preview
 
-最近交接报告包含：
+Status: `LOCAL_VALIDATED / OWNER_ACCEPTANCE_PENDING`
 
-- Python gate `146/146`；
-- invariant `145/145`；
-- cognitive capability `1/1`；
-- Route non-regression `810/810`；
-- OpenClaw plugin `32/32`；
-- compileall、Web、Desktop build 通过；
-- exact-SHA GitHub Actions success；
-- runtime Python 3.11.15，revision `da53ef8...`，startup dirty false。
+Veyra 0.1 is a local-first Product Preview, not Consumer V1 and not a public or externally delivering release. The default surface is Today-first: exact-scope context, current Situation/Attention, record-only suggestion preview, honest unknown/waiting state, curated Status, and a continuing conversation. Advanced remains the old operator console.
 
-这些证据只绑定该 revision。当前未提交前端和本文档不继承上述完整验证。
+### Evidence recorded for `e5fcf80`
 
-## 产品现实
+| Surface | Evidence | Honest label |
+|---|---|---|
+| Python gate | `148/148` = `145` invariant + `1` cognitive capability + `2` product capability | `AUTOMATED_VALIDATED` |
+| Route / governance | 9-route non-regression `810/810`; authority and record-only boundaries unchanged | `AUTOMATED_VALIDATED` |
+| OpenClaw | plugin contract `32/32` | `AUTOMATED_VALIDATED` |
+| Product backend | exact owner/session context, ambiguity/mismatch fail-closed, stable Matters sections, GET byte-purity, record-only preview and SSE lifecycle smoke | `AUTOMATED_VALIDATED` |
+| Web / desktop / browser | Web build, Desktop frontend build, browser acceptance, 390×844 readability, shared history sanitizer and `/product` contract | `AUTOMATED_VALIDATED + BOUNDED LIVE` |
+| Conversation | real SSE phases `accepted → phase → message → completed`; duplicate/rejected/failed are typed and no token/CoT stream is claimed | `AUTOMATED_VALIDATED` |
+| Local app | clean `build_desktop.sh package` exit `0`; ad-hoc Apple Silicon arm64 `.app`; bundled sidecar is Mach-O arm64, Python 3.11.15, PyInstaller 6.22.0; sidecar smoke, strict codesign and normalized payload comparison completed. App tree SHA-256 `c62ac2a0c69865278ecc4096ac69105442e985c0aec0ee5b3c5f3ae0666abeca`; sidecar SHA-256 `a996f308d0c18443238c646c143f1966b66d8944b1ed707dc46be33264c95501` | `LOCAL_VALIDATED / NOT NOTARIZED` |
+| Remote gate | final branch push and exact-SHA Actions | must be verified externally before handoff; never self-attested by this SHA-producing document |
+| Public release | Developer ID, notarization, DMG/store distribution | `OUT OF SCOPE / NOT VALIDATED` |
 
-### 基本成立
+### Known degraded or intentionally unproven
 
-- P0 工程、安全、scope、authority、runtime identity 和非弱化基础较强；
-- typed event 可以进入 Situation、Attention 和 record-only Suggestion；
-- Workspace Goal/Observer 已提供一条 production-shaped trusted canary；
-- Agent/Tool/Review/Verification 治理基础可复用；
-- 当前代码不需要推倒重写。
+- P1 and P2 remain `PARTIAL`; the Workspace Observer is a bounded trusted canary, not a multi-source or general-life producer.
+- User usefulness, timing, false silence and feedback aftereffect are not validated. The next planned slice is `LC-001 — Real non-code Situation`; it is not the current task while V0-001 remains release-evidence-pending.
+- `ask` remains dormant; `record_only` is the default and external delivery, Agent/Tool execution, Route/Risk changes and new authority remain disabled.
+- Generic cognition remains overconservative, production Economy metadata is incomplete, and no durable server conversation store is promised.
+- Feishu/OpenClaw connectivity and any external delivery claim require a fresh current-run message; local Product Preview evidence does not imply that proof.
 
-### 仍未完成
+## Current evidence by dimension
 
-- P1 产品闭环仍为 partial；
-- Generic Cognitive Loop 最近读取为 245 cycles、489 model calls、0 candidates、`overconservative_alert=true`；
-- 当前真实 Goal 主要是 Veyra 代码变化观察，不代表生活场景；
-- 当前真实 Commitment 为 0；
-- External World watchlist/summaries 为空；
-- `needs_observation` 尚未形成完整 Information Need → Observation/Ask 生产闭环；
-- `ask` 仍 dormant；
-- 当前建议以 record-only/Developer evidence 为主；
-- 当前 Belief Economy 没有生产 metadata 覆盖；
-- 长期 usefulness、timing、false silence 和 feedback aftereffect 未验证。
+| Dimension | Current label | Boundary |
+|---|---|---|
+| Implementation | `IMPLEMENTED IN BOUNDED V0.1 SLICE` | Product read model/router and Today-first UI exist; they do not replace underlying state truth. |
+| Configuration | `LOCAL / LOOPBACK-TAURI` | Non-loopback remains subject to the existing local control-token policy. |
+| Verification | `AUTOMATED_VALIDATED + BOUNDED LIVE` | Application evidence is revision-scoped to `e5fcf80`; the final branch SHA must be checked against GitHub Actions at handoff. |
+| Runtime | `DEGRADED WHERE SOURCES ARE UNKNOWN` | Unknown freshness/readiness is shown as unknown, never upgraded to production-ready. |
+| Authority | `RECORD_ONLY / NO EXTERNAL DELIVERY` | Product GETs and previews cannot grant execution, tool, route, risk or delivery authority. |
 
-## 前端
+## Next decision
 
-现有界面主要是 Developer Console。共享工作区正在进行产品前端重构，但本页没有审阅或验证该未提交实现，不能提前宣称 Today/Situation 产品体验完成。
-
-## 正确的下一产品方向
-
-优先形成：
-
-```text
-真实 Active Concern
-  → Situation
-  → Information Need
-  → ask 或一个非代码 trusted source
-  → Evidence/Belief update
-  → say/wait/silent
-  → 用户纠正与反馈
-```
-
-Workspace Observer 保留为 Developer canary，不再作为主要产品场景扩张。
-
-## 证据等级总结
-
-| 领域 | 当前诚实标签 |
-|---|---|
-| P0 工程/安全基线 | `MOSTLY CLOSED + AUTOMATED/LIVE ENGINEERING EVIDENCE` |
-| P1 typed cognition infrastructure | `IMPLEMENTED IN PART + AUTOMATED + BOUNDED CANARY LIVE` |
-| P1 real-world product cognition | `PARTIAL / NOT USER-VALIDATED` |
-| P2 Belief/Economy | `PARTIAL` |
-| Living Context product | `NORTH STAR / FIRST VERTICAL SLICE PENDING` |
-| Consumer V1 | `NOT READY` |
+Do not mark V0-001 complete or archive it as `LC-001`. The clean local package is closed, while final remote-gate evidence belongs in the GitHub handoff rather than this self-referential document. After that gate passes, V0-001 still waits for owner acceptance of the local preview. Only an explicit owner decision may close it and open the planned real non-code `LC-001` Situation slice.

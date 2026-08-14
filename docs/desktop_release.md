@@ -2,6 +2,31 @@
 
 Veyra Desktop is the local window distribution for Veyra. The product name is `Veyra` on macOS, Windows, and Linux.
 
+## Veyra 0.1 Product Preview — 2026-08-14
+
+The current release slice is deliberately narrower than the cross-platform
+scaffold below:
+
+- Supported boundary: local loopback/Tauri on Apple Silicon macOS (`arm64`).
+- Clean `scripts/build_desktop.sh package` on `e5fcf80` exited `0` and produced
+  an ad-hoc local `Veyra.app`.
+- The embedded `veyra-backend-aarch64-apple-darwin` is a Mach-O arm64 sidecar
+  built with Python `3.11.15` and PyInstaller `6.22.0`; sidecar smoke, strict
+  `codesign --verify --deep --strict`, and normalized source/package payload
+  comparison passed.
+- Auditable artifact digests: app tree
+  `c62ac2a0c69865278ecc4096ac69105442e985c0aec0ee5b3c5f3ae0666abeca`;
+  sidecar `a996f308d0c18443238c646c143f1966b66d8944b1ed707dc46be33264c95501`.
+- Signing is `ad_hoc_not_notarized_local_preview`: this is not Developer ID,
+  notarized, DMG, App Store, Windows/Linux, or public-release evidence.
+- Final branch push and exact-SHA GitHub Actions are external handoff evidence;
+  they must be checked against the final revision rather than self-attested here.
+
+The local package is a Product Preview artifact, not a promise that every
+first-run provider (OpenClaw, Feishu, model or Tool Proxy) is configured or
+live. Product status must continue to distinguish implemented, configured,
+validated, live and production-pending evidence.
+
 ## Cross-Platform Strategy
 
 Use one desktop shell and one console UI:
@@ -13,7 +38,7 @@ Use one desktop shell and one console UI:
 
 The web console build remains separate at `ui/console` with `/console/` asset paths. The desktop build writes relative assets into `apps/desktop/dist`, so a packaged window can load them without depending on the web route.
 
-## Operating System Targets
+## Operating System Targets (future scaffold)
 
 | OS | User-facing package | Build host |
 | --- | --- | --- |
@@ -21,7 +46,10 @@ The web console build remains separate at `ui/console` with `/console/` asset pa
 | Windows | `Veyra.msi` / `.exe` | Windows |
 | Linux | `Veyra.AppImage` / `.deb` | Linux |
 
-Build on the target operating system first. Cross-compilation, code signing, notarization, Microsoft Store packaging, and Linux distro-specific signing are later release-engineering work.
+Build on the target operating system first. Cross-compilation, Developer ID
+code signing, notarization, DMG/App Store packaging, Microsoft Store packaging,
+and Linux distro-specific signing remain later release-engineering work; they
+are not part of Veyra 0.1 Product Preview acceptance.
 
 ## Current Scaffold
 
@@ -44,7 +72,9 @@ Implemented now:
 
 Validation still pending:
 
-- Code signing and notarization.
+- Developer ID code signing, notarization and DMG/App Store distribution.
+- Exact-SHA GitHub Actions and branch-push trace for the final revision are
+  verified externally at handoff; public distribution remains out of scope.
 - Windows/Linux package validation.
 - Native cross-process state-writer locking on Windows; current status is explicitly `validation_pending`.
 - Full first-run coverage for every advanced Tool Proxy and alert value.
