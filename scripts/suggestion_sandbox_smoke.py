@@ -1148,6 +1148,31 @@ def main() -> int:
             user_id=USER,
             session_id=SESSION,
         )["proposal"]
+        record_only_preview = outbox.list_preview(
+            user_id=USER,
+            session_id=SESSION,
+        )
+        preview_item = (record_only_preview.get("items") or [None])[0]
+        preview_authority = (
+            preview_item.get("authority") if isinstance(preview_item, dict) else None
+        )
+        expect(
+            record_only_preview.get("status") == "success"
+            and record_only_preview.get("count") == 1
+            and isinstance(preview_item, dict)
+            and preview_item.get("proposal_id") == recorded.get("proposal_id")
+            and preview_item.get("delivery_disposition") == "none"
+            and preview_item.get("delivery") == {
+                "channel": "none",
+                "external_delivery": False,
+                "feishu_delivery": False,
+                "agent_delivery": False,
+            }
+            and isinstance(preview_authority, dict)
+            and all(value is False for value in preview_authority.values()),
+            "current record-only proposal is exact-owner preview with no delivery authority",
+            record_only_preview,
+        )
         recorded_count = int(
             store.read_json(SuggestionOutbox.STATE_FILE).get(
                 "proposal_count"
@@ -1192,6 +1217,38 @@ def main() -> int:
                 )
             ),
         )
+        attention_id = str(
+            (recorded.get("attention_hypothesis_ref") or {}).get("hypothesis_id") or ""
+        )
+        attention_before_expiry = copy.deepcopy(
+            store.read_json(AttentionHypothesisRuntime.STATE_FILE)
+        )
+
+        def expire_record(state: dict[str, Any]) -> dict[str, Any]:
+            record = (state.get("hypotheses") or {}).get(attention_id)
+            if not isinstance(record, dict):
+                raise AssertionError("record-only attention fixture was not persisted")
+            record["expires_at"] = (clock() - timedelta(seconds=1)).isoformat()
+            return state
+
+        store.mutate_json(AttentionHypothesisRuntime.STATE_FILE, expire_record)
+        expired_preview = outbox.list_preview(
+            user_id=USER,
+            session_id=SESSION,
+        )
+        expect(
+            expired_preview.get("status") == "success"
+            and expired_preview.get("count") == 0
+            and expired_preview.get("items") == []
+            and int(expired_preview.get("stale_hidden_count") or 0) >= 1,
+            "expired record-only binding is hidden from Product Preview",
+            expired_preview,
+        )
+
+        def restore_record(state: dict[str, Any]) -> dict[str, Any]:
+            return attention_before_expiry
+
+        store.mutate_json(AttentionHypothesisRuntime.STATE_FILE, restore_record)
 
         awareness = SimpleNamespace(
             event_awareness=SimpleNamespace(suggestion_outbox=outbox)

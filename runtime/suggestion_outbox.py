@@ -1081,6 +1081,113 @@ class SuggestionOutbox:
             "authority": self._authority_boundary(),
         }
 
+    def list_preview(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Pure exact-owner read of record-only suggestion previews.
+
+        ``list_inbox`` intentionally exposes only ``advise_only`` proposals.
+        Product Preview needs to explain that a trusted suggestion was formed
+        while preserving the existing record-only/no-delivery contract.  This
+        method therefore admits only current, integrity-checked ``record_only``
+        proposals for the exact owner.  It never
+        mutates inboxes, budgets, feedback, or lifecycle state.
+        """
+
+        user, session, scope_key = self._owner(user_id, session_id)
+        config = self._mode_snapshot()
+        if config.get("status") == "fail_closed":
+            return {**config, "items": [], "count": 0}
+        if config.get("mode") != "record_only":
+            return {
+                "status": "success",
+                "count": 0,
+                "items": [],
+                "legacy_hidden_count": 0,
+                "stale_hidden_count": 0,
+                "mode": config.get("mode"),
+                "state_revision": config.get("ops_config_revision", 0),
+                "authority": self._authority_boundary(),
+            }
+        state = self.state_store.read_json(self.STATE_FILE)
+        if not self._healthy(state):
+            return {
+                **self._closed("suggestion_outbox_state_corrupt"),
+                "items": [],
+                "count": 0,
+            }
+        proposals = self._records(state.get("proposals"))
+        visible: list[dict[str, Any]] = []
+        stale_hidden_count = 0
+        legacy_hidden_count = 0
+        for proposal in proposals.values():
+            if not isinstance(proposal, dict):
+                continue
+            if (
+                str(proposal.get("user_id") or "") != user
+                or str(proposal.get("session_id") or "") != session
+                or scope_key != self._proposal_scope_key(proposal)
+            ):
+                continue
+            if str(proposal.get("schema_version") or "") == "veyra.informational_suggestion.v1":
+                legacy_hidden_count += 1
+                continue
+            if str(proposal.get("mode") or "") != "record_only":
+                stale_hidden_count += 1
+                continue
+            # A preview must be a complete current record.  In particular,
+            # stale parent/attention bindings are not allowed to look like a
+            # current suggestion merely because they remain in the outbox.
+            if not self._valid_proposal_record(str(proposal.get("proposal_id") or ""), proposal):
+                stale_hidden_count += 1
+                continue
+            if not self._current_proposal_integrity(proposal):
+                stale_hidden_count += 1
+                continue
+            if self._current_proposal_issue(
+                proposal,
+                user_id=user,
+                scope_key=scope_key,
+                now=self._now(),
+            ) is not None:
+                stale_hidden_count += 1
+                continue
+            if (
+                str(proposal.get("delivery_disposition") or "") != "none"
+                or proposal.get("delivery") != {
+                    "channel": "none",
+                    "external_delivery": False,
+                    "feishu_delivery": False,
+                    "agent_delivery": False,
+                }
+                or proposal.get("authority") != self._authority_boundary()
+            ):
+                stale_hidden_count += 1
+                continue
+            visible.append(self._public_proposal(proposal))
+        visible.sort(
+            key=lambda item: (
+                str(item.get("updated_at") or ""),
+                str(item.get("proposal_id") or ""),
+            ),
+            reverse=True,
+        )
+        selected_limit = max(0, min(int(limit), self.MAX_INBOX_ITEMS))
+        return {
+            "status": "success",
+            "count": min(len(visible), selected_limit),
+            "items": visible[:selected_limit],
+            "legacy_hidden_count": legacy_hidden_count,
+            "stale_hidden_count": stale_hidden_count,
+            "mode": config.get("mode"),
+            "state_revision": self._nonnegative_int(state.get("_state_revision")),
+            "authority": self._authority_boundary(),
+        }
+
     def list_decisions(
         self,
         *,

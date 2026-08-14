@@ -1,10 +1,12 @@
+import asyncio
+import json
 import os
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
@@ -48,6 +50,7 @@ from routers.commitments import build_commitments_router
 from routers.debug_audit import build_debug_audit_router
 from routers.local_setup import build_local_setup_router
 from routers.ops_runtime import build_ops_runtime_router
+from routers.product import build_product_router
 from routers.phase5 import build_phase5_router
 from routers.phase6 import build_phase6_router
 from routers.phase6_extensions import (
@@ -114,6 +117,7 @@ from runtime.read_only_agent_collaboration import (
     ReadOnlyAgentCollaborationRuntime,
 )
 from runtime.read_only_cognitive_loop import ReadOnlyCognitiveLoopRuntime
+from runtime.product_experience import ProductExperienceService
 from runtime.extension_spec_quarantine import (
     ExtensionSpecQuarantine,
 )
@@ -928,6 +932,18 @@ def _deployment_readiness() -> dict[str, Any]:
     return readiness
 
 
+# Product Preview is deliberately a thin read-model boundary.  Its service
+# receives existing runtime projections explicitly; no product business logic
+# is assembled in this composition root beyond dependency injection.
+product_experience = ProductExperienceService(
+    state_store,
+    runtime_build_resolver=runtime_build_identity.public_projection,
+    agent_status_resolver=lambda: phase6_capability_directory.snapshot(read_only=True),
+    integration_status_resolver=feishu_ws_runner.status,
+    cognition_status_resolver=read_only_cognitive_loop.status,
+)
+
+
 class _DynamicDeps(dict[str, Any]):
     def _resolve(self, value: Any) -> Any:
         return value() if callable(value) else value
@@ -941,6 +957,9 @@ class _DynamicDeps(dict[str, Any]):
         return self._resolve(super().__getitem__(key))
 
 
+app.include_router(
+    build_product_router(service=product_experience)
+)
 app.include_router(
     build_runtime_observability_router(
         trace_recorder=awareness_loop.runtime_trace,
@@ -1143,9 +1162,16 @@ app.include_router(
 )
 
 
-@app.post("/events/message")
-async def message(request: MessageRequest):
-    receipt = await run_in_threadpool(
+def _public_message_result(receipt: dict[str, Any]) -> dict[str, Any]:
+    if receipt.get("status") == "duplicate":
+        return {"event_id": receipt.get("previous", {}).get("event_id"), "route": "duplicate", "status": "duplicate", "response": "Duplicate message ignored.", "risk_level": "R0", "artifacts": receipt}
+    if receipt.get("status") != "delivered":
+        return {"event_id": None, "route": "block", "status": receipt.get("status"), "response": receipt.get("reason", "Channel intake rejected."), "risk_level": "R0", "artifacts": receipt}
+    return receipt["loop_result"]
+
+
+async def _receive_message(request: MessageRequest) -> dict[str, Any]:
+    return await run_in_threadpool(
         intake_gateway.receive_message,
         text=request.text,
         channel=request.channel,
@@ -1154,11 +1180,61 @@ async def message(request: MessageRequest):
         message_id=request.message_id,
         metadata=request.metadata,
     )
-    if receipt.get("status") == "duplicate":
-        return {"event_id": receipt.get("previous", {}).get("event_id"), "route": "duplicate", "status": "duplicate", "response": "Duplicate message ignored.", "risk_level": "R0", "artifacts": receipt}
-    if receipt.get("status") != "delivered":
-        return {"event_id": None, "route": "block", "status": receipt.get("status"), "response": receipt.get("reason", "Channel intake rejected."), "risk_level": "R0", "artifacts": receipt}
-    return receipt["loop_result"]
+
+
+@app.post("/events/message")
+async def message(request: MessageRequest):
+    return _public_message_result(await _receive_message(request))
+
+
+def _sse_frame(event_type: str, seq: int, payload: dict[str, Any]) -> str:
+    event = {"schema_version": "veyra.message-stream.v1", "seq": seq, "type": event_type, "payload": payload}
+    return f"id: {seq}\nevent: {event_type}\ndata: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
+
+
+@app.post("/events/message/stream")
+async def message_stream(request: MessageRequest):
+    """Stream verified intake lifecycle events for the first conversation UI.
+
+    This is intentionally a connection-scoped stream. It exposes accepted and
+    processing phases, then the same verified final result as /events/message;
+    it never fabricates token deltas or exposes model chain-of-thought. Durable
+    turn replay can be layered on top once the conversation store is available.
+    """
+    task = asyncio.create_task(_receive_message(request))
+
+    async def events():
+        seq = 0
+        seq += 1
+        yield _sse_frame("accepted", seq, {"status": "accepted"})
+        seq += 1
+        yield _sse_frame("phase", seq, {"phase": "processing", "status": "running"})
+        try:
+            while True:
+                try:
+                    receipt = await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+                    break
+                except asyncio.TimeoutError:
+                    seq += 1
+                    yield _sse_frame("heartbeat", seq, {"phase": "processing", "status": "running"})
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        except Exception:
+            seq += 1
+            yield _sse_frame("failed", seq, {"message": "Veyra could not finish this request."})
+            return
+        result = _public_message_result(receipt)
+        seq += 1
+        yield _sse_frame("message", seq, result)
+        seq += 1
+        yield _sse_frame("completed", seq, {"status": result.get("status", "completed")})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/channels")

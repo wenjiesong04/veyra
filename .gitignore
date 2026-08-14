@@ -8,6 +8,8 @@ web/vite.config.js
 web/vite.config.d.ts
 web/vite.desktop.config.js
 web/vite.desktop.config.d.ts
+web/vite.proxy.js
+web/vite.proxy.d.ts
 
 apps/desktop/node_modules/
 apps/desktop/dist/

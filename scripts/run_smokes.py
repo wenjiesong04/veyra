@@ -165,7 +165,16 @@ COGNITIVE_CAPABILITY_SMOKES = [
     "trusted_workspace_observer_smoke.py",
 ]
 
-GATE_SMOKES = [*INVARIANT_SMOKES, *COGNITIVE_CAPABILITY_SMOKES]
+PRODUCT_CAPABILITY_SMOKES = [
+    "product_experience_smoke.py",
+    "message_stream_smoke.py",
+]
+
+GATE_SMOKES = [
+    *INVARIANT_SMOKES,
+    *COGNITIVE_CAPABILITY_SMOKES,
+    *PRODUCT_CAPABILITY_SMOKES,
+]
 
 SMOKE_TIMEOUT_OVERRIDES = {
     # This intentionally exercises eight sequential turns against the live
@@ -252,6 +261,9 @@ def main() -> int:
         capability_passed = sum(
             name in passed_names for name in COGNITIVE_CAPABILITY_SMOKES
         )
+        product_passed = sum(
+            name in passed_names for name in PRODUCT_CAPABILITY_SMOKES
+        )
         invariant_state = (
             "PASS"
             if invariant_passed == len(INVARIANT_SMOKES)
@@ -262,6 +274,11 @@ def main() -> int:
             if capability_passed == len(COGNITIVE_CAPABILITY_SMOKES)
             else "FAIL"
         )
+        product_state = (
+            "PASS"
+            if product_passed == len(PRODUCT_CAPABILITY_SMOKES)
+            else "FAIL"
+        )
         print(
             f"Invariant summary: {invariant_state} "
             f"{invariant_passed}/{len(INVARIANT_SMOKES)}"
@@ -269,6 +286,10 @@ def main() -> int:
         print(
             f"Cognitive capability summary: {capability_state} "
             f"{capability_passed}/{len(COGNITIVE_CAPABILITY_SMOKES)}"
+        )
+        print(
+            f"Product capability summary: {product_state} "
+            f"{product_passed}/{len(PRODUCT_CAPABILITY_SMOKES)}"
         )
 
     if failures:

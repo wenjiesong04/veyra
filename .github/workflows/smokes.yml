@@ -42,9 +42,14 @@ jobs:
       - name: Build browser console
         working-directory: web
         run: npm run build
+      - name: Check generated browser bundle freshness
+        working-directory: web
+        run: npm run check:bundle && npm run test:status-tone && npm run test:product-contract
       - name: Build desktop frontend
         working-directory: web
         run: npm run build:desktop
+      - name: Ensure tracked console bundle is current
+        run: git diff --exit-code -- ui/console
       - name: Validate Tauri config
         working-directory: apps/desktop
         run: |

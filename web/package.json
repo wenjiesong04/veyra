@@ -8,6 +8,9 @@
     "dev:desktop": "vite --config vite.desktop.config.ts --host 127.0.0.1 --port 5174",
     "build": "tsc -b && vite build",
     "build:desktop": "tsc -b && vite build --config vite.desktop.config.ts",
+    "check:bundle": "node scripts/check-bundle-freshness.mjs",
+    "test:status-tone": "node scripts/status-tone-check.mjs",
+    "test:product-contract": "node scripts/product-contract-check.mjs",
     "preview": "vite preview --host 127.0.0.1 --port 4173"
   },
   "dependencies": {
