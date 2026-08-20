@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
 
 from core.world_state import StateRevisionConflictError, WorldStateStore  # noqa: E402
 from interface.event_schema import EventSource, EventType, VeyraEvent  # noqa: E402
-from interface.living_context_contract import CandidateNeed, ContextQuote, LivingReactionFeedback  # noqa: E402
+from interface.living_context_contract import CandidateNeed, CandidateNeedReference, ContextQuote, LivingReactionFeedback  # noqa: E402
 from interface.living_source_contract import SourceConsent, canonical_utc  # noqa: E402
 from runtime.calendar_source import CalendarSource  # noqa: E402
 from runtime.living_context_composition import build_living_context_composition  # noqa: E402
@@ -520,6 +520,268 @@ def need_binding_checks(root: Path) -> None:
     expect(
         any(item.get("blocked_judgment") == "the second missing detail" for item in rotated_needs),
         "a new candidate Need does not inherit an unrelated old unknown binding",
+    )
+
+    # A natural-language continuation may explicitly answer one Need while
+    # leaving another unknown open.  The runtime must clear only the exact
+    # server-owned endpoint, never the human-readable blocked judgment.
+    continuation_store = WorldStateStore(root / "unknown-reconciliation")
+    continuation = build_living_context_composition(continuation_store)
+    continuation_owner, continuation_session = "unknown-owner", "unknown-session"
+    bound_unknown = "搬家公司服务未确认"
+    remaining_unknown = "网络迁移服务未确认"
+    continuation_catalog = continuation.orchestrator.model_catalog(
+        owner_id=continuation_owner,
+        session_id=continuation_session,
+    )
+    seed = candidate(
+        {
+            **FIXTURES[2],
+            "category": "logistics",
+            "subject": "月底搬家",
+            "goal": "完成月底搬家",
+            "unknown": bound_unknown,
+            "question": "搬家公司是否已经预约？",
+            "source": "user",
+            "text": "月底要搬家。",
+        },
+        continuation_catalog,
+    )
+    second_need = seed.needs[0].model_copy(
+        update={
+            "blocked_judgment": remaining_unknown,
+            "question": "网络迁移服务是否已经确认？",
+        }
+    )
+    seed = seed.model_copy(
+        update={
+            "unknown": [bound_unknown, remaining_unknown],
+            "needs": [seed.needs[0], second_need],
+        }
+    )
+    created = continuation.orchestrator.process_user_turn(
+        event(
+            "unknown-reconciliation-create",
+            continuation_owner,
+            continuation_session,
+            "月底要搬家。",
+        ),
+        SimpleNamespace(living_context_candidate=seed, living_reaction_feedback=None),
+        catalog=continuation_catalog,
+    )
+    continuation_situation_id = str(created["situation"]["situation_id"])
+    created_needs = continuation.core.needs.list(
+        owner_id=continuation_owner,
+        session_id=continuation_session,
+        situation_id=continuation_situation_id,
+        limit=8,
+    )
+    bound_need = next(item for item in created_needs if item["blocked_judgment"] == bound_unknown)
+    open_second = next(item for item in created_needs if item["blocked_judgment"] == remaining_unknown)
+    expect(
+        bound_need.get("unknown_binding") == bound_unknown
+        and open_second.get("unknown_binding") == remaining_unknown,
+        "continuation fixture persists one exact binding per Need",
+    )
+    update_catalog = continuation.orchestrator.model_catalog(
+        owner_id=continuation_owner,
+        session_id=continuation_session,
+    )
+    update_row = next(
+        row for row in update_catalog if str(row.get("situation_token")) == continuation_situation_id
+    )
+    update_payload = seed.model_dump(mode="json")
+    update_payload.update(
+        {
+            "disposition": "update",
+            "situation_token": continuation_situation_id,
+            "situation_revision": int(update_row["observation_revision"]),
+            "catalog_token": update_row["catalog_token"],
+            "create_subject": "",
+            "unknown": [remaining_unknown],
+            "needs": [second_need.model_dump(mode="json")],
+            "answered_need_tokens": [bound_need["need_id"]],
+            "answered_need_bindings": [
+                CandidateNeedReference(
+                    need_token=str(bound_need["need_id"]),
+                    generation=int(bound_need["generation"]),
+                ).model_dump(mode="json")
+            ],
+            "material_change": "搬家公司已经预约好了；只剩网络迁移未确认。",
+        }
+    )
+    update_candidate = seed.__class__.model_validate(update_payload, strict=True)
+    followup_text = "日期确定8月29日，搬家公司已经预约好了；只剩网络迁移未确认。"
+    followup_event = event(
+        "unknown-reconciliation-update",
+        continuation_owner,
+        continuation_session,
+        followup_text,
+    )
+    updated = continuation.orchestrator.process_user_turn(
+        followup_event,
+        SimpleNamespace(living_context_candidate=update_candidate, living_reaction_feedback=None),
+        catalog=update_catalog,
+    )
+    updated_unknown = (updated["situation"].get("semantic") or {}).get("unknown") or []
+    expect(
+        updated["status"] == "recorded"
+        and bound_unknown not in updated_unknown
+        and remaining_unknown in updated_unknown
+        and int(updated["situation"]["observation_revision"]) == 2,
+        "natural-language continuation clears only the answered bound unknown",
+    )
+    updated_needs = continuation.core.needs.list(
+        owner_id=continuation_owner,
+        session_id=continuation_session,
+        situation_id=continuation_situation_id,
+        limit=8,
+    )
+    expect(
+        next(item for item in updated_needs if item["need_id"] == bound_need["need_id"])["status"] == "resolved"
+        and next(item for item in updated_needs if item["need_id"] == open_second["need_id"])["status"] in {"open", "waiting"},
+        "answering one Need leaves the other Need active",
+    )
+    replayed = continuation.orchestrator.process_user_turn(
+        followup_event,
+        SimpleNamespace(living_context_candidate=update_candidate, living_reaction_feedback=None),
+        catalog=update_catalog,
+    )
+    expect(
+        replayed.get("semantic_replayed") is True
+        and ((replayed.get("situation") or {}).get("semantic") or {}).get("unknown") == updated_unknown,
+        "answered continuation replay is byte-stable",
+    )
+    restarted = build_living_context_composition(continuation_store)
+    restarted_situation = restarted.core.get_situation(
+        continuation_situation_id,
+        owner_id=continuation_owner,
+        session_id=continuation_session,
+    )
+    expect(
+        ((restarted_situation or {}).get("semantic") or {}).get("unknown") == updated_unknown,
+        "answered unknown reconciliation survives restart",
+    )
+    before_stale = restarted_situation
+    try:
+        restarted.orchestrator.process_user_turn(
+            event(
+                "unknown-reconciliation-stale-cas",
+                continuation_owner,
+                continuation_session,
+                "搬家安排又补充了一条信息。",
+            ),
+            SimpleNamespace(living_context_candidate=update_candidate, living_reaction_feedback=None),
+            catalog=update_catalog,
+        )
+    except StateRevisionConflictError:
+        pass
+    else:  # pragma: no cover - stale catalog must never be rebound
+        raise AssertionError("stale unknown reconciliation catalog unexpectedly admitted")
+    after_stale = restarted.core.get_situation(
+        continuation_situation_id,
+        owner_id=continuation_owner,
+        session_id=continuation_session,
+    )
+    expect(
+        (before_stale or {}).get("observation_revision") == (after_stale or {}).get("observation_revision")
+        and ((after_stale or {}).get("semantic") or {}).get("unknown") == updated_unknown,
+        "stale unknown reconciliation CAS leaves state untouched",
+    )
+
+    # If a Need has no binding because multiple unknowns were present, an
+    # answer token resolves the Need but does not guess which semantic unknown
+    # it addressed.
+    unbound_store = WorldStateStore(root / "unknown-reconciliation-unbound")
+    unbound = build_living_context_composition(unbound_store)
+    unbound_owner, unbound_session = "unbound-owner", "unbound-session"
+    unbound_catalog = unbound.orchestrator.model_catalog(
+        owner_id=unbound_owner,
+        session_id=unbound_session,
+    )
+    unbound_seed = candidate(
+        {
+            **FIXTURES[2],
+            "category": "logistics",
+            "subject": "Ambiguous move",
+            "goal": "keep the move current",
+            "unknown": "first unresolved detail",
+            "question": "Which move detail is confirmed?",
+            "source": "user",
+            "text": "搬家还有几个细节待确认。",
+        },
+        unbound_catalog,
+    ).model_copy(
+        update={
+            "unknown": ["first unresolved detail", "second unresolved detail"],
+            "needs": [
+                candidate(
+                    {
+                        **FIXTURES[2],
+                        "category": "logistics",
+                        "subject": "Ambiguous move",
+                        "goal": "keep the move current",
+                        "unknown": "a different blocked judgment",
+                        "question": "Which move detail is confirmed?",
+                        "source": "user",
+                        "text": "搬家还有几个细节待确认。",
+                    },
+                    unbound_catalog,
+                ).needs[0]
+            ],
+        }
+    )
+    unbound_created = unbound.orchestrator.process_user_turn(
+        event("unknown-reconciliation-unbound-create", unbound_owner, unbound_session, "搬家还有几个细节待确认。"),
+        SimpleNamespace(living_context_candidate=unbound_seed, living_reaction_feedback=None),
+        catalog=unbound_catalog,
+    )
+    unbound_id = str(unbound_created["situation"]["situation_id"])
+    unbound_need = unbound.core.needs.list(
+        owner_id=unbound_owner,
+        session_id=unbound_session,
+        situation_id=unbound_id,
+        limit=8,
+    )[0]
+    expect(unbound_need.get("unknown_binding") is None, "ambiguous unknowns remain unbound")
+    unbound_update_catalog = unbound.orchestrator.model_catalog(
+        owner_id=unbound_owner,
+        session_id=unbound_session,
+    )
+    unbound_row = next(row for row in unbound_update_catalog if str(row.get("situation_token")) == unbound_id)
+    unbound_payload = unbound_seed.model_dump(mode="json")
+    unbound_payload.update(
+        {
+            "disposition": "update",
+            "situation_token": unbound_id,
+            "situation_revision": int(unbound_row["observation_revision"]),
+            "catalog_token": unbound_row["catalog_token"],
+            "create_subject": "",
+            "unknown": ["second unresolved detail"],
+            "needs": [],
+            "answered_need_tokens": [unbound_need["need_id"]],
+            "answered_need_bindings": [
+                CandidateNeedReference(
+                    need_token=str(unbound_need["need_id"]),
+                    generation=int(unbound_need["generation"]),
+                ).model_dump(mode="json")
+            ],
+        }
+    )
+    unbound_update = unbound.orchestrator.process_user_turn(
+        event("unknown-reconciliation-unbound-update", unbound_owner, unbound_session, "搬家细节仍有多个未知。"),
+        SimpleNamespace(
+            living_context_candidate=unbound_seed.__class__.model_validate(unbound_payload, strict=True),
+            living_reaction_feedback=None,
+        ),
+        catalog=unbound_update_catalog,
+    )
+    unbound_unknown = ((unbound_update["situation"].get("semantic") or {}).get("unknown") or [])
+    expect(
+        unbound_update["status"] == "recorded"
+        and all(item in unbound_unknown for item in ("first unresolved detail", "second unresolved detail"))
+        and unbound_unknown,
+        "unbound multi-unknown answer resolves no guessed endpoint",
     )
 
 

@@ -198,13 +198,20 @@ class LivingContextRuntime:
             session_id=session_id,
         )
         if answered_needs:
-            resolved_judgments = {
-                str(item.get("blocked_judgment") or "") for item in answered_needs
+            # An answered Need may only clear the exact semantic endpoint
+            # admitted in its server-owned ``unknown_binding``.  The Need's
+            # human-readable blocked judgment is not an endpoint: it can be
+            # a paraphrase, and legacy/unbound Needs must not guess which of
+            # several unknowns a user answer resolved.
+            resolved_bindings = {
+                str(item.get("unknown_binding") or "").strip()
+                for item in answered_needs
+                if str(item.get("unknown_binding") or "").strip()
             }
             semantic_state["unknown"] = [
                 item
                 for item in semantic_state.get("unknown", [])
-                if str(item) not in resolved_judgments
+                if str(item) not in resolved_bindings
             ]
         persisted, current_needs, needs_repaired = self._persist_semantic_and_needs(
             event=event,

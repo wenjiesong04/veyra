@@ -10,6 +10,30 @@ export function text(value: unknown, fallback = "—"): string {
   return fallback;
 }
 
+// These are server-owned fallback sentences, not a general translation layer.
+// Keep this allow-list deliberately small: model/user-authored text must remain
+// unchanged so the product never invents a translation for an unknown value.
+const SERVER_FALLBACK_COPY: Record<string, [string, string]> = {
+  "The relevant deadline is close enough that the next step may affect the outcome.": ["相关截止时间已经临近，下一步可能会影响结果。", "The relevant deadline is close enough that the next step may affect the outcome."],
+  "The timing has changed and is worth checking while the signal is still timely.": ["时间情况已经变化，趁信号仍然及时，现在值得检查。", "The timing has changed and is worth checking while the signal is still timely."],
+  "A material change was recorded and the current understanding should be kept aligned.": ["已记录重要变化，需要及时对齐当前理解。", "A material change was recorded and the current understanding should be kept aligned."],
+  "There is no new material signal that needs an interruption right now.": ["目前没有需要打扰你的新重要信号。", "There is no new material signal that needs an interruption right now."],
+  "A relevant deadline is close enough to affect the next step.": ["相关截止时间已临近，可能影响下一步。", "A relevant deadline is close enough to affect the next step."],
+  "A material change was recorded for this Situation.": ["这条 Situation 已记录重要变化。", "A material change was recorded for this Situation."],
+  "An unresolved unknown may affect the current understanding.": ["一项尚未解决的未知可能影响当前理解。", "An unresolved unknown may affect the current understanding."],
+  "A fresh observation boundary has arrived.": ["新的观察节点已经到来。", "A fresh observation boundary has arrived."],
+  "The timing crossed a useful threshold.": ["时间已经到了值得关注的节点。", "The timing crossed a useful threshold."],
+  "A relevant signal was observed.": ["观察到一项相关信号。", "A relevant signal was observed."],
+  "This is the next useful point to review.": ["这是现在值得重新查看的节点。", "This is the next useful point to review."],
+};
+
+/** Translate only an exact, known server fallback; preserve all other text. */
+export function serverFallbackText(value: unknown, en: boolean, fallback: string): string {
+  const raw = text(value, "");
+  if (!raw) return fallback;
+  return SERVER_FALLBACK_COPY[raw]?.[en ? 1 : 0] ?? raw;
+}
+
 export function numberValue(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
@@ -125,15 +149,44 @@ export function dateLabel(value: unknown, en: boolean): string {
   return date.toLocaleString(en ? "en-US" : "zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
+const STATUS_LABELS: Record<string, [string, string]> = {
+  active: ["进行中", "Active"], observed: ["已观察", "Observed"], success: ["可用", "Available"],
+  available: ["可用", "Available"], configured: ["已配置", "Configured"], connected: ["已连接", "Connected"],
+  empty: ["暂无", "Empty"], waiting: ["等待中", "Waiting"], pending: ["待处理", "Pending"], open: ["待补充", "Open"],
+  asked: ["已询问", "Asked"], answered: ["已回答", "Answered"], observing: ["观察中", "Observing"], resolved: ["已解决", "Resolved"],
+  terminal: ["已结束", "Closed"], closed: ["已关闭", "Closed"], degraded: ["部分可用", "Degraded"], fail_closed: ["暂不可用", "Unavailable"],
+  unavailable: ["暂不可用", "Unavailable"], not_configured: ["尚未配置", "Not configured"], unsupported: ["不支持", "Unsupported"],
+  denied: ["已拒绝", "Denied"], error: ["错误", "Error"], timeout: ["已超时", "Timed out"], timed_out: ["已超时", "Timed out"],
+  stale: ["已过期", "Stale"], fresh: ["新鲜", "Fresh"], expired: ["已过期", "Expired"], dismissed: ["已忽略", "Dismissed"],
+  loading: ["加载中", "Loading"], ready: ["就绪", "Ready"], disabled: ["已停用", "Disabled"], unknown: ["未知", "Unknown"],
+};
+
 export function statusLabel(value: unknown, en: boolean): string {
-  const normalized = text(value, "unknown").toLowerCase();
-  const labels: Record<string, [string, string]> = {
-    active: ["进行中", "Active"], observed: ["已观察", "Observed"], success: ["可用", "Available"],
-    empty: ["暂无", "Empty"], waiting: ["等待中", "Waiting"], open: ["待补充", "Open"],
-    asked: ["已询问", "Asked"], observing: ["观察中", "Observing"], resolved: ["已解决", "Resolved"],
-    terminal: ["已结束", "Closed"], degraded: ["部分可用", "Degraded"], fail_closed: ["暂不可用", "Unavailable"],
-  };
-  return labels[normalized]?.[en ? 1 : 0] ?? (en ? normalized : "未知");
+  const raw = text(value, "unknown");
+  const normalized = raw.toLowerCase();
+  return STATUS_LABELS[normalized]?.[en ? 1 : 0] ?? raw;
+}
+
+const PROGRESS_LABELS: Record<string, [string, string]> = {
+  unknown: ["未知", "Unknown"], not_started: ["未开始", "Not started"], in_progress: ["进行中", "In progress"],
+  blocked: ["受阻", "Blocked"], waiting: ["等待中", "Waiting"], completed: ["已完成", "Completed"],
+};
+
+export function progressLabel(value: unknown, en: boolean): string {
+  const raw = text(value, "unknown");
+  return PROGRESS_LABELS[raw.toLowerCase()]?.[en ? 1 : 0] ?? raw;
+}
+
+const EPISTEMIC_LABELS: Record<string, [string, string, string]> = {
+  reported: ["事实", "Fact", "fact"], observed: ["已观察", "Observed", "observed"],
+  inferred: ["推断", "Inference", "inference"], verified: ["已验证", "Verified", "verified"],
+  unknown: ["未知", "Unknown", "unknown"],
+};
+
+export function epistemicLabel(value: unknown, en: boolean): { label: string; tone: string } | null {
+  const raw = text(value, "").toLowerCase();
+  const selected = EPISTEMIC_LABELS[raw];
+  return selected ? { label: selected[en ? 1 : 0], tone: selected[2] } : null;
 }
 
 export type ProductViewSituation = ProductSituation;

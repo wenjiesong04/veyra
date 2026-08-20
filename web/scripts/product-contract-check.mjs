@@ -55,6 +55,11 @@ must(files.home.includes("degraded") && files.home.includes("category={freshness
 must(files.home.includes('.filter((item) => text(item.material_change, "").trim())'), "Recent changes are not guarded by material_change");
 must(files.situations.includes("projectionStatus") && files.situations.includes("category={freshnessCategory}"), "Situation list does not explicitly render degraded and freshness categories");
 must(files.shared.includes("freshnessLabel") && files.shared.includes("category?: unknown"), "Freshness category renderer is missing");
+must(files.productShared.includes("serverFallbackText") && files.productShared.includes("SERVER_FALLBACK_COPY"), "server fallback copy is not bounded by a shared allow-list");
+for (const fallback of ["The timing has changed and is worth checking while the signal is still timely.", "An unresolved unknown may affect the current understanding."]) must(files.productShared.includes(fallback), `known server fallback is missing from the product copy allow-list: ${fallback}`);
+must(files.productShared.includes("?? raw"), "unknown product copy must remain unchanged");
+must(files.home.includes("serverFallbackText") && files.home.includes("progressLabel"), "Today does not use bounded fallback/status presentation");
+must(files.situations.includes("progressLabel") && files.situations.includes("epistemicLabel"), "Situation detail does not use friendly progress/epistemic enum labels");
 must(files.conversation.includes("needs_session_link") && files.conversation.includes("disabled={needsConnection}"), "session-link state does not disable First Meeting input");
 must(files.conversation.includes("sessionLinkRequired") && files.conversation.includes("!inputScope || sessionLinkRequired"), "session-link state does not disable Chat input");
 must(!files.conversation.includes("ask an Agent") && !files.conversation.includes("请 Agent"), "Product copy claims an unavailable Agent capability");

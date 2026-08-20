@@ -3,7 +3,7 @@ import { AlertTriangle, ArrowRight, CalendarClock, CircleHelp, Eye, Flag, Refres
 import { getProductToday, type JsonValue, type ProductContext, type ProductInputScope, type ProductQuestion, type ProductReaction, type ProductSituation, type ProductToday } from "./api";
 import { ProductQuestions } from "./product_questions";
 import { ProductReactions, reactionRecords } from "./product_reactions";
-import { dateLabel, record, records, statusLabel, text, uniqueRecords } from "./product_shared";
+import { dateLabel, progressLabel, record, records, serverFallbackText, statusLabel, text, uniqueRecords } from "./product_shared";
 import { ErrorBlock, Freshness, isEnglish, Language, LoadingBlock, OwnerScope, StatusBadge, Surface } from "./shared";
 
 type Props = { scope: OwnerScope; productContext?: ProductContext | null; inputScope?: ProductInputScope | null; language?: Language; refreshKey?: number; onStartChat: (text: string) => void; onOpenHistory?: () => void; onChanged?: () => void };
@@ -20,16 +20,16 @@ function SituationPreview({ item, en }: { item: ProductSituation; en: boolean })
 }
 
 function ChangeRow({ item, en }: { item: ProductSituation; en: boolean }) {
-  return <div className="productChangeRow"><strong>{text(item.title ?? item.label, en ? "Situation updated" : "Situation 有了变化")}</strong><span>{text(item.material_change, en ? "A material change was observed." : "观察到一项重要变化。")}</span><small>{text(item.changed_at, en ? "Recently" : "最近")}</small></div>;
+  return <div className="productChangeRow"><strong>{text(item.title ?? item.label, en ? "Situation updated" : "Situation 有了变化")}</strong><span>{serverFallbackText(item.material_change, en, en ? "A material change was observed." : "观察到一项重要变化。")}</span><small>{text(item.changed_at, en ? "Recently" : "最近")}</small></div>;
 }
 
 function AttentionRow({ item, index, en }: { item: Record<string, JsonValue>; index: number; en: boolean }) {
   const situationId = text(item.situation_id, "");
   const reaction = record(item.reaction);
   const rank = typeof item.rank === "number" && Number.isFinite(item.rank) ? item.rank : null;
-  const whatChanged = text(item.material_change ?? item.what_changed ?? reaction.what_changed, en ? "A relevant signal was observed." : "观察到一项值得留意的变化。");
-  const whyNow = text(item.why_now ?? reaction.why_now, en ? "This is the next useful point to review." : "这是现在值得重新查看的节点。");
-  const recommendation = text(item.recommendation ?? item.suggested_next_step ?? reaction.recommendation, en ? "Review the Situation." : "查看这条 Situation。");
+  const whatChanged = serverFallbackText(item.material_change ?? item.what_changed ?? reaction.what_changed, en, en ? "A relevant signal was observed." : "观察到一项值得留意的变化。");
+  const whyNow = serverFallbackText(item.why_now ?? reaction.why_now, en, en ? "This is the next useful point to review." : "这是现在值得重新查看的节点。");
+  const recommendation = serverFallbackText(item.recommendation ?? item.suggested_next_step ?? reaction.recommendation, en, en ? "Review the Situation." : "查看这条 Situation。");
   const href = situationId ? `#/situations/${encodeURIComponent(situationId)}` : "#";
   return <article className="productAttentionRow">
     <div className="productAttentionTop"><span className="attentionRank">#{index + 1}</span><strong>{text(item.title, en ? "Situation" : "Situation")}</strong>{rank !== null ? <small>{rank.toFixed(2)}</small> : null}</div>
@@ -61,7 +61,7 @@ function TodayView({ today, scope, language, readAt, onChanged }: { today: Produ
       <TodayCard title={en ? "Worth your attention now" : "现在值得关注"} icon={<Flag size={17} />} className="spanWide">{attention.length ? attention.slice(0, 8).map((item, index) => <AttentionRow key={`${text(item.situation_id, "attention")}-${index}`} item={item} index={index} en={en} />) : <p className="productMuted">{en ? "Nothing has crossed Veyra's attention threshold." : "暂时没有事项越过 Veyra 的关注阈值。"}</p>}</TodayCard>
       <TodayCard title={en ? "In progress" : "正在关心"} icon={<Eye size={17} />} className="spanWide">{situations.length ? situations.slice(0, 6).map((item, index) => <SituationPreview key={text(item.situation_id, String(index))} item={item} en={en} />) : <p className="productMuted">{en ? "No active Situation." : "暂无进行中的 Situation。"}</p>}</TodayCard>
       <TodayCard title={en ? "Recent changes" : "最近变化"} icon={<Sparkles size={17} />}>{changes.length ? changes.slice(0, 4).map((item, index) => <ChangeRow key={`${text(item.situation_id, "change")}-${index}`} item={item} en={en} />) : <p className="productMuted">{en ? "No material change recorded." : "暂无重要变化记录。"}</p>}</TodayCard>
-      <TodayCard title={en ? "Deadlines" : "临近时间"} icon={<CalendarClock size={17} />}>{deadlines.length ? deadlines.slice(0, 4).map((item, index) => <div className="productDeadlineRow" key={`${text(item.situation_id, "deadline")}-${index}`}><strong>{text(item.title ?? item.label, en ? "Upcoming" : "即将到来")}</strong><span>{dateLabel(item.deadline_at, en)}</span><small>{text(item.progress, en ? "Progress is not known yet." : "进展尚不清楚。")}</small></div>) : <p className="productMuted">{en ? "No deadline is close enough to surface." : "暂无需要现在提示的时间点。"}</p>}</TodayCard>
+      <TodayCard title={en ? "Deadlines" : "临近时间"} icon={<CalendarClock size={17} />}>{deadlines.length ? deadlines.slice(0, 4).map((item, index) => { const progress = record(item.progress); const progressValue = Object.keys(progress).length ? progress.status : item.progress; return <div className="productDeadlineRow" key={`${text(item.situation_id, "deadline")}-${index}`}><strong>{text(item.title ?? item.label, en ? "Upcoming" : "即将到来")}</strong><span>{dateLabel(item.deadline_at, en)}</span><small>{progressLabel(progressValue, en)}</small></div>; }) : <p className="productMuted">{en ? "No deadline is close enough to surface." : "暂无需要现在提示的时间点。"}</p>}</TodayCard>
       <TodayCard title={en ? "May be missed" : "可能遗漏"} icon={<Flag size={17} />}>{unknowns.length ? unknowns.slice(0, 5).map((item, index) => <div className="productUnknownRow" key={`${text(item.situation_id, "unknown")}-${index}`}><strong>{text(item.statement, en ? "An unknown may matter." : "有一项未知可能影响判断。")}</strong><small>{en ? "Still unknown" : "仍未知"}</small></div>) : waiting.length ? waiting.slice(0, 4).map((item, index) => <div className="productUnknownRow" key={`waiting-${index}`}><strong>{text(item.what_changed ?? item.message, en ? "Veyra is waiting." : "Veyra 正在等待。")}</strong><small>{en ? "Waiting for a clearer signal" : "等待更清晰的信号"}</small></div>) : <p className="productMuted">{en ? "No likely omission surfaced." : "暂时没有发现可能遗漏。"}</p>}</TodayCard>
       <TodayCard title={en ? "Questions" : "还想问你"} icon={<CircleHelp size={17} />} className="spanWide"><ProductQuestions questions={questions} scope={scope} language={language} onChanged={onChanged} compact /></TodayCard>
       <TodayCard title={en ? "Suggestions" : "建议"} icon={<Sparkles size={17} />} className="spanWide"><ProductReactions reactions={suggestions} scope={scope} language={language} onChanged={onChanged} compact /></TodayCard>
