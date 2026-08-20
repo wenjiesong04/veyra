@@ -1,53 +1,119 @@
 # Current Status
 
-> Evidence snapshot date: 2026-08-14 (Asia/Shanghai)
+> Evidence snapshot date: 2026-08-20 (Asia/Shanghai)
 >
-> 本页是 Project OS 的 current Living truth，不是 North Star。历史 live 不能自动继承到新 revision；提交、推送和 exact-SHA Actions 仍需独立核验。
+> 本页是 Project OS 的 current Living truth。当前 V1 工作树仍是未提交的
+> local alpha；自动化已收口，但没有把真实模型、clean runtime、live、浏览器
+> 或远端 CI 证据互相继承。未闭合的证据位置保持 `PENDING`，不稳定的真实模型
+> 证据标为 `PARTIAL / DEGRADED`。
 
-## Current revision and worktree
-
-- Final application evidence revision: `e5fcf80ad3e1e6e54f3602603bdf941e5aa8fd37` (`e5fcf80`)；Product Preview code slice is in its parent feature changeset `80ff937`.
-- `runtime v2` clean-start evidence is bound to `e5fcf80`: Python 3.11.15, `dirty_flag=false`, exact build identity, and business-state GETs remained byte-pure. This is revision-scoped evidence, not a claim that the shared worktree is currently clean.
-- A clean final package on `e5fcf80` is validated. Push and exact-SHA GitHub Actions remain `PENDING`.
-
-## V0-001 — Local Product Preview
-
-Status: `LOCAL_VALIDATED / OWNER_ACCEPTANCE_PENDING`
-
-Veyra 0.1 is a local-first Product Preview, not Consumer V1 and not a public or externally delivering release. The default surface is Today-first: exact-scope context, current Situation/Attention, record-only suggestion preview, honest unknown/waiting state, curated Status, and a continuing conversation. Advanced remains the old operator console.
-
-### Evidence recorded for `e5fcf80`
-
-| Surface | Evidence | Honest label |
-|---|---|---|
-| Python gate | `148/148` = `145` invariant + `1` cognitive capability + `2` product capability | `AUTOMATED_VALIDATED` |
-| Route / governance | 9-route non-regression `810/810`; authority and record-only boundaries unchanged | `AUTOMATED_VALIDATED` |
-| OpenClaw | plugin contract `32/32` | `AUTOMATED_VALIDATED` |
-| Product backend | exact owner/session context, ambiguity/mismatch fail-closed, stable Matters sections, GET byte-purity, record-only preview and SSE lifecycle smoke | `AUTOMATED_VALIDATED` |
-| Web / desktop / browser | Web build, Desktop frontend build, browser acceptance, 390×844 readability, shared history sanitizer and `/product` contract | `AUTOMATED_VALIDATED + BOUNDED LIVE` |
-| Conversation | real SSE phases `accepted → phase → message → completed`; duplicate/rejected/failed are typed and no token/CoT stream is claimed | `AUTOMATED_VALIDATED` |
-| Local app | clean `build_desktop.sh package` exit `0`; ad-hoc Apple Silicon arm64 `.app`; bundled sidecar is Mach-O arm64, Python 3.11.15, PyInstaller 6.22.0; sidecar smoke, strict codesign and normalized payload comparison completed. App tree SHA-256 `c62ac2a0c69865278ecc4096ac69105442e985c0aec0ee5b3c5f3ae0666abeca`; sidecar SHA-256 `a996f308d0c18443238c646c143f1966b66d8944b1ed707dc46be33264c95501` | `LOCAL_VALIDATED / NOT NOTARIZED` |
-| Remote gate | final branch push and exact-SHA Actions | must be verified externally before handoff; never self-attested by this SHA-producing document |
-| Public release | Developer ID, notarization, DMG/store distribution | `OUT OF SCOPE / NOT VALIDATED` |
-
-### Known degraded or intentionally unproven
-
-- P1 and P2 remain `PARTIAL`; the Workspace Observer is a bounded trusted canary, not a multi-source or general-life producer.
-- User usefulness, timing, false silence and feedback aftereffect are not validated. The next planned slice is `LC-001 — Real non-code Situation`; it is not the current task while V0-001 remains release-evidence-pending.
-- `ask` remains dormant; `record_only` is the default and external delivery, Agent/Tool execution, Route/Risk changes and new authority remain disabled.
-- Generic cognition remains overconservative, production Economy metadata is incomplete, and no durable server conversation store is promised.
-- Feishu/OpenClaw connectivity and any external delivery claim require a fresh current-run message; local Product Preview evidence does not imply that proof.
-
-## Current evidence by dimension
+## Release class and evidence ladder
 
 | Dimension | Current label | Boundary |
 |---|---|---|
-| Implementation | `IMPLEMENTED IN BOUNDED V0.1 SLICE` | Product read model/router and Today-first UI exist; they do not replace underlying state truth. |
-| Configuration | `LOCAL / LOOPBACK-TAURI` | Non-loopback remains subject to the existing local control-token policy. |
-| Verification | `AUTOMATED_VALIDATED + BOUNDED LIVE` | Application evidence is revision-scoped to `e5fcf80`; the final branch SHA must be checked against GitHub Actions at handoff. |
-| Runtime | `DEGRADED WHERE SOURCES ARE UNKNOWN` | Unknown freshness/readiness is shown as unknown, never upgraded to production-ready. |
-| Authority | `RECORD_ONLY / NO EXTERNAL DELIVERY` | Product GETs and previews cannot grant execution, tool, route, risk or delivery authority. |
+| Release class | `PRIVATE LOCAL ALPHA` | 本机 alpha；不是公开发布或外部交付产品 |
+| Implementation | `IMPLEMENTED` | V1 semantic/reaction/source/product paths exist in the shared worktree |
+| Automated | `AUTOMATED_VALIDATED` | final local gate `165/165` (`145` invariant + `1` cognitive + `19` product), OpenClaw `32/32`, Route `810/810`, Web/Desktop build/product contract/bundle green |
+| Real model | `REAL_MODEL_VALIDATED: PARTIAL / DEGRADED` | multiple isolated Moonshot runs together show three generic scenarios with create `3/3` once successful, update `3/3` once successful, Calendar update `1/1` once successful, and model-parsed/persisted `ignore feedback`; no single run completed the full chain. Final run: create `3/3`, update `2/3`, degraded by timeline `source_quote` binding fluctuation |
+| Bounded live | `BOUNDED_LIVE: PENDING` | clean runtime/restart identity, current source/live and browser acceptance not closed |
+| Two-week usefulness | `14_DAY_USEFULNESS: PENDING` | no 14-day owner sample or usefulness thresholds |
+| User validation | `USER_VALIDATED: PENDING` | owner acceptance and correction/timing evidence not closed |
+| Authority | `RECORD_ONLY / NO EXTERNAL DELIVERY` | Agent research, Tool/Grant expansion and external delivery remain disabled |
+
+## Current revision and worktree
+
+- Branch: `cognitive-awakening`.
+- Base HEAD observed for this documentation pass: `7439aeb`.
+- V1 implementation changes are uncommitted in the shared worktree; this status
+  page does not claim a final SHA, clean tree, push or exact-SHA Actions result.
+- The final local gate is green, but the worktree remains uncommitted. This page
+  does not claim a final SHA, clean tree, push or exact-SHA Actions result.
+
+## V1-001 — Living Context Alpha
+
+Status: `PRIVATE LOCAL ALPHA / IMPLEMENTED + AUTOMATED_VALIDATED / REAL_MODEL_VALIDATED PARTIAL / DEGRADED`
+
+V1 maintains one Living Context logical projection for three non-hardcoded life
+Situation families: travel/meeting/event arrangements, job-search/application/
+study plans, and moving/personal-project/family plans. The durable semantic view
+keeps Known, Unknown, Assumptions, timeline, evidence, Information Need and
+material change tied to exact owner/session/Situation scope.
+
+The reaction surface is bounded to `ask`, `read`, `wait`, `silent` and `suggest`
+with an explanation of what happened, why it matters, why now and the next step.
+Feedback can affect timing, cooldown and suppression within the governed local
+ledger, and LivingReaction history has a bounded archive/retention path with
+replay and scope/tamper checks. Calendar, Weather and Public Web are read-only
+source classes with server-owned scope/consent/freshness/receipt boundaries; a
+deterministic Calendar chain and separate real provider read are evidenced, as are
+current real reads for Weather and Public Web. Agent research and external
+delivery are disabled.
+
+### Product information architecture
+
+The current product route contract is:
+
+- `#/` — independent quiet First Meeting home;
+- `#/today` — independent Today view, not the default home;
+- `#/situations` and Situation detail — durable concerns, evidence, unknowns and
+  reactions;
+- `#/chat/<id>` — dedicated Chat for input, answers and corrections.
+
+Advanced/Developer Console remains a separate technical surface. A successful
+build does not prove these routes were accepted in a live browser.
+
+### Evidence ledger
+
+| Evidence position | Current state | What it supports | What it does not support |
+|---|---|---|---|
+| Python full gate | `AUTOMATED_VALIDATED` | final `165/165` = `145` invariant + `1` cognitive + `19` product | user value |
+| OpenClaw / Route | `AUTOMATED_VALIDATED` | OpenClaw `32/32`; Route `810/810`; governance/non-regression boundaries | external connectivity or delivery |
+| Web/Desktop build, product contract, bundle | `AUTOMATED_VALIDATED` | frontend product-contract, status-tone, build, `check:bundle` and `build:desktop` all PASS | browser acceptance, served revision, mobile readability |
+| Local desktop package | `LOCAL PREVIEW / AUTOMATED_VALIDATED` | final local arm64 Mach-O package PASS; Python `3.11.15`, PyInstaller `6.22.0`, Rust `1.96.1`, Tauri `2.11.4`; sidecar smoke PASS, normalized cmp PASS, `codesign --verify --deep --strict` PASS; App `NSAppleEventsUsageDescription` and `automation.apple-events` entitlement present; sidecar SHA `471ef080f84639e8ca445fe20c91695095873a004854290008f6d1012304351`, Veyra.app tree SHA `0257a1b8b004cbb95deee158164bacdc5481d6921193169b04e5a30a570ab590` | actual Calendar TCC user authorization; ad-hoc local preview, not Developer ID/notarized/DMG/public release |
+| Moonshot natural input | `REAL_MODEL_VALIDATED: PARTIAL / DEGRADED` | multiple isolated runs together show three generic scenarios with create `3/3` once successful, update `3/3` once successful, Calendar update `1/1` once successful, and model-parsed/persisted `ignore feedback`; no single run completed the full chain. Final run: create `3/3`, update `2/3`, degraded by timeline `source_quote` binding fluctuation | no single-run full-chain PASS; provider stability, long-term usefulness and Jarvis remain unproven |
+| Calendar / Weather / Public Web | `IMPLEMENTED + AUTOMATED_VALIDATED + REAL_SOURCE_READ_OBSERVED` | read-only source contracts; deterministic Calendar full chain; separate real Calendar/Weather/Public Web reads | actual packaged-app Calendar TCC authorization, restart and current served revision |
+| LivingReaction retention | `IMPLEMENTED + AUTOMATED_VALIDATED` | bounded archive/retention, replay and tamper/scope failure paths | long-term owner usage and operational soak |
+| Feedback | `IMPLEMENTED + AUTOMATED_VALIDATED` | bounded timing/cooldown/suppression ledger behavior | long-term calibration or user usefulness |
+| Clean runtime/restart | `BOUNDED_LIVE: PENDING` | — | runtime identity, restart and current served revision |
+| Browser / 390×844 | `BOUNDED_LIVE: PENDING` | — | route, layout and data-contract acceptance |
+| Push / exact-SHA CI | `PENDING` | — | remote build or delivery |
+| 14-day usefulness / owner validation | `PENDING` | — | usefulness, false silence, wrong timing, trust or launch readiness |
+
+## V0-001 disposition
+
+`V0-001 — Local Product Preview` is explicitly absorbed into V1-001 by the
+owner-expanded scope. Its bounded product projection and historical local package
+remain context, but it is not recorded as an independent V1 launch, Consumer V1,
+or user-validated release. Older V0 wording that called Today the default home is
+historical and does not override the route contract above.
+
+## Known degraded or intentionally unproven
+
+- Full `REAL_MODEL_VALIDATED` cannot be claimed before one complete, reproducible
+  same-run natural-language full chain passes; the final run had timeline
+  `source_quote` binding fluctuation, so current multi-run evidence remains
+  `PARTIAL / DEGRADED`.
+- Clean runtime/live, browser/390×844, served revision, exact-SHA CI and push are
+  unverified for the current worktree; exact-SHA runtime, browser, owner acceptance
+  and GitHub Actions remain `PENDING` before commit/push.
+- The arm64 Mach-O package is only a `LOCAL PREVIEW`: it is ad-hoc local and not
+  Developer ID signed, notarized, a DMG or a public release. Calendar's actual TCC
+  user authorization is still pending even though the app metadata/entitlement is
+  present.
+- `14_DAY_USEFULNESS` and `USER_VALIDATED` have no evidence; no launch-worthiness
+  or two-week usefulness conclusion is permitted.
+- Feedback effects are bounded to non-authority timing/cooldown/suppression; a
+  durable improvement in usefulness is not proven.
+- P3 identity/relationship expansion and Phase 6 self-extension are outside the
+  V1 gate; no future capability is implied by the automated green state.
 
 ## Next decision
 
-Do not mark V0-001 complete or archive it as `LC-001`. The clean local package is closed, while final remote-gate evidence belongs in the GitHub handoff rather than this self-referential document. After that gate passes, V0-001 still waits for owner acceptance of the local preview. Only an explicit owner decision may close it and open the planned real non-code `LC-001` Situation slice.
+Root should now independently establish clean runtime/restart, actual Calendar TCC
+user authorization, browser/390×844, served revision and exact-SHA CI/push evidence;
+the local package build itself is validated, but it remains a LOCAL PREVIEW. Resolve
+the timeline `source_quote` binding fluctuation and rerun one complete same-run
+natural-language acceptance once. Only
+after that may the relevant `PENDING` or `PARTIAL / DEGRADED` labels
+be reconsidered. A real two-week owner sample remains a separate product-
+validation decision.

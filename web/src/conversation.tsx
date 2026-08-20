@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, ArrowUpRight, Clock3, History, Info, MessageCircle, Paperclip, Plus, Send, ShieldCheck, Sparkles, X } from "lucide-react";
-import { getProductToday, streamMessage, type MessageResult, type MessageStreamEvent, type ProductContext, type ProductInputScope, type ProductToday } from "./api";
-import { asItems, asRecord, Disclosure, ErrorBlock, formatTime, isEnglish, Language, OwnerScope, sanitizeHistory, StatusBadge, Surface } from "./shared";
+import { streamMessage, type MessageResult, type MessageStreamEvent, type ProductContext, type ProductInputScope } from "./api";
+import { Disclosure, formatTime, isEnglish, Language, OwnerScope, safeText, sanitizeHistory, Surface } from "./shared";
 
 export type LocalConversation = {
   id: string;
@@ -75,7 +75,7 @@ function phaseText(phase: string | undefined, en: boolean): string {
     queued: ["正在排队", "Queued"],
     understanding: ["正在理解", "Understanding"],
     processing: ["正在处理", "Processing"],
-    agent: ["等待 Agent", "Waiting for Agent"],
+    agent: ["等待可用能力", "Waiting for an available capability"],
     review_required: ["需要你确认", "Needs your confirmation"],
     verifying: ["正在验证", "Verifying"],
     message: ["正在整理回应", "Preparing the response"],
@@ -97,73 +97,53 @@ function eventPhase(event: MessageStreamEvent): string | undefined {
   return undefined;
 }
 
-function listText(value: unknown): string {
-  if (!Array.isArray(value)) return "";
-  return value.map((item) => {
-    if (typeof item === "string" || typeof item === "number") return String(item);
-    if (item && typeof item === "object" && !Array.isArray(item)) {
-      const record = item as Record<string, unknown>;
-      return typeof record.label === "string" ? record.label : typeof record.title === "string" ? record.title : "";
-    }
-    return "";
-  }).filter(Boolean).slice(0, 5).join(" · ");
-}
-
-export function HomePage({ scope, productContext, inputScope, language = "zh", onOpenHistory, onStartChat }: { scope: OwnerScope; productContext?: ProductContext | null; inputScope?: ProductInputScope | null; language?: Language; onOpenHistory?: () => void; onStartChat: (text: string) => void }) {
+/**
+ * First meeting stays intentionally quiet. Product situations and runtime
+ * summaries belong to Matters/Status; this route only helps a person begin.
+ */
+export function HomePage({ scope: _scope, productContext, inputScope, language = "zh", onOpenHistory, onStartChat }: { scope: OwnerScope; productContext?: ProductContext | null; inputScope?: ProductInputScope | null; language?: Language; onOpenHistory?: () => void; onStartChat: (text: string) => void }) {
   const [text, setText] = useState("");
-  const [today, setToday] = useState<ProductToday | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
   const en = isEnglish(language);
   const contextStatus = String(productContext?.status ?? "loading");
-  const load = async () => {
-    if (!productContext || !["ready", "empty"].includes(contextStatus)) return;
-    setLoading(true); setLoadError(null);
-    try { setToday(await getProductToday({ user_id: scope.userId, session_id: scope.sessionId })); }
-    catch (caught) { setLoadError(caught instanceof Error ? caught.message : (en ? "Today is temporarily unavailable" : "Today 暂时不可用")); }
-    finally { setLoading(false); }
-  };
-  useEffect(() => { void load(); }, [scope.userId, scope.sessionId, contextStatus]);
-  const prompts = useMemo(() => en ? ["What am I working on?", "Remember a task for me", "Is Agent online?"] : ["我正在做什么？", "帮我记下一个待办", "看看 Agent 是否在线"], [en]);
+  const prompts = useMemo(
+    () => en
+      ? ["What deserves my attention?", "Help me set a goal", "Check the current runtime"]
+      : ["看看最近有什么值得关注", "帮我建立一个目标", "检查当前运行状态"],
+    [en],
+  );
+  const needsConnection = contextStatus === "loading" || contextStatus === "needs_session_link" || contextStatus === "degraded" || !inputScope;
+  const connectionCopy = contextStatus === "loading"
+    ? (en ? "Preparing the local connection…" : "正在准备本机连接…")
+    : contextStatus === "needs_session_link"
+      ? (en ? "This input is paused until the local session link is verified." : "本地 session link 完成验证前，输入已暂停。")
+      : contextStatus === "degraded"
+        ? (en ? "The local product state is degraded; input stays paused until scope can be verified." : "本机产品状态部分不可用；作用域验证完成前，输入会保持暂停。")
+        : (en ? "Before we begin, Veyra needs a local connection." : "开始前，Veyra 需要完成本地连接。");
   const submit = (event?: FormEvent) => {
     event?.preventDefault();
     const value = text.trim();
-    if (!value) return;
+    if (!value || !inputScope) return;
     setText("");
-    if (!inputScope) return;
     onStartChat(value);
   };
   const iconPath = `${import.meta.env.BASE_URL}veyra-icon.png`;
-  const goal = asRecord(today?.goal ?? productContext?.goal);
-  const situations = asItems(today?.situations);
-  const suggestions = asItems(today?.suggestions);
-  const attention = asItems(today?.attention);
-  const questions = asRecord(today?.questions);
-  const freshness = asRecord(today?.freshness);
-  const waiting = asItems(today?.waiting);
-  const emptyContext = contextStatus === "empty" || today?.status === "empty";
-  return <div className="conversationPage homePage todayPage">
-    <div className="welcomeKicker"><span className="kickerLine" />{en ? "TODAY" : "今天"}<span className="kickerLine" /></div>
+  return <div className="conversationPage homePage">
+    <div className="welcomeKicker"><span className="kickerLine" />{en ? "FIRST MEETING" : "初见"}<span className="kickerLine" /></div>
     <div className="welcomeMark" aria-hidden="true"><img src={iconPath} alt="" /><span /></div>
-    <h1>{en ? "What Veyra is keeping in view" : "Veyra 正在关注什么"}</h1>
-    <p className="welcomeLead">{goal.title ? String(goal.title) : en ? "Your local product context is ready when you are." : "你的本机产品上下文已准备好。"}</p>
-    {contextStatus === "loading" ? <Surface className="todayState"><span>{en ? "Connecting to the local product context…" : "正在连接本机产品上下文…"}</span></Surface> : null}
-    {!["loading", "ready", "empty"].includes(contextStatus) ? <Surface className="todayState"><StatusBadge value={contextStatus} /><span>{en ? "This product context needs a local session link before conversation can continue." : "产品上下文需要本机 session link，之后才能继续对话。"}</span></Surface> : null}
-    {loadError ? <ErrorBlock message={loadError} onRetry={() => void load()} /> : null}
-    {loading && !today ? <div className="todayLoading">{en ? "Reading Today…" : "正在读取 Today…"}</div> : null}
-    {today && !emptyContext ? <><div className="todayFreshness"><span>{en ? "Sources" : "来源"}: {String(freshness.situations ?? "unknown")}</span><span>{en ? "Attention" : "关注"}: {String(freshness.attention ?? "unknown")}</span></div><div className="todayGrid"><Surface className="todayCard todayFocusCard"><div className="todayCardHeader"><span className="eyebrow">{en ? "CURRENT SITUATION" : "当前情境"}</span><StatusBadge value={situations[0]?.status ?? "observed"} /></div>{situations.length ? <><h2>{String(situations[0].title ?? goal.title ?? (en ? "Current focus" : "当前关注"))}</h2><p>{String(situations[0].summary ?? (en ? "Veyra is observing this focus." : "Veyra 正在观察这一关注。"))}</p><small>{en ? "Known" : "已知"}: {listText(situations[0].known) || "—"}</small><small>{en ? "Unknown" : "仍未知"}: {listText(situations[0].unknown) || "—"}</small><small>{en ? "Changed" : "变化"}: {String(situations[0].changed_at ?? "unknown")}</small></> : <div className="todayEmpty">{en ? "No current situation is recorded yet." : "当前还没有记录情境。"}</div>}{attention.length ? <div className="todayListItem"><strong>{en ? "Attention hypothesis" : "关注假设"}: {String(attention[0].title ?? "—")}</strong><small>{en ? "Why now" : "为什么现在"}: {String(attention[0].why_now ?? "unknown")}</small></div> : null}</Surface><Surface className="todayCard"><div className="todayCardHeader"><span className="eyebrow">{en ? "SUGGESTIONS" : "建议"}</span><StatusBadge value={suggestions.length ? "recorded" : "empty"} /></div>{suggestions.length ? suggestions.slice(0, 2).map((item, index) => <div className="todayListItem" key={index}><strong>{String(item.message ?? (en ? "Suggestion preview" : "建议预览"))}</strong><small>{en ? "Recorded only · delivery none" : "仅记录 · 不发送"}</small></div>) : <div className="todayEmpty">{en ? "No current suggestion is ready." : "当前没有可信建议。"}</div>}</Surface><Surface className="todayCard"><div className="todayCardHeader"><span className="eyebrow">{en ? "QUESTIONS" : "问题"}</span><StatusBadge value={questions.status ?? "unsupported"} /></div>{questions.status === "unsupported" ? <div className="todayEmpty">{en ? "No trusted production question is available yet." : "当前没有可信的生产问题记录。"}</div> : <div className="todayListItem"><strong>{String(questions.items ?? "—")}</strong></div>}</Surface><Surface className="todayCard"><div className="todayCardHeader"><span className="eyebrow">{en ? "WAITING" : "等待"}</span><StatusBadge value={waiting.length ? "waiting" : "quiet"} /></div>{waiting.length ? waiting.slice(0, 2).map((item, index) => <div className="todayListItem" key={index}><strong>{String(item.message ?? (en ? "Waiting for a clearer signal" : "等待更清晰的信号"))}</strong></div>) : <div className="todayEmpty">{en ? "Nothing is waiting right now." : "目前没有等待中的事项。"}</div>}</Surface></div></> : null}
+    <h1>{en ? "Hi, I’m Veyra." : "你好，我是 Veyra。"}</h1>
+    <p className="welcomeLead">{en ? "I’ll first understand what you’re doing, then decide whether to answer, remember, remind you, or stay quiet." : "我会先了解你正在做什么，再决定是回答、记录、提醒，还是保持安静。"}</p>
+    {needsConnection ? <div className="welcomeNote connectionNote"><Info size={15} /><span>{connectionCopy}</span>{contextStatus !== "loading" ? <a href="#/settings">{en ? "Open Settings" : "打开设置"}<ArrowUpRight size={13} /></a> : null}</div> : null}
     <form className="composer" onSubmit={submit}>
-      <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder={en ? "Tell me what you’re working on…" : "告诉我你正在做什么，或希望我关注什么…"} aria-label={en ? "Message" : "输入消息"} rows={2} />
-      <div className="composerBar"><span className="composerHint"><ShieldCheck size={14} />{inputScope ? (en ? "Local Veyra · lifecycle events are real" : "本机 Veyra · 使用真实生命周期事件") : (en ? "Conversation waits for a local session link" : "对话等待本机 session link")}</span><div className="composerActions"><button type="button" className="iconButton subtle" title={en ? "Attachments not enabled" : "附件暂未启用"} aria-label={en ? "Attachments not enabled" : "附件暂未启用"} disabled><Paperclip size={17} /></button><button className="sendButton" type="submit" disabled={!text.trim() || !inputScope}><Send size={17} /><span>{en ? "Continue conversation" : "继续对话"}</span></button></div></div>
+      <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder={en ? "Tell me what you’re working on, or what I should keep in view…" : "告诉我你正在做什么，或希望我关注什么…"} aria-label={en ? "Message" : "输入消息"} rows={2} disabled={needsConnection} />
+      <div className="composerBar"><span className="composerHint"><ShieldCheck size={14} />{inputScope ? (en ? "Local Veyra · actions remain reviewable" : "本机 Veyra · 行动始终可复核") : (en ? "Waiting for the local connection" : "等待本机连接")}</span><div className="composerActions"><button type="button" className="iconButton subtle" title={en ? "Attachments not enabled" : "附件暂未启用"} aria-label={en ? "Attachments not enabled" : "附件暂未启用"} disabled><Paperclip size={17} /></button><button className="sendButton" type="submit" disabled={!text.trim() || !inputScope}><Send size={17} /><span>{en ? "Start conversation" : "开始对话"}</span></button></div></div>
     </form>
     <div className="promptRow" aria-label={en ? "Suggestions" : "引导问题"}>{prompts.map((prompt) => <button key={prompt} type="button" onClick={() => setText(prompt)}><Sparkles size={14} />{prompt}</button>)}</div>
-    <div className="welcomeNote"><Info size={15} /><span>{en ? "Boundary: this preview records suggestions only; important actions wait for your confirmation." : "边界：这个预览只记录建议；重要行动会显示依据并等待你的确认。"}</span></div>
     <div className="conversationFooter"><span>{en ? "A quiet place to begin · local browser history" : "从这里安静地开始 · 历史仅保存在本机浏览器"}</span><button className="textButton" type="button" onClick={onOpenHistory}><History size={14} />{en ? "View history" : "查看会话历史"}<ArrowUpRight size={13} /></button></div>
   </div>;
 }
 
 /** Dedicated conversation workspace. The landing page never renders a prior response. */
-export function ChatPage({ scope, inputScope, language = "zh", conversationId, historyEpoch = 0, pendingText, onPendingConsumed, onOpenHistory, onNewConversation, onHistoryChange }: { scope: OwnerScope; inputScope?: ProductInputScope | null; language?: Language; conversationId: string; historyEpoch?: number; pendingText?: string | null; onPendingConsumed?: () => void; onOpenHistory?: () => void; onNewConversation: () => void; onHistoryChange?: (items: LocalConversation[]) => void }) {
+export function ChatPage({ scope, inputScope, inputStatus, language = "zh", conversationId, historyEpoch = 0, pendingText, onPendingConsumed, onOpenHistory, onNewConversation, onBackHome, onHistoryChange }: { scope: OwnerScope; inputScope?: ProductInputScope | null; inputStatus?: string; language?: Language; conversationId: string; historyEpoch?: number; pendingText?: string | null; onPendingConsumed?: () => void; onOpenHistory?: () => void; onNewConversation: () => void; onBackHome?: () => void; onHistoryChange?: (items: LocalConversation[]) => void }) {
   const en = isEnglish(language);
   const [turns, setTurns] = useState<LocalConversation[]>(() => recoverInterruptedTurns(readHistory(scope).filter((item) => conversationIdFor(item) === conversationId), en));
   const [draft, setDraft] = useState("");
@@ -171,6 +151,7 @@ export function ChatPage({ scope, inputScope, language = "zh", conversationId, h
   const [activePhase, setActivePhase] = useState<string | undefined>();
   const [error, setError] = useState<string | null>(null);
   const startedPending = useRef<string | null>(null);
+  const sessionLinkRequired = inputStatus === "needs_session_link";
 
   useEffect(() => {
     setTurns(recoverInterruptedTurns(readHistory(scope).filter((item) => conversationIdFor(item) === conversationId), en));
@@ -214,6 +195,7 @@ export function ChatPage({ scope, inputScope, language = "zh", conversationId, h
         if (phase) { setActivePhase(phase); updateTurn(item.id, { phase }); }
       }, inputScope.channel);
       updateTurn(item.id, { result, status: "completed", phase: "completed" });
+      if (typeof window !== "undefined") window.dispatchEvent(new Event("veyra:refresh-product"));
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : (en ? "Veyra could not finish this request" : "Veyra 暂时没有完成这个请求");
       setError(message); updateTurn(item.id, { status: "failed", phase: "failed", error: message });
@@ -240,8 +222,8 @@ export function ChatPage({ scope, inputScope, language = "zh", conversationId, h
       {orderedTurns.map((item) => <ChatTurn key={item.id} item={item} language={language} />)}
       {busy ? <div className="streamStatus"><Clock3 size={16} className="spinIcon" /><span>{phaseText(activePhase, en)}</span><small>{en ? "Live lifecycle event · no simulated typing" : "真实生命周期事件 · 不模拟逐字输出"}</small></div> : null}
     </div>
-    <form className="composer chatComposer" onSubmit={(event) => { event.preventDefault(); void submitText(draft); }}><textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={en ? "Continue the conversation…" : "继续告诉 Veyra…"} aria-label={en ? "Continue the conversation" : "继续对话"} rows={2} disabled={busy} /><div className="composerBar"><span className="composerHint"><ShieldCheck size={14} />{en ? "Local Veyra · actions remain reviewable" : "本机 Veyra · 行动始终可复核"}</span><div className="composerActions"><button type="button" className="iconButton subtle" disabled aria-label={en ? "Attachments not enabled" : "附件暂未启用"}><Paperclip size={17} /></button><button className="sendButton" type="submit" disabled={busy || !draft.trim()}>{busy ? <Clock3 size={17} className="spinIcon" /> : <Send size={17} />}<span>{busy ? (en ? "Working…" : "处理中…") : (en ? "Send" : "发送")}</span></button></div></div></form>
-    <div className="chatFooter"><button className="textButton" type="button" onClick={onNewConversation}><ArrowLeft size={14} />{en ? "Back to first meeting" : "回到初见"}</button><span>{en ? "History is local to this browser" : "历史仅保存在当前浏览器"}</span></div>
+    <form className="composer chatComposer" onSubmit={(event) => { event.preventDefault(); void submitText(draft); }}><textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={sessionLinkRequired ? (en ? "Waiting for the local session link…" : "等待本地 session link…") : (en ? "Continue the conversation…" : "继续告诉 Veyra…")} aria-label={en ? "Continue the conversation" : "继续对话"} rows={2} disabled={busy || !inputScope || sessionLinkRequired} /><div className="composerBar"><span className="composerHint"><ShieldCheck size={14} />{sessionLinkRequired ? (en ? "Input paused · local session link required" : "输入已暂停 · 需要本地 session link") : inputScope ? (en ? "Local Veyra · actions remain reviewable" : "本机 Veyra · 行动始终可复核") : (en ? "Waiting for the local connection" : "等待本机连接")}</span><div className="composerActions"><button type="button" className="iconButton subtle" disabled aria-label={en ? "Attachments not enabled" : "附件暂未启用"}><Paperclip size={17} /></button><button className="sendButton" type="submit" disabled={busy || !draft.trim() || !inputScope || sessionLinkRequired}>{busy ? <Clock3 size={17} className="spinIcon" /> : <Send size={17} />}<span>{busy ? (en ? "Working…" : "处理中…") : (en ? "Send" : "发送")}</span></button></div></div></form>
+    <div className="chatFooter"><button className="textButton" type="button" onClick={onBackHome ?? onNewConversation}><ArrowLeft size={14} />{en ? "Back to Home" : "回到首页"}</button><span>{en ? "History is local to this browser" : "历史仅保存在当前浏览器"}</span></div>
   </div>;
 }
 
@@ -253,8 +235,20 @@ function ChatTurn({ item, language }: { item: LocalConversation; language: Langu
 function ResponseCard({ item, language = "zh" }: { item: LocalConversation; language?: Language }) {
   const result = item.result ?? {};
   const en = isEnglish(language);
-  const response = typeof result.response === "string" && result.response.trim() ? result.response : typeof result.message === "string" && result.message.trim() ? result.message : en ? "The request completed, but no displayable response was returned." : "请求已完成，但服务没有返回可展示的回应。";
-  return <Surface className="responseCard"><div className="responseHeader"><div><span className="responseEyebrow">{en ? "Veyra's response" : "Veyra 的回应"}</span><time>{formatTime(item.createdAt)}</time></div><span className="routeTag">{String(result.status ?? "—")}</span></div><p>{response}</p><Disclosure title={en ? "Response status" : "回应状态"}><div className="detailGrid"><div><span>{en ? "Status" : "状态"}</span><code>{String(result.status ?? "unknown")}</code></div><div><span>{en ? "Risk" : "风险"}</span><code>{String(result.risk_level ?? (en ? "Not assessed" : "未评估"))}</code></div></div><p className="smallNote">{en ? "Technical evidence remains available in Advanced." : "技术证据仍可在 Advanced 中查看。"}</p></Disclosure></Surface>;
+  const fallback = en ? "The request completed, but no displayable response was returned." : "请求已完成，但服务没有返回可展示的回应。";
+  const response = safeText(result.response, safeText(result.message, fallback));
+  const artifacts = result.artifacts && typeof result.artifacts === "object" && !Array.isArray(result.artifacts) ? result.artifacts : {};
+  const living = artifacts.living_context && typeof artifacts.living_context === "object" && !Array.isArray(artifacts.living_context) ? artifacts.living_context as Record<string, unknown> : null;
+  const situation = living?.situation && typeof living.situation === "object" && !Array.isArray(living.situation) ? living.situation as Record<string, unknown> : null;
+  const semantic = situation?.semantic && typeof situation.semantic === "object" && !Array.isArray(situation.semantic) ? situation.semantic as Record<string, unknown> : {};
+  const needs = Array.isArray(living?.information_needs) ? living.information_needs.filter((need): need is Record<string, unknown> => Boolean(need) && typeof need === "object" && !Array.isArray(need)) : [];
+  const openNeeds = needs.filter((need) => ["open", "asked", "observing", "waiting"].includes(safeText(need.status, "")));
+  const livingStatus = safeText(living?.status, "");
+  const semanticTitle = safeText(semantic.title, safeText(semantic.label, safeText(semantic.summary, livingStatus === "quiet" ? (en ? "No Situation changed" : "没有 Situation 变化") : (en ? "Context recorded" : "上下文已记录"))));
+  const missingKnowledge = openNeeds.length ? safeText(openNeeds[0].question, safeText(openNeeds[0].blocked_judgment, en ? "More information" : "更多信息")) : (en ? "Nothing urgent" : "暂时没有紧要未知");
+  const routeStatus = safeText(result.status, "—");
+  const riskLevel = safeText(result.risk_level, en ? "Not assessed" : "未评估");
+  return <Surface className="responseCard"><div className="responseHeader"><div><span className="responseEyebrow">{en ? "Veyra's response" : "Veyra 的回应"}</span><time>{formatTime(item.createdAt)}</time></div><span className="routeTag">{routeStatus}</span></div><p>{response}</p>{living ? <div className="responseLivingContext"><div><span>{en ? "Situation updated" : "已更新的 Situation"}</span><strong>{semanticTitle}</strong></div><div><span>{en ? "Still unknown" : "仍缺什么"}</span><strong>{missingKnowledge}</strong></div><div><span>{en ? "Why Veyra stayed quiet" : "为什么保持安静"}</span><strong>{livingStatus === "quiet" ? (en ? "The signal was not strong enough to interrupt you." : "信号还不够强，不值得打扰你。") : (en ? "The update was recorded without external delivery." : "这次更新只记录，不向外发送。")}</strong></div></div> : null}<Disclosure title={en ? "Response status" : "回应状态"}><div className="detailGrid"><div><span>{en ? "Status" : "状态"}</span><code>{safeText(result.status, "unknown")}</code></div><div><span>{en ? "Risk" : "风险"}</span><code>{riskLevel}</code></div></div><p className="smallNote">{en ? "Technical evidence remains available in Advanced." : "技术证据仍可在 Advanced 中查看。"}</p></Disclosure></Surface>;
 }
 
 export function HistoryDrawer({ open, onClose, items, onSelect, language = "zh", onClear }: { open: boolean; onClose: () => void; items: LocalConversation[]; onSelect?: (item: LocalConversation) => void; language?: Language; onClear?: () => void }) {
@@ -274,6 +268,3 @@ export function HistoryDrawer({ open, onClose, items, onSelect, language = "zh",
 }
 
 export function NewConversationButton({ onClick }: { onClick: () => void }) { return <button type="button" className="newConversation" onClick={onClick}><Plus size={15} />新会话</button>; }
-
-// Backward-compatible name for any downstream imports; the shell now mounts HomePage explicitly.
-export const Conversation = HomePage;

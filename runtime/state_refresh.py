@@ -23,6 +23,8 @@ from runtime.belief_refresh_scheduler import (
     MAX_UNREFRESHABLE,
     SCHEDULER_SCHEMA_VERSION,
     merge_bounded_ledger,
+    merge_conflict_retry_ledger,
+    conflict_retry_suppressed,
     schedule_marker,
     select_fair,
     unrefreshable_entry,
@@ -282,11 +284,11 @@ class StateRefresh:
             for item in (refresh_state.get("consumed_due") or [])
             if isinstance(item, dict) and item.get("marker")
         }
-        conflict_markers = {
-            str(item.get("marker"))
+        conflict_entries = [
+            item
             for item in (refresh_state.get("conflict_retry") or [])
             if isinstance(item, dict) and item.get("marker")
-        }
+        ]
         archived_skipped: list[dict[str, Any]] = []
         selectable: list[dict[str, Any]] = []
         pre_archived: list[dict[str, Any]] = []
@@ -324,7 +326,7 @@ class StateRefresh:
                 str(claim.get("status") or "") == "conflict"
                 and not schedule.get("next_refresh_at")
                 and not schedule.get("hard_overdue")
-                and marker in conflict_markers
+                and conflict_retry_suppressed(claim, conflict_entries, now=now)
             ):
                 archived_skipped.append(
                     {
@@ -435,7 +437,7 @@ class StateRefresh:
             archived_items, archive_blocked = merge_bounded_ledger(
                 state.get("unrefreshable"), unrefreshable, limit=MAX_UNREFRESHABLE
             )
-            conflict_items, conflict_blocked = merge_bounded_ledger(
+            conflict_items, conflict_blocked = merge_conflict_retry_ledger(
                 state.get("conflict_retry"), conflict_retry, limit=MAX_CONFLICT_RETRY
             )
             # Capacity pressure is observable and fail-closed. Existing hard

@@ -1,141 +1,176 @@
-# V0-001 — Local Product Preview
+# V1-001 — Living Context Alpha
 
-- Status: `LOCAL_VALIDATED / OWNER_ACCEPTANCE_PENDING`
-- Owner/window: root planning/review/docs; `luna_worker` implementation
-- Date: 2026-08-14
-- Final evidence revision: `e5fcf80ad3e1e6e54f3602603bdf941e5aa8fd37`
-- Feature slice: `80ff937` (`feat(product): ship local Veyra preview`)
-- Related roadmap stages: `R0 + bounded R5 preview`
-- Related ADRs: ADR-001, ADR-002 (still Proposed)
+- Status: `PRIVATE LOCAL ALPHA / IMPLEMENTED + AUTOMATED_VALIDATED / REAL_MODEL_VALIDATED PARTIAL / DEGRADED`
+- Owner/window: root planning/review/docs; shared V1 implementation worktree
+- Date: 2026-08-20
+- Base revision: `cognitive-awakening @ 7439aeb` (V1 changes remain uncommitted)
+- Related roadmap stages: `R1–R7 bounded alpha evidence`
+- Related ADRs: ADR-001, ADR-002, ADR-003, ADR-004 (still Proposed)
+
+## V0-001 disposition
+
+`V0-001 — Local Product Preview` was explicitly expanded by the owner into this
+V1 alpha. It is absorbed as the bounded product foundation, not reported as an
+independent launch or as a completed Consumer V1. Any older Today-first wording
+belongs to that historical preview and is superseded for the current information
+architecture by the quiet First Meeting home, independent Today, Situations and
+dedicated Chat routes described in `product_experience_v1.md`.
 
 ## User Outcome
 
-用户打开 Veyra 后，不再先面对聊天壳或运维仪表盘，而能在十秒内看见：
+在本地 alpha 中，用户可以把三类非硬编码的生活情境交给 Veyra 持续维护：
 
-- Veyra 当前持续关注什么；
-- 最近形成了什么 Situation；
-- 是否存在有依据的 suggestion、question 或 waiting state；
-- 数据来自哪里、是否新鲜、Veyra 被允许做什么；
-- 如何继续对话、纠正、暂停或进入 Advanced 查看技术证据。
+- 旅行、会议或活动安排；
+- 求职、申请或学习计划；
+- 搬家、个人项目或家庭计划。
 
-这是一个 local-first `0.1 Product Preview`，不是 Consumer V1、公开云服务或外部交付产品。
+同一条 Living Context 逻辑投影持续显示 Situation 的 Known、Unknown、
+Assumptions、timeline、Information Need、evidence、material change 和
+当前 reaction。用户能看到 Veyra 为什么现在建议、询问、读取、等待或沉默，
+并可通过反馈影响 timing、cooldown 和 suppression；权限仍停留在本机、只读、
+应用内、record-only 边界。
+
+这是 `PRIVATE LOCAL ALPHA`，不是公开发布、外部交付产品或两周价值结论。
 
 ## Why Now
 
-Workspace Observer 已提供 production-shaped trusted canary，但此前默认页、Matters、Status 与后端 exact scope 不一致。这个切片先把真实 Goal/Situation/Attention/record-only suggestion 投影成可读的 Today/Matters/Status，并保留 Advanced 与现有 authority 边界，尽快获得真实用户反馈。
-
-## Required Reading
-
-- [`../README.md`](../README.md)
-- [`../living_context.md`](../living_context.md)
-- [`../product_experience_v1.md`](../product_experience_v1.md)
-- [`../architecture/overview.md`](../architecture/overview.md)
-- [`../architecture/authority.md`](../architecture/authority.md)
-- [`../definition_of_done.md`](../definition_of_done.md)
+V0 的产品投影已经提供了可读的入口，但不能继续把一个预览首页或自动化绿灯
+称作持续生活理解。当前切片把真实生活 Situation、显式 Information Need、
+受治理 source、解释性 reaction 和反馈后效贯通到同一条 V1 alpha 链路，随后
+用独立证据位置判断哪些结论仍需真实模型、干净运行态和用户样本。
 
 ## Current Evidence
 
-- `e5fcf80` runtime v2 clean evidence：Python 3.11.15、`dirty_flag=false`、exact build identity；业务状态 GET 前后 byte-pure。
-- Python gate `148/148`：`145` invariant + `1` cognitive capability + `2` product capability；OpenClaw plugin `32/32`；9-route matrix `810/810`。
-- Product smoke 覆盖 exact owner/session、ambiguous/mismatch/malformed fail-closed、stable Matters section schema、record-only preview、status evidence and GET purity；SSE smoke 覆盖真实 lifecycle、duplicate/rejected/failed typed result 和无 token/CoT。
-- Web production/Desktop frontend build、browser acceptance、390×844 readability、shared history sanitizer、`/product` proxy/contract 均通过。
-- Clean `build_desktop.sh package` on `e5fcf80` exited `0`: local `.app` is ad-hoc Apple Silicon arm64; sidecar is Mach-O arm64, Python `3.11.15`, PyInstaller `6.22.0`; sidecar smoke, strict codesign and normalized payload comparison passed. App tree SHA-256: `c62ac2a0c69865278ecc4096ac69105442e985c0aec0ee5b3c5f3ae0666abeca`; sidecar SHA-256: `a996f308d0c18443238c646c143f1966b66d8944b1ed707dc46be33264c95501`.
-- Final branch push and exact-SHA Actions must be verified externally at handoff; this SHA-producing document does not self-attest them. Signing is `ad_hoc_not_notarized_local_preview`, not Developer ID, notarized, DMG or store release.
+### Implementation and automated evidence — final local gate
 
-## Research Question
+- `IMPLEMENTED + AUTOMATED_VALIDATED`：Python full gate `165/165`
+  (`145` invariant + `1` cognitive + `19` product)；OpenClaw `32/32`；Route
+  `810/810`。
+- `IMPLEMENTED + AUTOMATED_VALIDATED`：frontend product-contract、status-tone、
+  build、`check:bundle` 与 `build:desktop` 均 PASS；这些是构建/合同证据，不是
+  浏览器或用户价值证据。
+- `LOCAL PREVIEW / AUTOMATED_VALIDATED`：最终本地 arm64 Mach-O package PASS；Python
+  `3.11.15`、PyInstaller `6.22.0`、Rust `1.96.1`、Tauri `2.11.4`；sidecar smoke
+  PASS、normalized cmp PASS、`codesign --verify --deep --strict` PASS；App 内
+  `NSAppleEventsUsageDescription` 与 `automation.apple-events` entitlement 存在。
+  sidecar SHA 为
+  `471ef080f84639e8ca445fe20c91695095873a004854290008f6d1012304351`，Veyra.app
+  tree SHA 为 `0257a1b8b004cbb95deee158164bacdc5481d6921193169b04e5a30a570ab590`。
+  这仍是 ad-hoc local preview，不是 Developer ID/notarized/DMG/public release；
+  实际 Calendar TCC 用户授权仍 pending。
+- `IMPLEMENTED + AUTOMATED_VALIDATED`：通用自然语言路径覆盖三类 Situation、
+  durable semantic fields、Information Need、read-only Calendar/Weather/Public
+  Web source、ask/read/wait/silent/suggest 反应和 feedback timing/cooldown/
+  suppression 边界；LivingReaction archive/retention 及 replay/tamper/scope
+  checks 已纳入验证；Agent research 保持 disabled。
 
-在不新增外部写入或自治权限的前提下，Situation-first 的 Today/Matters 投影是否能让用户正确说明“Veyra 正在理解什么、依据是什么、现在能做什么”，并比 Chat-first/Console-first 更容易开始持续使用？
+### Real-model and live evidence — deliberately separated
+
+- `REAL_MODEL_VALIDATED: PARTIAL / DEGRADED`：多次隔离运行的合并证据是三个通用
+  场景 create `3/3` 曾成功、update `3/3` 曾成功、Calendar update `1/1` 曾成功，
+  `ignore feedback` 曾被模型解析并持久记录；这些不是同一次 run，未在同一次 run
+  完成全链。最终 run 为 create `3/3`、update `2/3`，因 timeline `source_quote`
+  binding 波动而 DEGRADED。它证明通用路径曾经可用，但不能宣称单次全链 PASS、
+  provider 稳定性、长期 usefulness 或 Jarvis 已证明。
+- Calendar 的确定性完整 source→Need→understanding→reaction 链已验证，并有独立
+  real provider read；Weather/Public Web 也有当前真实 read 证据。Calendar production
+  consent/TCC contract 已实现，但实际 Calendar TCC 用户授权仍 pending。
+- `BOUNDED_LIVE: PENDING`：clean runtime/restart identity、现场源读取、浏览器
+  acceptance 和 served revision 尚未在本任务中闭合。
+- `EXACT_SHA_CI / PUSH: PENDING`：当前工作树未提交，不能自证远端 CI 或 push；
+  exact-SHA runtime、browser acceptance、owner acceptance 和 GitHub Actions 在提交
+  推送前均保持 `PENDING`。
+- `14_DAY_USEFULNESS: PENDING`、`USER_VALIDATED: PENDING`：没有两周真实样本、
+  usefulness、漏报/误报、wrong timing 或 owner acceptance 结论。
 
 ## Scope
 
-1. 建立 versioned、纯读、exact-scope 的 product-facing API；
-2. 由服务端选择或诚实拒绝 primary local product context，前端不再硬编码伪 scope；
-3. 将 Today 设为默认产品页，并对齐 Goal/Commitment/Situation/Attention/Suggestion/Question/Waiting；
-4. Matters 不再读取 operator-wide Review、猜测 `/state` 数组或展示不可用假卡片；
-5. Status 只显示产品健康、新鲜度、来源、证据等级和 authority；完整细节进入 Advanced；
-6. Settings 展示 Sources & Permissions、本机边界和 stop/setup 入口；
-7. Conversation 继续使用真实 lifecycle SSE，不伪造 token stream，并最小化浏览器持久化数据；
-8. 保留当前视觉语言、Setup Wizard 与旧 Advanced Console；
-9. 通过本机浏览器、390px、Web/Desktop build、product capability smoke、runtime purity 和 Apple Silicon local package 验收。
+1. 维护三类真实生活 Situation 的同一套通用语义与 durable lifecycle；
+2. 维护 Known/Unknown/Assumption/timeline/Need/evidence 的投影与可纠正性；
+3. 维护 ask/read/wait/silent/suggest 的解释性 reaction；
+4. 维护 Calendar、Weather、Public Web 的只读、exact-scope、consent、freshness
+   和 receipt 边界；
+5. 维护反馈对 timing、cooldown、suppression 的受限后效；
+6. 维护 `#/` First Meeting、`#/today`、`#/situations`/detail、`#/chat/<id>`
+   的产品信息架构；
+7. 记录自动化、真实模型、source、feedback、runtime/live、浏览器和 CI 的
+   独立 evidence position。
 
 ## Non-goals
 
-- 不完成全部 P1–P8 或把一个 UI 切片称为 Living Context V1；
-- 不在本轮实现 Calendar、Email、Agent research、通用 Observation Broker 或 durable conversation store；
-- 不启用 `ask`、外部主动推送、Agent/Tool execution 或受治理学习 aftereffect；
-- 不修改 Route/Risk、Review、Grant、Phase 6 或 provider/model 配置；
-- 不承诺 Developer ID、notarization、DMG、App Store、Windows/Linux 包或公网托管；
-- 不删除 Developer Console，不批量迁移旧文档。
+- 不把 V0-001 伪称为独立上线，也不宣称 V1 已完成；
+- 不把当前 `REAL_MODEL_VALIDATED: PARTIAL / DEGRADED` 升格为完整 validated，也不
+  推断 `BOUNDED_LIVE`、`14_DAY_USEFULNESS` 或 `USER_VALIDATED`；
+- 不启用 Agent research、外部 delivery、Agent/Tool/Grant/Route/Risk 或执行
+  authority；
+- 不把 Calendar、Weather、Public Web 的只读合同写成已经完成的实时个人来源接入；
+- 不将 P3 identity/relationship 全面化、Phase 6 自扩展或通用 automation 作为 V1
+  gate；
+- 不新增 LivingContext aggregate truth，不迁移现有 authoritative state；
+- 不修改代码、前端或 runtime state（本 task ownership 仅文档同步）。
 
 ## Authority Delta
 
 | Dimension | Before | After | Evidence |
 |---|---|---|---|
-| Agent | governed, no new product dispatch | unchanged | Route/authority regression |
-| Tool/Grant | no new grant | unchanged | product API is read-only |
-| Route/Risk | 9 Routes, existing risk contract | unchanged | 810 matrix |
-| External delivery | disabled for preview | unchanged | record-only proposal projection |
-| Execution | none from product read model | unchanged | negative tests |
-| Data/source access | existing local exact-scope state | curated product projection only | scope/privacy tests |
-
-## State and Migration
-
-- Product pages remain logical projections of existing Goal, Commitment,
-  Situation, Attention, Suggestion and runtime state; no new durable truth or
-  state migration is introduced.
-- GETs are pure reads and cross-owner/session access fails closed. Browser
-  history persists only the allow-listed display fields and is sanitized on
-  legacy reads.
+| Agent research | disabled | unchanged / disabled | automated boundary checks; live pending |
+| Tool/Grant | no new product grant | unchanged | Route/authority regression |
+| Route/Risk | existing contract | unchanged | Route `810/810` final local-gate snapshot |
+| External delivery | disabled / record-only | unchanged | suggestion/reaction negative paths |
+| Execution | none from alpha product path | unchanged | automated negative tests |
+| Data/source access | local exact-scope state | read-only allowlisted source classes | source contract tests; live source pending |
 
 ## Acceptance
 
-### Automated — validated
+### Automated
 
-- `148/148` Python gate, with `145/145` invariant, `1/1` cognitive capability and `2/2` product capability;
-- OpenClaw plugin `32/32`, Route `810/810`, structured observation and suggestion/interaction regressions;
-- product API exact scope/privacy/ambiguity, record-only no-delivery/all-authority-false, malformed/degraded source, status evidence, and GET byte-purity tests;
-- SSE lifecycle smoke and frontend product contract, bundle, status-tone, Web/Desktop build checks.
+Full gate `165/165` (`145` invariant + `1` cognitive + `19` product), OpenClaw
+`32/32`, Route `810/810`, Web/Desktop build, product contract and bundle are green
+in the final local gate. The arm64 package is a validated LOCAL PREVIEW with the
+toolchain and hashes recorded above; it is not Developer ID/notarized/DMG/public
+release evidence. This is still local worktree evidence until a committed revision,
+exact-SHA push/CI and current live runtime are independently verified.
 
-### Runtime/live — bounded evidence
+### Runtime/live
 
-- clean runtime v2 identity at `e5fcf80`, loopback/Tauri boundary, browser acceptance and 390×844 review;
-- local arm64 app package, sidecar Mach-O/Python 3.11.15/PyInstaller 6.22.0, sidecar smoke, strict codesign and normalized sidecar comparison;
-- no claim of Feishu external delivery, production Economy validation or long-term usefulness.
+Clean restart/runtime identity, actual Calendar TCC user authorization,
+browser/390px acceptance, served revision and exact-SHA CI are independent
+positions and remain `PENDING`.
 
-### User-visible — validated within the preview boundary
+### User-visible
 
-- Today-first home answers what Veyra follows, what changed, what remains
-  unknown/waiting and what it can do; Matters/Status/Settings remain readable;
-  Advanced is reachable but not the default.
-- No raw path, token, digest wall, fake Goal/Case/Task or false production
-  validation claim is exposed in the ordinary product surface.
+The intended alpha surface is route-separated First Meeting, Today, Situations,
+Situation detail and dedicated Chat. It exposes evidence/unknown/reaction meaning,
+not raw model payloads, private locators or execution claims. Actual owner
+acceptance and two-week usefulness remain `PENDING`.
 
-### Failure/negative — validated
+### Failure/negative
 
-- zero/multiple/mismatched context is explicit, not cross-scope fallback;
-- unavailable or malformed sections retain fail-closed/degraded source status;
-- no current canonical record means no suggestion/question is shown;
-- production-pending evidence cannot render as validated or live.
-
-### Remaining acceptance evidence
-
-- final branch push and exact-SHA GitHub Actions must pass and be linked in the handoff;
-- the owner has not yet accepted the packaged local preview as the first usable release;
-- P1/P2 remain `PARTIAL`; user usefulness is not validated.
+Scope mismatch, stale candidate/revision, unsupported source, source failure,
+duplicate tick, feedback replay and authority escalation must fail closed or retain
+an explicit degraded/unknown state. Green automation does not close live evidence.
 
 ## Definition of Done
 
-1. 代码提供稳定、纯读、exact-scope 的产品 projection；
-2. 用户第一次能够在 Today/Matters 看见 Veyra 的真实持续理解，而非内部 JSON；
-3. 新前端与同一后端 scope、evidence 和 authority 合同一致；
-4. 未证明项继续标 `PARTIAL`/`PENDING`；
-5. authority 无扩张；
-6. Project OS、status/current、canonical 入口、验证证据和下一任务同步；
-7. clean local package 已验证；最终 branch push/exact-SHA Actions 在 handoff 外部核验，并且只有 owner 明确接受本地预览后，V0-001 才可归档，不得提前 `COMPLETED`。
+1. Project OS and canonical links describe V1-001 as a private local alpha;
+2. implementation and automated evidence are separated from real-model/live/user
+   evidence;
+3. the route architecture and current implementation boundaries agree;
+4. all unproven evidence remains `PENDING` until root confirms it with fresh proof;
+5. authority remains unchanged and Agent research/external delivery remain disabled;
+6. the next handoff states exactly what root must rerun and what evidence is still
+   missing.
 
 ## Handoff
 
-- Final code/runtime evidence: `e5fcf80`; clean local app package evidence is recorded above.
-- Known degraded: P1/P2 partial, user usefulness/timing unvalidated, `ask` dormant, no external delivery, no durable conversation store, production Economy metadata incomplete.
-- Rollback: retain the prior console route and remove the product router/UI changes as one release slice; do not mutate user state.
-- Next planned task: `LC-001 — Real non-code Situation`; it remains planned until V0-001 release evidence is closed and a new `CURRENT.md` is created.
+- Worktree/base: `cognitive-awakening @ 7439aeb`; V1 implementation changes are
+  uncommitted and owned by the other work window.
+- Documentation changes in this task are limited to Project OS and the two
+  canonical/addendum files named by the owner; no code, frontend or state was
+  changed here.
+- Remaining: resolve the timeline `source_quote` binding fluctuation and rerun one
+  complete same-run real-model full-chain acceptance; then independent clean runtime, actual Calendar TCC user
+  authorization, bounded live/browser, exact-SHA CI/push, and owner/two-week
+  validation.
+- Rollback: revert this documentation slice only; do not mutate user state or
+  the V1 implementation worktree.

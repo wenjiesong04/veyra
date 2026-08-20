@@ -118,6 +118,7 @@ from runtime.read_only_agent_collaboration import (
 )
 from runtime.read_only_cognitive_loop import ReadOnlyCognitiveLoopRuntime
 from runtime.product_experience import ProductExperienceService
+from runtime.living_context_composition import build_living_context_composition
 from runtime.extension_spec_quarantine import (
     ExtensionSpecQuarantine,
 )
@@ -471,6 +472,13 @@ active_loop = ActiveRuntimeLoop(
     component_health_producer=_component_health_background_tick,
     workspace_observer=trusted_workspace_observer.run_once,
 )
+living_context_composition = build_living_context_composition(
+    state_store,
+    weather_probe=awareness_loop.probes.get("weather_probe"),
+    search_probe=awareness_loop.probes.get("search_probe"),
+)
+awareness_loop.attach_living_context_runtime(living_context_composition.orchestrator)
+active_loop.attach_living_context(living_context_composition.orchestrator)
 runtime_cron = Cron(state_store=state_store, active_loop=active_loop, commitment_push=commitment_push)
 agent_orchestrator = AgentOrchestrator(
     state_store=state_store,
@@ -941,6 +949,9 @@ product_experience = ProductExperienceService(
     agent_status_resolver=lambda: phase6_capability_directory.snapshot(read_only=True),
     integration_status_resolver=feishu_ws_runner.status,
     cognition_status_resolver=read_only_cognitive_loop.status,
+    living_context_runtime=living_context_composition.core,
+    reaction_runtime=living_context_composition.reaction,
+    living_context_orchestrator=living_context_composition.orchestrator,
 )
 
 

@@ -58,11 +58,29 @@ Veyra 的主动性、时机、长期 usefulness 和“被持续理解”的体�
 ## 事实与证据纪律
 
 1. Git、代码、配置、运行态和 exact-SHA CI 高于旧文档。
-2. `IMPLEMENTED`、`CONFIGURED`、`AUTOMATED_VALIDATED`、`LIVE_OBSERVED`、`USER_VALIDATED` 分开报告。
+2. `IMPLEMENTED`、`CONFIGURED`、`AUTOMATED_VALIDATED`、`REAL_MODEL_VALIDATED`、
+   `BOUNDED_LIVE`、`14_DAY_USEFULNESS`、`USER_VALIDATED` 分开报告。
 3. Fixture、smoke 和 synthetic replay 不能证明长期 usefulness。
 4. 历史 live 样本不能自动继承到新 revision。
 5. `status/current.md` 必须标注观察时间和 revision；过期时宁可写 `UNKNOWN`。
 6. Current Task 完成后先更新状态和任务，不因一个切片改写哲学或 North Star。
+
+### V1 alpha 证据分层
+
+V1-001 的发布范围标为 `PRIVATE LOCAL ALPHA`。`IMPLEMENTED` 表示代码路径
+存在，`AUTOMATED_VALIDATED` 表示合同/负向/full gate/build 等检查通过；这两者
+都不能推断真实模型或用户价值。
+
+`REAL_MODEL_VALIDATED` 只在 root 对最终修复后的 revision 执行最终可复现真实
+模型脚本并明确确认后填写，其他窗口必须保持 `PENDING`。`BOUNDED_LIVE` 需要
+当前 revision 的 clean runtime、真实 source/浏览器等独立现场证据；
+`14_DAY_USEFULNESS` 需要两周真实样本和预设阈值；`USER_VALIDATED` 需要 owner
+明确验收。任何一层未闭合，都不能用其他层、历史 live、fixture、短时计数或
+构建结果代替。
+
+P3 identity/relationship 全面化、Phase 6 自扩展、Agent research、external
+delivery 和 execution authority 不是 V1 gate；文档必须明确写作范围，不能由
+alpha 自动化证据暗示它们完成。
 
 ## 迁移原则
 

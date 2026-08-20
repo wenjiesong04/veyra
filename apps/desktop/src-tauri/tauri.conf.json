@@ -29,6 +29,9 @@
   },
   "bundle": {
     "active": true,
+    "macOS": {
+      "entitlements": "Entitlements.plist"
+    },
     "targets": "all",
     "externalBin": [
       "binaries/veyra-backend"

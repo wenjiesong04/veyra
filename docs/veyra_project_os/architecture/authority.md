@@ -2,7 +2,7 @@
 
 ## Status
 
-`STRONG ENGINEERING BASELINE / USER PRINCIPAL STILL LOCAL-LOGICAL`
+`STRONG ENGINEERING BASELINE / V1 ALPHA LOCAL-LOGICAL / LIVE PENDING`
 
 ## 目的
 
@@ -42,6 +42,12 @@ Authority 确保持续理解不会变成持续越权。它是产品可信度的�
 
 不能因为前一层是低风险就自动授权后一层。
 
+V1 alpha 当前只实现本机 exact-scope、read-only source admission（Calendar、
+Weather、Public Web）以及应用内 `ask/read/wait/silent/suggest` 反应。Agent
+research、Tool/Grant 新授权、external delivery、Route/Risk 扩展和现实执行均
+disabled。反馈后效只允许 timing、cooldown 和 suppression，不得改变 authority
+ceiling。
+
 ## 用户控制
 
 产品必须提供：
@@ -63,3 +69,7 @@ Authority 确保持续理解不会变成持续越权。它是产品可信度的�
 - 错 scope、stale、replay、tamper fail closed；
 - 公开投影不泄露私有 locator、token、raw path 或跨 owner 内容；
 - disabled 真正停止感知/触达或按合同完成 drain。
+
+当前 scope/authority 非弱化测试属于 pre-final automated evidence。clean runtime、
+current live source 和 browser/exact-SHA handoff 尚未验证；它们不能从自动化绿灯
+或历史 live 推断。

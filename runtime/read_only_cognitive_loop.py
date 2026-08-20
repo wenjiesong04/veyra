@@ -6,7 +6,7 @@ import json
 import re
 import threading
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from awareness.claim_schema import detect_conflicts, refresh_claim_status
@@ -201,9 +201,16 @@ class ReadOnlyCognitiveLoopRuntime:
         *,
         state_store: WorldStateStore,
         reasoning: Any,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.state_store = state_store
         self.reasoning = reasoning
+        # Keep the production default wall-clock based, while allowing the
+        # durable bridge to share the caller's clock in deterministic replay
+        # and crash-recovery tests.  Attention admission compares its
+        # assessment timestamp with the commit clock; using separate clocks
+        # can make an otherwise valid bridge look expired or stale.
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         # Re-entrant because bridge phase commits hold the lifecycle fence
         # while delegating to the shared durable writer, which performs its
         # own final stop/config re-check under the same lock.
@@ -213,6 +220,14 @@ class ReadOnlyCognitiveLoopRuntime:
         self._last_worker_result: dict[str, Any] | None = None
         self._generation = 0
         self._stopped = False
+
+    def _now(self) -> datetime:
+        selected = self._clock()
+        if not isinstance(selected, datetime):
+            raise ValueError("cognitive loop clock must return a datetime")
+        if selected.tzinfo is None or selected.utcoffset() is None:
+            raise ValueError("cognitive loop clock must be timezone-aware")
+        return selected.astimezone(timezone.utc)
 
     def resume(self) -> dict[str, Any]:
         """Admit a new Active Loop generation without reviving old workers."""
@@ -956,8 +971,14 @@ class ReadOnlyCognitiveLoopRuntime:
             or parent.get("parent_revision") != parent_revision
         ):
             return {"status": "rejected", "reason": "parent_not_current_or_scoped"}
-        assessment = GeneralAttentionScheduler(self.state_store).assess(parent)
-        attention_runtime = AttentionHypothesisRuntime(self.state_store)
+        assessment = GeneralAttentionScheduler(
+            self.state_store,
+            clock=self._now,
+        ).assess(parent)
+        attention_runtime = AttentionHypothesisRuntime(
+            self.state_store,
+            clock=self._now,
+        )
         try:
             evaluated = attention_runtime._evaluate(parent, assessment)
         except (TypeError, ValueError):
@@ -1100,7 +1121,7 @@ class ReadOnlyCognitiveLoopRuntime:
                                 **binding,
                                 "status": "committed",
                                 "phase_revision": 3,
-                                "committed_at": utc_now_iso(),
+                                "committed_at": self._now().isoformat(),
                                 "rejection_reason": None,
                             }
                             self._persist_bridge_binding(
@@ -1192,7 +1213,7 @@ class ReadOnlyCognitiveLoopRuntime:
                     **admitted_binding,
                     "status": "committed",
                     "phase_revision": int(admitted_binding.get("phase_revision") or 2) + 1,
-                    "committed_at": utc_now_iso(),
+                    "committed_at": self._now().isoformat(),
                     "rejection_reason": None,
                 }
                 self._persist_bridge_binding(
@@ -1259,7 +1280,7 @@ class ReadOnlyCognitiveLoopRuntime:
                 "veyra.attention_bridge.assessment_binding.v1",
                 evaluated.get("assessment_binding") or {},
             ),
-            "prepared_at": utc_now_iso(),
+            "prepared_at": self._now().isoformat(),
             "committed_at": None,
             "rejection_reason": None,
             "authority": False,

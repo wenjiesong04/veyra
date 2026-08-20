@@ -5,6 +5,8 @@
 > 本目录自 2026-08-14 起承载 current/task Living truth：
 > [`status/current.md`](status/current.md) 是当前状态，
 > [`tasks/CURRENT.md`](tasks/CURRENT.md) 是当前执行窗口唯一任务。
+> V1-001 的独立 evidence ledger 见
+> [`status/v1-acceptance-2026-08-20.md`](status/v1-acceptance-2026-08-20.md)。
 > [`docs/README_Veyra.md`](../README_Veyra.md) 保留为 canonical 入口，负责链接和 dated checkpoint；
 > 它不再复制本目录的高频状态快照。
 

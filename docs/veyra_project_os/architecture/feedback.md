@@ -2,7 +2,7 @@
 
 ## Status
 
-`RECORDING IMPLEMENTED / GOVERNED AFTEREFFECT NOT PRODUCT-VALIDATED`
+`RECORDING + BOUNDED EFFECTS IMPLEMENTED / REAL_MODEL_VALIDATED PENDING`
 
 ## 反馈类型
 
@@ -20,6 +20,11 @@
 ### 立即语义更新
 
 用户回答和纠正应立即更新当前 Situation、Known/Unknown 和后续建议有效性。
+
+当前 alpha 已把自然语言反馈绑定到 exact owner/session/Situation/reaction
+revision，并记录可重放的受限 effect。`useful/not useful`、`too early/too late`、
+`repeated/irrelevant`、`accept/reject/dismiss` 等反馈可以影响当前 reaction 的
+timing、cooldown 或 suppression；它们不改变事实权威。
 
 ### 长期校准
 
@@ -57,6 +62,10 @@
 - 用户可见和可纠正。
 
 `policy_effect=none` 是安全早期阶段，但不是长期终点。没有可审计后效的 feedback 只是日志。
+
+V1 alpha 的可用后效只停留在非权限行为：timing、cooldown、suppression。真实
+Moonshot feedback 的最终可复现 run 和两周 usefulness 尚未完成，因此不能把
+当前持久化 effect 标为 `REAL_MODEL_VALIDATED`、`BOUNDED_LIVE` 或用户价值。
 
 ## 评估
 

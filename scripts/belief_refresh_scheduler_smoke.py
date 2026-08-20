@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -19,6 +20,10 @@ from awareness.claim_schema import make_claim
 from core.world_state import WorldStateStore
 from runtime.belief_refresh_scheduler import (
     MAX_OWNER_OFFSETS,
+    conflict_retry_entry,
+    conflict_retry_generation,
+    conflict_retry_suppressed,
+    merge_conflict_retry_ledger,
     schedule_marker,
     select_fair,
     validate_refresh_state,
@@ -417,6 +422,133 @@ def main() -> int:
             and conflict_probe.calls == 1,
             "durable cadence-less conflict is recorded once then suppressed",
             {"first": first_conflict, "second": second_conflict},
+        )
+
+        # A conflict retry slot is a latest-generation upsert, not a revision
+        # history.  Six hundred ordinary claim revisions/ticks with the same
+        # typed evidence frontier must remain one bounded private entry.
+        conflict_generation_claim = {
+            **conflict,
+            "user_id": "owner-a",
+            "session_id": "session-a",
+            "claim_revision": 1,
+            "evidence_graph_status": "unresolved",
+            "evidence_graph_conflict_refs": ["ev_" + "a" * 24],
+            "conflict_observations": [
+                {
+                    "value_digest": "b" * 64,
+                    "conflict_refs": ["ev_" + "a" * 24],
+                    "evidence_graph_status": "unresolved",
+                }
+            ],
+        }
+        first_generation = conflict_retry_generation(conflict_generation_claim)
+        expect(first_generation, "conflict retry generation has typed frontier")
+        ledger = [conflict_retry_entry(conflict_generation_claim, now=BASE)]
+        expect(
+            conflict_retry_suppressed(conflict_generation_claim, ledger, now=BASE),
+            "fresh conflict generation suppresses after first attempt",
+        )
+        changed_spec = {
+            **conflict_generation_claim,
+            "refresh_spec": {
+                "schema_version": "veyra.belief.refresh_spec.v1",
+                "probe_kind": "git_probe",
+                "target_ref": "main",
+                "resolver_id": "probe_default.v1",
+            },
+        }
+        expect(
+            not conflict_retry_suppressed(changed_spec, ledger, now=BASE),
+            "refresh spec generation releases suppression",
+        )
+        for revision in range(2, 602):
+            churned = {
+                **conflict_generation_claim,
+                "claim_revision": revision,
+                "updated_at": f"2026-08-13T00:{revision // 60:02d}:{revision % 60:02d}.000000Z",
+                "history": [{"claim_revision": revision}],
+            }
+            expect(
+                conflict_retry_suppressed(churned, ledger, now=BASE),
+                "ordinary revision churn remains suppressed",
+                revision,
+            )
+            ledger, blocked = merge_conflict_retry_ledger(
+                ledger,
+                [conflict_retry_entry(churned, now=BASE)],
+                limit=512,
+            )
+            expect(blocked == 0 and len(ledger) == 1, "revision churn reuses one ledger slot", revision)
+        # A real value/frontier change releases exactly one retry and updates
+        # the same slot; it does not append an unbounded history record.
+        new_evidence = {
+            **conflict_generation_claim,
+            "claim_revision": 602,
+            "conflict_observations": [
+                {
+                    "value_digest": "c" * 64,
+                    "conflict_refs": ["ev_" + "d" * 24],
+                    "evidence_graph_status": "unresolved",
+                }
+            ],
+        }
+        expect(
+            not conflict_retry_suppressed(new_evidence, ledger, now=BASE),
+            "new evidence frontier releases one retry",
+        )
+        ledger, blocked = merge_conflict_retry_ledger(
+            ledger,
+            [conflict_retry_entry(new_evidence, now=BASE)],
+            limit=512,
+        )
+        expect(
+            blocked == 0
+            and len(ledger) == 1
+            and conflict_retry_suppressed(new_evidence, ledger, now=BASE),
+            "new evidence replaces the prior identity slot",
+            ledger,
+        )
+        other_owner = {
+            **new_evidence,
+            "user_id": "owner-b",
+            "session_id": "session-b",
+        }
+        other_ledger, blocked = merge_conflict_retry_ledger(
+            ledger,
+            [conflict_retry_entry(other_owner, now=BASE)],
+            limit=512,
+        )
+        expect(
+            blocked == 0
+            and len(other_ledger) == 2
+            and not conflict_retry_suppressed(other_owner, ledger, now=BASE),
+            "cross-owner conflict retry slots remain isolated",
+            other_ledger,
+        )
+        replayed = json.loads(json.dumps(other_ledger))
+        expect(
+            conflict_retry_suppressed(other_owner, replayed, now=BASE),
+            "conflict retry suppression survives restart replay",
+        )
+        try:
+            merge_conflict_retry_ledger(
+                [{"marker": "m1"}, {"marker": "m2"}], [], limit=1
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("over-capacity conflict ledger must fail closed")
+        malformed_frontier = {
+            **conflict_generation_claim,
+            "conflict_observations": [{"value_digest": 42}],
+        }
+        malformed_entry = conflict_retry_entry(malformed_frontier, now=BASE)
+        expect(
+            malformed_entry.get("generation") is None
+            and not conflict_retry_suppressed(malformed_frontier, [malformed_entry], now=BASE),
+            "malformed evidence frontier never suppresses a retry",
+            malformed_entry,
         )
         refresh.probes = {"git_probe": ImmediateProbe()}
         refresh.perception = AcceptedPerception()

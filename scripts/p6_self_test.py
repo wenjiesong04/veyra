@@ -371,11 +371,80 @@ def main() -> int:
         expect(model_decision.route == Route.AGENT, "core model can select agent route", model_decision.to_dict())
         expect(bool(model_decision.model_assist.get("solution_outline")), "core model keeps solution outline", model_decision.to_dict())
 
+        r5_text = "rm -rf /tmp/veyra-danger"
+        r5_frame = {
+            "schema_version": "veyra.semantic_frame.v1",
+            "acts": [
+                {
+                    "act_id": "p6-r5",
+                    "kind": "workspace_task",
+                    "goal": r5_text,
+                    "operation": "execute",
+                    "target": {
+                        "type": "shell_command",
+                        "value": r5_text,
+                        "attributes": {},
+                    },
+                    "polarity": "positive",
+                    "explicitness": "explicit",
+                    "source_quote": {
+                        "text": r5_text,
+                        "start": 0,
+                        "end": len(r5_text),
+                    },
+                    "speaker": "user",
+                    "authority": "direct_user",
+                    "mention_mode": "normal_use",
+                    "evidence_need": "none",
+                    "referent": {
+                        "surface": "",
+                        "resolved": "",
+                        "status": "not_applicable",
+                        "candidates": [],
+                    },
+                    "condition": None,
+                    "modality": "asserted",
+                    "arguments": {},
+                }
+            ],
+            "relations": [],
+            "ambiguities": [],
+            "resolver_status": "resolved",
+            "source": "p6_self_test",
+        }
         blocked_decision = DecisionCore(
             app_module.state_store,
             reasoning=FakeCoreReasoning(decision={"status": "model_assisted", "route": "direct_answer", "risk_level": "R0", "reason": "safe"}),
-        ).decide("rm -rf /tmp/veyra-danger", [])
+        ).decide(
+            r5_text,
+            [],
+            turn_understanding={
+                "user_message": r5_text,
+                "intent": "action",
+                "task_type": "workspace_task",
+                "suggested_mode": "governed_execution",
+                "semantic_frame": r5_frame,
+            },
+        )
         expect(blocked_decision.route == Route.BLOCK and blocked_decision.risk_level.value == "R5", "core model cannot lower R5 risk", blocked_decision.to_dict())
+
+        missing_frame_decision = DecisionCore(
+            app_module.state_store,
+            reasoning=FakeCoreReasoning(
+                decision={
+                    "status": "model_assisted",
+                    "route": "agent",
+                    "risk_level": "R1",
+                    "reason": "model candidate",
+                }
+            ),
+        ).decide("实现一个新的组件", [])
+        expect(
+            missing_frame_decision.route == Route.ASK_USER
+            and "semantic frame" in missing_frame_decision.reason,
+            "effectful route without a semantic frame fails closed to ASK_USER",
+            missing_frame_decision.to_dict(),
+        )
 
         def read_turn(
             text: str,

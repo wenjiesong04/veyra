@@ -167,6 +167,23 @@ COGNITIVE_CAPABILITY_SMOKES = [
 
 PRODUCT_CAPABILITY_SMOKES = [
     "product_experience_smoke.py",
+    "information_need_adversarial_smoke.py",
+    "model_boundary_smoke.py",
+    "reported_time_window_smoke.py",
+    "living_context_contract_smoke.py",
+    "living_context_boundary_smoke.py",
+    "living_context_lifecycle_smoke.py",
+    "living_context_adversarial_smoke.py",
+    "living_context_awareness_smoke.py",
+    "living_context_understanding_smoke.py",
+    "living_reaction_smoke.py",
+    "living_reaction_retention_smoke.py",
+    "living_source_smoke.py",
+    "living_source_core_integration_smoke.py",
+    "living_source_adversarial_smoke.py",
+    "living_calendar_production_smoke.py",
+    "v1_backend_blockers_smoke.py",
+    "v1_living_context_acceptance_smoke.py",
     "message_stream_smoke.py",
 ]
 

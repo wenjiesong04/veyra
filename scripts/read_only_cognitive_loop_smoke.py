@@ -435,6 +435,7 @@ def test_cognitive_brief_attention_bridge() -> None:
         runtime = ReadOnlyCognitiveLoopRuntime(
             state_store=store,
             reasoning=FakeReasoning(FakeClient()),
+            clock=clock,
         )
         evidence_refs = ["view:situation_graph:bridge-evidence"]
         cycle = {
@@ -740,6 +741,7 @@ def test_admitted_bridge_crash_recovery() -> None:
         runtime = ReadOnlyCognitiveLoopRuntime(
             state_store=store,
             reasoning=FakeReasoning(FakeClient()),
+            clock=clock,
         )
         projection_payload = {
             "attention_parent": {

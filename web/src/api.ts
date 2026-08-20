@@ -1,3 +1,5 @@
+import { safeText } from "./shared";
+
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
 export function detectDesktopRuntime(): boolean {
@@ -28,8 +30,12 @@ export async function fetchJson<T>(url: string, options?: RequestInit): Promise<
         const payload = JSON.parse(body) as { detail?: JsonValue; message?: string };
         if (typeof payload.message === "string" && payload.message.trim()) {
           detail = payload.message;
+        } else if (typeof payload.detail === "string" && payload.detail.trim()) {
+          detail = payload.detail;
         } else if (payload.detail !== undefined) {
-          detail = typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail);
+          // Product surfaces must never render raw server objects, paths, or
+          // opaque tokens. Keep the status useful without leaking the body.
+          detail = `${response.status} ${response.statusText || "Request failed"}`;
         }
       }
     } catch {
@@ -86,6 +92,18 @@ export type ProductToday = {
   [key: string]: JsonValue | undefined;
 };
 
+export type ProductSituation = Record<string, JsonValue>;
+export type ProductQuestion = Record<string, JsonValue>;
+export type ProductReaction = Record<string, JsonValue>;
+export type ProductSources = {
+  schema_version?: string;
+  status?: string;
+  scope?: ProductScope;
+  items?: Record<string, Record<string, JsonValue>>;
+  authority?: Record<string, JsonValue>;
+  [key: string]: JsonValue | undefined;
+};
+
 export type ProductMatters = {
   schema_version?: string;
   status?: string;
@@ -114,9 +132,72 @@ export async function getProductContext(options: { userId?: string; externalSess
   return fetchJson<ProductContext>(`/product/context${suffix}`, { signal: options.signal });
 }
 
-export async function getProductToday(scope: ProductScope): Promise<ProductToday> {
+export async function getProductToday(scope: ProductScope, options: { firstMeeting?: boolean; signal?: AbortSignal } = {}): Promise<ProductToday> {
   const query = `user_id=${encodeURIComponent(scope.user_id)}&session_id=${encodeURIComponent(scope.session_id)}`;
-  return fetchJson<ProductToday>(`/product/today?${query}`);
+  const firstMeeting = options.firstMeeting === false ? "" : "&first_meeting=true";
+  return fetchJson<ProductToday>(`/product/today?${query}${firstMeeting}`, { signal: options.signal });
+}
+
+function scopedQuery(scope: ProductScope, extra: Record<string, string | number | undefined> = {}): string {
+  const params = new URLSearchParams({ user_id: scope.user_id, session_id: scope.session_id });
+  for (const [key, value] of Object.entries(extra)) if (value !== undefined && value !== "") params.set(key, String(value));
+  return params.toString();
+}
+
+export async function getProductSituations(scope: ProductScope, options: { signal?: AbortSignal } = {}): Promise<{ status?: string; items?: ProductSituation[]; recent_terminal?: ProductSituation[]; count?: number; [key: string]: JsonValue | undefined }> {
+  return fetchJson(`/product/situations?${scopedQuery(scope)}`, { signal: options.signal });
+}
+
+export async function getProductSituation(situationId: string, scope: ProductScope, options: { signal?: AbortSignal } = {}): Promise<{ status?: string; situation?: ProductSituation | null; questions?: ProductQuestion[]; reactions?: ProductReaction[]; [key: string]: JsonValue | undefined }> {
+  return fetchJson(`/product/situations/${encodeURIComponent(situationId)}?${scopedQuery(scope)}`, { signal: options.signal });
+}
+
+export type SituationCommand = "correct" | "resolve" | "reopen" | "quiet";
+export async function commandProductSituation(situationId: string, scope: ProductScope, body: { command: SituationCommand; expected_revision: number; patch?: Record<string, JsonValue>; reason?: string; event_id?: string }): Promise<Record<string, JsonValue>> {
+  return fetchJson(`/product/situations/${encodeURIComponent(situationId)}/command?${scopedQuery(scope)}`, { method: "POST", body: JSON.stringify(body) });
+}
+
+export async function getProductQuestions(scope: ProductScope, options: { signal?: AbortSignal } = {}): Promise<{ status?: string; items?: ProductQuestion[]; [key: string]: JsonValue | undefined }> {
+  return fetchJson(`/product/questions?${scopedQuery(scope)}`, { signal: options.signal });
+}
+
+export async function answerProductQuestion(needId: string, scope: ProductScope, body: { answer: string; expected_generation: number; expected_revision?: number; event_id?: string }): Promise<Record<string, JsonValue>> {
+  return fetchJson(`/product/questions/${encodeURIComponent(needId)}/answer?${scopedQuery(scope)}`, { method: "POST", body: JSON.stringify(body) });
+}
+
+export async function deferProductQuestion(needId: string, scope: ProductScope, body: { expected_generation: number; event_id?: string }): Promise<Record<string, JsonValue>> {
+  return fetchJson(`/product/questions/${encodeURIComponent(needId)}/defer?${scopedQuery(scope)}`, { method: "POST", body: JSON.stringify(body) });
+}
+
+export async function dismissProductQuestion(needId: string, scope: ProductScope, body: { expected_generation: number; event_id?: string }): Promise<Record<string, JsonValue>> {
+  return fetchJson(`/product/questions/${encodeURIComponent(needId)}/dismiss?${scopedQuery(scope)}`, { method: "POST", body: JSON.stringify(body) });
+}
+
+export async function getProductReactions(scope: ProductScope, options: { situationId?: string; situationRevision?: number; signal?: AbortSignal } = {}): Promise<{ status?: string; items?: ProductReaction[]; silent_count?: number; [key: string]: JsonValue | undefined }> {
+  return fetchJson(`/product/reactions?${scopedQuery(scope, { situation_id: options.situationId, situation_revision: options.situationRevision })}`, { signal: options.signal });
+}
+
+export async function getProductSuggestions(scope: ProductScope, options: { situationId?: string; situationRevision?: number; signal?: AbortSignal } = {}): Promise<{ status?: string; items?: ProductReaction[]; [key: string]: JsonValue | undefined }> {
+  return fetchJson(`/product/suggestions?${scopedQuery(scope, { situation_id: options.situationId, situation_revision: options.situationRevision })}`, { signal: options.signal });
+}
+
+export type ReactionFeedbackLabel = "useful" | "not_useful" | "ignore" | "resolved" | "too_early" | "too_late" | "too_frequent" | "remind_before" | "remind_offset";
+export async function feedbackProductReaction(reactionId: string, scope: ProductScope, body: { label: ReactionFeedbackLabel; situation_revision: number; category?: string; remind_before_seconds?: number; evidence_refs?: string[] }): Promise<Record<string, JsonValue>> {
+  return fetchJson(`/product/reactions/${encodeURIComponent(reactionId)}/feedback?${scopedQuery(scope)}`, { method: "POST", body: JSON.stringify(body) });
+}
+
+export async function getProductSources(scope: ProductScope, options: { signal?: AbortSignal } = {}): Promise<ProductSources> {
+  return fetchJson(`/product/sources?${scopedQuery(scope)}`, { signal: options.signal });
+}
+
+// The current backend intentionally exposes status before provider authority.
+// Keep these seams explicit so a missing consent route is shown as unsupported.
+export async function consentProductSource(source: string, scope: ProductScope, body: { expected_generation?: number; purpose?: string; consent_id?: string; expires_at?: string } = {}): Promise<Record<string, JsonValue>> {
+  return fetchJson(`/product/sources/${encodeURIComponent(source)}/consent?${scopedQuery(scope)}`, { method: "POST", body: JSON.stringify({ expected_generation: body.expected_generation ?? 0, purpose: body.purpose ?? "Veyra V1 read-only Living Context", ...(body.consent_id ? { consent_id: body.consent_id } : {}), ...(body.expires_at ? { expires_at: body.expires_at } : {}) }) });
+}
+
+export async function revokeProductSource(source: string, scope: ProductScope, body: { expected_generation: number; consent_id?: string }): Promise<Record<string, JsonValue>> {
+  return fetchJson(`/product/sources/${encodeURIComponent(source)}/consent?${scopedQuery(scope)}`, { method: "DELETE", body: JSON.stringify({ expected_generation: body.expected_generation, ...(body.consent_id ? { consent_id: body.consent_id } : {}) }) });
 }
 
 export async function getProductMatters(scope: ProductScope): Promise<ProductMatters> {
@@ -173,7 +254,7 @@ export async function streamMessage(
     onEvent?.({ type: "phase", phase: "processing", status: "synchronous" });
     const result = await sendMessage(text, userId, sessionId, messageId, channel);
     onEvent?.({ type: "message", payload: result });
-    onEvent?.({ type: "completed", status: String(result.status ?? "completed") });
+    onEvent?.({ type: "completed", status: safeText(result.status, "completed") });
     return result;
   }
   if (response.status === 403) {
@@ -184,7 +265,7 @@ export async function streamMessage(
       onEvent?.({ type: "phase", phase: "processing", status: "synchronous" });
       const result = await sendMessage(text, userId, sessionId, messageId, channel);
       onEvent?.({ type: "message", payload: result });
-      onEvent?.({ type: "completed", status: String(result.status ?? "completed") });
+      onEvent?.({ type: "completed", status: safeText(result.status, "completed") });
       return result;
     }
     throw new Error("请求被后端治理策略拒绝（403），不是前端流式显示问题。");
@@ -194,7 +275,8 @@ export async function streamMessage(
     try {
       const payload = JSON.parse(await response.text()) as { detail?: JsonValue; message?: string };
       if (typeof payload.message === "string" && payload.message.trim()) detail = payload.message;
-      else if (payload.detail !== undefined) detail = typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail);
+      else if (typeof payload.detail === "string" && payload.detail.trim()) detail = payload.detail;
+      else if (payload.detail !== undefined) detail = `${response.status} ${response.statusText || "Request failed"}`;
     } catch { /* retain HTTP status */ }
     throw new Error(detail);
   }
@@ -226,7 +308,9 @@ export async function streamMessage(
     }
     if (parsed.type === "failed") {
       const payload = parsed.payload;
-      const message = payload && typeof payload === "object" && !Array.isArray(payload) ? String((payload as Record<string, JsonValue>).message ?? "Veyra could not finish this request") : "Veyra could not finish this request";
+      const message = payload && typeof payload === "object" && !Array.isArray(payload)
+        ? safeText((payload as Record<string, JsonValue>).message, "Veyra could not finish this request")
+        : safeText(payload, "Veyra could not finish this request");
       throw new Error(message);
     }
   };

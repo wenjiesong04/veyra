@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""Focused contract smoke for the local Product Preview read models.
-
-This deliberately uses an isolated temporary state root.  It proves the
-product boundary without touching the running local runtime or its state
-writer, and it keeps the assertions at the user-facing contract level.
-"""
+"""V1 Product backend contract, scope, mutation, and purity smoke."""
 
 from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -21,274 +17,261 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.goal_store_policy import (
-    WORKSPACE_GOAL_KIND,
-    WORKSPACE_GOAL_SCHEMA,
-    WORKSPACE_GOAL_SOURCE,
-)
-from core.world_state import WorldStateStore
-from interface.session_mapper import SessionMapper
-from routers.product import build_product_router
-from runtime.product_experience import LOCAL_EXTERNAL_SESSION, ProductExperienceService
-from runtime.product_experience_projection import readiness_projection
+from core.world_state import WorldStateStore  # noqa: E402
+from interface.event_schema import EventSource, EventType, VeyraEvent  # noqa: E402
+from routers.product import build_product_router  # noqa: E402
+from runtime.living_context_runtime import LivingContextRuntime  # noqa: E402
+from runtime.product_experience import ProductExperienceService  # noqa: E402
 
 
-SENSITIVE_VALUES = {
-    "/private/veyra/workspace-secret",
-    "control-token-should-never-leak",
-    "state/path/should-stay-private.json",
-    "other-owner-only-task",
-}
+SENSITIVE_VALUES = {"/private/veyra/workspace-secret", "control-token-should-never-leak", "state/path/should-stay-private.json"}
 
 
-def _goal(user_id: str, external_session: str, title: str) -> dict[str, Any]:
-    return {
-        "schema_version": WORKSPACE_GOAL_SCHEMA,
-        "kind": WORKSPACE_GOAL_KIND,
-        "source": WORKSPACE_GOAL_SOURCE,
-        "status": "active",
-        "user_id": user_id,
-        "session_id": SessionMapper().map("api", user_id, external_session),
-        "title": title,
-        "description": "A local product preview focus.",
-        "priority": 0.9,
-        "workspace_path": "/private/veyra/workspace-secret",
-        "control_token": "control-token-should-never-leak",
-        "state_path": "state/path/should-stay-private.json",
+class Understanding:
+    living_context_candidate: dict[str, Any]
+
+
+def expect(condition: bool, label: str) -> None:
+    if not condition:
+        raise AssertionError(f"{label} failed")
+    print(f"PASS {label}")
+
+
+def event(owner: str, session: str, number: int, text: str) -> VeyraEvent:
+    return VeyraEvent(
+        type=EventType.USER_MESSAGE,
+        source=EventSource(channel="api", user_id=owner, session_id=session),
+        payload={"text": text},
+        event_id=f"product-smoke-event-{number}",
+        timestamp=datetime(2026, 8, 17, 12, number, tzinfo=timezone.utc).isoformat(),
+    )
+
+
+def candidate(number: int) -> Understanding:
+    value = Understanding()
+    value.living_context_candidate = {
+        "schema_version": "veyra.living_context_candidate.v1",
+        "disposition": "create",
+        "create_subject": f"subject-{number}",
+        "category": "personal" if number == 1 else "work",
+        "title": f"Situation {number}",
+        "label": f"Focus {number}",
+        "summary": f"A generic long-lived Situation {number}.",
+        "goal": "Keep the next meaningful step clear.",
+        "lifecycle": "active",
+        "progress": {"status": "in_progress", "value": 0.25},
+        "known": [{"statement": f"The user reported Situation {number}."}],
+        "unknown": [f"The next fact for Situation {number} is not known."],
+        "assumptions": [{"statement": "The next observation may change the plan."}],
+        "timeline": [],
+        "material_change": f"Situation {number} entered the user's active context.",
+        "next_step": "Confirm the highest-impact next step.",
+        "needs": [{
+            "blocked_judgment": f"Missing fact {number}",
+            "evidence_kind": "user",
+            "why_now": "This is the next useful piece of context.",
+            "urgency": 0.7,
+            "allowed_source_classes": ["user"],
+            "fallback_reaction": "ask",
+            "question": f"What is the missing fact for Situation {number}?",
+        }],
     }
+    return value
 
 
-def _assert_no_sensitive_values(value: Any) -> None:
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True)
-    leaked = [needle for needle in SENSITIVE_VALUES if needle in encoded]
-    assert not leaked, f"product projection leaked private values: {leaked}"
-
-
-def _assert_authority_disabled(value: dict[str, Any]) -> None:
-    authority = value.get("authority")
-    assert isinstance(authority, dict), "authority summary is required"
-    assert all(item is False for item in authority.values()), authority
-
-
-def _state_bytes(state: WorldStateStore) -> dict[str, bytes]:
+def bytes_snapshot(store: WorldStateStore) -> dict[str, bytes]:
     return {
-        str(path.relative_to(state.root)): path.read_bytes()
-        for path in state.root.rglob("*")
+        str(path.relative_to(store.root)): path.read_bytes()
+        for path in store.root.rglob("*")
         if path.is_file() and path.name != ".veyra-writer.lock"
     }
 
 
-def _assert_matter_sections(value: dict[str, Any]) -> None:
-    sections = value.get("sections")
-    assert isinstance(sections, dict)
-    for name, section in sections.items():
-        assert set(section) == {"status", "count", "items"}, (name, section)
-        assert isinstance(section["count"], int)
-        assert isinstance(section["items"], list)
+def assert_safe(value: Any) -> None:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    leaked = [item for item in SENSITIVE_VALUES if item in encoded]
+    if leaked:
+        raise AssertionError(f"private value leaked: {leaked}")
+
+
+def assert_authority(value: dict[str, Any]) -> None:
+    authority = value.get("authority")
+    expect(isinstance(authority, dict) and all(item is False for item in authority.values()), "authority remains disabled")
 
 
 def main() -> int:
-    main_source = (ROOT / "main.py").read_text(encoding="utf-8")
-    product_block = main_source.split("product_experience = ProductExperienceService(", 1)[1].split("class _DynamicDeps", 1)[0]
-    assert "snapshot(read_only=True)" in product_block
-    assert "connection_status()" not in product_block
-    with TemporaryDirectory(prefix="veyra-product-smoke-") as temporary:
-        state = WorldStateStore(Path(temporary))
-        service = ProductExperienceService(state)
-        user = "owner-a"
-        external = "veyra-workspace-primary-v1"
-        internal = SessionMapper().map("api", user, external)
-        other_user = "owner-b"
-        other_external = "external-b"
+    with TemporaryDirectory(prefix="veyra-product-v1-") as temporary:
+        store = WorldStateStore(Path(temporary) / "state")
+        living = LivingContextRuntime(store)
+        owner, session = "owner-a", "session-a"
+        service = ProductExperienceService(store, living_context_runtime=living)
+        outputs: list[dict[str, Any]] = []
+        for number in range(1, 4):
+            current_event = event(owner, session, number, f"Situation {number} is real.")
+            outputs.append(living.process_user_turn(current_event, candidate(number)))
+        ids = [str(item["situation"]["situation_id"]) for item in outputs]
+        need_id = str(outputs[0]["information_needs"][0]["need_id"])
 
-        state.write_json(
-            "user_goals.json",
-            {
-                "goals": [_goal(user, external, "Local product focus")],
-                "updated_at": "2026-08-14T00:00:00+00:00",
-            },
-        )
-        state.write_json(
-            "task_state.json",
-            {"pending_agent_tasks": [{"title": "other-owner-only-task"}]},
-        )
-        state.write_json(
-            "user_commitments.json",
-            {
-                "commitments": [
-                    {"title": "Owner A commitment", "status": "open", "user_id": user, "session_id": internal},
-                    {"title": "other-owner-only-task", "status": "open", "user_id": other_user, "session_id": SessionMapper().map("api", other_user, other_external)},
-                ]
-            },
-        )
-
-        routes = {route.path for route in build_product_router(service=service).routes}
-        assert routes == {"/product/context", "/product/today", "/product/matters", "/product/status"}, routes
         app = FastAPI()
         app.include_router(build_product_router(service=service))
         client = TestClient(app)
-        for endpoint, schema in {
-            "/product/context": "veyra.product_context.v1",
-            "/product/today": "veyra.product_today.v1",
-            "/product/matters": "veyra.product_matters.v1",
-            "/product/status": "veyra.product_status.v1",
-        }.items():
-            response = client.get(endpoint)
-            assert response.status_code == 200, (endpoint, response.status_code)
-            assert response.json().get("schema_version") == schema, response.json()
-        assert client.get("/product/today?user_id=owner-a").status_code == 422
-        assert client.get("/product/context?session_id=one&external_session_id=two").status_code == 422
-        assert client.get("/product/context?session_id=one&external_session_id=one").status_code == 200
+        routes = {route.path for route in build_product_router(service=service).routes}
+        expect({"/product/context", "/product/today", "/product/matters", "/product/status"}.issubset(routes), "legacy product routes remain")
+        expect({"/product/situations", "/product/situations/{situation_id}", "/product/questions", "/product/reactions", "/product/sources"}.issubset(routes), "V1 product routes are registered")
 
-        context = service.context()
-        assert context["status"] == "ready"
-        assert context["internal_read_scope"] == {"user_id": user, "session_id": internal}
-        assert context["external_input_scope"] == {"channel": "api", "user_id": user, "session_id": external}
-        _assert_authority_disabled(context)
-        _assert_no_sensitive_values(context)
+        today = client.get(f"/product/today?user_id={owner}&session_id={session}&first_meeting=true")
+        expect(today.status_code == 200 and today.json()["schema_version"] == "veyra.product_today.v1", "Today contract is served")
+        today_value = today.json()
+        expect(len(today_value["situations"]) == 3 and today_value["first_meeting"] is False, "Today leads with three semantic Situations")
+        expect(len(today_value["questions"]["items"]) == 3 and today_value["focus"] is None, "questions work without a Workspace Goal")
+        assert_authority(today_value)
+        assert_safe(today_value)
 
-        mismatch = service.context(user_id=user, external_session_id="wrong-session")
-        assert mismatch["status"] == "needs_session_link"
-        assert mismatch["internal_read_scope"] is None
-        assert mismatch["goal"] is None
+        listed = client.get(f"/product/situations?user_id={owner}&session_id={session}").json()
+        expect(listed["count"] == 3 and all("situation_id" in item for item in listed["items"]), "Situation list uses semantic truth")
+        detail = client.get(f"/product/situations/{ids[0]}?user_id={owner}&session_id={session}")
+        expect(detail.status_code == 200, "Situation detail is available")
+        detail_value = detail.json()["situation"]
+        expect({"title", "goal", "status", "progress", "deadline_at", "known", "unknown", "assumptions", "timeline", "evidence_refs", "next_observation_at", "next_step", "material_change"}.issubset(detail_value), "Situation detail exposes the V1 fields")
+        assert_safe(detail.json())
+        expect(client.get(f"/product/situations?user_id=owner-b&session_id=session-b").json()["items"] == [], "Situation list is owner/session isolated")
 
-        today = service.today(user_id=user, session_id=internal)
-        assert today["status"] in {"success", "empty", "degraded"}
-        assert today["questions"]["status"] == "unsupported"
-        assert all(item.get("delivery") == "none" for item in today["suggestions"])
-        for item in today["suggestions"]:
-            _assert_authority_disabled(item)
-        _assert_authority_disabled(today)
-        _assert_no_sensitive_values(today)
+        questions = client.get(f"/product/questions?user_id={owner}&session_id={session}").json()
+        expect(any(item["need_id"] == need_id for item in questions["items"]), "InformationNeed is projected as a question")
+        answer = client.post(f"/product/questions/{need_id}/answer?user_id={owner}&session_id={session}", json={"answer": "The user supplied the missing fact.", "expected_generation": 1, "expected_revision": 1})
+        expect(answer.status_code == 200 and answer.json()["status"] == "answered", "answer updates Situation through LivingContextRuntime")
+        after_answer = client.get(f"/product/situations/{ids[0]}?user_id={owner}&session_id={session}").json()
+        expect(after_answer["situation"]["revision"] == 2 and after_answer["questions"] == [], "answer changes understanding and resolves the need")
 
-        matters = service.matters(user_id=user, session_id=internal)
-        commitments = matters["sections"]["commitments"]["items"]
-        assert [item["title"] for item in commitments] == ["Owner A commitment"]
-        _assert_matter_sections(matters)
-        _assert_authority_disabled(matters)
-        _assert_no_sensitive_values(matters)
+        command = client.post(f"/product/situations/{ids[0]}/command?user_id={owner}&session_id={session}", json={"command": "correct", "expected_revision": 2, "patch": {"next_step": "Take the next small step."}})
+        expect(command.status_code == 200 and command.json()["situation"]["revision"] == 3, "typed Situation correction uses revision CAS")
+        wrong_revision = client.post(f"/product/situations/{ids[0]}/command?user_id={owner}&session_id={session}", json={"command": "correct", "expected_revision": 2, "patch": {}})
+        expect(wrong_revision.status_code == 409, "stale Situation command fails closed")
+        expect(client.get(f"/product/situations/{ids[0]}?user_id=owner-b&session_id=session-b").status_code == 404, "wrong Situation scope is not observable")
+        resolved = client.post(f"/product/situations/{ids[2]}/command?user_id={owner}&session_id={session}", json={"command": "resolve", "expected_revision": 1, "patch": {}})
+        expect(resolved.status_code == 200 and resolved.json()["situation"]["status"] == "resolved", "resolve command closes a Situation")
+        reopened = client.post(f"/product/situations/{ids[2]}/command?user_id={owner}&session_id={session}", json={"command": "reopen", "expected_revision": 2, "reason": "the user has more to do", "patch": {}})
+        expect(reopened.status_code == 200 and reopened.json()["situation"]["status"] == "active", "reopen command requires and restores a terminal Situation")
+        quieted = client.post(f"/product/situations/{ids[2]}/command?user_id={owner}&session_id={session}", json={"command": "quiet", "expected_revision": 3, "patch": {}})
+        expect(quieted.status_code == 200 and quieted.json()["situation"]["status"] == "waiting", "quiet command enters a waiting phase")
 
-        corrupt_commitments = ProductExperienceService(state)
-        state.write_json("user_commitments.json", {"_state_corrupt": True, "commitments": []})
-        corrupt_matters = corrupt_commitments.matters(user_id=user, session_id=internal)
-        assert corrupt_matters["sections"]["commitments"]["status"] == "fail_closed"
+        # A generic reaction is persisted through the reaction runtime, then
+        # projected as a user-facing explanation and feedback target.
+        current = service.situation_detail(ids[1], user_id=owner, session_id=session)["situation"]
+        reaction = service.reaction_runtime.evaluate({
+            "owner_id": owner,
+            "session_id": session,
+            "now": datetime(2026, 8, 17, 13, tzinfo=timezone.utc).isoformat(),
+            "quiet_hours": False,
+            "consent": {"user": True},
+            "source_availability": {"user": True},
+            "situation": {**current, "owner_id": owner, "session_id": session, "revision": current["revision"], "progress": 0.25, "material_change": {"statement": current["material_change"] or "A material signal was recorded.", "revision": 1}},
+            "information_need": {"need_id": "need-reaction", "revision": 1, "status": "open", "kind": "clarification", "question": "What changed?", "source": "user", "priority": "high"},
+        })
+        reaction_id = reaction["decision"]["reaction_id"]
+        reactions = client.get(f"/product/reactions?user_id={owner}&session_id={session}").json()
+        expect(any(item["reaction_id"] == reaction_id and item["what_changed"] and item["why_relevant"] and item["why_now"] and item["recommendation"] for item in reactions["items"]), "reaction exposes what/why/why-now/recommendation")
+        feedback = client.post(f"/product/reactions/{reaction_id}/feedback?user_id={owner}&session_id={session}", json={"label": "useful", "situation_revision": current["revision"]})
+        expect(feedback.status_code == 200 and feedback.json()["status"] == "recorded", "typed reaction feedback is accepted")
+        stale_feedback = client.post(f"/product/reactions/{reaction_id}/feedback?user_id={owner}&session_id={session}", json={"label": "ignore", "situation_revision": current["revision"] + 1})
+        expect(stale_feedback.status_code == 409, "feedback revision mismatch fails closed")
+        suggestion_situation = service.situation_detail(ids[0], user_id=owner, session_id=session)["situation"]
+        suggested = service.reaction_runtime.evaluate({
+            "owner_id": owner,
+            "session_id": session,
+            "now": datetime(2026, 8, 17, 13, 1, tzinfo=timezone.utc).isoformat(),
+            "quiet_hours": False,
+            "consent": {"user": True},
+            "source_availability": {"user": True},
+            "situation": {**suggestion_situation, "owner_id": owner, "session_id": session, "revision": suggestion_situation["revision"], "progress": 0.25, "material_change": {"statement": "A second material signal was recorded.", "revision": 2}},
+            "information_need": None,
+        })
+        suggestions = client.get(f"/product/suggestions?user_id={owner}&session_id={session}")
+        expect(suggestions.status_code == 200 and suggestions.json()["items"] and all(item["disposition"] == "suggest" for item in suggestions.json()["items"]), "suggestions expose only suggest dispositions")
+        today_after_reaction = client.get(f"/product/today?user_id={owner}&session_id={session}").json()
+        expect(all(item["disposition"] == "suggest" for item in today_after_reaction["suggestions"]), "Today suggestions exclude ask/read/wait")
+        expect(all(item["disposition"] == "wait" for item in today_after_reaction["waiting"]), "Today waiting contains only wait dispositions")
+        detail_with_reactions = client.get(f"/product/situations/{ids[1]}?user_id={owner}&session_id={session}").json()
+        expect(all(item["situation_revision"] == current["revision"] for item in detail_with_reactions["reactions"]), "Situation detail excludes stale reactions")
+        advanced = client.post(f"/product/situations/{ids[1]}/command?user_id={owner}&session_id={session}", json={"command": "correct", "expected_revision": 1, "patch": {"next_step": "The current next step changed."}})
+        expect(advanced.status_code == 200 and advanced.json()["situation"]["revision"] == 2, "reaction stale-revision fixture advances through real command seam")
+        stale_detail = client.get(f"/product/situations/{ids[1]}?user_id={owner}&session_id={session}").json()
+        expect(stale_detail["reactions"] == [], "stale reaction is absent from current Situation detail")
+        stale_row_feedback = client.post(f"/product/reactions/{reaction_id}/feedback?user_id={owner}&session_id={session}", json={"label": "ignore", "situation_revision": 1})
+        expect(stale_row_feedback.status_code == 409, "feedback against stale current Situation fails closed")
+        expect(client.get(f"/product/reactions?user_id={owner}&session_id={session}&situation_id=missing").status_code == 404, "missing reaction Situation is not observable")
+        expect(client.post(f"/product/reactions/missing/feedback?user_id={owner}&session_id={session}", json={"label": "ignore", "situation_revision": 1}).status_code == 404, "missing reaction feedback target is not observable")
 
-        status = service.status()
-        assert status["evidence"] == {
-            "implementation": "implemented",
-            "configuration": "configuration_pending",
-            "automated": "validation_pending",
-            "live": "validation_pending",
-            "production": "not_in_scope",
-        }
-        _assert_authority_disabled(status)
-        _assert_no_sensitive_values(status)
+        sources = client.get(f"/product/sources?user_id={owner}&session_id={session}").json()
+        expect(sources["schema_version"] == "veyra.product_sources.v1" and sources["items"]["calendar"]["available"] is False, "sources are projected without provider execution")
+        matters = client.get(f"/product/matters?user_id={owner}&session_id={session}").json()
+        expect(set(matters["sections"]) >= {"situations", "questions", "suggestions", "deadlines"}, "Matters keeps a stable section envelope")
+        expect(client.get("/product/today?user_id=owner-a").status_code == 422, "legacy Today still requires exact scope when partially supplied")
+        status_before = bytes_snapshot(store)
+        product_status = client.get("/product/status")
+        expect(product_status.status_code == 200 and product_status.json()["integrity"]["status"] == "success", "status performs a healthy read-only integrity check")
+        expect(bytes_snapshot(store) == status_before, "status integrity check is byte-pure")
 
-        # Every product GET is read-only, including the selected-agent status
-        # projection.  The callback receives a cached capability snapshot and
-        # can never fall through to a live connection probe.
-        snapshot_read_only: list[bool] = []
+        class PagedReactionRuntime:
+            def __init__(self, rows: list[dict[str, Any]]) -> None:
+                self.rows = rows
 
-        def capability_snapshot(*, read_only: bool) -> dict[str, Any]:
-            snapshot_read_only.append(read_only)
-            return {
-                "selected_runtime": "openclaw",
-                "runtimes": [{
-                    "runtime": "openclaw",
-                    "operator_selected": True,
-                    "status": "not_configured",
-                    "configured": True,
-                    "base_url": "http://127.0.0.1:18789",
-                    "connected": False,
-                }],
-            }
+            def list_reactions(self, **_: Any) -> list[dict[str, Any]]:
+                return list(self.rows)
 
-        pure_service = ProductExperienceService(
-            state,
-            agent_status_resolver=lambda: capability_snapshot(read_only=True),
-            runtime_build_resolver=lambda: {"status": "available", "revision": "abc123456789"},
-        )
-        before = _state_bytes(state)
-        pure_status: dict[str, Any] | None = None
-        for endpoint in ("/product/context", "/product/today", "/product/matters", "/product/status"):
-            if endpoint == "/product/status":
-                pure_status = pure_service.status()
-            elif endpoint == "/product/context":
-                pure_service.context(user_id=user, external_session_id=external)
-            elif endpoint == "/product/today":
-                pure_service.today(user_id=user, session_id=internal)
-            else:
-                pure_service.matters(user_id=user, session_id=internal)
-        assert _state_bytes(state) == before
-        assert snapshot_read_only == [True]
-        assert pure_status is not None
-        readiness = pure_status["runtime"]["agent"]
-        assert readiness["status"] == "not_configured" and readiness["configured"] is False
-        assert readiness_projection({"status": "unknown", "base_url": "http://localhost"})["configured"] is False
+        current_revision = int(service.situation_detail(ids[0], user_id=owner, session_id=session)["situation"]["revision"])
+        paged_rows = [
+            {"owner_id": owner, "session_id": session, "situation_id": ids[0], "situation_revision": current_revision - 1, "reaction_id": "stale-suggestion-1", "disposition": "suggest", "category": "test", "created_at": "2026-08-17T15:03:00+00:00", "what_happened": "stale", "why_it_matters": "stale", "why_now": "stale", "suggested_next_step": "stale", "rank": 0.9},
+            {"owner_id": owner, "session_id": session, "situation_id": ids[0], "situation_revision": current_revision - 1, "reaction_id": "stale-suggestion-2", "disposition": "suggest", "category": "test", "created_at": "2026-08-17T15:02:00+00:00", "what_happened": "stale", "why_it_matters": "stale", "why_now": "stale", "suggested_next_step": "stale", "rank": 0.8},
+            {"owner_id": owner, "session_id": session, "situation_id": ids[0], "situation_revision": current_revision, "reaction_id": "current-suggestion", "disposition": "suggest", "category": "test", "created_at": "2026-08-17T15:01:00+00:00", "what_happened": "current", "why_it_matters": "current", "why_now": "current", "suggested_next_step": "current", "rank": 0.7},
+        ]
+        paged_service = ProductExperienceService(store, living_context_runtime=living, reaction_runtime=PagedReactionRuntime(paged_rows))
+        paged_suggestions = paged_service.reactions(user_id=owner, session_id=session, situation_id=ids[0], limit=1, visible_dispositions={"suggest"})
+        expect(len(paged_suggestions["items"]) == 1 and paged_suggestions["items"][0]["reaction_id"] == "current-suggestion", "suggestions filter current revision before limiting")
 
-        # Product previews are hidden as soon as the suggestion mode leaves
-        # record_only; this must hold even when a durable outbox is present.
-        state.write_json("ops_config.json", {"general_suggestions": {"mode": "disabled", "mode_epoch": 1}})
-        assert service.suggestion_outbox.list_preview(user_id=user, session_id=internal)["items"] == []
+        before = bytes_snapshot(store)
+        for path in (
+            f"/product/today?user_id={owner}&session_id={session}",
+            f"/product/matters?user_id={owner}&session_id={session}",
+            f"/product/situations?user_id={owner}&session_id={session}",
+            f"/product/situations/{ids[0]}?user_id={owner}&session_id={session}",
+            f"/product/questions?user_id={owner}&session_id={session}",
+            f"/product/reactions?user_id={owner}&session_id={session}",
+            f"/product/suggestions?user_id={owner}&session_id={session}",
+            f"/product/sources?user_id={owner}&session_id={session}",
+        ):
+            expect(client.get(path).status_code == 200, f"GET {path.split('?')[0]} succeeds")
+        expect(bytes_snapshot(store) == before, "all product GETs are byte-pure")
 
-        # Waiting rows only bind to current situations.  Malformed source
-        # records degrade the whole projection without leaking raw payloads.
-        service.attention_hypotheses.list_for_owner = lambda **_: {"status": "fail_closed", "items": []}
-        attention_closed = service.today(user_id=user, session_id=internal)
-        assert attention_closed["section_statuses"]["attention"] == "fail_closed"
-        current_id, expired_id = "s-current", "s-expired"
-        service.general_situations.list_for_owner = lambda **_: {"status": "success", "items": [
-            {"general_situation_id": current_id, "status": "open", "distinct_event_count": 2},
-            {"general_situation_id": expired_id, "status": "open", "distinct_event_count": 1, "expires_at": "2020-01-01T00:00:00+00:00"},
-        ]}
-        service.attention_hypotheses.list_for_owner = lambda **_: {"status": "success", "items": []}
-        service.suggestion_outbox.list_preview = lambda **_: {"status": "success", "items": []}
-        service.suggestion_outbox.list_decisions = lambda **_: {"status": "success", "items": [
-            {"general_situation_id": current_id, "decision_disposition": "wait"},
-            {"general_situation_id": expired_id, "decision_disposition": "wait"},
-        ]}
-        projection = service.today(user_id=user, session_id=internal)
-        assert len(projection["waiting"]) == 1
-        assert projection["waiting"][0]["status"] == "waiting"
-        service.general_situations.list_for_owner = lambda **_: {"status": "success", "items": [
-            {"general_situation_id": "malformed", "status": "open", "distinct_event_count": {"secret": "value"}},
-        ]}
-        malformed = service.today(user_id=user, session_id=internal)
-        assert malformed["status"] == "degraded"
-        assert malformed["situations"] == []
-        _assert_no_sensitive_values(malformed)
+        valid_state = store.read_json("situation_state.json")
+        store.mutate_json("situation_state.json", lambda state: {**state, "situations": [{**item, "semantic": {**item["semantic"], "material_change": ""}} if item.get("record_kind") == "semantic_situation" else item for item in state["situations"]]})
+        no_change_today = client.get(f"/product/today?user_id={owner}&session_id={session}")
+        expect(no_change_today.status_code == 200 and no_change_today.json()["recent_changes"] == [], "Recent changes only exposes material changes")
+        store.mutate_json("situation_state.json", lambda state: valid_state)
 
-        # An explicit user with no Goal gets a fresh local scope and never
-        # borrows the active Goal belonging to another owner.
-        state.write_json("user_goals.json", {"goals": [_goal(other_user, other_external, "Other owner")], "updated_at": None})
-        empty = service.context(user_id=user, external_session_id=external)
-        assert empty["status"] == "empty"
-        assert empty["goal"] is None
-        assert empty["internal_read_scope"] == {"user_id": user, "session_id": internal}
-        _assert_no_sensitive_values(empty)
-        empty_default = service.context(user_id=user)
-        assert empty_default["external_input_scope"]["session_id"] == LOCAL_EXTERNAL_SESSION
+        def corrupt(state: dict[str, Any]) -> dict[str, Any]:
+            for item in state["situations"]:
+                if item.get("situation_id") == ids[0]:
+                    item["semantic"] = "malformed"
+                    break
+            return state
+        store.mutate_json("situation_state.json", corrupt)
+        malformed = client.get(f"/product/situations?user_id={owner}&session_id={session}")
+        expect(malformed.status_code == 200 and malformed.json()["status"] == "degraded" and malformed.json()["degraded"]["status"] == "degraded", "malformed semantic state is typed degraded")
+        malformed_detail = client.get(f"/product/situations/{ids[0]}?user_id={owner}&session_id={session}")
+        expect(malformed_detail.status_code == 200 and malformed_detail.json()["status"] == "degraded", "malformed Situation detail is typed degraded")
+        degraded_status = client.get("/product/status")
+        expect(degraded_status.status_code == 200 and degraded_status.json()["status"] == "degraded" and degraded_status.json()["integrity"]["status"] == "degraded", "status reports corrupted product state without repair")
+        degraded_before = bytes_snapshot(store)
+        malformed_today = client.get(f"/product/today?user_id={owner}&session_id={session}&first_meeting=true")
+        expect(malformed_today.status_code == 200 and malformed_today.json()["first_meeting"] is False, "malformed Situation state never claims first meeting")
+        expect(bytes_snapshot(store) == degraded_before, "malformed reads remain read-only")
+        store.mutate_json("situation_state.json", lambda state: valid_state)
+        empty_service = ProductExperienceService(WorldStateStore(Path(temporary) / "empty-state"))
+        empty_today = empty_service.today(user_id=owner, session_id=session, first_meeting=True)
+        expect(empty_today["status"] == "empty" and empty_today["first_meeting"] is True, "explicit empty Situation source may claim first meeting")
 
-        # Without an explicit owner, more than one active workspace Goal is an
-        # ambiguity rather than permission to merge scopes.
-        state.write_json("user_goals.json", {"goals": [_goal(user, external, "Owner A"), _goal(other_user, other_external, "Owner B")], "updated_at": None})
-        ambiguous = service.context()
-        assert ambiguous["status"] == "ambiguous"
-        assert ambiguous["internal_read_scope"] is None
-        assert ambiguous["external_input_scope"] is None
-
-        # Duplicate active Goals for the same exact owner/session are also
-        # ambiguous; Today and Matters must not merge or guess a winner.
-        state.write_json("user_goals.json", {"goals": [_goal(user, external, "Owner A1"), _goal(user, external, "Owner A2")], "updated_at": None})
-        duplicate_today = service.today(user_id=user, session_id=internal)
-        duplicate_matters = service.matters(user_id=user, session_id=internal)
-        assert duplicate_today["status"] == duplicate_matters["status"] == "ambiguous"
-        _assert_matter_sections(duplicate_matters)
-        state.write_json("user_goals.json", {"goals": [_goal(user, external, "Owner A")], "updated_at": None})
-        mismatch_today = service.today(user_id=user, session_id="different-internal-session")
-        assert mismatch_today["status"] == "needs_session_link"
-
-    print("product experience smoke passed (scope, privacy, preview, status, router)")
+    print("RESULT product experience V1 smoke passed")
     return 0
 
 

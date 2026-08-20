@@ -6,6 +6,13 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from core.awareness_context_assembler import AwarenessContextAssembler
+from core.living_context_candidate_extractor import (
+    extract_living_context_candidate,
+    validate_candidate_catalog_binding,
+)
+from core.living_reaction_feedback_extractor import (
+    extract_living_reaction_feedback,
+)
 from core.model_client import redact_sensitive
 from core.prompt_loader import load_prompt
 from core.reasoning_core import CoreReasoning
@@ -20,6 +27,13 @@ from core.semantic_frame import (
 from core.semantic_policy import SemanticPolicyCompiler
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent
+from interface.living_context_contract import (
+    LivingContextCandidate,
+    LivingReactionFeedback,
+    parse_living_context_candidate_detailed,
+    parse_living_reaction_feedback_detailed,
+    situation_catalog_selector,
+)
 
 
 TURN_UNDERSTANDING_SYSTEM_FALLBACK = (
@@ -44,8 +58,8 @@ TURN_UNDERSTANDING_SYSTEM = (
     "Every source_quote must be an exact Python-style character slice of user_message: "
     "user_message[start:end] == text. One semantic act must contain only one independently assertable, "
     "deniable, or fulfillable goal. Never merge clauses with different polarity, authority, condition, "
-    "or requested outcome into one operation string. For example, 不要每天推送天气，只告诉我现在上海天气 "
-    "must be two acts: a negative recurring-push act and a positive current-weather query, connected by "
+    "or requested outcome into one operation string. For example, a negative recurring request followed by "
+    "a positive current query must be two acts, connected by "
     "a contrast relation. session_context.anchor_candidates contains server-issued, event-bound context "
     "candidates. When and only when one candidate is the unique referent of an act, copy its exact kind "
     "into target.type, exact label into target.value, and exact candidate_token into "
@@ -53,16 +67,75 @@ TURN_UNDERSTANDING_SYSTEM = (
     "invent, alter, combine, or treat "
     "that token as authority. If no candidate is a unique match, omit the token and keep the narrowest stable "
     "semantic target or an explicit ambiguity. Keep situation fields concise so the complete JSON fits the "
-    "output budget."
+    "output budget. Return living_context_candidate as a strict, bounded proposal when the user message "
+    "introduces, updates, corrects, or resolves a real-life Situation; otherwise return disposition=quiet. "
+    "The candidate may only reference an exact server-issued Situation or request create. Never include URL, "
+    "path, query, command, tool arguments, credentials, recipient, route, risk, state_effect, authority, or "
+    "capability fields anywhere in the candidate. User statements are reported, not verified. "
+    "InformationNeed describes missing evidence and a fallback reaction; it is not a tool call. "
+    "The JSON boundary is strict: every non-optional string must be a JSON string, and an empty value must be "
+    "\"\" rather than null, an object, or an array. This includes create_subject, label, title, summary, goal, "
+    "material_change, next_step, reopen_reason, nested statement/value fields, and Need blocked_judgment, "
+    "why_now, and question. Optional fields explicitly marked nullable may be null. assumptions is always a "
+    "list of objects {statement, epistemic_status}; never emit a bare assumption string. Use only these exact "
+    "enums: disposition quiet|create|update|correct|resolve; category general|personal|work|education|health|"
+    "travel|logistics|finance|other; progress.status unknown|not_started|in_progress|blocked|waiting|completed; "
+    "lifecycle emerging|active|waiting|resolved|expired|contradicted|archived; requested_reaction and "
+    "fallback_reaction ask|read|wait|silent; Need evidence_kind user|calendar|email|message|weather|public_web|"
+    "agent|time|other; entity.kind place|person|organization|item|other; epistemic_status reported|inferred. "
+    "Unknown enum values are invalid, not approximate synonyms. The literal candidate schema_version is "
+    "veyra.living_context_candidate.v1 (never veyra.context.v1). The literal semantic_frame schema_version is "
+    "veyra.semantic_frame.v1. For semantic_frame explicitness use only explicit|strong_implied|weak_implied|"
+    "inferred|unknown, mention_mode only normal_use|quoted_term|reported_speech|example|hypothetical|unknown, "
+    "and evidence_need is a string such as none or context, never an object. A minimal valid Situation candidate "
+    "is {schema_version:'veyra.living_context_candidate.v1',disposition:'create',create_subject:'...',"
+    "category:'general',summary:'...',known:[{statement:'...',epistemic_status:'reported'}],unknown:[],"
+    "assumptions:[],needs:[],requested_reaction:'wait',source:'model'}. A non-Situation candidate is "
+    "{schema_version:'veyra.living_context_candidate.v1',disposition:'quiet',source:'model'}. A minimal valid "
+    "feedback object is {schema_version:'veyra.living_reaction_feedback.v1',reaction_token:'<exact current "
+    "reaction token>',label:'useful',source_quote:{text:'<exact substring of user_message>',start:0,end:<length>}}; "
+    "feedback.source_quote is always an object, never a string. An explicit evaluation of a prior reaction "
+    "(useful, not useful, ignore, resolved, too early, too late, too frequent, or remind before) is direct "
+    "feedback: when the current catalog row contains reaction, emit living_reaction_feedback and copy its exact "
+    "reaction.reaction_token; do not omit feedback merely because the message is phrased as an acknowledgment. "
+    "Use feedback.label=ignore only when the user explicitly asks Veyra to suppress, dismiss, or stop acting on "
+    "that reaction; use not_useful when the reaction was evaluated as unhelpful but should not be suppressed; use "
+    "resolved only when the user states that the underlying Situation is complete or solved. Do not conflate these "
+    "labels, and do not infer one from a generic negative sentiment. "
+    "If no current reaction is supplied, omit feedback. A minimal valid "
+    "semantic frame has one act with exact keys act_id,kind,goal,operation,target,polarity,explicitness,"
+    "source_quote,speaker,authority,mention_mode,evidence_need,referent,condition,modality,arguments. Use "
+    "referent:{surface:'',resolved:'',status:'not_applicable',candidates:[]}, condition:null, arguments:{} "
+    "when they do not apply; condition is never a string and arguments is never a list. Use only "
+    "explicit|strong_implied|weak_implied|inferred|unknown for explicitness and only the four referent statuses. "
+    "Set relations:[], ambiguities:[], resolver_status:'resolved', source:'model'. A living Situation token "
+    "is not an anchor_candidate_token: only copy anchor_candidate_token from session_context.anchor_candidates, "
+    "and omit it when no such exact anchor is supplied. For a create or update candidate, extract a concise "
+    "user-grounded goal whenever the message states an objective; do not leave goal empty when the objective is directly "
+    "stated. Set progress.status from the user's wording: preparing/underway maps to in_progress, planning maps "
+    "to not_started, and only an explicit completion maps to completed; otherwise use unknown. Treat relative time "
+    "as a bounded reported time expression. Use only session_context.current_time (the server-provided "
+    "timezone-aware ISO timestamp) to resolve phrases such as next week or the end of this month. For a window, "
+    "deadline_at may be the timezone-aware end of that bounded window, while a Need or inferred assumption must "
+    "preserve that the exact event date is unknown. Never invent a calendar date from unstated facts, and leave "
+    "deadline_at null when no time expression is present."
 )
 
 TURN_UNDERSTANDING_REPAIR_SYSTEM = (
     TURN_UNDERSTANDING_SYSTEM
     + "\nYour previous candidate was incomplete or invalid. Rebuild the entire JSON object from the original "
     "user_message. Treat validation_issues as defects to fix, not as semantic facts. Preserve atomic acts, "
-    "opposite polarities, conditions, quotation/authority boundaries, and exact source slices. Return no prose."
+    "opposite polarities, conditions, quotation/authority boundaries, and exact source slices. Every non-optional "
+    "string must be a JSON string (use \"\" when empty, never null/object/array). Keep assumptions as a list of "
+    "{statement,epistemic_status} objects. answered_need_tokens is a JSON list of strings and "
+    "answered_need_bindings is a JSON list of {need_token,generation} objects. Keep the output compact: at most "
+    "one item per candidate list and one semantic act; timeline must remain a JSON list of bounded objects "
+    "{statement,occurred_at,source_quote,material}, never a scalar or mapping; omit optional feedback when no exact current reaction token "
+    "and quote exist. If the original user_message explicitly reports progress or a change to an existing Situation "
+    "or asks to add it to the original Situation, do not emit a quiet candidate: emit one update candidate using "
+    "only the exact matching situation_token, situation_revision, and catalog_token from the supplied current "
+    "catalog. This is a strict boundary repair, not permission to invent a Situation or token. Return no prose."
 )
-
 
 @dataclass(slots=True)
 class TurnUnderstanding:
@@ -93,10 +166,24 @@ class TurnUnderstanding:
     reason: str = ""
     source: str = ""
     semantic_frame: TurnSemanticFrame | None = None
+    living_context_candidate: LivingContextCandidate | None = None
+    living_context_candidate_issues: list[str] = field(default_factory=list)
+    living_context_candidate_metrics: dict[str, Any] = field(default_factory=dict)
+    living_reaction_feedback: LivingReactionFeedback | None = None
+    living_reaction_feedback_issues: list[str] = field(default_factory=list)
+    living_reaction_feedback_metrics: dict[str, Any] = field(default_factory=dict)
+    model_boundary_metrics: dict[str, Any] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_payload(cls, payload: dict[str, Any], *, source_text: str = "") -> "TurnUnderstanding":
+    def from_payload(
+        cls,
+        payload: dict[str, Any],
+        *,
+        source_text: str = "",
+        current_time: Any = None,
+        catalog: list[dict[str, Any]] | None = None,
+    ) -> "TurnUnderstanding":
         root_payload = payload
         if isinstance(payload.get("turn_understanding"), dict):
             payload = payload["turn_understanding"]
@@ -129,6 +216,34 @@ class TurnUnderstanding:
         semantic_text = source_text or str(root_payload.get("user_message") or explicit_request or task_summary or "")
         semantic_frame = _semantic_frame_from_payload(root_payload, source_text=semantic_text)
         semantic_frame = _apply_model_clarification_gap(semantic_frame, situation)
+        living_candidate_payload = situation.get("living_context_candidate")
+        if living_candidate_payload is None:
+            living_candidate_payload = payload.get("living_context_candidate")
+        if living_candidate_payload is None:
+            living_candidate_payload = root_payload.get("living_context_candidate")
+        (
+            living_candidate,
+            living_candidate_issues,
+            living_candidate_metrics,
+        ) = parse_living_context_candidate_detailed(
+            living_candidate_payload,
+            source_text=semantic_text,
+            current_time=current_time,
+            catalog=catalog,
+        )
+        reaction_feedback_payload = situation.get("living_reaction_feedback")
+        if reaction_feedback_payload is None:
+            reaction_feedback_payload = payload.get("living_reaction_feedback")
+        if reaction_feedback_payload is None:
+            reaction_feedback_payload = root_payload.get("living_reaction_feedback")
+        (
+            reaction_feedback,
+            reaction_feedback_issues,
+            reaction_feedback_metrics,
+        ) = parse_living_reaction_feedback_detailed(
+            reaction_feedback_payload,
+            source_text=semantic_text,
+        )
         return cls(
             intent=str(situation.get("intent") or payload.get("intent") or "unknown"),
             task_summary=task_summary or explicit_request,
@@ -161,6 +276,16 @@ class TurnUnderstanding:
                 or ("model" if root_payload.get("status") == "model_assisted" else "")
             ),
             semantic_frame=semantic_frame,
+            living_context_candidate=living_candidate,
+            living_context_candidate_issues=living_candidate_issues,
+            living_context_candidate_metrics=living_candidate_metrics,
+            living_reaction_feedback=reaction_feedback,
+            living_reaction_feedback_issues=reaction_feedback_issues,
+            living_reaction_feedback_metrics=reaction_feedback_metrics,
+            model_boundary_metrics={
+                "candidate": dict(living_candidate_metrics),
+                "feedback": dict(reaction_feedback_metrics),
+            },
             raw=payload,
         )
 
@@ -193,6 +318,19 @@ class TurnUnderstanding:
             "reason": self.reason,
             "source": self.source,
             "semantic_frame": self.semantic_frame.model_dump(mode="json") if self.semantic_frame is not None else None,
+            "living_context_candidate": (
+                self.living_context_candidate.model_dump(mode="json")
+                if self.living_context_candidate is not None
+                else None
+            ),
+            "living_context_candidate_metrics": dict(self.living_context_candidate_metrics),
+            "living_reaction_feedback": (
+                self.living_reaction_feedback.model_dump(mode="json")
+                if self.living_reaction_feedback is not None
+                else None
+            ),
+            "living_reaction_feedback_metrics": dict(self.living_reaction_feedback_metrics),
+            "model_boundary_metrics": dict(self.model_boundary_metrics),
         }
         if include_raw:
             data["raw"] = self.raw
@@ -215,6 +353,28 @@ class TurnUnderstanding:
                 "capability_needs": self.capability_needs,
                 "confidence": self.confidence,
                 "source": self.source,
+                "living_context_candidate": (
+                    {
+                        "disposition": self.living_context_candidate.disposition,
+                        "situation_token": self.living_context_candidate.situation_token,
+                        "needs": len(self.living_context_candidate.needs),
+                    }
+                    if self.living_context_candidate is not None
+                    else None
+                ),
+                "living_reaction_feedback": (
+                    {
+                        "label": self.living_reaction_feedback.label,
+                        "reaction_token": self.living_reaction_feedback.reaction_token,
+                    }
+                    if self.living_reaction_feedback is not None
+                    else None
+                ),
+                "model_boundary": {
+                    "candidate": dict(self.living_context_candidate_metrics),
+                    "feedback": dict(self.living_reaction_feedback_metrics),
+                    "overall": dict(self.model_boundary_metrics),
+                },
                 "semantic_frame": self.semantic_frame.compact() if self.semantic_frame is not None else None,
             },
             max_string=360,
@@ -284,6 +444,12 @@ class UnderstandingCore:
         awareness_snapshot: dict[str, Any] | None = None,
         allow_model: bool = True,
     ) -> TurnUnderstanding:
+        # The turn-context builder intentionally keeps a small allowlist of
+        # catalog fields.  Add the server-derived short selector locally so
+        # the model can copy one stable row reference without widening the
+        # shared context surface; the selector is resolved back to the full
+        # binding triple at the model boundary.
+        turn_context = _with_situation_catalog_selectors(turn_context)
         snapshot = (
             awareness_snapshot
             if isinstance(awareness_snapshot, dict)
@@ -319,6 +485,11 @@ class UnderstandingCore:
         if not self.reasoning.is_enabled():
             return None
         active = turn_context.get("active_context") if isinstance(turn_context.get("active_context"), dict) else {}
+        catalog = (
+            turn_context.get("living_context_situation_candidates")
+            if isinstance(turn_context.get("living_context_situation_candidates"), list)
+            else []
+        )
         short_memory = turn_context.get("short_memory") if isinstance(turn_context.get("short_memory"), dict) else {}
         conversation_tail = (
             short_memory.get("conversation_tail")
@@ -332,6 +503,17 @@ class UnderstandingCore:
         )
         payload = {
             "user_message": text,
+            # This is a source-binding aid, not a semantic fact.  Supplying
+            # the precomputed Python character span prevents providers from
+            # counting UTF-8 bytes when copying a feedback/candidate quote.
+            "source_binding": {
+                "python_character_length": len(text),
+                "exact_full_turn_quote": {
+                    "text": text,
+                    "start": 0,
+                    "end": len(text),
+                },
+            },
             "awareness_snapshot": awareness_snapshot,
             "session_context": {
                 "current_time": active.get("current_time"),
@@ -345,118 +527,134 @@ class UnderstandingCore:
                     if isinstance(turn_context.get("anchor_candidates"), list)
                     else []
                 ),
+                "living_context_situation_candidates": (
+                    turn_context.get("living_context_situation_candidates")
+                    if isinstance(turn_context.get("living_context_situation_candidates"), list)
+                    else []
+                ),
             },
             "required_json_fields": {
                 "situation_assessment": {
-                    "explicit_request": "what the user directly asks for",
-                    "hidden_need": "practical need behind the words, including frustration/confusion if present",
+                    "explicit_request": "string",
+                    "hidden_need": "string",
                     "emotion": "neutral|frustrated|confused|urgent|curious|other",
-                    "project": "project or domain anchor, e.g. Veyra, OpenClaw, course, deployment",
+                    "project": "string",
                     "risk_to_goal": "none|abandonment|wrong_direction|unsafe_execution|stale_evidence|lost_context|other",
                     "suggested_mode": "direct_answer|strategic_discussion|runtime_evidence|governed_execution|clarify|meta_cognition_discussion|other",
-                    "constraints": "list of user or environment constraints",
-                    "capability_needs": "list of capability ids or classes needed later, not route decisions",
+                    "constraints": "list[string]",
+                    "capability_needs": "list[string] (ids only, never routes)",
                     "time_scale": "immediate|today|week|long_term|unknown",
-                    "history_links": "list of exact candidate_token values from session_context.anchor_candidates that matter; never synthesize an id",
-                    "user_goal": "what the user is trying to accomplish",
-                    "what_user_really_needs": "same as hidden_need if useful",
+                    "history_links": "list of exact anchor_candidate_token values only",
+                    "user_goal": "string",
+                    "what_user_really_needs": "string",
                     "task_type": "chat|explanation|current_fact|local_status|workspace_task|code_task|proactive_request|meta_question|other",
                     "intent": "conversation|information|action|implementation|preference|unknown",
-                    "task_summary": "one sentence summary",
-                    "entities": "object: location, person, query, url, port, platform, topic, project",
-                    "relevant_awareness": "list of current perception items that may help",
-                    "stale_or_uncertain_awareness": "list of claims that must not be treated as fresh fact",
-                    "evidence_gap": {
-                        "needs_fresh_evidence": "boolean",
-                        "evidence_kind": "none|local|runtime|external|file|attachment|calendar|email|memory|weather|time|search|web",
-                        "what_would_change_the_answer": "concrete observation needed before a reliable answer",
-                    },
+                    "task_summary": "short string",
+                    "entities": "object of bounded mentions",
+                    "relevant_awareness": "list",
+                    "stale_or_uncertain_awareness": "list",
+                    "evidence_gap": "object {needs_fresh_evidence:boolean,evidence_kind:enum,what_would_change_the_answer:string}; evidence_kind=none|local|runtime|external|file|attachment|calendar|email|memory|weather|time|search|web",
                     "can_answer_from_current_context": "boolean",
-                    "confidence": "0.0-1.0",
-                    "reason": "short rationale",
+                    "confidence": "number 0.0..1.0",
+                    "reason": "short string",
                 },
-                "semantic_frame": {
-                    "schema_version": "veyra.semantic_frame.v1",
-                    "acts": [
-                        {
-                            "act_id": "unique id such as a1",
-                            "kind": "open-world discourse act, e.g. request, question, prohibition, correction, preference, statement",
-                            "goal": "the act's natural-language goal without collapsing other acts",
-                            "operation": "concise open-world semantic operation; unknown is allowed",
-                            "target": {
-                                "type": "open-world target type",
-                                "value": "target value",
-                                "attributes": "JSON object with target qualifiers; optional anchor_candidate_token must exactly copy one supplied candidate token, target.type its kind, and target.value its label",
-                            },
-                            "polarity": "positive|negative|neutral|other open-world semantic polarity",
-                            "explicitness": "explicit|strong_implied|weak_implied|inferred|unknown",
-                            "source_quote": {
-                                "text": "exact quote from user_message",
-                                "start": "integer Unicode character offset, inclusive",
-                                "end": "integer Unicode character offset, exclusive",
-                            },
-                            "speaker": "actual speaker of this act",
-                            "authority": "direct_user|reported_speech|quoted_text|hypothetical|other open-world value",
-                            "mention_mode": "normal_use|quoted_term|reported_speech|example|hypothetical|unknown",
-                            "evidence_need": "open-world evidence requirement such as none, context, fresh_local, fresh_external",
-                            "referent": {
-                                "surface": "pronoun or referring expression, empty when absent",
-                                "resolved": "resolved entity, empty when unresolved or absent",
-                                "status": "resolved|ambiguous|unresolved|not_applicable",
-                                "candidates": "list of possible referents",
-                            },
-                            "condition": "null or {kind, expression, source_quote}",
-                            "modality": "open-world modality such as asserted, conditional, hypothetical, reported",
-                            "arguments": "JSON object with semantic arguments; never put route, risk, state_effect, or capability grants here",
-                        }
-                    ],
-                    "relations": [
-                        {
-                            "relation_id": "unique id such as r1",
-                            "kind": "open-world relation such as contrast, correction, condition, sequence, alternative, quotation",
-                            "from_act_id": "existing act id",
-                            "to_act_id": "existing act id",
-                            "description": "short explanation",
-                            "source_quote": "null or exact source quote object",
-                        }
-                    ],
-                    "ambiguities": [
-                        {
-                            "ambiguity_id": "unique id such as u1",
-                            "kind": "open-world ambiguity type",
-                            "description": "what cannot yet be resolved",
-                            "affected_act_ids": "list of existing act ids",
-                            "candidates": "list of candidates",
-                        }
-                    ],
-                    "resolver_status": "resolved|ambiguous",
-                    "source": "model",
-                },
-                "retrieval_hints": "optional list: conversation, belief, user, task, capabilities, runtime",
+                "living_context_candidate": "If this message introduces or changes a real-life Situation, emit one compact object; otherwise emit {schema_version, disposition=quiet, source=model}. For create use {schema_version, disposition=create, create_subject, category, summary, goal, progress, deadline_at, known:[{statement,epistemic_status}], unknown:[string], assumptions:[{statement,epistemic_status}], needs:[{blocked_judgment,evidence_kind,why_now,urgency,allowed_source_classes,fallback_reaction,question}], requested_reaction, source}. When the user states an objective, goal is required and must be grounded in the direct user wording; progress.status reflects explicit wording and progress.value, when present, must be a JSON number from 0 to 1 or null (never a string, percentage, object, or NaN). Resolve next-week/end-of-month windows only from the server current_time into a timezone-aware bounded deadline_at; keep the exact event date as an unknown/Need, and never invent an exact date. Omit deadline_at only when the user gives no time expression. Exact enums: category=general|personal|work|education|health|travel|logistics|finance|other; epistemic_status=reported|inferred; evidence_kind=user|calendar|email|message|weather|public_web|agent|time|other; fallback_reaction/requested_reaction=ask|read|wait|silent; urgency is a JSON number 0..1. For update/correct/resolve copy exact situation_selector, situation_token, situation_revision, catalog_token from one current catalog row; situation_selector is a short opaque row selector and never replaces the final binding triple; never invent server-issued values.",
+                "living_reaction_feedback": "Emit when the user directly evaluates the current reaction; otherwise omit. Shape: {schema_version:'veyra.living_reaction_feedback.v1', reaction_token copied exactly from the current catalog, label=ignore|resolved|useful|not_useful|too_early|too_late|too_frequent|remind_before, remind_before_seconds:number only for remind_before, source_quote:{text,start,end} exact}. source_quote is an object, never a string; its text must be an exact user_message slice. Candidate and feedback are independent.",
+                "semantic_frame": "Compact exact object: {schema_version:'veyra.semantic_frame.v1', acts:[{act_id,kind,goal,operation,target:{type,value,attributes:{}},polarity,explicitness,source_quote:{text,start,end},speaker:'user',authority:'direct_user',mention_mode:'normal_use',evidence_need:'none',referent:{surface:'',resolved:'',status:'not_applicable',candidates:[]},condition:null,modality:'asserted',arguments:{}}], relations:[], ambiguities:[], resolver_status:'resolved'|'ambiguous', source:'model'}. Every source_quote must be an exact user_message slice; keep one act per independent assertion. condition is null or an object {kind,expression,source_quote}, never a string; arguments is an object, never a list.",
+                "retrieval_hints": "optional list of strings",
             },
+            "model_rules": [
+                "Never emit a Situation revision or invent a Situation/InformationNeed token.",
+                "Use only exact server-issued selectors, tokens, revisions, and Need references from session_context.living_context_situation_candidates.",
+                "For update/correct/resolve copy situation_selector, situation_revision, and catalog_token from the same current catalog row; never infer them.",
+                "For answered_need_tokens copy matching need_token and generation into answered_need_bindings from the same current catalog row.",
+                "A correct/resolve candidate requires an exact source_quote and direct_user assertion; otherwise leave it inferred and do not emit the lifecycle disposition.",
+                "A living_reaction_feedback entry requires an exact user source_quote and an exact current reaction_token; never infer either token or quote.",
+                "Feedback changes only the bounded reaction ledger. It never changes route, risk, authority, tools, execution, or delivery.",
+                "For all non-optional strings, emit \"\" when empty, never null. Keep assumptions as objects and copy only exact server-issued tokens, revisions, and Need generations.",
+                "Do not emit URL, path, query, command, tool, tool_args, authority, route, risk, or capability fields.",
+                "answered_need_tokens is a JSON list of strings; answered_need_bindings is a JSON list of {need_token, generation} objects. Do not use an object or string for either list.",
+                "Keep model output compact: at most one entity, one known item, one timeline item, and one InformationNeed. timeline is always a JSON list of bounded objects {statement,occurred_at,source_quote,material}; use [] when no valid timeline item is grounded in the user turn. If no exact source class is clear, use evidence_kind=other; never use a category such as travel or logistics as evidence_kind.",
+            ],
         }
-        result = self.reasoning.client.complete_json(
+        result = _complete_model_json_safe(
+            self.reasoning.client,
             purpose="turn_understanding",
             system=TURN_UNDERSTANDING_SYSTEM,
             user=json.dumps(payload, ensure_ascii=False),
         )
         self.reasoning._trace("turn_understanding", result, {"text_len": len(text)})
-        candidate, issues = _validated_model_understanding(result, source_text=text)
-        if candidate is not None and not issues:
-            return candidate
+        candidate, issues = _validated_model_understanding(
+            result,
+            source_text=text,
+            current_time=active.get("current_time"),
+            catalog=catalog,
+        )
+        initial_candidate = candidate
+        initial_issues = list(issues)
+        candidate_extraction_attempted = False
+        repaired_candidate: TurnUnderstanding | None = None
+        repaired: dict[str, Any] | None = None
+        if candidate is not None and not _has_semantic_boundary_issues(issues):
+            feedback_status = _boundary_status(candidate.living_reaction_feedback_metrics)
+            candidate, candidate_extraction_attempted, quiet_continuation_conflict = (
+                _recover_candidate_if_needed(
+                    candidate,
+                    text=text,
+                    turn_context=turn_context,
+                    current_time=active.get("current_time"),
+                    client=self.reasoning.client,
+                )
+            )
+            candidate = _recover_feedback_if_needed(
+                candidate,
+                text=text,
+                turn_context=turn_context,
+                client=self.reasoning.client,
+            )
+            candidate_status = _boundary_status(candidate.living_context_candidate_metrics)
+            if candidate_extraction_attempted and (
+                candidate.living_context_candidate is None
+                or quiet_continuation_conflict
+            ):
+                # Preserve an independently valid feedback artifact, but do
+                # not enter a second full semantic repair after this bounded
+                # candidate recovery has failed.
+                return candidate
+            # Candidate and feedback are independent optional model artifacts.
+            # A valid candidate remains useful even when optional feedback is
+            # malformed; a valid feedback artifact is retained across a
+            # candidate repair attempt below.
+            if candidate_status in {"accepted", "repaired", "absent"} and not quiet_continuation_conflict:
+                if candidate_status in {"accepted", "repaired"} or feedback_status in {
+                    "accepted",
+                    "repaired",
+                    "absent",
+                }:
+                    return candidate
+            elif feedback_status in {"accepted", "repaired"}:
+                # Try to recover the Situation candidate, but never throw away
+                # an independently valid reaction feedback proposal.
+                pass
+            if quiet_continuation_conflict:
+                issues = [
+                    *issues,
+                    "living_context_candidate:quiet_conflicts_with_explicit_continuation",
+                ]
 
         repairable_status = str(result.get("status") or "") in {
             "invalid_json",
             "invalid_response",
             "model_assisted",
         }
-        if repairable_status:
+        if repairable_status and not candidate_extraction_attempted:
             repair_payload = {
                 **payload,
-                "validation_issues": issues or [str(result.get("status") or "invalid_model_output")],
+                "validation_issues": issues or [_safe_status_marker(result.get("status"))],
                 "previous_candidate": _repair_candidate_for_prompt(result),
             }
-            repaired = self.reasoning.client.complete_json(
+            repaired = _complete_model_json_safe(
+                self.reasoning.client,
                 purpose="turn_understanding_repair",
                 system=TURN_UNDERSTANDING_REPAIR_SYSTEM,
                 user=json.dumps(repair_payload, ensure_ascii=False),
@@ -466,8 +664,42 @@ class UnderstandingCore:
                 repaired,
                 {"text_len": len(text), "validation_issues": issues[:8]},
             )
-            repaired_candidate, repaired_issues = _validated_model_understanding(repaired, source_text=text)
-            if repaired_candidate is not None and not repaired_issues:
+            repaired_candidate, repaired_issues = _validated_model_understanding(
+                repaired,
+                source_text=text,
+                current_time=active.get("current_time"),
+                catalog=catalog,
+            )
+            repaired_quiet_conflict = False
+            if repaired_candidate is not None and not _has_semantic_boundary_issues(repaired_issues):
+                repaired_candidate, recovery_attempted, repaired_quiet_conflict = (
+                    _recover_candidate_if_needed(
+                        repaired_candidate,
+                        text=text,
+                        turn_context=turn_context,
+                        current_time=active.get("current_time"),
+                        client=self.reasoning.client,
+                    )
+                )
+                candidate_extraction_attempted = (
+                    candidate_extraction_attempted or recovery_attempted
+                )
+            if (
+                repaired_candidate is not None
+                and not _has_semantic_boundary_issues(repaired_issues)
+                and _model_boundary_is_usable(repaired_candidate)
+                and not repaired_quiet_conflict
+                and (
+                    repaired_candidate.living_context_candidate is not None
+                    or _boundary_status(repaired_candidate.living_reaction_feedback_metrics)
+                    in {"accepted", "repaired"}
+                )
+            ):
+                _merge_model_boundary_metrics(
+                    repaired_candidate,
+                    initial=candidate,
+                    repair_attempted=True,
+                )
                 repaired_candidate.reason = (
                     f"{repaired_candidate.reason}; semantic repair retry passed"
                     if repaired_candidate.reason
@@ -475,15 +707,92 @@ class UnderstandingCore:
                 )
                 return repaired_candidate
             issues = repaired_issues or issues
+            if repaired_quiet_conflict:
+                issues = [
+                    *issues,
+                    "living_context_candidate:quiet_after_explicit_continuation_repair",
+                ]
 
+        # A strict candidate rejection must not erase an exact, independently
+        # validated feedback token/label/quote.  Keep the model semantic frame
+        # and feedback while leaving Situation admission fail-closed.
+        if (
+            initial_candidate is not None
+            and not _has_semantic_boundary_issues(initial_issues)
+            and _boundary_status(initial_candidate.living_reaction_feedback_metrics)
+            in {"accepted", "repaired"}
+        ):
+            _merge_model_boundary_metrics(
+                initial_candidate,
+                initial=initial_candidate,
+                repair_attempted=bool(repairable_status),
+            )
+            initial_candidate.reason = (
+                f"{initial_candidate.reason}; Situation candidate rejected at model boundary"
+                if initial_candidate.reason
+                else "Situation candidate rejected at model boundary"
+            )
+            return initial_candidate
+
+        if fallback is not None and not candidate_extraction_attempted:
+            # The combined understanding envelope is larger than the
+            # Situation contract and may fail independently at transport. A
+            # failed full response repair is still one bounded opportunity for
+            # the smaller candidate seam; never start another full repair.
+            return _attach_candidate_to_fallback(
+                fallback,
+                text=text,
+                turn_context=turn_context,
+                current_time=active.get("current_time"),
+                client=self.reasoning.client,
+                prior_repair_attempted=bool(repairable_status),
+                combined_status=_safe_status_marker(result.get("status")),
+                full_repair_status=(
+                    _safe_status_marker(repaired.get("status"))
+                    if isinstance(repaired, dict)
+                    else None
+                ),
+            )
         if not repairable_status or fallback is None:
             return None
-        return replace(
+        degraded = replace(
             fallback,
             semantic_frame=TurnSemanticFrame.fallback(text, resolver_status="invalid_output"),
             source="model_invalid_output",
             reason=f"model semantic output invalid after bounded repair: {', '.join(issues[:4]) or 'invalid output'}",
         )
+        boundary_holder = repaired_candidate or initial_candidate
+        candidate_metrics = (
+            dict(boundary_holder.living_context_candidate_metrics)
+            if boundary_holder is not None
+            else _rejected_boundary_report("living_context_candidate", issues, result)
+        )
+        feedback_metrics = (
+            dict(boundary_holder.living_reaction_feedback_metrics)
+            if boundary_holder is not None
+            else _rejected_boundary_report("living_reaction_feedback", issues, result)
+        )
+        degraded.living_context_candidate_metrics = candidate_metrics
+        degraded.living_reaction_feedback_metrics = feedback_metrics
+        degraded.living_context_candidate_issues = _boundary_issue_subset(
+            issues,
+            "living_context_candidate",
+        )
+        degraded.living_reaction_feedback_issues = _boundary_issue_subset(
+            issues,
+            "living_reaction_feedback",
+        )
+        degraded.model_boundary_metrics = {
+            "candidate": dict(candidate_metrics),
+            "feedback": dict(feedback_metrics),
+            "repair_attempted": bool(repairable_status),
+            "initial": (
+                dict(initial_candidate.model_boundary_metrics)
+                if initial_candidate is not None
+                else {}
+            ),
+        }
+        return degraded
 
     def fallback(
         self,
@@ -912,6 +1221,274 @@ def _blocks_contextual_read_recovery(text: str) -> bool:
     )
 
 
+def _quiet_candidate_conflicts_with_explicit_continuation(
+    *,
+    text: str,
+    candidate: LivingContextCandidate | None,
+    turn_context: dict[str, Any],
+) -> bool:
+    """Identify a narrow model-boundary conflict without choosing a Situation.
+
+    A valid ``quiet`` proposal is normally authoritative as a model boundary
+    result.  The one exception is a user turn that explicitly says it is
+    adding progress/change to an existing Situation while the current catalog
+    is non-empty.  The marker set is discourse-level (continuation/update),
+    not a domain or scenario vocabulary; the bounded repair model still has
+    to select an exact catalog row and produce the typed update candidate.
+    """
+
+    if candidate is None or candidate.disposition != "quiet":
+        return False
+    rows = turn_context.get("living_context_situation_candidates")
+    if not isinstance(rows, list) or not rows:
+        return False
+    compact = re.sub(r"[\s，,。！？!?、:：;；]+", "", str(text or "")).lower()
+    if not compact:
+        return False
+    continuation_markers = (
+        "补充",
+        "更新",
+        "进展",
+        "原事项",
+        "原来的事项",
+        "记到",
+        "同一件",
+        "继续处理",
+        "addthis",
+        "addthis to",
+        "update",
+        "progress",
+        "followup",
+        "follow-up",
+        "same situation",
+        "original situation",
+    )
+    return any(marker.replace(" ", "") in compact for marker in continuation_markers)
+
+
+def _recover_candidate_if_needed(
+    understanding: TurnUnderstanding,
+    *,
+    text: str,
+    turn_context: dict[str, Any],
+    current_time: Any,
+    client: Any,
+) -> tuple[TurnUnderstanding, bool, bool]:
+    """Run the single candidate-only recovery seam when it is needed.
+
+    Both the initial model result and a successful full semantic repair use
+    this helper.  The helper never decides admission and never retries the
+    full Understanding response; its typed result remains subject to the
+    existing server catalog/CAS downstream.
+    """
+
+    catalog = (
+        turn_context.get("living_context_situation_candidates")
+        if isinstance(turn_context.get("living_context_situation_candidates"), list)
+        else []
+    )
+    primary_candidate = understanding.living_context_candidate
+    primary_binding_issues = validate_candidate_catalog_binding(
+        primary_candidate,
+        catalog,
+    ) if primary_candidate is not None else []
+    if primary_binding_issues:
+        # Keep the primary artifact's diagnostics, but mark it rejected for
+        # this catalog snapshot before bounded recovery.  The model boundary
+        # must never silently rewrite a stale revision or token.
+        primary_metrics = dict(understanding.living_context_candidate_metrics)
+        primary_metrics.update(
+            {
+                "status": "rejected",
+                "issue_codes": list(primary_binding_issues),
+                "binding_issues": list(primary_binding_issues),
+            }
+        )
+        understanding.living_context_candidate_metrics = primary_metrics
+        understanding.living_context_candidate_issues = list(
+            dict.fromkeys(
+                [
+                    *understanding.living_context_candidate_issues,
+                    *primary_binding_issues,
+                ]
+            )
+        )[:16]
+    quiet_conflict = _quiet_candidate_conflicts_with_explicit_continuation(
+        text=text,
+        candidate=primary_candidate,
+        turn_context=turn_context,
+    )
+    if (
+        primary_candidate is not None
+        and not quiet_conflict
+        and not primary_binding_issues
+    ):
+        return understanding, False, False
+
+    extraction = extract_living_context_candidate(
+        client,
+        text=text,
+        current_time=current_time,
+        catalog=catalog,
+        primary_understanding={
+            "intent": understanding.intent,
+            "task_type": understanding.task_type,
+            "task_summary": understanding.task_summary,
+            "explicit_request": understanding.explicit_request,
+            "user_goal": understanding.user_goal,
+            "hidden_need": understanding.hidden_need,
+        },
+    )
+    if extraction.candidate is not None and not extraction.issues:
+        understanding.living_context_candidate = extraction.candidate
+        understanding.living_context_candidate_issues = []
+        understanding.living_context_candidate_metrics = dict(extraction.metrics)
+        _record_candidate_extraction(understanding, extraction)
+        quiet_conflict = _quiet_candidate_conflicts_with_explicit_continuation(
+            text=text,
+            candidate=understanding.living_context_candidate,
+            turn_context=turn_context,
+        )
+        if quiet_conflict:
+            understanding.living_context_candidate_issues = [
+                "living_context_candidate:quiet_after_explicit_continuation_extraction",
+            ]
+    else:
+        _record_candidate_extraction(understanding, extraction)
+        if primary_binding_issues:
+            # Do not leave a parsed-but-stale candidate object attached to the
+            # turn when recovery fails.  Its primary issue/metrics remain in
+            # model_boundary_metrics.primary_candidate.
+            understanding.living_context_candidate = None
+            understanding.living_context_candidate_issues = list(
+                dict.fromkeys(
+                    [
+                        *primary_binding_issues,
+                        *understanding.living_context_candidate_issues,
+                        *list(extraction.issues or []),
+                    ]
+                )
+            )[:16]
+        if quiet_conflict:
+            understanding.living_context_candidate_issues = [
+                "living_context_candidate:quiet_conflicts_with_explicit_continuation",
+                *extraction.issues[:2],
+            ]
+    return understanding, True, quiet_conflict
+
+
+def _recover_feedback_if_needed(
+    understanding: TurnUnderstanding,
+    *,
+    text: str,
+    turn_context: dict[str, Any],
+    client: Any,
+) -> TurnUnderstanding:
+    """Recover only an omitted current-reaction feedback artifact.
+
+    The combined understanding response and the optional feedback proposal
+    are independent model products.  When the response already carries a
+    strict feedback artifact this helper is a no-op.  Otherwise one bounded
+    feedback-only call receives the exact current reaction rows and may return
+    either an independently source-bound proposal or explicit absence.  It
+    never selects a Situation, rewrites a candidate, or changes admission.
+    """
+
+    feedback_status = _boundary_status(understanding.living_reaction_feedback_metrics)
+    if feedback_status in {"accepted", "repaired"}:
+        return understanding
+    catalog = (
+        turn_context.get("living_context_situation_candidates")
+        if isinstance(turn_context.get("living_context_situation_candidates"), list)
+        else []
+    )
+    extraction = extract_living_reaction_feedback(
+        client,
+        text=text,
+        catalog=catalog,
+    )
+    if extraction.feedback is not None and not extraction.issues:
+        understanding.living_reaction_feedback = extraction.feedback
+        understanding.living_reaction_feedback_issues = []
+        understanding.living_reaction_feedback_metrics = dict(extraction.metrics)
+        boundary_metrics = dict(understanding.model_boundary_metrics)
+        boundary_metrics["feedback"] = dict(extraction.metrics)
+        boundary_metrics["feedback_extraction"] = dict(extraction.metrics)
+        understanding.model_boundary_metrics = boundary_metrics
+        return understanding
+    if extraction.metrics.get("extractor_attempted"):
+        understanding.living_reaction_feedback = None
+        understanding.living_reaction_feedback_issues = list(extraction.issues)[:16]
+        understanding.living_reaction_feedback_metrics = dict(extraction.metrics)
+        boundary_metrics = dict(understanding.model_boundary_metrics)
+        boundary_metrics["feedback"] = dict(extraction.metrics)
+        boundary_metrics["feedback_extraction"] = dict(extraction.metrics)
+        understanding.model_boundary_metrics = boundary_metrics
+    return understanding
+
+
+def _attach_candidate_to_fallback(
+    understanding: TurnUnderstanding,
+    *,
+    text: str,
+    turn_context: dict[str, Any],
+    current_time: Any,
+    client: Any,
+    prior_repair_attempted: bool = False,
+    combined_status: str = "unavailable",
+    full_repair_status: str | None = None,
+) -> TurnUnderstanding:
+    """Attach one typed candidate when the combined model envelope is absent.
+
+    The rest of the turn remains the ordinary deterministic understanding;
+    only the optional Living Context artifact is model-derived. This avoids
+    treating a transport failure in the larger prompt as proof that the user
+    did not introduce or update a Situation.
+    """
+
+    catalog = (
+        turn_context.get("living_context_situation_candidates")
+        if isinstance(turn_context.get("living_context_situation_candidates"), list)
+        else []
+    )
+    extraction = extract_living_context_candidate(
+        client,
+        text=text,
+        current_time=current_time,
+        catalog=catalog,
+        primary_understanding={
+            "intent": understanding.intent,
+            "task_type": understanding.task_type,
+            "task_summary": understanding.task_summary,
+            "explicit_request": understanding.explicit_request,
+            "user_goal": understanding.user_goal,
+            "hidden_need": understanding.hidden_need,
+        },
+    )
+    understanding.living_context_candidate = extraction.candidate
+    understanding.living_context_candidate_metrics = dict(extraction.metrics)
+    understanding.living_context_candidate_issues = list(extraction.issues)[:16]
+    understanding.model_boundary_metrics = {
+        "candidate": dict(extraction.metrics),
+        "feedback": dict(understanding.living_reaction_feedback_metrics),
+        "candidate_extraction": dict(extraction.metrics),
+        "repair_attempted": bool(
+            extraction.metrics.get("repair_attempted")
+            or prior_repair_attempted
+        ),
+        "combined_understanding_available": False,
+        "combined_understanding_status": combined_status,
+    }
+    if full_repair_status is not None:
+        understanding.model_boundary_metrics["full_repair_status"] = full_repair_status
+    if extraction.candidate is not None:
+        understanding.source = "model_candidate"
+        understanding.reason = "bounded model candidate extracted after combined understanding was unavailable"
+    else:
+        understanding.reason = "combined understanding unavailable and bounded model candidate was not admitted"
+    return understanding
+
+
 def _weather_followup_location(*, text: str, previous_location: str) -> str:
     fragment = re.sub(r"[\s，,。！？!?、~～]+", "", text or "")
     for token in ("现在", "当前", "今天", "今日", "明天", "天气", "气温", "温度", "怎么样", "如何", "呢"):
@@ -943,20 +1520,259 @@ def _semantic_frame_from_payload(payload: dict[str, Any], *, source_text: str) -
         )
 
 
+def _complete_model_json_safe(
+    client: Any,
+    *,
+    purpose: str,
+    system: str,
+    user: str,
+) -> dict[str, Any]:
+    """Keep model transport failures inside the bounded understanding seam.
+
+    The normal ``CoreModelClient`` already returns a structured status, but a
+    test/provider adapter can still raise while completing a request.  Keep
+    only a stable exception type marker; never retain or surface exception
+    text, then let the caller use the same candidate-only fallback path.
+    """
+
+    try:
+        result = client.complete_json(
+            purpose=purpose,
+            system=system,
+            user=user,
+        )
+    except Exception as exc:
+        return {
+            "status": "exception",
+            "error_type": type(exc).__name__[:80],
+        }
+    if isinstance(result, dict):
+        safe_result = dict(result)
+        if safe_result.get("status") in {"error", "http_error"}:
+            # CoreModelClient normally returns a provider exception string in
+            # ``error``.  Preserve the transport class, but never carry that
+            # text into the understanding trace or boundary diagnostics.
+            safe_result.pop("error", None)
+            safe_result["error_code"] = "transport_error"
+        return safe_result
+    return {
+        "status": "invalid_response",
+        "response_type": type(result).__name__[:80],
+    }
+
+
+_SAFE_MODEL_STATUS_MARKERS = frozenset(
+    {
+        "model_assisted",
+        "invalid_json",
+        "invalid_response",
+        "error",
+        "http_error",
+        "unconfigured",
+        "unsupported_provider",
+        "auth_missing",
+        "exception",
+        "skipped",
+    }
+)
+
+
+def _safe_status_marker(value: Any) -> str:
+    marker = str(value or "").strip()
+    return marker if marker in _SAFE_MODEL_STATUS_MARKERS else "unknown"
+
+
+def _with_situation_catalog_selectors(
+    turn_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Copy a turn context and add deterministic selectors to catalog rows."""
+
+    context = dict(turn_context) if isinstance(turn_context, dict) else {}
+    raw_catalog = context.get("living_context_situation_candidates")
+    if not isinstance(raw_catalog, list):
+        return context
+    catalog: list[dict[str, Any]] = []
+    for raw_row in raw_catalog:
+        if not isinstance(raw_row, dict):
+            continue
+        row = dict(raw_row)
+        selector = row.get("situation_selector")
+        owner_id = row.get("owner_id")
+        session_id = row.get("session_id")
+        situation_token = row.get("situation_token")
+        if (
+            isinstance(owner_id, str)
+            and owner_id
+            and isinstance(session_id, str)
+            and session_id
+            and isinstance(situation_token, str)
+            and situation_token
+        ):
+            expected = situation_catalog_selector(owner_id, session_id, situation_token)
+            # Only advertise a selector that agrees with the server-derived
+            # value.  An inconsistent incoming projection is left without a
+            # selector and remains governed by the existing full-token path.
+            if selector is None:
+                row["situation_selector"] = expected
+            elif selector != expected:
+                row.pop("situation_selector", None)
+        catalog.append(row)
+    context["living_context_situation_candidates"] = catalog
+    return context
+
+
 def _validated_model_understanding(
     payload: dict[str, Any],
     *,
     source_text: str,
+    current_time: Any = None,
+    catalog: list[dict[str, Any]] | None = None,
 ) -> tuple[TurnUnderstanding | None, list[str]]:
     if payload.get("status") != "model_assisted":
-        return None, [str(payload.get("status") or "model_transport_failure")]
-    candidate = TurnUnderstanding.from_payload(payload, source_text=source_text)
+        status = _safe_status_marker(payload.get("status"))
+        return None, [status if status != "unknown" else "model_transport_failure"]
+    candidate = TurnUnderstanding.from_payload(
+        payload,
+        source_text=source_text,
+        current_time=current_time,
+        catalog=catalog,
+    )
     frame = candidate.semantic_frame
     if frame is None:
         return None, ["semantic_frame_missing"]
     if frame.resolver_status == "invalid_output":
         return None, ["semantic_frame_schema_or_source_binding_invalid"]
-    return candidate, semantic_frame_quality_issues(frame, source_text)
+    issues = semantic_frame_quality_issues(frame, source_text)
+    if candidate.living_context_candidate_issues:
+        issues.extend(_ensure_boundary_issue_prefix(
+            candidate.living_context_candidate_issues[:4],
+            "living_context_candidate",
+        ))
+    if candidate.living_reaction_feedback_issues:
+        issues.extend(_ensure_boundary_issue_prefix(
+            candidate.living_reaction_feedback_issues[:4],
+            "living_reaction_feedback",
+        ))
+    return candidate, issues
+
+
+def _boundary_status(metrics: dict[str, Any] | None) -> str:
+    if not isinstance(metrics, dict):
+        return "absent"
+    return str(metrics.get("status") or "absent")
+
+
+def _has_semantic_boundary_issues(issues: list[str]) -> bool:
+    """Return true only for frame/transport issues, not optional artifacts."""
+
+    return any(
+        not str(issue).startswith(("living_context_candidate:", "living_reaction_feedback:"))
+        for issue in issues
+    )
+
+
+def _model_boundary_is_usable(understanding: TurnUnderstanding) -> bool:
+    candidate_status = _boundary_status(understanding.living_context_candidate_metrics)
+    feedback_status = _boundary_status(understanding.living_reaction_feedback_metrics)
+    return candidate_status in {"accepted", "repaired", "absent"} or feedback_status in {
+        "accepted",
+        "repaired",
+    }
+
+
+def _merge_model_boundary_metrics(
+    understanding: TurnUnderstanding,
+    *,
+    initial: TurnUnderstanding | None,
+    repair_attempted: bool,
+) -> None:
+    """Keep bounded quality counters without copying model output."""
+
+    initial_metrics = initial.model_boundary_metrics if initial is not None else {}
+    existing_metrics = dict(understanding.model_boundary_metrics)
+    merged = {
+        "candidate": dict(understanding.living_context_candidate_metrics),
+        "feedback": dict(understanding.living_reaction_feedback_metrics),
+        "repair_attempted": bool(
+            repair_attempted or existing_metrics.get("repair_attempted")
+        ),
+        "initial": dict(initial_metrics) if isinstance(initial_metrics, dict) else {},
+    }
+    for key in ("candidate_extraction", "primary_candidate"):
+        if key in existing_metrics:
+            merged[key] = dict(existing_metrics[key])
+    understanding.model_boundary_metrics = merged
+
+
+def _record_candidate_extraction(
+    understanding: TurnUnderstanding,
+    extraction: Any,
+) -> None:
+    """Attach bounded extractor diagnostics without copying model payloads."""
+
+    previous_candidate_metrics = dict(understanding.living_context_candidate_metrics)
+    extraction_metrics = dict(getattr(extraction, "metrics", {}) or {})
+    if getattr(extraction, "candidate", None) is None and str(
+        previous_candidate_metrics.get("status") or ""
+    ) in {"absent", "rejected"}:
+        # The primary artifact was not admissible and the bounded recovery
+        # also failed.  Surface the recovery's safe issue codes instead of
+        # leaving an unhelpful ``absent/none`` diagnosis at the boundary.
+        understanding.living_context_candidate_metrics = extraction_metrics
+        extraction_issues = list(getattr(extraction, "issues", []) or [])
+        if extraction_issues:
+            understanding.living_context_candidate_issues = extraction_issues[:16]
+    boundary = dict(understanding.model_boundary_metrics)
+    boundary["candidate_extraction"] = extraction_metrics
+    boundary["primary_candidate"] = previous_candidate_metrics
+    boundary["repair_attempted"] = True
+    boundary["candidate"] = dict(understanding.living_context_candidate_metrics)
+    boundary["feedback"] = dict(understanding.living_reaction_feedback_metrics)
+    understanding.model_boundary_metrics = boundary
+    if getattr(extraction, "candidate", None) is not None:
+        understanding.reason = (
+            f"{understanding.reason}; bounded candidate extraction passed"
+            if understanding.reason
+            else "bounded candidate extraction passed"
+        )
+    else:
+        issues = list(getattr(extraction, "issues", []) or [])
+        if issues:
+            understanding.reason = (
+                f"{understanding.reason}; bounded candidate extraction unavailable"
+                if understanding.reason
+                else "bounded candidate extraction unavailable"
+            )
+
+
+def _boundary_issue_subset(issues: list[str], prefix: str) -> list[str]:
+    return [str(issue) for issue in issues if str(issue).startswith(f"{prefix}:")][:16]
+
+
+def _ensure_boundary_issue_prefix(issues: list[str], prefix: str) -> list[str]:
+    return [
+        str(issue)
+        if str(issue).startswith(f"{prefix}:")
+        else f"{prefix}:{issue}"
+        for issue in issues
+    ]
+
+
+def _rejected_boundary_report(
+    prefix: str,
+    issues: list[str],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    codes = _boundary_issue_subset(issues, prefix)
+    if not codes:
+        transport_status = _safe_status_marker(result.get("status"))
+        codes = [f"{prefix}:transport:{transport_status}"]
+    return {
+        "status": "rejected",
+        "repair_count": 0,
+        "repaired_fields": [],
+        "issue_codes": codes[:16],
+    }
 
 
 def _repair_candidate_for_prompt(payload: dict[str, Any]) -> dict[str, Any]:

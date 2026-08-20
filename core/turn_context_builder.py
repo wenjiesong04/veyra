@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -34,6 +35,7 @@ class TurnContextBuilder:
         rule_decision: dict[str, Any] | None = None,
         persona_hint: dict[str, Any] | None = None,
         anchor_candidates: list[dict[str, Any]] | None = None,
+        living_context_situation_candidates: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         state = self._scoped_state()
         relevant_claims = self.belief.relevant_claims(
@@ -118,6 +120,9 @@ class TurnContextBuilder:
             max_list=6,
         )
         context["anchor_candidates"] = safe_anchor_candidates
+        context["living_context_situation_candidates"] = self._living_context_catalog(
+            living_context_situation_candidates or []
+        )
         context, drift_report = self.drift_detector.apply(context, decision=rule_decision or {})
         context["_context_metrics"] = {
             "context_chars": drift_report["remediated_context_chars"],
@@ -142,6 +147,144 @@ class TurnContextBuilder:
                 },
             )
         return context
+
+    @staticmethod
+    def _living_context_catalog(
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Keep the Situation catalog bounded and model-safe.
+
+        The reaction entry is a deliberately tiny server projection.  The
+        understanding model needs the opaque token to bind direct feedback,
+        the revision to detect a stale catalog, and the disposition to
+        understand what the user is reacting to.  It must not receive the
+        durable reaction row (which contains authority/audit fields).
+        """
+
+        output: list[dict[str, Any]] = []
+        for item in candidates[:8]:
+            if not isinstance(item, dict):
+                continue
+            token = str(item.get("situation_token") or "")[:240]
+            if not token:
+                continue
+            observation_revision = item.get("observation_revision")
+            if (
+                isinstance(observation_revision, bool)
+                or not isinstance(observation_revision, int)
+                or observation_revision < 1
+            ):
+                continue
+            projection = {
+                key: item.get(key)
+                for key in (
+                    "situation_token",
+                    "observation_revision",
+                    "catalog_token",
+                    "owner_id",
+                    "session_id",
+                    "category",
+                    "label",
+                    "title",
+                    "summary",
+                    "goal",
+                    "lifecycle",
+                    "deadline_at",
+                    "progress",
+                    "unknown",
+                    "entities",
+                    "open_needs",
+                )
+                if key in item
+            }
+            catalog_token = item.get("catalog_token")
+            if isinstance(catalog_token, str) and re.fullmatch(r"cat_[0-9a-f]{32}", catalog_token.strip()):
+                projection["catalog_token"] = catalog_token.strip()
+            else:
+                projection.pop("catalog_token", None)
+            if "open_needs" in item:
+                projection["open_needs"] = TurnContextBuilder._living_context_need_catalog(
+                    item.get("open_needs")
+                )
+            reaction = TurnContextBuilder._living_context_reaction_projection(
+                item.get("reaction")
+            )
+            if reaction is not None:
+                projection["reaction"] = reaction
+            projection["situation_token"] = token
+            projection["observation_revision"] = observation_revision
+            # These two fields are server scope metadata, never user claims.
+            projection["owner_id"] = (
+                item.get("owner_id", "")[:240]
+                if isinstance(item.get("owner_id"), str)
+                else ""
+            )
+            projection["session_id"] = (
+                item.get("session_id", "")[:240]
+                if isinstance(item.get("session_id"), str)
+                else ""
+            )
+            output.append(projection)
+        return output
+
+    @staticmethod
+    def _living_context_need_catalog(value: Any) -> list[dict[str, Any]]:
+        """Project only the Need identity and bounded explanatory fields."""
+
+        if not isinstance(value, list):
+            return []
+        output: list[dict[str, Any]] = []
+        for item in value[:8]:
+            if not isinstance(item, dict):
+                continue
+            token = str(item.get("need_token") or "").strip()[:240]
+            generation = item.get("generation")
+            if (
+                not token
+                or "/" in token
+                or "\\" in token
+                or isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 1
+            ):
+                continue
+            projection: dict[str, Any] = {
+                "need_token": token,
+                "generation": generation,
+            }
+            for key, limit in (
+                ("blocked_judgment", 240),
+                ("question", 240),
+            ):
+                selected = item.get(key)
+                if isinstance(selected, str) and selected.strip():
+                    projection[key] = selected.strip()[:limit]
+            status = item.get("status")
+            if status in {"open", "asked", "observing", "waiting"}:
+                projection["status"] = status
+            output.append(projection)
+        return output
+
+    @staticmethod
+    def _living_context_reaction_projection(value: Any) -> dict[str, Any] | None:
+        """Return the exact minimal reaction catalog needed for feedback."""
+
+        if not isinstance(value, dict):
+            return None
+        token = str(value.get("reaction_token") or "").strip()
+        if not re.fullmatch(r"rxn_[0-9a-f]{32}", token):
+            return None
+        revision = value.get("reaction_revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            return None
+        disposition = value.get("disposition")
+        if disposition not in {"ask", "read", "wait", "silent", "suggest"}:
+            return None
+        return {
+            "reaction_token": token,
+            "reaction_revision": revision,
+            "disposition": disposition,
+        }
 
     @staticmethod
     def _anchor_candidate_catalog(

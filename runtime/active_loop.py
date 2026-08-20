@@ -36,6 +36,7 @@ class ActiveRuntimeLoop:
         cognitive_loop: Any | None = None,
         component_health_producer: Callable[[], Any] | None = None,
         workspace_observer: Callable[..., Any] | None = None,
+        living_context: Any | None = None,
     ) -> None:
         self.state_store = state_store
         self.runtime_entity = runtime_entity
@@ -54,6 +55,7 @@ class ActiveRuntimeLoop:
         self.cognitive_loop = cognitive_loop
         self.component_health_producer = component_health_producer
         self.workspace_observer = workspace_observer
+        self.living_context = living_context
         self.task_tracker = task_tracker
         self.adapter_resolver = adapter_resolver
         self.verifier = verifier
@@ -133,6 +135,7 @@ class ActiveRuntimeLoop:
                 lambda: self._workspace_observer_tick(),
             ),
             self._step("event_inbox", lambda: self._event_inbox_tick()),
+            self._step("living_context", lambda: self._living_context_tick()),
             self._step(
                 "project_guardian_producers",
                 lambda: self._project_guardian_producers_tick(),
@@ -171,6 +174,11 @@ class ActiveRuntimeLoop:
         self.state_store.append_jsonl("action_record.jsonl", {"route": "active_loop_tick", "status": status, "artifacts": tick})
         self._retention_after_tick_audit()
         return tick
+
+    def attach_living_context(self, runtime: Any | None) -> None:
+        """Attach the bounded V1 callback without changing legacy steps."""
+
+        self.living_context = runtime
 
     def _run_forever(self, loop_id: str, interval_seconds: float, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
@@ -306,6 +314,15 @@ class ActiveRuntimeLoop:
         output["general_situation_maintenance"] = maintenance
         return output
 
+    def _living_context_tick(self) -> dict[str, Any]:
+        if self.living_context is None:
+            return {"status": "not_configured"}
+        tick = getattr(self.living_context, "tick", None)
+        if not callable(tick):
+            return {"status": "degraded", "reason": "living_context_tick_unavailable"}
+        result = tick(limit=20, reason="active_loop")
+        return result if isinstance(result, dict) else {"status": "success"}
+
     def _project_guardian_tick(self) -> dict[str, Any]:
         if self.project_guardian is None:
             return {"status": "not_configured"}
@@ -363,6 +380,8 @@ class ActiveRuntimeLoop:
                     "projected_count",
                     "deduplicated_count",
                     "closure_count",
+                    "evaluated_count",
+                    "error_count",
                 )
                 if key in value
             }

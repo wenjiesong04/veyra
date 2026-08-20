@@ -2,7 +2,7 @@
 
 ## Status
 
-`CURRENT APPROACH / PARTIALLY IMPLEMENTED`
+`IMPLEMENTED BOUNDED ALPHA / CLEAN RUNTIME PENDING`
 
 ## 目的
 
@@ -49,6 +49,12 @@ Heartbeat 不能成为唯一触发器。没有变化、到期义务或 unresolve
 - retention；
 - bounded recovery。
 
+当前 alpha 已将自然语言 turn、Situation admission、Information Need/source
+observation、reaction 记录和反馈 ledger 接入同一条 owner/session-scoped runtime
+路径；持久化 authoritative Situation 与 projection 分开，重启/重放边界由
+revision、dedupe 和 CAS 合同保护。Calendar、Weather、Public Web 只读；Agent
+research、external delivery 和 execution disabled。
+
 长模型调用和外部观察不得阻塞整个 runtime tick。Reservation、generation fence、timeout、replay 和 crash recovery 应保持明确。
 
 ## 运行合同
@@ -61,6 +67,10 @@ Heartbeat 不能成为唯一触发器。没有变化、到期义务或 unresolve
 - status GET 不触发 probe、Agent、Git 或业务写；
 - stale/unknown/degraded 分开；
 - 每次运行说明处理、等待、失败与下一时间点。
+
+这些是实现和 pre-final automated contract 的边界。当前文档没有把某个进程的
+运行结果当作 clean runtime/live：干净启动身份、当前 served revision、浏览器
+acceptance 和 exact-SHA CI 仍需独立验证并保持 `PENDING`。
 
 ## 当前开放问题
 

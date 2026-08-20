@@ -1,6 +1,6 @@
 # Architecture Index
 
-Architecture 描述 **current approach**：当前准备怎样实现产品目标。它可以演进，不是 North Star，也不是永久类图。
+Architecture 描述 **current approach**：当前 V1 alpha 怎样组织已有能力以实现产品目标。它可以演进，不是 North Star，也不是永久类图。实现与 automated evidence 已有 bounded slice；real-model、live、browser、CI 和 user-value evidence 仍按状态文档独立记录。
 
 ## 阅读路径
 

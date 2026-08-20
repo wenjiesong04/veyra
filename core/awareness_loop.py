@@ -167,6 +167,9 @@ class AwarenessLoop:
         )
         self.event_inbox = self.event_awareness.event_inbox
         self.situation_evaluator = self.event_awareness.situation_evaluator
+        # Optional V1 product cognition seam.  Keeping this detached preserves
+        # the existing low-latency/chat path when the runtime is unavailable.
+        self.living_context_runtime: Any | None = None
         self.skill_loader = SkillLoader()
         self.skill_runtime = SkillRuntime(state_store)
         self.probes = {
@@ -187,6 +190,11 @@ class AwarenessLoop:
             "mcp": McpProbe(),
         }
 
+    def attach_living_context_runtime(self, runtime: Any | None) -> None:
+        """Attach the optional Situation/InformationNeed coordinator."""
+
+        self.living_context_runtime = runtime
+
     def handle_event(self, event: VeyraEvent) -> LoopResult:
         started_at = time.perf_counter()
         route_trace: list[dict[str, object]] = [
@@ -198,6 +206,30 @@ class AwarenessLoop:
             }
         ]
         context_observability: dict[str, Any] = {}
+        # This is a per-turn value, not shared mutable state.  Every return
+        # path carries at least a quiet/skipped Living Context artifact.
+        living_context: dict[str, Any] = {
+            "status": "skipped",
+            "reason": "before_understanding",
+            "authority": {
+                "route": False,
+                "risk": False,
+                "tool": False,
+                "execution": False,
+                "delivery": False,
+            },
+        }
+
+        def finalize(result: LoopResult) -> LoopResult:
+            return self._finalize_event(
+                event,
+                result,
+                started_at,
+                route_trace,
+                context_observability,
+                living_context=living_context,
+            )
+
         self.runtime_entity.set_status(LifecycleStatus.THINKING.value)
         text = event.payload.get("text", "")
         self.state_store.append_jsonl("event_log.jsonl", self._event_log_record(event))
@@ -251,7 +283,7 @@ class AwarenessLoop:
                     "execution_tier": TIER_L0_DIRECT_ANSWER,
                 },
             )
-            return self._finalize_event(event, result, started_at, route_trace, context_observability)
+            return finalize(result)
         belief_state = self.belief.refresh()
         preliminary_persona = self.persona_engine.patch_for(
             text,
@@ -276,6 +308,22 @@ class AwarenessLoop:
                 "model_catalog": [],
                 "snapshot_digest": "",
             }
+        living_catalog: list[dict[str, Any]] = []
+        if self.living_context_runtime is not None:
+            try:
+                living_catalog = self.living_context_runtime.model_catalog(
+                    owner_id=event.source.user_id,
+                    session_id=event.source.session_id,
+                    limit=8,
+                )
+            except Exception as exc:
+                route_trace.append(
+                    {
+                        "phase": "living_context_catalog",
+                        "status": "degraded",
+                        "reason": type(exc).__name__,
+                    }
+                )
         turn_context = self.core_reasoning.turn_context.build(
             user_message=text,
             attention_focus=attention_focus,
@@ -287,6 +335,7 @@ class AwarenessLoop:
                 if isinstance(anchor_candidate_index.get("model_catalog"), list)
                 else []
             ),
+            living_context_situation_candidates=living_catalog,
         )
         context_observability = {
             "context_metrics": turn_context.get("_context_metrics", {}) if isinstance(turn_context, dict) else {},
@@ -308,6 +357,21 @@ class AwarenessLoop:
             turn_context=turn_context,
         )
         understanding_payload = turn_understanding.to_dict(include_raw=False)
+        living_context = self._process_living_context(
+            event,
+            turn_understanding,
+            catalog=living_catalog,
+        )
+        route_trace.append(
+            {
+                "phase": "living_context",
+                "status": living_context.get("status"),
+                "operation": living_context.get("operation"),
+                "situation_id": (living_context.get("situation") or {}).get("situation_id")
+                if isinstance(living_context.get("situation"), dict)
+                else None,
+            }
+        )
         attention_refinement = self.attention.refine_from_understanding(
             text=str(text or ""),
             understanding=turn_understanding,
@@ -473,7 +537,7 @@ class AwarenessLoop:
                     "route": followup_result.route.value,
                 }
             )
-            return self._finalize_event(event, followup_result, started_at, route_trace, context_observability)
+            return finalize(followup_result)
         early_response = self._early_awareness_response(
             event,
             str(text or ""),
@@ -501,7 +565,7 @@ class AwarenessLoop:
                     "turn_understanding": understanding_payload,
                 },
             )
-            return self._finalize_event(event, result, started_at, route_trace, context_observability)
+            return finalize(result)
         decision, controller_plan = self.controller.prepare(decision)
         route_trace.append({"phase": "controller", **controller_plan.to_dict()})
         self.state_store.patch_json("risk_state.json", {"current_risk": decision.risk_level.value})
@@ -549,13 +613,7 @@ class AwarenessLoop:
                     "review_created": False,
                 }
             )
-            return self._finalize_event(
-                event,
-                result,
-                started_at,
-                route_trace,
-                context_observability,
-            )
+            return finalize(result)
         foresight = self._foresight_for_decision(text, decision)
         guardian_decision = self.guardian.review_text_action(text=text, decision=decision, foresight=foresight)
         route_trace.append(
@@ -577,7 +635,7 @@ class AwarenessLoop:
                 risk_level=decision.risk_level,
                 artifacts={"guardian": guardian_decision, "foresight": foresight, "persona": persona_patch, "controller": controller_plan.to_dict()},
             )
-            return self._finalize_event(event, result, started_at, route_trace, context_observability)
+            return finalize(result)
 
         if guardian_decision["decision"] == GuardianDecision.ASK_USER.value:
             self.runtime_entity.set_status(LifecycleStatus.WAITING_CONFIRMATION.value)
@@ -606,7 +664,7 @@ class AwarenessLoop:
                 risk_level=decision.risk_level,
                 artifacts={"guardian": guardian_decision, "foresight": foresight, "review": review, "proposal": proposal, "persona": persona_patch, "controller": controller_plan.to_dict()},
             )
-            return self._finalize_event(event, result, started_at, route_trace, context_observability)
+            return finalize(result)
 
         self.runtime_entity.set_status(LifecycleStatus.ACTING.value)
         execution_tier = classify_execution_tier(text, decision)
@@ -643,7 +701,7 @@ class AwarenessLoop:
                         **({"probe_result": compact.get("probe_result")} if isinstance(compact.get("probe_result"), dict) else {}),
                     },
                 )
-                return self._finalize_event(event, result, started_at, route_trace, context_observability)
+                return finalize(result)
             route_trace.append({"phase": "compact_external_lookup", "status": "fallback", "reason": compact.get("reason")})
             compact_probe_result = self._compact_search_probe_result(compact)
             if compact_probe_result:
@@ -662,7 +720,7 @@ class AwarenessLoop:
                         "probe_result": compact_probe_result,
                     },
                 )
-                return self._finalize_event(event, result, started_at, route_trace, context_observability)
+                return finalize(result)
             failed_probe_result = self._compact_lookup_failure_probe_result(compact)
             result = LoopResult(
                 event_id=event.event_id,
@@ -688,7 +746,7 @@ class AwarenessLoop:
                     },
                 },
             )
-            return self._finalize_event(event, result, started_at, route_trace, context_observability)
+            return finalize(result)
 
         if decision.route == Route.DIRECT_ANSWER:
             result = LoopResult(
@@ -1194,7 +1252,7 @@ class AwarenessLoop:
             result.artifacts["memory_policy_execution"] = {"status": "written", "policy": decision.memory_policy, "write": result.artifacts.get("memory_write")}
         else:
             result.artifacts["memory_policy_execution"] = self.memory_policy_runtime.apply(event, decision, result)
-        return self._finalize_event(event, result, started_at, route_trace, context_observability)
+        return finalize(result)
 
     def _finalize_event(
         self,
@@ -1203,7 +1261,25 @@ class AwarenessLoop:
         started_at: float,
         route_trace: list[dict[str, object]],
         context_observability: dict[str, Any],
+        *,
+        living_context: dict[str, Any] | None = None,
     ) -> LoopResult:
+        if not isinstance(living_context, dict):
+            living_context = {
+                "status": "skipped",
+                "reason": "no_living_context_artifact",
+                "authority": {
+                    "route": False,
+                    "risk": False,
+                    "tool": False,
+                    "execution": False,
+                    "delivery": False,
+                },
+            }
+        result.artifacts.setdefault("living_context", living_context)
+        followup = self._living_context_followup(living_context)
+        if followup and followup not in result.followup_messages:
+            result.followup_messages.append(followup)
         context_metrics = context_observability.get("context_metrics") if isinstance(context_observability.get("context_metrics"), dict) else {}
         context_drift = context_observability.get("context_drift") if isinstance(context_observability.get("context_drift"), dict) else {}
         result.artifacts.setdefault("context_metrics", context_metrics)
@@ -1332,6 +1408,123 @@ class AwarenessLoop:
         """Project pending events into situations, never actions."""
 
         return self.event_awareness.process_pending(limit=limit)
+
+    def _process_living_context(
+        self,
+        event: VeyraEvent,
+        understanding: Any,
+        *,
+        catalog: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Admit a model candidate without allowing it to affect routing.
+
+        The coordinator is deliberately best-effort from the main response's
+        perspective.  A malformed candidate, stale CAS, or unavailable need
+        store becomes an honest artifact and never suppresses the ordinary
+        answer already produced by AwarenessLoop.
+        """
+
+        runtime = self.living_context_runtime
+        if runtime is None:
+            return {
+                "status": "unavailable",
+                "reason": "runtime_not_attached",
+                "authority": {
+                    "route": False,
+                    "risk": False,
+                    "tool": False,
+                    "execution": False,
+                    "delivery": False,
+                },
+            }
+        try:
+            result = runtime.process_user_turn(
+                event,
+                understanding,
+                catalog=catalog,
+            )
+            if not isinstance(result, dict):
+                raise TypeError("LivingContextRuntime returned a non-object")
+            if (
+                str(result.get("status") or "") == "quiet"
+                and str(getattr(understanding, "source", ""))
+                in {"context_fallback", "model_invalid_output"}
+            ):
+                result["cognition_status"] = "degraded"
+                result["degraded_reason"] = "model_candidate_unavailable"
+            result.setdefault("authority", {
+                "route": False,
+                "risk": False,
+                "tool": False,
+                "execution": False,
+                "delivery": False,
+            })
+            return result
+        except Exception as exc:
+            return {
+                "status": "degraded",
+                "reason": "living_context_admission_failed",
+                "error_type": type(exc).__name__,
+                "authority": {
+                    "route": False,
+                    "risk": False,
+                    "tool": False,
+                    "execution": False,
+                    "delivery": False,
+                },
+            }
+
+    @staticmethod
+    def _living_context_followup(artifact: dict[str, Any]) -> str:
+        """Render only the server-owned reaction decision for this turn.
+
+        Living Context admission may persist a Situation without authorising a
+        user-facing interruption.  The reaction runtime is the sole owner of
+        that choice; the candidate's requested reaction and the presence of an
+        open InformationNeed are only hints.  In particular, read is a
+        background operation and wait/silent (including quiet-hour and
+        suppression decisions) must not leak through this helper.
+        """
+        if str(artifact.get("status") or "") not in {"recorded", "replayed"}:
+            return ""
+        decision = artifact.get("current_reaction")
+        if not isinstance(decision, dict):
+            reaction = artifact.get("reaction")
+            decision = reaction.get("decision") if isinstance(reaction, dict) else None
+        if not isinstance(decision, dict):
+            return ""
+        disposition = str(decision.get("disposition") or "").strip().lower()
+        if disposition not in {"ask", "suggest"}:
+            return ""
+        situation = artifact.get("situation") if isinstance(artifact.get("situation"), dict) else {}
+        semantic = situation.get("semantic") if isinstance(situation.get("semantic"), dict) else {}
+        label = str(
+            semantic.get("label") or semantic.get("title") or semantic.get("summary") or "这件事"
+        ).strip()[:120]
+        prefix = "已记录" if str(artifact.get("status")) == "recorded" else "已接上"
+        if disposition == "ask":
+            question = str(decision.get("suggested_next_step") or "").strip()[:240]
+            if not question:
+                needs = artifact.get("information_needs") if isinstance(artifact.get("information_needs"), list) else []
+                need_id = str(decision.get("information_need_id") or "")
+                selected = next(
+                    (
+                        item
+                        for item in needs
+                        if isinstance(item, dict) and str(item.get("need_id") or "") == need_id
+                    ),
+                    {},
+                )
+                question = str(selected.get("question") or "").strip()[:240]
+            if not question:
+                return ""
+            return f"{prefix}「{label}」。我想确认：{question}"
+
+        happened = str(decision.get("what_happened") or "这件事出现了变化").strip()[:180]
+        matters = str(decision.get("why_it_matters") or "它可能影响你当前的目标").strip()[:180]
+        why_now = str(decision.get("why_now") or "现在值得重新看一眼").strip()[:180]
+        next_step = str(decision.get("suggested_next_step") or "看看下一步安排").strip()[:180]
+        return f"{prefix}「{label}」：发生了{happened} → 因为{matters} → 现在值得关注：{why_now} → 建议：{next_step}。"
 
     def _result_execution_tier(self, result: LoopResult) -> str:
         direct_tier = str(result.artifacts.get("execution_tier") or "").strip()

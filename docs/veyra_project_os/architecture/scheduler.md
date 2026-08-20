@@ -2,7 +2,7 @@
 
 ## Status
 
-`PARTIALLY IMPLEMENTED / PRODUCT TIMING UNVALIDATED`
+`IMPLEMENTED BOUNDED SCHEDULING / PRODUCT TIMING UNVALIDATED`
 
 ## 目的
 
@@ -68,3 +68,10 @@ Scheduler 决定什么时候重新观察、重新理解或触达用户。它不�
 - 是否因预算/故障沉默；
 - 同一用户多个 Concern 是否公平；
 - 两周后 timing 是否因反馈改善。
+
+当前 alpha 的 scheduler 已消费 due Information Need/source work、Situation
+material change 和 reaction state，并保留 `read`、`wait`、`silent`、`suggest`
+的显式决定。重复 tick 通过 generation/idempotence 边界避免重复 reaction，
+feedback effect 只允许 timing、cooldown 和 suppression。上述是 pre-final
+automated evidence；没有真实两周样本，所以产品 timing、false silence 和
+usefulness 仍为 `PENDING`。

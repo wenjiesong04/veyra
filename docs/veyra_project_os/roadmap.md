@@ -4,17 +4,17 @@ Roadmap 按用户结果和研究问题排序，不按模块数量排序。阶段
 
 ## 路线
 
-| 阶段 | User Outcome | Research Question | 最小证据 | Exit 条件 |
-|---|---|---|---|---|
-| R0 诚实基线 | 用户知道 Veyra 当前能理解什么、不能做什么 | 现有状态能否被准确、可纠正地投影？ | current-revision state review、scope/privacy tests | Living Context 只读投影不复制 truth，状态与证据语言诚实 |
-| R1 一个持续 Situation | 用户表达一件真实生活中的事，Veyra 跨天保持上下文 | Situation 是否比 conversation/task 更能维持连续理解？ | 一条真实非代码 Situation、restart/replay、用户纠正 | 两次以上独立更新后仍正确维护 Known/Unknown/时间线 |
-| R2 一个 Information Need | Veyra 识别自己缺什么，而不是盲目观察 | 显式 Information Need 是否比更大 Prompt 更有效？ | needs_observation → ask/source → evidence | 信息需求被解决或诚实 expiry，且改变后续理解 |
-| R3 必要的 Ask | 用户收到一个真正值得回答的问题 | Ask 能否减少错误建议，而不过度打扰？ | necessary/duplicate/dismiss/answered live samples | 问题有 why-now、不重复、回答能更新 Situation |
-| R4 两个真实来源 | Veyra 能感知对真实生活有意义的变化 | Calendar + Message/Web 是否能跨场景复用？ | 至少两个非代码 source、三个场景 | exact scope、consent、freshness、真实 material changes |
-| R5 应用内帮助 | 用户在 Today/Situation 中看到变化、问题和建议 | Situation-first UI 是否比 Chat/Console 更易理解？ | task-based usability、行为日志、访谈 | 用户能解释 Veyra 关注什么、为什么、如何停止 |
-| R6 两周使用 | 用户明显感到 Veyra 帮助管理近期生活上下文 | 有用感来自持续理解，还是提醒数量？ | 14 天真实样本 | usefulness、漏报、误报、时机、纠正均达到 owner 设定阈值 |
-| R7 受治理校准 | 系统根据反馈减少重复和错误时机 | 非权限性 aftereffect 是否稳定改善体验？ | versioned A/B 或 before/after | 可回退改善，且没有 authority/privacy 扩张 |
-| R8 有限委托 | Veyra 在需要时让 Agent 研究并验证结果 | Agent 是否真正补强理解而非制造更多文本？ | bounded research + independent verification | 结果进入 Situation、可追溯、成本和失败可控 |
+| 阶段 | User Outcome | Research Question | 最小证据 | Exit 条件 | 2026-08-20 evidence |
+|---|---|---|---|---|---|
+| R0 诚实基线 | 用户知道 Veyra 当前能理解什么、不能做什么 | 现有状态能否被准确、可纠正地投影？ | current-revision state review、scope/privacy tests | Living Context 只读投影不复制 truth，状态与证据语言诚实 | `IMPLEMENTED + AUTOMATED_VALIDATED`; alpha scope remains local |
+| R1 一个持续 Situation | 用户表达一件真实生活中的事，Veyra 跨天保持上下文 | Situation 是否比 conversation/task 更能维持连续理解？ | 一条真实非代码 Situation、restart/replay、用户纠正 | 两次以上独立更新后仍正确维护 Known/Unknown/时间线 | 通用三场景路径与 durable lifecycle `IMPLEMENTED + AUTOMATED_VALIDATED`; `REAL_MODEL_VALIDATED PENDING` |
+| R2 一个 Information Need | Veyra 识别自己缺什么，而不是盲目观察 | 显式 Information Need 是否比更大 Prompt 更有效？ | needs_observation → ask/source → evidence | 信息需求被解决或诚实 expiry，且改变后续理解 | admission/source/replay contracts automated; real-model/live resolution `PENDING` |
+| R3 必要的 Ask | 用户收到一个真正值得回答的问题 | Ask 能否减少错误建议，而不过度打扰？ | necessary/duplicate/dismiss/answered live samples | 问题有 why-now、不重复、回答能更新 Situation | reaction/feedback boundaries automated; necessary live ask and usefulness `PENDING` |
+| R4 两个真实来源 | Veyra 能感知对真实生活有意义的变化 | Calendar + Message/Web 是否能跨场景复用？ | 至少两个非代码 source、三个场景 | exact scope、consent、freshness、真实 material changes | Calendar/Weather/Public Web read-only contracts implemented/automated; current real-source `PENDING` |
+| R5 应用内帮助 | 用户在 Today/Situation 中看到变化、问题和建议 | Situation-first UI 是否比 Chat/Console 更易理解？ | task-based usability、行为日志、访谈 | 用户能解释 Veyra 关注什么、为什么、如何停止 | product routes/contracts/build automated; browser, bounded live and user evidence `PENDING` |
+| R6 两周使用 | 用户明显感到 Veyra 帮助管理近期生活上下文 | 有用感来自持续理解，还是提醒数量？ | 14 天真实样本 | usefulness、漏报、误报、时机、纠正均达到 owner 设定阈值 | `14_DAY_USEFULNESS PENDING`; no two-week sample or launch claim |
+| R7 受治理校准 | 系统根据反馈减少重复和错误时机 | 非权限性 aftereffect 是否稳定改善体验？ | versioned A/B 或 before/after | 可回退改善，且没有 authority/privacy 扩张 | bounded timing/cooldown/suppression automated; real-model/before-after/user value `PENDING` |
+| R8 有限委托 | Veyra 在需要时让 Agent 研究并验证结果 | Agent 是否真正补强理解而非制造更多文本？ | bounded research + independent verification | 结果进入 Situation、可追溯、成本和失败可控 | `OUT OF V1 GATE / DEFERRED`; Agent research remains disabled |
 
 ## 当前优先级
 
@@ -24,10 +24,16 @@ Roadmap 按用户结果和研究问题排序，不按模块数量排序。阶段
 4. 建立用户产品体验和两周验证；
 5. 最后扩大 Agent 委托和受治理学习。
 
+V1-001 当前只把 R1–R7 的 bounded implementation/automated evidence 组织成
+alpha；它没有关闭 R6 的两周价值问题。`REAL_MODEL_VALIDATED` 只有 root 完成
+最终可复现 run 后才能填，`BOUNDED_LIVE`、`14_DAY_USEFULNESS` 和
+`USER_VALIDATED` 不得由 build、fixture 或 smoke 推断。
+
 ## 当前暂缓
 
 - 继续扩大代码观察器作为产品主线；
 - Phase 6 自扩展投入；
+- P3 identity/relationship 全面化与 Phase 6 自扩展均不是 V1 gate；
 - 任意 Tool 和外部写入；
 - 复杂 EvidenceGraph 新功能；
 - P3 全面身份/关系模型；

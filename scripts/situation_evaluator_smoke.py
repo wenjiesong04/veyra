@@ -17,6 +17,11 @@ from core.situation_evaluator import (  # noqa: E402
     SituationEvaluator,
     SituationTraceBackpressureError,
 )
+from core.situation_state_repository import (  # noqa: E402
+    SituationStateCapacityError,
+    SituationStateError,
+    SituationStateRepository,
+)
 from core.world_state import WorldStateStore  # noqa: E402
 from interface.event_schema import EventSource, EventType, VeyraEvent  # noqa: E402
 
@@ -64,6 +69,23 @@ class FaultInjectingWorldStateStore(WorldStateStore):
         super().append_jsonl(name, payload)
         if mode == "after":
             raise OSError("injected interruption after trace append")
+
+
+class CountingSituationStateRepository(SituationStateRepository):
+    """Expose repository validation so every legacy write seam is observable."""
+
+    def __init__(self, state_store: WorldStateStore, **kwargs: Any) -> None:
+        super().__init__(state_store, **kwargs)
+        self.mutation_calls = 0
+        self.validation_calls = 0
+
+    def mutate(self, callback: Any) -> dict[str, Any]:
+        self.mutation_calls += 1
+        return super().mutate(callback)
+
+    def validate(self, state: dict[str, Any]) -> dict[str, Any]:
+        self.validation_calls += 1
+        return super().validate(state)
 
 
 def event(
@@ -850,6 +872,387 @@ def test_atomic_resolution_is_retryable_and_idempotent(root: Path) -> None:
     )
 
 
+def _semantic_row(
+    situation_id: str,
+    *,
+    user_id: str,
+    session_id: str,
+    subject: str,
+    lifecycle: str = "active",
+    timestamp: str = "2026-07-25T08:00:00+00:00",
+) -> dict[str, Any]:
+    return {
+        "record_kind": "semantic_situation",
+        "situation_id": situation_id,
+        "semantic_subject_key": subject,
+        "user_id": user_id,
+        "session_id": session_id,
+        "status": lifecycle,
+        "observation_revision": 1,
+        "semantic": {
+            "title": subject,
+            "label": subject,
+            "summary": subject,
+            "goal": f"Understand {subject}",
+            "category": "general",
+            "lifecycle": lifecycle,
+            "deadline_at": None,
+            "progress": {"status": "unknown", "value": None},
+            "entities": [],
+            "known": [],
+            "unknown": [],
+            "assumptions": [],
+            "timeline": [],
+            "evidence": [],
+            "material_change": "",
+            "next_observation_at": None,
+            "next_step": "",
+            "next_step_epistemic_status": "inferred",
+        },
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+
+
+def test_shared_retention_protects_semantic_context(root: Path) -> None:
+    """Mixed legacy/semantic writes use one bounded, fail-closed policy."""
+
+    store = WorldStateStore(root)
+    repository = SituationStateRepository(
+        store,
+        max_situations=4,
+        max_situations_per_user=3,
+    )
+    repository.mutate(
+        lambda state: {
+            **state,
+            "situations": [
+                _semantic_row(
+                    "sem-a-active",
+                    user_id="user-a",
+                    session_id="session-a",
+                    subject="active-a",
+                ),
+                _semantic_row(
+                    "sem-b-active",
+                    user_id="user-b",
+                    session_id="session-b",
+                    subject="active-b",
+                    timestamp="2026-07-25T08:00:01+00:00",
+                ),
+                _semantic_row(
+                    "sem-a-terminal",
+                    user_id="user-a",
+                    session_id="session-a",
+                    subject="terminal-a",
+                    lifecycle="resolved",
+                    timestamp="2026-07-25T08:00:02+00:00",
+                ),
+                {
+                    "record_kind": "situation_candidate",
+                    "situation_id": "legacy-a-old",
+                    "user_id": "user-a",
+                    "session_id": "session-a",
+                    "status": "observed",
+                    "created_at": "2026-07-25T08:00:03+00:00",
+                    "updated_at": "2026-07-25T08:00:03+00:00",
+                },
+            ],
+            "count": 4,
+        }
+    )
+    evaluator = SituationEvaluator(
+        store,
+        max_situations=4,
+        max_situations_per_user=3,
+    )
+    evaluator.observe(
+        event(
+            "legacy-a-new",
+            user_id="user-a",
+            session_id="session-a",
+        )
+    )
+    rows = store.read_json("situation_state.json")["situations"]
+    ids = {str(row["situation_id"]) for row in rows}
+    expect(
+        {"sem-a-active", "sem-b-active"}.issubset(ids)
+        and any(str(row.get("source_event_id")) == "legacy-a-new" for row in rows)
+        and "sem-a-terminal" not in ids
+        and len(rows) == 4,
+        "legacy writer preserves active semantic rows and evicts terminal semantic context first",
+        rows,
+    )
+
+    # If all capacity is protected semantic context, a new legacy observation
+    # fails before the state file changes and remains safely replayable.
+    overflow_root = root / "overflow"
+    overflow_store = WorldStateStore(overflow_root)
+    overflow_repository = SituationStateRepository(
+        overflow_store,
+        max_situations=2,
+        max_situations_per_user=2,
+    )
+    overflow_repository.mutate(
+        lambda state: {
+            **state,
+            "situations": [
+                _semantic_row(
+                    "overflow-a",
+                    user_id="overflow-user-a",
+                    session_id="overflow-session-a",
+                    subject="overflow-a",
+                ),
+                _semantic_row(
+                    "overflow-b",
+                    user_id="overflow-user-b",
+                    session_id="overflow-session-b",
+                    subject="overflow-b",
+                ),
+            ],
+            "count": 2,
+        }
+    )
+    overflow_evaluator = SituationEvaluator(
+        overflow_store,
+        max_situations=2,
+        max_situations_per_user=2,
+    )
+    before = overflow_store.path_for("situation_state.json").read_bytes()
+    rejected = False
+    try:
+        overflow_evaluator.observe(
+            event(
+                "overflow-legacy",
+                user_id="overflow-user-a",
+                session_id="overflow-session-a",
+            )
+        )
+    except SituationStateCapacityError:
+        rejected = True
+    after_rejection = overflow_store.path_for("situation_state.json").read_bytes()
+    replay_rejected = False
+    try:
+        overflow_evaluator.observe(
+            event(
+                "overflow-legacy",
+                user_id="overflow-user-a",
+                session_id="overflow-session-a",
+            )
+        )
+    except SituationStateCapacityError:
+        replay_rejected = True
+    expect(
+        rejected and replay_rejected and before == after_rejection
+        and after_rejection == overflow_store.path_for("situation_state.json").read_bytes(),
+        "protected-capacity overflow is fail-closed and byte-pure across replay",
+    )
+
+    duplicate_store = WorldStateStore(root / "duplicate")
+    duplicate_repository = SituationStateRepository(duplicate_store)
+    try:
+        duplicate_repository.retain_rows(
+            [{"situation_id": "duplicate"}, {"situation_id": "duplicate"}]
+        )
+    except SituationStateError:
+        duplicate_rejected = True
+    else:  # pragma: no cover - smoke assertion
+        duplicate_rejected = False
+    expect(duplicate_rejected, "duplicate Situation identities fail closed")
+
+
+def test_legacy_write_entrypoints_use_repository(root: Path) -> None:
+    """All five pre-repository state writers validate through one repository API."""
+
+    store = FaultInjectingWorldStateStore(root)
+    evaluator = SituationEvaluator(store)
+    repository = CountingSituationStateRepository(store)
+    evaluator._situation_repository = repository
+    # Keep lifecycle traces pending so each public legacy write contributes one
+    # repository mutation; the final flush exercises the fifth original writer
+    # (trace-outbox acknowledgement) independently.
+    store.trace_failure_modes = ["before"] * 100
+
+    source_event = event(
+        "evt-repository-entrypoints",
+        user_id="repository-user",
+        session_id="repository-session",
+        payload={
+            "correlation_id": "corr-repository-entrypoints",
+            "goal_id": "goal-repository-entrypoints",
+        },
+    )
+    observed = evaluator.observe(source_event)
+    expect(
+        repository.mutation_calls == 1 and repository.validation_calls >= 2,
+        "observe uses repository mutation and validation",
+        {
+            "mutations": repository.mutation_calls,
+            "validations": repository.validation_calls,
+        },
+    )
+
+    binding_digest = "b" * 64
+    binding = evaluator.record_context_binding(
+        observed["situation_id"],
+        expected_source_event_id=source_event.event_id,
+        expected_observation_revision=1,
+        operation_id="context-operation-1",
+        binding_digest=binding_digest,
+        anchors=[{"kind": "goal", "ref_id": "goal-repository-entrypoints"}],
+        provenance=[
+            {
+                "kind": "goal",
+                "ref_id": "goal-repository-entrypoints",
+                "source_event_id": source_event.event_id,
+                "epistemic_status": "context_hypothesis",
+                "is_fact": False,
+                "causality_asserted": False,
+                "authority": False,
+                "semantic_score": 0.8,
+                "source_quote": {"start": 0, "end": 1, "digest": "a" * 64},
+            }
+        ],
+        user_id="repository-user",
+        session_id="repository-session",
+    )
+    expect(
+        binding["observation_revision"] == 2
+        and repository.mutation_calls == 2
+        and repository.validation_calls >= 4,
+        "context binding uses repository mutation and validation",
+        {
+            "binding": binding,
+            "mutations": repository.mutation_calls,
+            "validations": repository.validation_calls,
+        },
+    )
+
+    decision = evaluator.record_decision(
+        observed["situation_id"],
+        {"recommendation": "keep observing"},
+        user_id="repository-user",
+        session_id="repository-session",
+        status="monitoring",
+    )
+    expect(
+        decision["status"] == "monitoring"
+        and repository.mutation_calls == 3
+        and repository.validation_calls >= 6,
+        "shared decision/outcome writer uses repository mutation and validation",
+        {
+            "decision": decision,
+            "mutations": repository.mutation_calls,
+            "validations": repository.validation_calls,
+        },
+    )
+
+    resolved = evaluator.record_resolution(
+        observed["situation_id"],
+        idempotency_key="resolution-repository-entrypoint",
+        expected_source_event_id=source_event.event_id,
+        expected_correlation_id="corr-repository-entrypoints",
+        decision={"recommendation": "close observation"},
+        outcome={"state": "closed"},
+        user_id="repository-user",
+        session_id="repository-session",
+    )
+    expect(
+        resolved["status"] == "resolved"
+        and repository.mutation_calls == 4
+        and repository.validation_calls >= 8,
+        "atomic resolution uses repository mutation and validation",
+        {
+            "resolution": resolved,
+            "mutations": repository.mutation_calls,
+            "validations": repository.validation_calls,
+        },
+    )
+
+    store.trace_failure_modes = []
+    repair = evaluator.flush_trace_outbox()
+    expect(
+        repair["pending"] == 0
+        and repair["acknowledged"] > 0
+        and repository.mutation_calls == 5
+        and repository.validation_calls >= 10,
+        "trace outbox acknowledgement uses repository mutation and validation",
+        {
+            "repair": repair,
+            "mutations": repository.mutation_calls,
+            "validations": repository.validation_calls,
+        },
+    )
+
+
+def test_repository_noop_preserves_existing_valid_state(root: Path) -> None:
+    """Repository validation must not rewrite an already-valid document."""
+
+    store = WorldStateStore(root)
+    repository = SituationStateRepository(store)
+    repository.mutate(
+        lambda state: {
+            **state,
+            "situations": [
+                {
+                    "record_kind": "situation_candidate",
+                    "situation_id": "legacy-valid-row",
+                    "user_id": "valid-user",
+                    "session_id": "valid-session",
+                    "status": "observed",
+                    "created_at": "2026-07-25T08:00:00+00:00",
+                    "updated_at": "2026-07-25T08:00:00+00:00",
+                }
+            ],
+            "count": 1,
+        }
+    )
+    path = store.path_for("situation_state.json")
+    before = path.read_bytes()
+    result = repository.mutate(lambda state: state)
+    after = path.read_bytes()
+    expect(
+        result["situations"][0]["situation_id"] == "legacy-valid-row"
+        and before == after,
+        "valid existing state is unchanged by repository validation",
+        {"before_bytes": len(before), "after_bytes": len(after)},
+    )
+
+
+def test_repository_rejects_semantic_lifecycle_drift(root: Path) -> None:
+    """One semantic row cannot claim active and resolved at the same time."""
+
+    repository = SituationStateRepository(WorldStateStore(root))
+    state = repository.empty_state()
+    state["situations"] = [
+        {
+            "record_kind": "semantic_situation",
+            "situation_id": "semantic-lifecycle-drift",
+            "semantic_subject_key": "subject-lifecycle-drift",
+            "user_id": "semantic-user",
+            "session_id": "semantic-session",
+            "status": "active",
+            "observation_revision": 1,
+            "semantic": {
+                "lifecycle": "resolved",
+                "category": "general",
+                "progress": {"status": "completed", "value": 1.0},
+            },
+        }
+    ]
+    state["count"] = 1
+    try:
+        repository.validate(state)
+    except SituationStateError:
+        rejected = True
+    else:
+        rejected = False
+    expect(
+        rejected,
+        "semantic status and lifecycle cannot drift",
+    )
+
+
 def main() -> int:
     with TemporaryDirectory(prefix="veyra-situation-evaluator-") as temp:
         root = Path(temp) / "state"
@@ -859,6 +1262,10 @@ def main() -> int:
         test_trace_outbox_recovers_append_failures(root / "trace-outbox")
         test_trace_outbox_backpressure_is_bounded(root / "trace-outbox-cap")
         test_atomic_resolution_is_retryable_and_idempotent(root / "resolution")
+        test_shared_retention_protects_semantic_context(root / "shared-retention")
+        test_legacy_write_entrypoints_use_repository(root / "repository-entrypoints")
+        test_repository_noop_preserves_existing_valid_state(root / "repository-noop")
+        test_repository_rejects_semantic_lifecycle_drift(root / "repository-lifecycle")
     print("situation evaluator smoke passed")
     return 0
 

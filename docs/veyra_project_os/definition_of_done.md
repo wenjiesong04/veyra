@@ -62,6 +62,24 @@
 
 不得把其中一种冒充另一种。
 
+#### V1 alpha evidence labels
+
+V1-001 使用以下不可互相升级的证据层级：
+
+| Label | Meaning | Promotion rule |
+|---|---|---|
+| `PRIVATE LOCAL ALPHA` | 发布/使用范围是本机私有 alpha | 不代表 live、用户价值或公开发布 |
+| `IMPLEMENTED` | 代码路径与边界存在 | 不代表配置、运行态或价值 |
+| `AUTOMATED_VALIDATED` | targeted/full gate、合同、负向和构建检查通过 | 不代表真实模型、浏览器、live 或用户价值 |
+| `REAL_MODEL_VALIDATED` | 配置中的真实模型按最终可复现脚本通过自然输入链 | 只有 root 在最终修复后明确重跑并确认才能填写；此前必须 `PENDING` |
+| `BOUNDED_LIVE` | 当前 revision 的干净运行态、真实 source/浏览器等现场证据闭合 | 不能由 build、fixture 或历史 live 继承 |
+| `14_DAY_USEFULNESS` | 真实用户两周样本达到预设 usefulness/漏报/误报/时机阈值 | 未采样或未达阈值必须 `PENDING` |
+| `USER_VALIDATED` | owner/用户明确验收并可说明实际改进 | 不得由自动化或模型样本替代 |
+
+这些标签是独立 evidence positions，不是累加计数；任一层缺失时，相关结论
+必须保持 `PENDING`、`PARTIAL` 或 `DEGRADED`。V1 alpha 不把 P3、Phase 6、
+Agent research、外部 delivery 或执行 authority 作为完成条件。
+
 ### Documentation
 
 - Architecture 记录 current approach；

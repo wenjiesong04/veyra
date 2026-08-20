@@ -1,9 +1,13 @@
 import { useEffect, useState } from "react";
-import { ArrowUpRight, ClipboardList, Clock3, Eye, Flag, MessageSquareText, RefreshCw, Sparkles } from "lucide-react";
+import { ArrowUpRight, ChevronDown, ClipboardList, Clock3, Eye, Flag, MessageSquareText, RefreshCw, Sparkles } from "lucide-react";
 import { getProductMatters, type ProductContext, type ProductMatters } from "./api";
 import { asItems, asRecord, ErrorBlock, Freshness, isEnglish, Language, LoadingBlock, OwnerScope, StatusBadge, Surface } from "./shared";
 
 type MatterSection = { status?: string; items?: unknown[]; count?: number };
+
+function sectionCount(payload: MatterSection, items: unknown[]): number {
+  return typeof payload.count === "number" && payload.count > 0 ? payload.count : items.length;
+}
 
 function section(data: ProductMatters, key: string): MatterSection {
   const sections = asRecord(data.sections);
@@ -15,6 +19,22 @@ function text(value: unknown, fallback: string): string {
   if (typeof value === "string" && value.trim()) return value;
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   return fallback;
+}
+
+function userDetail(value: unknown, fallback: string, en: boolean): string {
+  const result = text(value, fallback);
+  if (en || !/[A-Za-z]/.test(result) || /[\u3400-\u9fff]/.test(result)) return result;
+  return fallback;
+}
+
+function statusLabel(value: unknown, en: boolean): string {
+  const normalized = String(value ?? "unknown").toLowerCase();
+  const labels: Record<string, [string, string]> = {
+    success: ["已有记录", "Recorded"], observed: ["已观察", "Observed"], active: ["进行中", "Active"],
+    empty: ["暂无", "Empty"], unsupported: ["暂不可用", "Unavailable"], waiting: ["等待中", "Waiting"],
+    stale: ["需要刷新", "Stale"], degraded: ["部分可用", "Degraded"], unknown: ["未知", "Unknown"],
+  };
+  return labels[normalized]?.[en ? 1 : 0] ?? (en ? normalized : "未知");
 }
 
 const META = [
@@ -35,12 +55,23 @@ function rowTitle(item: Record<string, unknown>, key: string, en: boolean): stri
 }
 
 function rowDetail(item: Record<string, unknown>, key: string, en: boolean): string {
-  if (key === "situations") return text(item.summary, en ? "A situation is being observed." : "正在观察这一情境。");
-  if (key === "attention") return text(item.why_now, en ? "Why now is still a hypothesis." : "为什么是现在仍属于假设。");
-  if (key === "suggestions") return text(item.delivery, en ? "Delivery: none" : "交付：无");
-  if (key === "commitments") return text(item.next_at, en ? "No next time set" : "尚未设置下一时间");
-  if (key === "questions") return text(item.why_now, en ? "Why now is not available" : "暂时没有 why now");
-  return text(item.status, en ? "Waiting" : "等待中");
+  if (key === "situations") return userDetail(item.summary, en ? "A situation is being observed." : "正在观察这一情境。", en);
+  if (key === "attention") return userDetail(item.why_now, en ? "Why now is still a hypothesis." : "为什么是现在仍属于假设。", en);
+  if (key === "suggestions") return userDetail(item.delivery, en ? "Delivery: none" : "交付：无", en);
+  if (key === "commitments") return userDetail(item.next_at, en ? "No next time set" : "尚未设置下一时间", en);
+  if (key === "questions") return userDetail(item.why_now, en ? "Why now is not available" : "暂时没有 why now", en);
+  return userDetail(item.status, en ? "Waiting" : "等待中", en);
+}
+
+function uniqueItems(items: unknown[], key: string, en: boolean): unknown[] {
+  const seen = new Set<string>();
+  return items.filter((raw) => {
+    const item = asRecord(raw);
+    const signature = `${rowTitle(item, key, en)}\u0000${rowDetail(item, key, en)}`;
+    if (seen.has(signature)) return false;
+    seen.add(signature);
+    return true;
+  });
 }
 
 export function Matters({ scope, productContext, language = "zh" }: { scope: OwnerScope; productContext?: ProductContext | null; language?: Language }) {
@@ -60,16 +91,47 @@ export function Matters({ scope, productContext, language = "zh" }: { scope: Own
     finally { setLoading(false); }
   };
   useEffect(() => { void load(); }, [scope.userId, scope.sessionId, contextStatus, productContext?.internal_read_scope?.user_id, productContext?.internal_read_scope?.session_id]);
-  const copy = en ? { kicker: "Matters", title: "What Veyra is keeping in view", intro: "A quiet projection of situations, suggestions, commitments, and waiting states. No operator-wide reviews or guessed tasks.", refresh: "Refresh", count: "items", empty: "Nothing is recorded for this scope yet.", unsupported: "No trusted production record is available yet.", advanced: "Need deeper technical evidence?", open: "Open Advanced console" } : { kicker: "事项", title: "Veyra 正在关注什么", intro: "这里展示情境、建议、承诺和等待状态；不混入全局 Review，也不猜测任务。", refresh: "刷新", count: "条", empty: "这个作用域还没有记录。", unsupported: "当前还没有可信的生产记录。", advanced: "需要更深的技术证据？", open: "打开 Advanced 旧控制台" };
+  const copy = en ? {
+    kicker: "Matters", title: "What Veyra is keeping in view", intro: "One clear focus first. The rest stays available when you need it.", refresh: "Refresh", count: "items", empty: "Nothing is recorded for this scope yet.", unsupported: "No trusted production record is available yet.", current: "Current focus", other: "Other matters", expand: "Show details", collapse: "Hide details", records: "recorded", scope: "This local scope only", advanced: "Need deeper technical evidence?", open: "Open Advanced console"
+  } : {
+    kicker: "事项", title: "Veyra 正在关注什么", intro: "先看一件最值得知道的事，其余内容按需展开。", refresh: "刷新", count: "条", empty: "这个作用域还没有记录。", unsupported: "当前还没有可信的生产记录。", current: "当前关注", other: "其他事项", expand: "展开详情", collapse: "收起详情", records: "条记录", scope: "只显示当前本机范围", advanced: "需要更深的技术证据？", open: "打开 Advanced 旧控制台"
+  };
   const goal = asRecord(data?.goal);
+  const sectionData = data ? META.map((meta) => {
+    const payload = section(data, meta.key);
+    const items = uniqueItems(payload.items ?? [], meta.key, en);
+    const status = payload.status ?? (items.length ? "success" : "empty");
+    return { ...meta, payload, items, count: sectionCount(payload, items), status };
+  }) : [];
+  const primary = sectionData.find((item) => item.items.length > 0) ?? sectionData.find((item) => item.key === "situations") ?? sectionData[0];
+  const secondary = primary ? sectionData.filter((item) => item.key !== primary.key) : sectionData;
+  const PrimaryIcon = primary?.icon ?? Sparkles;
   return <div className="sectionPage mattersPage">
     <div className="pageIntro"><div><span className="eyebrow">{copy.kicker}</span><h1>{copy.title}</h1><p>{copy.intro}</p></div><button className="ghostButton" onClick={() => void load()} disabled={loading}><RefreshCw size={15} className={loading ? "spinIcon" : ""} />{copy.refresh}</button></div>
-    <div className="pageFreshness"><Freshness at={updatedAt} loading={loading} error={error} language={language} /><span>{data?.status === "degraded" ? (en ? "Some sections are waiting for a fresh source." : "部分分区正在等待新鲜来源。") : (en ? "Exact owner/session product projection" : "精确 owner/session 产品投影")}</span></div>
+    <div className="pageFreshness"><Freshness at={updatedAt} loading={loading} error={error} language={language} /><span>{data?.status === "degraded" ? (en ? "Some sections are waiting for a fresh source." : "部分分区正在等待新鲜来源。") : copy.scope}</span></div>
     {error ? <ErrorBlock message={error} onRetry={() => void load()} /> : null}
     {loading && !data ? <LoadingBlock label={en ? "Reading product matters…" : "正在读取产品事项…"} /> : null}
     {!loading && !data && !error && contextStatus !== "loading" ? <Surface className="todayState"><StatusBadge value={contextStatus} /><span>{en ? "This product scope needs a local session link before Matters can be shown." : "事项需要本机 session link，之后才能显示。"}</span></Surface> : null}
-    {data && goal.title ? <Surface className="matterFocus"><div className="matterFocusIcon"><Flag size={18} /></div><div><span className="eyebrow">{en ? "CURRENT FOCUS" : "当前关注"}</span><h2>{text(goal.title, en ? "Current focus" : "当前关注")}</h2><p>{text(goal.description, en ? "Veyra is keeping this local focus in view." : "Veyra 正在本机持续关注这一目标。")}</p></div><StatusBadge value={goal.status ?? "active"} /></Surface> : null}
-    {data ? <div className="matterGrid">{META.map(({ key, icon: Icon, zh, en: enLabel, hintZh, hintEn }) => { const payload = section(data, key); const items = payload.items ?? []; const status = payload.status ?? (items.length ? "success" : "empty"); return <Surface className="matterCard" key={key}><div className="matterCardHeader"><div className="matterIcon"><Icon size={18} /></div><div><h2>{en ? enLabel : zh}</h2><p>{en ? hintEn : hintZh}</p></div><StatusBadge value={status} /></div><div className="matterCount">{items.length || payload.count || 0}<span>{copy.count}</span></div>{items.slice(0, 4).map((raw, index) => { const item = asRecord(raw); return <div className="matterRow" key={`${key}-${index}`}><div><strong>{rowTitle(item, key, en)}</strong><small>{rowDetail(item, key, en)}</small></div><ArrowUpRight size={15} /></div>; })}{!items.length ? <div className="matterEmpty">{status === "unsupported" ? copy.unsupported : copy.empty}</div> : null}<a className="cardLink" href="#/status">{en ? "See status" : "查看状态"} <ArrowUpRight size={14} /></a></Surface>; })}</div> : null}
+    {data && primary ? <>
+      <Surface className="matterHero">
+        <div className="matterHeroTop">
+          <div className="matterIcon matterHeroIcon"><PrimaryIcon size={18} /></div>
+          <div className="matterHeroHeading"><span className="eyebrow">{copy.current}</span><h2>{en ? primary.en : primary.zh}</h2><p>{en ? primary.hintEn : primary.hintZh}</p></div>
+          <StatusBadge value={primary.status} label={statusLabel(primary.status, en)} />
+        </div>
+        <div className="matterHeroBody">
+          <div>
+            <strong>{primary.items.length ? rowTitle(asRecord(primary.items[0]), primary.key, en) : (goal.title ? text(goal.title, copy.current) : (primary.status === "unsupported" ? copy.unsupported : copy.empty))}</strong>
+            <p>{primary.items.length ? rowDetail(asRecord(primary.items[0]), primary.key, en) : (goal.description ? text(goal.description, copy.empty) : (primary.status === "unsupported" ? copy.unsupported : copy.empty))}</p>
+          </div>
+          <div className="matterHeroMeta"><strong>{primary.count}</strong><span>{copy.count}</span></div>
+        </div>
+        {goal.title ? <div className="matterGoal"><Flag size={14} /><span>{text(goal.title, copy.current)}</span><StatusBadge value={goal.status ?? "active"} label={statusLabel(goal.status ?? "active", en)} /></div> : null}
+        {primary.items.length > 1 ? <details className="disclosure matterHeroDetails"><summary><ChevronDown size={14} />{copy.expand} · {primary.items.length} {copy.records}</summary><div className="matterRows">{primary.items.slice(0, 4).map((raw, index) => { const item = asRecord(raw); return <div className="matterRow" key={`${primary.key}-${index}`}><div><strong>{rowTitle(item, primary.key, en)}</strong><small>{rowDetail(item, primary.key, en)}</small></div><ArrowUpRight size={15} /></div>; })}</div></details> : null}
+      </Surface>
+      <div className="matterRailHeading"><div><span className="eyebrow">{copy.other}</span><h2>{en ? "More context, when you need it" : "其他信息，按需查看"}</h2></div><a href="#/status">{en ? "Open status" : "查看状态"} <ArrowUpRight size={14} /></a></div>
+      <div className="matterRail">{secondary.map(({ key, icon: Icon, zh, en: enLabel, hintZh, hintEn, items, count, status }) => <Surface className="matterMini" key={key}><div className="matterMiniHeader"><div className="matterIcon"><Icon size={16} /></div><div className="matterMiniTitle"><h3>{en ? enLabel : zh}</h3><p>{en ? hintEn : hintZh}</p></div><StatusBadge value={status} label={statusLabel(status, en)} /></div><div className="matterMiniMeta"><strong>{count}</strong><span>{copy.count}</span></div>{items.length ? <details className="disclosure"><summary><ChevronDown size={13} />{copy.expand}</summary><div className="matterRows">{items.slice(0, 3).map((raw, index) => { const item = asRecord(raw); return <div className="matterRow" key={`${key}-${index}`}><div><strong>{rowTitle(item, key, en)}</strong><small>{rowDetail(item, key, en)}</small></div></div>; })}</div></details> : <p className="matterMiniEmpty">{status === "unsupported" ? copy.unsupported : copy.empty}</p>}</Surface>)}</div>
+    </> : null}
     <div className="advancedHint"><span>{copy.advanced}</span><a href="#/advanced">{copy.open} <ArrowUpRight size={14} /></a></div>
   </div>;
 }

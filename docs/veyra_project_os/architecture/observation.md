@@ -2,7 +2,7 @@
 
 ## Status
 
-`CURRENT APPROACH / FIRST TRUSTED PRODUCER VALIDATED`
+`IMPLEMENTED BOUNDED READ-ONLY SOURCES / BOUNDED_LIVE PENDING`
 
 ## 目标
 
@@ -36,12 +36,17 @@ V1 优先：
 
 - 用户回答；
 - Calendar；
-- Email/Message 或用户授权的更新流；
 - Weather/Public Web；
+- Email/Message 或用户授权的更新流（V1 alpha 尚未作为实时 source 验收）；
 - local read-only Probe；
-- bounded Agent research。
+- bounded Agent research（V1 alpha disabled，不计入当前 source coverage）。
 
 代码 Workspace Observer 保留为 Developer canary，不计入真实生活 source coverage。
+
+当前 alpha 已实现 Calendar、Weather 和 Public Web 的 read-only source contract：
+server 绑定 Information Need、owner/session/Situation scope、consent、freshness、
+TTL、预算与 typed receipt，再将被接纳的 evidence 回写原 Situation truth。
+这证明的是实现和自动化边界，不是当前个人账号的实时读取或 bounded live。
 
 ## Source Registry 原则
 
@@ -92,3 +97,7 @@ Server 将需求映射到预注册能力。找不到合法来源时，应 ask、
 - 去重和 crash recovery；
 - 不扩大 Route/Risk/Agent/Tool authority；
 - 用户第一次因此获得的结果。
+
+当前 full gate 和 source smokes 是 pre-final automated evidence。现场 source、
+clean runtime、浏览器和真实模型闭环仍单独记录为 `PENDING`，不能由 source fixture
+或 build 结果升级为 `BOUNDED_LIVE`。

@@ -9,6 +9,10 @@ from enum import Enum
 from typing import Any, Callable, Iterable
 from uuid import uuid4
 
+from core.situation_state_repository import (
+    SituationStateCapacityError,
+    SituationStateRepository,
+)
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent
 from interface.general_situation_contract import (
@@ -123,6 +127,16 @@ class SituationEvaluator:
         self.max_trace_entry_bytes = int(max_trace_entry_bytes)
         self.max_trace_outbox_bytes = int(max_trace_outbox_bytes)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        # Legacy observations and semantic Situations share one durable JSON
+        # document.  Keep retention in the repository so this writer cannot
+        # silently evict active semantic context while compacting legacy rows.
+        self._situation_repository = SituationStateRepository(
+            state_store,
+            state_file=self.state_file,
+            max_situations=self.max_situations,
+            max_situations_per_user=self.max_situations_per_user,
+            max_history_per_situation=self.max_history_per_situation,
+        )
 
     def observe(
         self,
@@ -412,7 +426,29 @@ class SituationEvaluator:
                 persisted = copy.deepcopy(incoming)
                 transition_created = True
             if transition_created:
-                situations, evicted_ids = self._bound_state(situations)
+                situations, evicted_ids = self._bound_state(
+                    situations,
+                    preserve_ids={selected_id},
+                )
+                if selected_id in evicted_ids:
+                    # Retention may compact old legacy rows, but it must never
+                    # report an observation that was itself dropped.  Raising
+                    # here keeps mutate_json byte-pure and makes replay honest.
+                    raise SituationStateCapacityError(
+                        "new Situation cannot be retained within bounded capacity"
+                    )
+                if evicted_ids:
+                    retention_audit = state.setdefault("retention_audit", [])
+                    if not isinstance(retention_audit, list):
+                        raise ValueError("Situation retention audit is invalid")
+                    retention_audit.append(
+                        {
+                            "evicted_situation_ids": list(evicted_ids),
+                            "reason": "terminal_or_legacy_first",
+                            "recorded_at": now,
+                        }
+                    )
+                    del retention_audit[:-128]
             state["schema_version"] = self.SCHEMA_VERSION
             state["situations"] = situations
             state["count"] = len(situations)
@@ -455,10 +491,17 @@ class SituationEvaluator:
                 )
             return state
 
-        self.state_store.mutate_json(self.state_file, upsert)
+        self._situation_repository.mutate(upsert)
         self._try_flush_trace_outbox()
         return copy.deepcopy(persisted)
 
+    def record_semantic(self, event: VeyraEvent, **kwargs: Any) -> dict[str, Any]:
+        """Compatibility seam; semantic CRUD lives in SemanticSituationRuntime."""
+        from runtime.semantic_situation_runtime import SemanticSituationRuntime
+        return SemanticSituationRuntime(
+            self.state_store,
+            repository=self._situation_repository,
+        ).record_semantic(event, **kwargs)
     def record_context_binding(
         self,
         situation_id: str,
@@ -620,7 +663,7 @@ class SituationEvaluator:
                 timestamp=now,
             )
 
-        self.state_store.mutate_json(self.state_file, update)
+        self._situation_repository.mutate(update)
         self._try_flush_trace_outbox()
         if persisted is None:  # pragma: no cover - guarded by the mutation.
             raise KeyError(f"unknown situation: {selected_id}")
@@ -981,7 +1024,7 @@ class SituationEvaluator:
             )
             return state
 
-        self.state_store.mutate_json(self.state_file, resolve)
+        self._situation_repository.mutate(resolve)
         self._try_flush_trace_outbox()
         if persisted is None:  # pragma: no cover - guarded by the mutation.
             raise KeyError(f"unknown situation: {selected_id}")
@@ -1038,6 +1081,19 @@ class SituationEvaluator:
             return copy.deepcopy(item)
         return None
 
+    def list_semantic(self, **kwargs: Any) -> list[dict[str, Any]]:
+        from runtime.semantic_situation_runtime import SemanticSituationRuntime
+        return SemanticSituationRuntime(
+            self.state_store,
+            repository=self._situation_repository,
+        ).list_semantic(**kwargs)
+
+    def get_semantic(self, situation_id: str, **kwargs: Any) -> dict[str, Any] | None:
+        from runtime.semantic_situation_runtime import SemanticSituationRuntime
+        return SemanticSituationRuntime(
+            self.state_store,
+            repository=self._situation_repository,
+        ).get_semantic(situation_id, **kwargs)
     def due_candidates(
         self,
         *,
@@ -1121,7 +1177,7 @@ class SituationEvaluator:
             )
             return state
 
-        self.state_store.mutate_json(self.state_file, update)
+        self._situation_repository.mutate(update)
         if persisted is None:  # pragma: no cover - guarded by the mutation above.
             raise KeyError(f"unknown situation: {selected_id}")
         return persisted
@@ -1239,26 +1295,16 @@ class SituationEvaluator:
         merged["updated_at"] = incoming["updated_at"]
         return merged
 
-    def _bound_state(self, situations: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
-        ordered = sorted(
+    def _bound_state(
+        self,
+        situations: list[dict[str, Any]],
+        *,
+        preserve_ids: Iterable[str] | None = None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        return self._situation_repository.retain_rows(
             situations,
-            key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
+            preserve_ids=preserve_ids,
         )
-        per_user: dict[str, list[dict[str, Any]]] = {}
-        for item in ordered:
-            per_user.setdefault(str(item.get("user_id") or ""), []).append(item)
-        retained: list[dict[str, Any]] = []
-        for items in per_user.values():
-            retained.extend(items[-self.max_situations_per_user :])
-        retained.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""))
-        retained = retained[-self.max_situations :]
-        retained_ids = {str(item.get("situation_id") or "") for item in retained}
-        evicted = [
-            str(item.get("situation_id") or "")
-            for item in situations
-            if str(item.get("situation_id") or "") not in retained_ids
-        ]
-        return retained, evicted
 
     def _try_flush_trace_outbox(self) -> dict[str, Any]:
         """Best-effort delivery for lifecycle writes that are already durable."""
@@ -1346,7 +1392,7 @@ class SituationEvaluator:
                     current["updated_at"] = self._now_iso()
                     return current
 
-                self.state_store.mutate_json(self.state_file, acknowledge)
+                self._situation_repository.mutate(acknowledge)
 
         return {
             "pending": remaining_after_ack,
@@ -1491,6 +1537,7 @@ class SituationEvaluator:
         identity = "\0".join((user_id, session_id, event_id, correlation_id))
         return f"sit_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16]}"
 
+
     def _assert_owner(
         self,
         item: dict[str, Any],
@@ -1514,6 +1561,7 @@ class SituationEvaluator:
             raise ValueError("situation belongs to a different source event")
         if str(item.get("correlation_id") or "") != str(correlation_id):
             raise ValueError("situation belongs to a different correlation")
+
 
     def _normalize_salience(self, components: dict[str, Any]) -> dict[str, Any]:
         normalized: dict[str, float] = {}
@@ -2155,8 +2203,18 @@ class SituationEvaluator:
         if isinstance(raw, dict):
             raw = list(raw.values())
         if not isinstance(raw, list):
-            return []
-        return [copy.deepcopy(item) for item in raw if isinstance(item, dict)]
+            raise ValueError("Situation state situations must be a list")
+        rows: list[dict[str, Any]] = []
+        identities: set[str] = set()
+        for item in raw:
+            if not isinstance(item, dict):
+                raise ValueError("Situation row must be an object")
+            situation_id = str(item.get("situation_id") or "").strip()
+            if not situation_id or situation_id in identities:
+                raise ValueError("Situation identity is missing or duplicated")
+            identities.add(situation_id)
+            rows.append(copy.deepcopy(item))
+        return rows
 
     def _status_filter(self, status: str | Iterable[str] | None) -> set[str]:
         if status is None:

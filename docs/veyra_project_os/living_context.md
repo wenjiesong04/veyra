@@ -1,5 +1,28 @@
 # Living Context
 
+## 0. 2026-08-20 V1 alpha alignment
+
+当前实现以 `Living Context (logical projection)` 组合 durable Situation、
+Information Need、evidence/source receipt 和 reaction state；没有新增一个
+LivingContext aggregate truth。每个 Situation 在 exact owner/session scope 下
+维护 Known、Unknown、Assumptions、timeline、material change、evidence 和当前
+Need/reaction，并通过 revision/CAS、dedupe、capacity 与失败降级保护原 truth。
+
+同一条自然语言路径覆盖旅行/会议/活动、求职/申请/学习、搬家/个人项目/家庭
+计划三类非硬编码生活 Situation。模型只提出 candidate、解释和 Information
+Need；server 负责 admission、scope、source mapping、persistence 与 authority。
+当前 reaction vocabulary 是 `ask/read/wait/silent/suggest`，解释性输出说明
+what happened、why it matters、why now 和 next step。
+
+Calendar、Weather、Public Web 仅作为 read-only、allowlisted、consent/freshness/
+TTL/receipt 受治理 source；Agent research 和 external delivery disabled。反馈
+后效只影响 timing、cooldown、suppression，不扩大 Agent、Tool、Grant、Route、Risk
+或执行 authority。
+
+这些边界已有 pre-final automated evidence；Moonshot 最终可复现 run、clean
+runtime/live、浏览器、exact-SHA CI、两周 usefulness 和 owner validation 均保持
+`PENDING`。
+
 ## 1. 定义
 
 `Living Context (logical projection)` 是 Veyra 在某个 owner/session、某个时间点，对用户当前生活的有证据约束、可修正、带未知和权限边界的综合理解。

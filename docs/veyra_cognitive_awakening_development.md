@@ -521,3 +521,44 @@ Attention lifecycle 仍明确保持 fail-closed：`attention_lifecycle_producer_
 自动化证据为 `146/146` gate、9 Route `810/810`、plugin `32/32`、compileall 和 Web/Desktop build。current bounded live 证明：不可刷新 event 只留一个 bounded marker，已持久的 cadence-less conflict 在同 revision 不重复 probe，GET 不改写业务 state，公开回执不泄露 claim/target/CAS/private ledger。但生产 state 的 8 条 claim 中 Economy metadata 仍是 `0/8`，因此不能宣称真实 `next_refresh_at`/max-staleness 前后效果已验证。P2 整体仍是 `PARTIAL`。
 
 下一个窄切片是为一个注册的可信 producer 提供 server-owned Economy policy，然后用长时窗比较 stale coverage、fairness、timing 和真实 feedback；之后再接第二个独立可核验 domain producer。不进入 P3，不开启 external delivery、Agent、Tool、Route、Risk 或 execution authority。
+
+## 2026-08-20 V1-001 dated addendum
+
+本历史开发路线不再作为当前 V1 状态真值。用户已将原 V0-001 产品预览显式
+扩大并吸收到 `PRIVATE LOCAL ALPHA` 的 V1-001；当前任务、证据分层和未闭合项
+统一见 [`docs/veyra_project_os/tasks/CURRENT.md`](veyra_project_os/tasks/CURRENT.md)、
+[`docs/veyra_project_os/status/current.md`](veyra_project_os/status/current.md)
+和 [`docs/veyra_project_os/status/v1-acceptance-2026-08-20.md`](veyra_project_os/status/v1-acceptance-2026-08-20.md)。
+
+V1 的当前产品边界是三类非硬编码生活 Situation、durable Known/Unknown/
+Assumption/timeline/Information Need、ask/read/wait/silent/suggest、解释性
+主动帮助、反馈对 timing/cooldown/suppression 的受限后效，以及 Calendar、
+Weather、Public Web 的只读 source。LivingReaction 已增加有界 archive/retention
+与 replay/tamper/scope 验证。Agent research、外部 delivery、P3 和 Phase 6 不属于
+V1 gate。
+
+当前本地自动化证据为 full gate `165/165`（`145` invariant + `1` cognitive +
+`19` product）、OpenClaw `32/32`、Route `810/810`，并通过 frontend
+product-contract/status-tone/build/check:bundle/build:desktop、Web/Desktop build、
+product contract/bundle。arm64 Mach-O package 作为 `LOCAL PREVIEW` 通过；Python
+`3.11.15`、PyInstaller `6.22.0`、Rust `1.96.1`、Tauri `2.11.4`；sidecar smoke
+PASS、normalized cmp PASS、`codesign --verify --deep --strict` PASS，App 内
+`NSAppleEventsUsageDescription` 与 `automation.apple-events` entitlement 存在。
+sidecar SHA 为
+`471ef080f84639e8ca445fe20c91695095873a004854290008f6d1012304351`，Veyra.app tree
+SHA 为 `0257a1b8b004cbb95deee158164bacdc5481d6921193169b04e5a30a570ab590`；这仍是
+ad-hoc local preview，不是 Developer ID/notarized/DMG/public release，实际 Calendar
+TCC 用户授权仍 pending。Moonshot 真实模型证据是 `PARTIAL / DEGRADED`：多次隔离
+运行的合并证据是三个通用场景 create `3/3` 曾成功、update `3/3` 曾成功、Calendar
+update `1/1` 曾成功，`ignore feedback` 曾被模型解析并持久记录，但没有同一次 run
+完成全链；最终 run 为 create `3/3`、update `2/3`，因 timeline `source_quote`
+binding 波动而 DEGRADED。这不能升级为单次全链 PASS、稳定模型验证、长期
+usefulness 或 Jarvis 已证明。
+Calendar 的确定性完整链与独立 real provider read 均有证据，Weather/Public Web 也有
+当前 real read；Calendar production consent/TCC contract 已实现。
+
+`BOUNDED_LIVE`、实际 Calendar TCC 用户授权、浏览器/390×844、push、exact-SHA CI、
+两周 usefulness 和用户验收仍保持 `PENDING`；exact-SHA runtime、browser、owner
+acceptance 和 GitHub Actions 在提交推送前均为 `PENDING`。当前 worktree 仍未提交，不在这里写入
+最终 SHA；authority 保持 record-only/no external delivery，Agent research disabled。旧
+文档中的 Today-first/default-home 仅保留为历史预览语境。

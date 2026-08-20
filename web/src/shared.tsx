@@ -49,6 +49,14 @@ export function sanitizeHistory(value: unknown): LocalHistoryRecord[] {
   return value.map(sanitizeHistoryRecord).filter((item): item is LocalHistoryRecord => item !== null);
 }
 
+/** Render only scalar, bounded values from an untrusted product payload. */
+export function safeText(value: unknown, fallback = "—", maxLength = 640): string {
+  if (typeof value === "string" && value.trim()) return value.trim().slice(0, maxLength);
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "boolean") return String(value);
+  return fallback;
+}
+
 export function isEnglish(language: Language): boolean {
   if (language === "en") return true;
   if (language === "zh") return false;
@@ -87,10 +95,29 @@ export function StatusBadge({ value, label }: { value: unknown; label?: string }
   return <span className={`statusBadge ${statusTone(value)}`}><span className="statusDot" />{text}</span>;
 }
 
-export function Freshness({ at, loading, error, language = "zh" }: { at?: string | null; loading?: boolean; error?: string | null; language?: Language }) {
+export function freshnessLabel(value: unknown, en: boolean): string {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  const labels: Record<string, [string, string]> = {
+    fresh: ["新鲜", "Fresh"],
+    stale: ["已过期", "Stale"],
+    unknown: ["未知", "Unknown"],
+    degraded: ["部分可用", "Degraded"],
+    pending: ["待读取", "Pending"],
+  };
+  return labels[normalized]?.[en ? 1 : 0] ?? (en ? "Freshness unknown" : "新鲜度未知");
+}
+
+export function Freshness({ at, category, loading, error, language = "zh" }: { at?: string | null; category?: unknown; loading?: boolean; error?: string | null; language?: Language }) {
   const en = isEnglish(language);
   if (loading) return <span className="freshness"><LoaderCircle size={13} className="spinIcon" />{en ? "Syncing" : "同步中"}</span>;
   if (error) return <span className="freshness bad"><AlertTriangle size={13} />{en ? "Unavailable" : "不可用"}</span>;
+  const normalized = String(category ?? "").trim().toLowerCase();
+  if (["fresh", "stale", "unknown", "degraded", "pending"].includes(normalized)) {
+    const bad = normalized === "degraded";
+    const warn = normalized !== "fresh" && !bad;
+    const readAt = at ? new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+    return <span className={`freshness ${bad ? "bad" : warn ? "warn" : ""}`}>{bad || warn ? <AlertTriangle size={13} /> : <CheckCircle2 size={13} />}{freshnessLabel(normalized, en)}{readAt ? <small>{en ? ` · read ${readAt}` : ` · 读取于 ${readAt}`}</small> : null}</span>;
+  }
   if (!at) return <span className="freshness warn">{en ? "Not read" : "尚未读取"}</span>;
   const date = new Date(at);
   const label = Number.isNaN(date.valueOf()) ? "已读取" : `刚刚读取 · ${date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
