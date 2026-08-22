@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +22,7 @@ from core.world_state import WorldStateStore  # noqa: E402
 from interface.event_schema import EventSource, EventType, VeyraEvent  # noqa: E402
 from routers.product import build_product_router  # noqa: E402
 from runtime.living_context_runtime import LivingContextRuntime  # noqa: E402
-from runtime.product_experience import ProductExperienceService  # noqa: E402
+from runtime.product_experience import ProductExperienceService, _dedupe_bound_need_rows  # noqa: E402
 
 
 SENSITIVE_VALUES = {"/private/veyra/workspace-secret", "control-token-should-never-leak", "state/path/should-stay-private.json"}
@@ -99,7 +100,47 @@ def assert_authority(value: dict[str, Any]) -> None:
     expect(isinstance(authority, dict) and all(item is False for item in authority.values()), "authority remains disabled")
 
 
+def need_row(
+    *,
+    need_id: str,
+    situation_id: str,
+    owner: str = "owner-a",
+    session: str = "session-a",
+    status: str = "open",
+    created_at: str = "2026-08-17T12:00:00+00:00",
+    binding: str | None = None,
+) -> dict[str, Any]:
+    row = {
+        "need_id": need_id,
+        "situation_id": situation_id,
+        "owner_id": owner,
+        "session_id": session,
+        "status": status,
+        "created_at": created_at,
+        "question": need_id,
+    }
+    if binding is not None:
+        row["unknown_binding"] = binding
+        row["unknown_binding_digest"] = hashlib.sha256(binding.encode("utf-8")).hexdigest()
+    return row
+
+
 def main() -> int:
+    digest = hashlib.sha256(b"shared endpoint").hexdigest()
+    deduped = _dedupe_bound_need_rows(
+        [
+            {"need_id": "new-open", "situation_id": "s1", "status": "open", "created_at": "2026-01-02", "unknown_binding_digest": digest},
+            {"need_id": "old-asked", "situation_id": "s1", "status": "asked", "created_at": "2026-01-01", "unknown_binding_digest": digest},
+            {"need_id": "other-situation", "situation_id": "s2", "status": "open", "created_at": "2026-01-01", "unknown_binding_digest": digest},
+            {"need_id": "unbound-a", "situation_id": "s1", "status": "open", "created_at": "2026-01-01"},
+            {"need_id": "unbound-b", "situation_id": "s1", "status": "open", "created_at": "2026-01-01"},
+        ]
+    )
+    expect(
+        [row["need_id"] for row in deduped]
+        == ["old-asked", "other-situation", "unbound-a", "unbound-b"],
+        "Product questions dedupe only one exact bound endpoint and prefer asked state",
+    )
     with TemporaryDirectory(prefix="veyra-product-v1-") as temporary:
         store = WorldStateStore(Path(temporary) / "state")
         living = LivingContextRuntime(store)
