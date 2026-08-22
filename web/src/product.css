@@ -142,6 +142,31 @@
 .sourceInfo small { color:var(--subtle); font-size:10px; }
 .sourceBoundary { display:flex; align-items:flex-start; gap:7px; margin-top:9px; border-radius:9px; padding:10px; color:var(--muted); background:var(--surface-soft); font-size:11px; line-height:1.45; }
 .sourceBoundary svg { flex:0 0 auto; margin-top:1px; }
+
+.consentOverlay { position:fixed; z-index:40; inset:0; display:flex; align-items:center; justify-content:center; padding:24px; background:rgba(29,26,38,.34); backdrop-filter:blur(10px); }
+.consentDialog { position:relative; width:min(428px,100%); max-height:min(86vh,640px); overflow:auto; border:1px solid var(--line); border-radius:22px; color:var(--ink); background:var(--surface); box-shadow:0 24px 70px rgba(26,22,38,.22); }
+.consentDialogAccent { position:absolute; inset:0 0 auto; height:3px; background:linear-gradient(90deg,color-mix(in srgb,var(--indigo) 80%,transparent),color-mix(in srgb,var(--indigo-strong) 55%,transparent)); }
+.consentDialogHeader { display:flex; align-items:flex-start; gap:12px; padding:22px 20px 0; }
+.consentDialogIcon { display:grid; place-items:center; width:38px; height:38px; flex:0 0 38px; border-radius:12px; color:var(--indigo-strong); background:var(--indigo-soft); }
+.consentDialogHeader small { display:block; color:var(--subtle); letter-spacing:.12em; text-transform:uppercase; font-size:10px; font-weight:800; }
+.consentDialogHeader h2 { margin:5px 0 0; font-size:20px; letter-spacing:-.04em; line-height:1.2; }
+.consentDialogClose { margin-left:auto; }
+.consentDialogBody { display:grid; gap:12px; padding:16px 20px 6px; }
+.consentDialogBody > p { margin:0; color:var(--muted); font-size:13px; line-height:1.6; }
+.consentDialogReason { border-radius:12px; padding:10px 12px; background:var(--surface-soft); }
+.consentDialogReason strong { margin-right:6px; color:var(--ink); }
+.consentChips { display:flex; flex-wrap:wrap; gap:6px; margin:0; padding:0; list-style:none; }
+.consentChips li { border-radius:99px; padding:5px 9px; color:var(--indigo-strong); background:var(--indigo-soft); font-size:11px; font-weight:750; }
+.consentLists { display:grid; gap:10px; }
+.consentLists section { min-width:0; border:1px solid var(--line); border-radius:14px; padding:11px 12px; background:var(--surface-soft); }
+.consentLists h3 { margin:0 0 6px; color:var(--ink); font-size:11px; font-weight:800; }
+.consentLists ul { margin:0; padding-left:16px; color:var(--muted); font-size:12px; line-height:1.55; }
+.consentDialogExtra { display:flex; align-items:flex-start; gap:6px; margin:0; color:var(--muted); font-size:11px; line-height:1.5; }
+.consentDialogExtra svg { flex:0 0 auto; margin-top:1px; color:var(--indigo); }
+.consentDialogError { margin:0; border-radius:10px; padding:9px 11px; color:var(--bad); background:var(--bad-soft); font-size:12px; }
+.consentDialogActions { display:flex; justify-content:flex-end; gap:8px; padding:16px 20px 20px; }
+.consentRevokeButton { color:var(--bad); border-color:color-mix(in srgb,var(--bad) 28%,var(--line)); }
+
 .responseLivingContext { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin-top:13px; }
 .responseLivingContext > div { min-width:0; border-radius:9px; padding:9px; background:var(--surface-soft); }
 .responseLivingContext span { display:block; color:var(--subtle); font-size:10px; }
@@ -161,6 +186,10 @@
   .situationCorrection .productSectionHeading { align-items:flex-start; }
   .sourceRow { align-items:flex-start; flex-wrap:wrap; }
   .sourceRow > button { margin-left:42px; }
+  .consentOverlay { align-items:flex-end; padding:10px 10px 78px; }
+  .consentDialog { width:100%; max-height:min(82vh,640px); border-radius:22px 22px 18px 18px; }
+  .consentDialogActions { justify-content:stretch; }
+  .consentDialogActions > button { flex:1; justify-content:center; }
   .productRefreshButton { right:16px; bottom:78px; }
   .mobileNav { grid-template-columns:repeat(6,minmax(0,1fr)); }
 }

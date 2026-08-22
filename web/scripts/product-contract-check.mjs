@@ -11,6 +11,8 @@ const files = {
   questions: read("src/product_questions.tsx"),
   reactions: read("src/product_reactions.tsx"),
   sources: read("src/product_sources.tsx"),
+  sourceConsent: read("src/source_consent.ts"),
+  sourceConsentDialog: read("src/source_consent_dialog.tsx"),
   conversation: read("src/conversation.tsx"),
   shared: read("src/shared.tsx"),
   productShared: read("src/product_shared.ts"),
@@ -91,6 +93,11 @@ must(files.sources.includes("Configure first") && files.sources.includes("Permis
 must(files.sources.includes("Agent research is disabled") || files.sources.includes("Agent research"), "Sources does not disclose Agent research boundary");
 must(files.sources.includes("Email") && !files.sources.includes('id: "email"'), "Email must remain outside the supported source list");
 for (const value of ["configured", "system_permission", "consented", "available", "can_request", "Permission denied; revoke consent"]) must(files.sources.includes(value), `Sources UI does not preserve ${value} boundary`);
+must(files.sourceConsentDialog.includes('role="dialog"') && files.sourceConsentDialog.includes("aria-modal") && files.sourceConsentDialog.includes("Allow read-only") && files.sourceConsentDialog.includes("允许只读"), "Source consent is not a confirmable dialog");
+must(files.sources.includes("Consent never grants execution") && files.sourceConsentDialog.includes("No execution or delivery"), "Source consent copy must keep the no-execution boundary");
+must(files.sourceConsent.includes("macOS") && files.sourceConsent.includes("Calendar access"), "Calendar consent does not disclose the extra system permission");
+must(files.questions.includes("SourceConsentDialog") && files.questions.includes("isReadableSource") && files.sourceConsent.includes("Let Veyra read") && files.sourceConsent.includes("让 Veyra 去看"), "Questions cannot request a governed source read from the same consent dialog");
+must(files.home.includes("productContext={productContext}") && files.situations.includes("productContext={productContext}"), "Today and Situation detail do not pass Product Context into Questions");
 
 // Browser history is sanitized and response cards use living_context artifacts.
 must(files.shared.includes("sanitizeHistoryRecord") && files.shared.includes("sanitizeHistory("), "History sanitizer is not shared");

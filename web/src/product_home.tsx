@@ -38,7 +38,7 @@ function AttentionRow({ item, index, en }: { item: Record<string, JsonValue>; in
   </article>;
 }
 
-function TodayView({ today, scope, language, readAt, onChanged }: { today: ProductToday; scope: OwnerScope; language: Language; readAt?: string | null; onChanged?: () => void }) {
+function TodayView({ today, scope, language, readAt, onChanged, productContext }: { today: ProductToday; scope: OwnerScope; language: Language; readAt?: string | null; onChanged?: () => void; productContext?: ProductContext | null }) {
   const en = isEnglish(language);
   const situations = uniqueRecords(today.situations, { mode: "situation" });
   // The backend owns this ranking. Keep the received order intact: Today is
@@ -63,7 +63,7 @@ function TodayView({ today, scope, language, readAt, onChanged }: { today: Produ
       <TodayCard title={en ? "Recent changes" : "最近变化"} icon={<Sparkles size={17} />}>{changes.length ? changes.slice(0, 4).map((item, index) => <ChangeRow key={`${text(item.situation_id, "change")}-${index}`} item={item} en={en} />) : <p className="productMuted">{en ? "No material change recorded." : "暂无重要变化记录。"}</p>}</TodayCard>
       <TodayCard title={en ? "Deadlines" : "临近时间"} icon={<CalendarClock size={17} />}>{deadlines.length ? deadlines.slice(0, 4).map((item, index) => { const progress = record(item.progress); const progressValue = Object.keys(progress).length ? progress.status : item.progress; return <div className="productDeadlineRow" key={`${text(item.situation_id, "deadline")}-${index}`}><strong>{text(item.title ?? item.label, en ? "Upcoming" : "即将到来")}</strong><span>{dateLabel(item.deadline_at, en)}</span><small>{progressLabel(progressValue, en)}</small></div>; }) : <p className="productMuted">{en ? "No deadline is close enough to surface." : "暂无需要现在提示的时间点。"}</p>}</TodayCard>
       <TodayCard title={en ? "May be missed" : "可能遗漏"} icon={<Flag size={17} />}>{unknowns.length ? unknowns.slice(0, 5).map((item, index) => <div className="productUnknownRow" key={`${text(item.situation_id, "unknown")}-${index}`}><strong>{text(item.statement, en ? "An unknown may matter." : "有一项未知可能影响判断。")}</strong><small>{en ? "Still unknown" : "仍未知"}</small></div>) : waiting.length ? waiting.slice(0, 4).map((item, index) => <div className="productUnknownRow" key={`waiting-${index}`}><strong>{text(item.what_changed ?? item.message, en ? "Veyra is waiting." : "Veyra 正在等待。")}</strong><small>{en ? "Waiting for a clearer signal" : "等待更清晰的信号"}</small></div>) : <p className="productMuted">{en ? "No likely omission surfaced." : "暂时没有发现可能遗漏。"}</p>}</TodayCard>
-      <TodayCard title={en ? "Questions" : "还想问你"} icon={<CircleHelp size={17} />} className="spanWide"><ProductQuestions questions={questions} scope={scope} language={language} onChanged={onChanged} compact /></TodayCard>
+      <TodayCard title={en ? "Questions" : "还想问你"} icon={<CircleHelp size={17} />} className="spanWide"><ProductQuestions questions={questions} scope={scope} productContext={productContext} language={language} onChanged={onChanged} compact /></TodayCard>
       <TodayCard title={en ? "Suggestions" : "建议"} icon={<Sparkles size={17} />} className="spanWide"><ProductReactions reactions={suggestions} scope={scope} language={language} onChanged={onChanged} compact /></TodayCard>
     </div>
     <p className="productAuthorityNote">{en ? "Suggestions are record-only in this preview. Nothing is sent or executed automatically." : "这个预览中的建议只记录，不会自动发送或执行。"}</p>
@@ -137,7 +137,7 @@ export function ProductHome({ scope, productContext, inputScope, language = "zh"
   if (loading && !today) return <div className="sectionPage productLoadingPage"><LoadingBlock label={en ? "Reading Today…" : "正在读取 Today…"} /></div>;
   if (error && !today) return <div className="sectionPage"><ErrorBlock message={error} onRetry={() => void load()} /></div>;
   if (!today) return null;
-  return <><TodayView today={today} scope={scope} language={language} readAt={updatedAt} onChanged={() => { onChanged?.(); void load(); }} /><button className="productRefreshButton" type="button" onClick={() => void load()} disabled={loading} aria-label={en ? "Refresh Today" : "刷新 Today"}><RefreshCw size={15} className={loading ? "spinIcon" : ""} /></button></>;
+  return <><TodayView today={today} scope={scope} language={language} readAt={updatedAt} productContext={productContext} onChanged={() => { onChanged?.(); void load(); }} /><button className="productRefreshButton" type="button" onClick={() => void load()} disabled={loading} aria-label={en ? "Refresh Today" : "刷新 Today"}><RefreshCw size={15} className={loading ? "spinIcon" : ""} /></button></>;
 }
 
 export function refreshProductSurfaces() {
