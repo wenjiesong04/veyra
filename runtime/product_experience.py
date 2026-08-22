@@ -680,6 +680,7 @@ class ProductExperienceService:
                 "attention": "success" if attention else "empty",
             },
             "freshness": self._projection_freshness(),
+            "suggestions_boundary": self._other_suggestion_ledger(owner, session),
             "source_summary": {
                 "semantic": "situation_state.json via SituationStateRepository (SemanticSituationRuntime; legacy SituationEvaluator)",
                 "information_needs": "InformationNeedRuntime",
@@ -1138,6 +1139,48 @@ class ProductExperienceService:
             visible.append({"title": _text(item.get("title") or item.get("kind"), "Untitled commitment", limit=240), "status": _text(item.get("status"), "unknown", limit=32), "next_at": _text(item.get("next_run_at") or item.get("next_refresh_at")) or None, "source": "commitment"})
         selected = visible[: max(0, min(int(limit), 100))]
         return selected, "success" if selected else "empty"
+
+    def _other_suggestion_ledger(self, owner: str, session: str) -> dict[str, Any]:
+        """Name the older suggestion ledger instead of leaving a silent gap.
+
+        Product suggestions are the ``suggest`` dispositions of the Living
+        Reaction ledger, because those are the only rows this surface can also
+        collect feedback on.  The General Situation outbox is a separate
+        record-only ledger with its own contract.  An empty Suggestions card
+        should say that, rather than let a reader assume a broken pipe.
+        """
+
+        disclosure: dict[str, Any] = {
+            "projected_ledger": "living_reaction.suggest",
+            "other_ledger": "general_suggestion_outbox",
+            "other_ledger_projected": False,
+            "reason": "a general suggestion proposal has its own contract and no product feedback path",
+        }
+        try:
+            raw = self.state_store.read_json("suggestion_outbox.json")
+        except Exception:
+            return {**disclosure, "other_ledger_status": "unavailable"}
+        proposals = raw.get("proposals")
+        rows = list(proposals.values()) if isinstance(proposals, dict) else proposals
+        if not isinstance(rows, list):
+            return {**disclosure, "other_ledger_status": "unavailable"}
+        recorded = 0
+        console_deliverable = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("user_id") or "") != owner or str(row.get("session_id") or "") != session:
+                continue
+            recorded += 1
+            delivery = row.get("delivery") if isinstance(row.get("delivery"), dict) else {}
+            if str(delivery.get("channel") or "") == "owner_scoped_console":
+                console_deliverable += 1
+        return {
+            **disclosure,
+            "other_ledger_status": "success",
+            "other_ledger_recorded_count": recorded,
+            "other_ledger_console_deliverable_count": console_deliverable,
+        }
 
     def _projection_freshness(self) -> dict[str, str]:
         return {

@@ -3,7 +3,7 @@ import { AlertTriangle, ArrowRight, CalendarClock, CircleHelp, Eye, Flag, Refres
 import { getProductToday, type JsonValue, type ProductContext, type ProductInputScope, type ProductQuestion, type ProductReaction, type ProductSituation, type ProductToday } from "./api";
 import { ProductQuestions } from "./product_questions";
 import { ProductReactions, reactionRecords } from "./product_reactions";
-import { dateLabel, progressLabel, record, records, serverFallbackText, statusLabel, text, uniqueRecords } from "./product_shared";
+import { dateLabel, numberValue, progressLabel, record, records, serverFallbackText, statusLabel, text, uniqueRecords } from "./product_shared";
 import { ErrorBlock, Freshness, isEnglish, Language, LoadingBlock, OwnerScope, StatusBadge, Surface } from "./shared";
 
 type Props = { scope: OwnerScope; productContext?: ProductContext | null; inputScope?: ProductInputScope | null; language?: Language; refreshKey?: number; onStartChat: (text: string) => void; onOpenHistory?: () => void; onChanged?: () => void };
@@ -52,6 +52,10 @@ function TodayView({ today, scope, language, readAt, onChanged, productContext }
   const suggestions = uniqueRecords(today.suggestions, { mode: "reaction" }) as ProductReaction[];
   const waiting = uniqueRecords(today.waiting, { mode: "waiting" });
   const freshness = record(today.freshness);
+  // An empty Suggestions card must not read as a broken pipe: the server
+  // names the other record-only ledger and how many rows it holds.
+  const suggestionsBoundary = record(today.suggestions_boundary);
+  const otherLedgerCount = numberValue(suggestionsBoundary.other_ledger_recorded_count, 0);
   const hasContent = attention.length || situations.length || changes.length || deadlines.length || unknowns.length || questions.length || suggestions.length || waiting.length;
   const degraded = String(today.status ?? "").toLowerCase() === "degraded";
   const summary = en ? "Veyra keeps the living context here: what is moving, what may be missed, and what deserves your attention now." : "Veyra 在这里维护生活上下文：什么在变化、什么可能被遗漏，以及现在最值得关注什么。";
@@ -64,7 +68,7 @@ function TodayView({ today, scope, language, readAt, onChanged, productContext }
       <TodayCard title={en ? "Deadlines" : "临近时间"} icon={<CalendarClock size={17} />}>{deadlines.length ? deadlines.slice(0, 4).map((item, index) => { const progress = record(item.progress); const progressValue = Object.keys(progress).length ? progress.status : item.progress; return <div className="productDeadlineRow" key={`${text(item.situation_id, "deadline")}-${index}`}><strong>{text(item.title ?? item.label, en ? "Upcoming" : "即将到来")}</strong><span>{dateLabel(item.deadline_at, en)}</span><small>{progressLabel(progressValue, en)}</small></div>; }) : <p className="productMuted">{en ? "No deadline is close enough to surface." : "暂无需要现在提示的时间点。"}</p>}</TodayCard>
       <TodayCard title={en ? "May be missed" : "可能遗漏"} icon={<Flag size={17} />}>{unknowns.length ? unknowns.slice(0, 5).map((item, index) => <div className="productUnknownRow" key={`${text(item.situation_id, "unknown")}-${index}`}><strong>{text(item.statement, en ? "An unknown may matter." : "有一项未知可能影响判断。")}</strong><small>{en ? "Still unknown" : "仍未知"}</small></div>) : waiting.length ? waiting.slice(0, 4).map((item, index) => <div className="productUnknownRow" key={`waiting-${index}`}><strong>{text(item.what_changed ?? item.message, en ? "Veyra is waiting." : "Veyra 正在等待。")}</strong><small>{en ? "Waiting for a clearer signal" : "等待更清晰的信号"}</small></div>) : <p className="productMuted">{en ? "No likely omission surfaced." : "暂时没有发现可能遗漏。"}</p>}</TodayCard>
       <TodayCard title={en ? "Questions" : "还想问你"} icon={<CircleHelp size={17} />} className="spanWide"><ProductQuestions questions={questions} scope={scope} productContext={productContext} language={language} onChanged={onChanged} compact /></TodayCard>
-      <TodayCard title={en ? "Suggestions" : "建议"} icon={<Sparkles size={17} />} className="spanWide"><ProductReactions reactions={suggestions} scope={scope} language={language} onChanged={onChanged} compact /></TodayCard>
+      <TodayCard title={en ? "Suggestions" : "建议"} icon={<Sparkles size={17} />} className="spanWide"><ProductReactions reactions={suggestions} scope={scope} language={language} onChanged={onChanged} compact />{!suggestions.length && otherLedgerCount > 0 ? <p className="productQuestionHint"><Flag size={13} />{en ? `Veyra has produced no suggestion on this path yet. An older record-only ledger holds ${otherLedgerCount} proposal(s) for this scope; they were never delivered and are not shown here.` : `这条路径上还没有产生建议。旧的只记录账本里为这个作用域存着 ${otherLedgerCount} 条提案，它们从未投递，也不会显示在这里。`}</p> : null}</TodayCard>
     </div>
     <p className="productAuthorityNote">{en ? "Suggestions are record-only in this preview. Nothing is sent or executed automatically." : "这个预览中的建议只记录，不会自动发送或执行。"}</p>
   </div>;

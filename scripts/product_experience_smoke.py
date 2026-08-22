@@ -233,6 +233,54 @@ def main() -> int:
         today_after_reaction = client.get(f"/product/today?user_id={owner}&session_id={session}").json()
         expect(all(item["disposition"] == "suggest" for item in today_after_reaction["suggestions"]), "Today suggestions exclude ask/read/wait")
         expect(all(item["disposition"] == "wait" for item in today_after_reaction["waiting"]), "Today waiting contains only wait dispositions")
+        boundary = today_after_reaction["suggestions_boundary"]
+        expect(
+            boundary["projected_ledger"] == "living_reaction.suggest"
+            and boundary["other_ledger"] == "general_suggestion_outbox"
+            and boundary["other_ledger_projected"] is False
+            and boundary["other_ledger_recorded_count"] == 0,
+            f"Today names the other suggestion ledger without projecting it: {boundary}",
+        )
+        store.mutate_json(
+            "suggestion_outbox.json",
+            lambda state: state.__setitem__(
+                "proposals",
+                {
+                    "prop_scoped_console": {
+                        "proposal_id": "prop_scoped_console",
+                        "user_id": owner,
+                        "session_id": session,
+                        "status": "would_suggest",
+                        "delivery": {"channel": "owner_scoped_console", "external_delivery": False},
+                    },
+                    "prop_scoped_recorded": {
+                        "proposal_id": "prop_scoped_recorded",
+                        "user_id": owner,
+                        "session_id": session,
+                        "status": "recorded",
+                        "delivery": {"channel": "none", "external_delivery": False},
+                    },
+                    "prop_other_owner": {
+                        "proposal_id": "prop_other_owner",
+                        "user_id": "someone-else",
+                        "session_id": session,
+                        "status": "recorded",
+                        "delivery": {"channel": "none", "external_delivery": False},
+                    },
+                },
+            ),
+        )
+        scoped_boundary = client.get(f"/product/today?user_id={owner}&session_id={session}").json()["suggestions_boundary"]
+        expect(
+            scoped_boundary["other_ledger_recorded_count"] == 2
+            and scoped_boundary["other_ledger_console_deliverable_count"] == 1
+            and scoped_boundary["other_ledger_projected"] is False,
+            f"the other suggestion ledger is counted for this exact owner only: {scoped_boundary}",
+        )
+        expect(
+            all(item["disposition"] == "suggest" for item in client.get(f"/product/today?user_id={owner}&session_id={session}").json()["suggestions"]),
+            "legacy proposals never enter the product suggestion list",
+        )
         detail_with_reactions = client.get(f"/product/situations/{ids[1]}?user_id={owner}&session_id={session}").json()
         expect(all(item["situation_revision"] == current["revision"] for item in detail_with_reactions["reactions"]), "Situation detail excludes stale reactions")
         advanced = client.post(f"/product/situations/{ids[1]}/command?user_id={owner}&session_id={session}", json={"command": "correct", "expected_revision": 1, "patch": {"next_step": "The current next step changed."}})

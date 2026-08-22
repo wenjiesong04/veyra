@@ -85,6 +85,7 @@ must(files.main.includes("lazy(() => import(\"./LegacyConsole\")"), "Advanced co
 for (const value of ["answerProductQuestion", "deferProductQuestion", "dismissProductQuestion", "expected_generation", "onChanged"]) must(files.questions.includes(value), `Question contract is missing ${value}`);
 for (const value of ["useful", "not_useful", "ignore", "resolved", "too_early", "too_late", "too_frequent", "remind_before", "remind_before_seconds", "remindButton", "feedbackProductReaction"]) must(files.reactions.includes(value), `Reaction feedback contract is missing ${value}`);
 must(files.home.includes("<ProductQuestions") && files.home.includes("<ProductReactions"), "Today does not expose Questions and Suggestions");
+must(files.home.includes("suggestions_boundary") && files.home.includes("other_ledger_recorded_count"), "an empty Suggestions card does not disclose the other record-only ledger");
 
 // Sources remain status-first and honest about unsupported consent authority.
 for (const value of ["getProductSources", "consentProductSource", "revokeProductSource", "expected_generation", "calendar", "weather", "public_web"]) must(files.sources.includes(value) || files.api.includes(value), `Sources contract is missing ${value}`);
