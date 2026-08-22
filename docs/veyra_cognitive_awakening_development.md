@@ -562,3 +562,34 @@ Calendar 的确定性完整链与独立 real provider read 均有证据，Weathe
 acceptance 和 GitHub Actions 在提交推送前均为 `PENDING`。当前 worktree 仍未提交，不在这里写入
 最终 SHA；authority 保持 record-only/no external delivery，Agent research disabled。旧
 文档中的 Today-first/default-home 仅保留为历史预览语境。
+
+## 2026-08-22 V1 final code checkpoint
+
+上面的 2026-08-20 addendum 保留为历史 evidence snapshot；以下是当前 V1 code
+checkpoint 的收口记录，不把未完成的 P1/P2 或用户价值阶段写成完成：
+
+- Code checkpoint：`cognitive-awakening @ 34d44dfca0534f837b72b2ebe15949ed517ea699`。
+  本地 gate `166/166`（`145` invariant + `1` cognitive + `20` product）、OpenClaw
+  `32/32` 与 Route `810/810` 通过；generic health/education/finance generalization
+  smoke 通过，三个原始 live Situation 复用同一通用机制。
+- Long-session move update 已解析 mover Information Need，同时保留 network/date
+  Unknowns。isolated real-model asked-answer series 为 `3/3`；更广泛的 natural-language
+  model reliability 仍是 `PARTIAL / DEGRADED`，不证明稳定 provider、长期 usefulness
+  或 Jarvis-like relationship。
+- Home/Today/Situations/Chat/Settings 与 `390x844` browser acceptance 通过；Context
+  gating、404 UX、source labels、question dedupe 已核验。authority 未变化：
+  `record_only / no external delivery`，Agent research disabled。
+- Clean local package 为 arm64、ad-hoc signed；Python `3.11.15`、PyInstaller `6.22.0`、
+  Rust `1.96.1`、Tauri `2.11.4`；sidecar smoke、strict verify、normalized sidecar
+  match 通过。sidecar SHA 为
+  `818f8f34be54f9fb1ab1a088c5c800eaae588abf757bd62f8d0e21373f2cc106`，Veyra.app SHA
+  为 `a5cd2dd483872f88d6a1f3b56f0b8ce2316293a74db1da1ff78c5415039667ab`。它不是
+  Developer ID、notarized、DMG 或 public release。
+- 34d44df 的 exact-SHA Actions run `32564052536` 已成功
+  （<https://github.com/wenjiesong04/veyra/actions/runs/32564052536>）；重启后的 startup
+  `runtime_build` 报告该 revision、`dirty=false`、`loaded_code_attested=false`，current served UI/browser validation
+  通过，bounded live 对 core product/runtime/browser 已验证。Calendar real TCC,
+  Weather/Public Web user consent、sustained 7–14 day usefulness/quiet-rate、owner sign-off
+  和 public release 仍 pending；notarization/DMG 也未完成。V1 仍是 private/local
+  preview candidate，不是 public stable release；P1/P2 与所有后续阶段没有被这次代码
+  checkpoint 一并标记完成。

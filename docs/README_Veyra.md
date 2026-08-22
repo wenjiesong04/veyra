@@ -4,11 +4,11 @@
 >
 > 文档角色：Veyra 的 canonical project hub（项目总入口）
 >
-> 文档最近维护：2026-08-20
+> 文档最近维护：2026-08-22
 >
-> 最近事实核验：2026-08-20
+> 最近事实核验：2026-08-22
 >
-> 当前 V1 工作树证据：`cognitive-awakening` 分支上的未提交 changeset；不在此处伪造最终 SHA。最终本地 full gate 为 `165/165`（`145` invariant + `1` cognitive + `19` product），OpenClaw `32/32`，Route `810/810`；frontend contract/status-tone/build/check:bundle/build:desktop 与 arm64 LOCAL PREVIEW package 均通过。push、exact-SHA Actions、current-revision live、实际 Calendar TCC 授权和 browser acceptance 仍须独立核验。该 changeset 保持 local-first、read-only/record-only 与 disabled authority 边界，不启用 P3，不迁移现有 state，也不扩大 Agent、Tool、Route、Risk、external delivery 或执行权限。实际任务 HEAD 与工作区必须用 Git 重新读取
+> 当前 V1 code checkpoint：`cognitive-awakening @ 34d44dfca0534f837b72b2ebe15949ed517ea699`。本次只同步文档，不改变该代码 checkpoint。最终本地 full gate 为 `166/166`（`145` invariant + `1` cognitive + `20` product），OpenClaw `32/32`，Route `810/810`；generic health/education/finance generalization smoke、三个原始 live Situation 的同一通用机制、frontend Home/Today/Situations/Chat/Settings 与 `390x844` browser acceptance 均有本地证据。Context gating、404 UX、source labels 与 question dedupe 也已核验。clean local arm64 package 证据包括 sidecar SHA `818f8f34be54f9fb1ab1a088c5c800eaae588abf757bd62f8d0e21373f2cc106`、Veyra.app SHA `a5cd2dd483872f88d6a1f3b56f0b8ce2316293a74db1da1ff78c5415039667ab`、Python `3.11.15`、PyInstaller `6.22.0`、Rust `1.96.1`、Tauri `2.11.4`，ad-hoc signed，strict verify 与 normalized sidecar match 通过。34d44df exact-SHA Actions run `32564052536` 已成功（<https://github.com/wenjiesong04/veyra/actions/runs/32564052536>）；重启后的 startup `runtime_build` 报告该 revision、`dirty=false`、`loaded_code_attested=false`，current served UI/browser validation 通过，bounded live 对 core product/runtime/browser 已验证。Calendar real TCC、Weather/Public Web user consent、sustained 7–14 day usefulness/quiet-rate、owner sign-off、notarization/DMG 与 public release 仍 pending。当前 `/health` 的 `critical` 来自继承的 Belief 冲突、stale Agent snapshot 与历史 review，不是 V1 API/认知循环离线。该候选保持 private/local preview、record-only/no external delivery，不是 public stable release；不启用 P3，不迁移现有 state，也不扩大 Agent、Tool、Route、Risk、external delivery 或执行权限。实际任务 HEAD 与工作区必须用 Git 重新读取
 >
 > 运行态说明：本文保留 `5b80a26`、`6776f97` 的历史快照；`e5fcf80` 的 current bounded live、Product Preview 和 clean package 证据以 dated checkpoint 与 Project OS 为准。它们都不能自动转移到未来 docs SHA。本文不再用每次 PID、短寿命告警数量或 status-only commit 追赶运行态；exact runtime SHA 和 GitHub Actions 仍按最终 revision 独立核验。
 
@@ -60,6 +60,32 @@
 > 和 GitHub Actions 在提交推送前均为 `PENDING`。当前产品路由是独立 quiet `#/` First Meeting、
 > 独立 `#/today`、`#/situations`/detail 与 `#/chat/<id>`；旧的 Today-first/default-home
 > 表述仅属历史预览语境。
+
+> 上述 2026-08-20 addendum 保留为历史快照；当前 code/package/browser 证据以
+> 下方 2026-08-22 checkpoint 与 Project OS current ledger 为准。
+
+> **2026-08-22 V1 final code checkpoint:** 当前代码 checkpoint 为
+> `34d44dfca0534f837b72b2ebe15949ed517ea699`。本地 gate `166/166`（`145`
+> invariant + `1` cognitive + `20` product）、OpenClaw `32/32` 与 Route
+> `810/810` 通过；generic health/education/finance generalization smoke 与三个
+> 原始 live Situation 的同一通用机制通过。long-session move update 已解析 mover
+> Information Need，同时保留 network/date Unknowns；isolated real-model asked-answer
+> series 为 `3/3`，但更广泛的 natural-language model reliability 仍是
+> `PARTIAL / DEGRADED`。Home/Today/Situations/Chat/Settings 与 `390x844` browser
+> acceptance 通过，Context gating、404 UX、source labels、question dedupe 已核验。
+> clean local arm64 package 的 sidecar SHA 为
+> `818f8f34be54f9fb1ab1a088c5c800eaae588abf757bd62f8d0e21373f2cc106`，Veyra.app SHA
+> 为 `a5cd2dd483872f88d6a1f3b56f0b8ce2316293a74db1da1ff78c5415039667ab`；Python
+> `3.11.15`、PyInstaller `6.22.0`、Rust `1.96.1`、Tauri `2.11.4`，ad-hoc signed，
+> strict verify 与 normalized sidecar match 通过。34d44df 的 exact-SHA Actions
+> run `32564052536` 已成功（<https://github.com/wenjiesong04/veyra/actions/runs/32564052536>），
+> 重启后的 startup `runtime_build` 报告该 revision、`dirty=false`、
+> `loaded_code_attested=false`，current served UI/browser
+> validation 通过，bounded live 对 core product/runtime/browser 已验证。Calendar real TCC、
+> Weather/Public Web user consent、sustained 7–14 day usefulness/quiet-rate、owner sign-off、
+> notarization/DMG 和 public release 仍 pending；V1 是 private/local preview candidate，
+> 不是 public stable release。authority 保持 `record_only / no external delivery`，Agent
+> research disabled；bounded Jarvis-like route 有所演示，但未证明。
 
 The sections below dated 2026-08-13 are retained as historical context. For
 current status, task scope, release evidence and known degraded conditions,
@@ -622,7 +648,7 @@ Hypothesis 已支持 `candidate / accumulating / confirmed / contradicted / expi
 
 ### 4.8 Runtime revision 已安全收口，但不是 loaded-code attestation
 
-`6776f97` 当前 live 运行于 Python 3.11.15；runtime v2 报 exact revision、`dirty_flag=false`、`loaded_code_attested=false`，Goal/observer 可跨重启保留，clean workspace 保持 unchanged/silent。一次 wrapper cold-start 超过 readiness，随后 direct kickstart 在约 6 秒 ready，属非阻塞 timing 观察，不是失败。`5b80a26` 的历史 clean restart 证据仍不能转移给最终 docs SHA；docs exact-SHA live/Actions 尚未验证。GET runtime/health/state/state-health/belief status 前后业务 state hashes 不变；public response redacts claim/target/CAS/private ledger，authority 仍全 false。
+以下是 `6776f97` 的历史 live 快照：运行于 Python 3.11.15；runtime v2 报该 revision、`dirty_flag=false`、`loaded_code_attested=false`，Goal/observer 可跨重启保留，clean workspace 保持 unchanged/silent。一次 wrapper cold-start 超过 readiness，随后 direct kickstart 在约 6 秒 ready，属非阻塞 timing 观察，不是失败。当时 `5b80a26` 的 clean restart 证据不能转移给后续 SHA，且 docs exact-SHA live/Actions 尚未验证；该历史 pending 已由本文顶部的 2026-08-22 checkpoint 取代。GET runtime/health/state/state-health/belief status 前后业务 state hashes 不变；public response redacts claim/target/CAS/private ledger，authority 仍全 false。
 
 ---
 
@@ -632,26 +658,29 @@ Hypothesis 已支持 `candidate / accumulating / confirmed / contradicted / expi
 
 ### P0：当前 `cognitive-awakening` 分支的应用自动化检查点
 
-当前 V1 应用检查点已完成独立审阅、定向/对抗 smoke、`165/165` gate（`145`
-invariant + `1` cognitive + `19` product）、OpenClaw plugin `32/32`、Route
+当前 V1 应用检查点已完成独立审阅、定向/对抗 smoke、`166/166` gate（`145`
+invariant + `1` cognitive + `20` product）、OpenClaw plugin `32/32`、Route
 `810/810`、compileall、frontend product-contract/status-tone/build/check:bundle/
-build:desktop 和 product contract/bundle 验证。arm64 package 也已作为 LOCAL PREVIEW
-通过 sidecar smoke、normalized comparison、strict ad-hoc codesign 与 App metadata/
-entitlement 检查。当前 changeset 尚未提交，因此本文不伪造最终 SHA；runtime/
-GET-purity、实际 Calendar TCC、browser、push 与 exact-SHA Actions 仍须对最终 revision
-独立核验。LivingReaction bounded
-archive/retention 已纳入 product evidence；真实 Moonshot 仍是多次隔离运行的
-`PARTIAL / DEGRADED`：三个通用场景 create `3/3` 曾成功、update `3/3` 曾成功、
-Calendar update `1/1` 曾成功，`ignore feedback` 曾被模型解析并持久记录，但没有
-同一次 run 完成全链；最终 run 为 create `3/3`、update `2/3`，因 timeline
-`source_quote` binding 波动而 degraded。它不是稳定 provider、单次全链 PASS、长期
-usefulness 或 Jarvis 证明。
-
-当前收口动作是解决 timeline `source_quote` binding 波动并重跑一次同一 run 的
-real-model full-chain acceptance，完成实际 Calendar TCC 用户授权，再核对最终 clean HEAD 的 runtime/GET-purity/Belief
-quarantine/Phase 6 fail-closed、浏览器/390×844、普通 push 与 exact-SHA Actions；
-本窗口不合并 `main`，也不开始 P3。本轮不因缺少 Feishu fresh nonce 阻塞
-Console-only repair，但也不把 WebSocket connected 当作外部交付通过。
+build:desktop 和 product contract/bundle 验证。generic health/education/finance
+generalization smoke 通过，三个原始 live Situation 复用同一通用机制；long-session
+move update 解析 mover Information Need，同时保留 network/date Unknowns。arm64
+package 也已作为 clean LOCAL PREVIEW 通过 sidecar smoke、normalized sidecar match、
+strict ad-hoc codesign 与 App metadata/entitlement 检查；sidecar SHA 为
+`818f8f34be54f9fb1ab1a088c5c800eaae588abf757bd62f8d0e21373f2cc106`，Veyra.app SHA
+为 `a5cd2dd483872f88d6a1f3b56f0b8ce2316293a74db1da1ff78c5415039667ab`，工具链为 Python
+`3.11.15`、PyInstaller `6.22.0`、Rust `1.96.1`、Tauri `2.11.4`。
+Home/Today/Situations/Chat/Settings 与 `390x844` browser acceptance 已通过，Context
+gating、404 UX、source labels、question dedupe 已核验。当前代码 checkpoint 为
+`34d44dfca0534f837b72b2ebe15949ed517ea699`；exact-SHA Actions run `32564052536`
+已成功（<https://github.com/wenjiesong04/veyra/actions/runs/32564052536>）；重启后的
+startup `runtime_build` 报告该 revision、`dirty=false`、`loaded_code_attested=false`，
+current served UI/browser validation 通过，bounded live 对 core product/runtime/browser
+已验证。实际 Calendar TCC、Weather/Public Web
+user consent、sustained 7–14 day usefulness/quiet-rate、owner sign-off、notarization/DMG
+与 public release 仍须独立核验。isolated real-model asked-answer series 为 `3/3`，但更广泛的 natural-language
+model reliability 仍是 `PARTIAL / DEGRADED`；这不是稳定 provider、完整通用全链、长期
+usefulness 或 Jarvis 证明。authority 保持 record-only/no external delivery，Agent
+research disabled。本窗口不合并 `main`，也不开始 P3。
 
 ### P1：Cognitive Awakening M1（`PARTIAL + AUTOMATED_VALIDATED + CURRENT BOUNDED LIVE`，Console-only、无权限扩大）
 
@@ -693,8 +722,8 @@ Console-only repair，但也不把 WebSocket connected 当作外部交付通过�
 - [ ] 加入跨 tick 长期公平/覆盖率指标、通用归档保留策略和 owner-scoped EvidenceGraph projection；
 - [ ] 对冲突做生产 producer 接入的显式仲裁或保持 unresolved，不静默覆盖；当前仍主要由 smoke 覆盖，不能写成全链路完成。
 
-本轮自动化检查点接受标准已满足：当前 V1 full gate `165/165`（`145` invariant、
-`1` cognitive、`19` product）、claim CAS/current-clock TTL、same-batch owner
+本轮自动化检查点接受标准已满足：当前 V1 full gate `166/166`（`145` invariant、
+`1` cognitive、`20` product）、claim CAS/current-clock TTL、same-batch owner
 fairness、quarantine byte-purity、9 Route `810/810`、plugin `32/32`、compile/
 frontend 均通过。当前 live 已证明 Workspace Goal observer 的两窗真实链路、
 unsupported event 的单一 bounded marker、cadence-less conflict 的同 revision
@@ -1056,33 +1085,40 @@ Workspace observer 已把 durable state codec 与 delivery outbox 从 service �
 - [x] 重新核对当前 branch、canonical handbook、运行代码和真实状态，复核 build identity、EvidenceGraph、bridge、decision ledger 与 producer 边界；
 - [x] 完成隔离 Git snapshot 的 worktree 修复及定向 smoke；
 - [x] 独立只读 review 当前安全修复；未发现 hook/filter/GIT 环境或仓库 index 写入绕过，schema v2、SHA-256、split/linked worktree 和竞态测试已补齐；
-- [x] 按 Constitutional / Living Zone 更新本次真实 Living 快照；最终 changeset
-  尚未提交；
+- [x] 按 Constitutional / Living Zone 更新本次真实 Living 快照；代码 checkpoint
+  `34d44dfca0534f837b72b2ebe15949ed517ea699` 已核对，本次仅有文档同步；
 - [x] 定向 runtime、认知、结构化观测、Belief refresh-spec/CAS、EvidenceGraph、
-  Economy、workspace observer 与 LivingReaction retention smoke 通过；`165/165`
-  gate（`145` invariant + `1` cognitive + `19` product）、plugin `32/32`、
+  Economy、workspace observer 与 LivingReaction retention smoke 通过；`166/166`
+  gate（`145` invariant + `1` cognitive + `20` product）、plugin `32/32`、
   compileall、Web/Desktop frontend build 与 9 Route `810/810` 均通过；
-- [x] frontend product-contract/status-tone/build/check:bundle/build:desktop 与
-  arm64 LOCAL PREVIEW package 通过；Python `3.11.15`、PyInstaller `6.22.0`、
-  Tauri `2.11.4`、sidecar smoke、normalized comparison、strict ad-hoc codesign、
-  App `NSAppleEventsUsageDescription`/automation entitlement 已核验；不代表
-  Developer ID/notarized/DMG/public release；
+- [x] frontend product-contract/status-tone/build/check:bundle/build:desktop、Home/
+  Today/Situations/Chat/Settings 与 `390x844` browser acceptance 通过；Context gating、
+  404 UX、source labels、question dedupe 已核验；arm64 LOCAL PREVIEW package 通过；
+  Python `3.11.15`、PyInstaller `6.22.0`、Rust `1.96.1`、Tauri `2.11.4`、sidecar
+  smoke、normalized sidecar match、strict ad-hoc codesign、App
+  `NSAppleEventsUsageDescription`/automation entitlement 已核验；sidecar SHA
+  `818f8f34be54f9fb1ab1a088c5c800eaae588abf757bd62f8d0e21373f2cc106`、Veyra.app SHA
+  `a5cd2dd483872f88d6a1f3b56f0b8ce2316293a74db1da1ff78c5415039667ab`；不代表 Developer
+  ID/notarized/DMG/public release；
 - [ ] 实际 Calendar TCC 用户授权；
-- [ ] clean restart 最终文档 SHA，核对 Conda Python 3.11.15、`build_revision`、`dirty_flag=false`、冻结 runtime projection 与业务 state GET 纯读；本文只保留 `5b80a26` 历史 live，不冒充当前证据；
-- [ ] 对最终 clean revision 复核 runtime surfaces、Belief quarantine、External scoped projection 和 Phase 6 fail-closed；自动化正反例已完成，current-revision live 待提交后执行；
+- [ ] Weather/Public Web user consent；
+- [x] 重启后的 startup `runtime_build` 报告 code checkpoint `34d44dfca0534f837b72b2ebe15949ed517ea699`、`dirty_flag=false`、`loaded_code_attested=false`，核对 Conda Python 3.11.15、冻结 runtime projection 与 current served UI/browser validation；
+- [ ] 对最终 clean revision 继续复核 Belief quarantine、External scoped projection 和 Phase 6 fail-closed；exact-revision runtime/current served UI/browser 已验证，自动化正反例不等于所有 P1/P2 live 证据；
 - [x] 验证 durable bridge、typed contradiction/supersede、不可复活、canonical interaction-decision ledger 的定向与 crash-recovery smoke；
 - [x] 完成 EvidenceGraph 1000-observation bounded soak：同值 observation 全部可写，frontier/node compaction 生效；冲突保留旧值，容量不足时 fail closed；
 - [x] `/phase6/status` 与其他 10 个状态 GET 的 state-file purity 复核通过，未触发 OpenClaw device token 写入；
 - [ ] Feishu fresh current-run 入站→处理→`provider_sent` 证据；该证据属于未来外部交付阶段，本次 Console-only M1 不阻塞；
-- [ ] GitHub Actions 对最终 docs SHA 通过（本次文档提交后重新触发并核对 exact SHA）；
+- [x] GitHub Actions 对 `34d44dfca0534f837b72b2ebe15949ed517ea699` 的 exact-SHA 结果成功：
+  run `32564052536`（<https://github.com/wenjiesong04/veyra/actions/runs/32564052536>）；
+- [ ] sustained 7–14 day usefulness/quiet-rate、owner sign-off、notarization/DMG 与 public release；
 - [ ] P1/P2 剩余缺口完成可信 lifecycle producer 与 domain policy、第二个独立可核验 producer、生产 Economy policy、长时 fairness/coverage/soak、通用归档与 owner-scoped graph projection；
 - [ ] P1/P2 真实验收完成后再通过 PR 合并 `cognitive-awakening -> main`；本窗口不合并 main，不开始 P3。
 
 ### P1/P2 修复检查点之后的下一开发切片（仍留在 cognitive-awakening）
 
 - [x] trusted Git/CI typed workspace observer：隔离 snapshot、Goal/scope/origin/ref 绑定、可选 exact-SHA GitHub Actions、ActiveLoop 与私有控制面已接入；当前 Workspace Goal 为 `record_only` 且 exact owner/session/workspace 绑定，CI producer 未配置，Project Guardian 保持 disabled，未运行任意 workspace test command；
-- [x] EvidenceGraph v1、valid-time unknown/invalid fail-closed、typed support/contradiction/supersede、bounded partition/compaction 与 tamper checks；对应 invariant 与 Belief GET purity 已纳入当前 `165/165` gate；
-- [x] Belief Economy v1 typed 三因子、claim-level CAS、current-clock TTL、same-batch owner fairness 与 honest persistence receipt；对应 invariant 已纳入当前 `165/165` gate；生产 Economy metadata 当前 `0/8`；
+- [x] EvidenceGraph v1、valid-time unknown/invalid fail-closed、typed support/contradiction/supersede、bounded partition/compaction 与 tamper checks；对应 invariant 与 Belief GET purity 已纳入当前 `166/166` gate；
+- [x] Belief Economy v1 typed 三因子、claim-level CAS、current-clock TTL、same-batch owner fairness 与 honest persistence receipt；对应 invariant 已纳入当前 `166/166` gate；生产 Economy metadata 当前 `0/8`；
 - [ ] 多真实样本下的 usefulness / timing / evidence 校准；
 - [x] 用私有 Workspace Goal 控制面创建 exact-scope 长期 Goal，配置 `record_only` observer；两个不同时间窗的真实代码变化已形成 confirmed Attention 与一条 suggestion，但不把它写成多源或长期 usefulness；
 - [x] bounded refresh scheduler contract（`next_refresh_at`/max staleness/lifecycle/value/fairness）、不可刷新 ordinary disposition 与同 revision conflict suppression；
