@@ -307,7 +307,7 @@ def seed_scope_isolation_views(store: WorldStateStore) -> None:
                     "user_id": user_id,
                     "session_id": session_id,
                     "title": "OWN_VISIBLE_GOAL",
-                    "status": "active",
+                    "status": "resolved",
                 },
                 {
                     "goal_id": "goal_PEER_SECRET_ID",
@@ -411,6 +411,188 @@ def seed_scope_isolation_views(store: WorldStateStore) -> None:
             ],
             "knowledge_items": [],
             "push_candidates": [],
+        },
+    )
+    store.patch_json(
+        "situation_state.json",
+        {
+            "situations": [
+                {
+                    "record_kind": "semantic_situation",
+                    "situation_id": "sit_own_private_id",
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "observation_revision": 2,
+                    "status": "active",
+                    "updated_at": "2026-01-02T00:00:00+00:00",
+                    "semantic": {
+                        "title": "OWN_CURRENT_SITUATION",
+                        "summary": "OWN_CURRENT_SITUATION_SUMMARY",
+                        "goal": "OWN_CURRENT_GOAL",
+                        "category": "work",
+                        "lifecycle": "active",
+                        "progress": {"status": "in_progress", "value": 0.4},
+                        "unknown": ["OWN_CURRENT_UNKNOWN"],
+                        "material_change": "OWN_CURRENT_CHANGE",
+                        "next_step": "OWN_CURRENT_NEXT_STEP",
+                    },
+                },
+                {
+                    "record_kind": "semantic_situation",
+                    "situation_id": "sit_peer_private_id",
+                    "user_id": user_id,
+                    "session_id": peer_session,
+                    "observation_revision": 9,
+                    "status": "resolved",
+                    "updated_at": "2026-01-03T00:00:00+00:00",
+                    "semantic": {
+                        "title": "PEER_SESSION_SECRET_SITUATION",
+                        "summary": "PEER_SESSION_SECRET_SITUATION_SUMMARY",
+                        "lifecycle": "resolved",
+                    },
+                },
+            ],
+            "count": 2,
+        },
+    )
+    store.patch_json(
+        "information_need_state.json",
+        {
+            "needs": {
+                "need_own_private_id": {
+                    "need_id": "need_own_private_id",
+                    "owner_id": user_id,
+                    "session_id": session_id,
+                    "status": "open",
+                    "blocked_judgment": "OWN_CURRENT_NEED",
+                    "evidence_kind": "calendar",
+                    "why_now": "OWN_CURRENT_NEED_WHY_NOW",
+                    "urgency": 0.7,
+                    "allowed_source_classes": ["calendar"],
+                    "fallback_reaction": "ask",
+                    "question": "OWN_CURRENT_NEED_QUESTION",
+                    "generation": 1,
+                    "updated_at": "2026-01-02T00:00:00+00:00",
+                },
+                "need_peer_private_id": {
+                    "need_id": "need_peer_private_id",
+                    "owner_id": user_id,
+                    "session_id": peer_session,
+                    "status": "resolved",
+                    "blocked_judgment": "PEER_SESSION_SECRET_NEED",
+                    "evidence_kind": "calendar",
+                    "why_now": "PEER_SESSION_SECRET_NEED_WHY_NOW",
+                    "urgency": 0.9,
+                    "allowed_source_classes": ["calendar"],
+                    "fallback_reaction": "ask",
+                    "question": "PEER_SESSION_SECRET_NEED_QUESTION",
+                    "generation": 1,
+                    "updated_at": "2026-01-03T00:00:00+00:00",
+                },
+            },
+            "need_count": 2,
+        },
+    )
+    store.patch_json(
+        "living_source_state.json",
+        {
+            "requests": {
+                "request_own_private_id": {
+                    "request_id": "request_own_private_id",
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "status": "completed",
+                },
+                "request_peer_private_id": {
+                    "request_id": "request_peer_private_id",
+                    "user_id": user_id,
+                    "session_id": peer_session,
+                    "status": "completed",
+                },
+            },
+            "receipts": {
+                "receipt_own_private_id": {
+                    "receipt_id": "receipt_own_private_id",
+                    "request_id": "request_own_private_id",
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "source": "calendar",
+                    "status": "ok",
+                    "reason": "OWN_RECEIPT_SUCCESS",
+                    "observed_at": "2026-01-02T00:00:00+00:00",
+                    "fresh_until": "2026-01-03T00:00:00+00:00",
+                    "ttl_seconds": 3600,
+                    "payload": {"facts": {"event": "OWN_EVENT"}},
+                },
+                "receipt_peer_private_id": {
+                    "receipt_id": "receipt_peer_private_id",
+                    "request_id": "request_peer_private_id",
+                    "user_id": user_id,
+                    "session_id": peer_session,
+                    "source": "calendar",
+                    "status": "unavailable",
+                    "reason": "PEER_SESSION_SECRET_RECEIPT_FAILURE",
+                    "observed_at": "2026-01-03T00:00:00+00:00",
+                    "fresh_until": None,
+                    "ttl_seconds": 0,
+                    "payload": {},
+                },
+            },
+        },
+    )
+    store.patch_json(
+        "living_reaction_state.json",
+        {
+            "reactions": {
+                "reaction_own_private_id": {
+                    "reaction_id": "reaction_own_private_id",
+                    "owner_id": user_id,
+                    "session_id": session_id,
+                    "disposition": "read",
+                    "reason": "OWN_REACTION_REASON",
+                    "what_happened": "OWN_REACTION_HAPPENED",
+                    "why_it_matters": "OWN_REACTION_MATTERS",
+                    "why_now": "OWN_REACTION_NOW",
+                    "suggested_next_step": "OWN_REACTION_NEXT",
+                    "situation_revision": 2,
+                    "created_at": "2026-01-02T00:00:00+00:00",
+                },
+                "reaction_peer_private_id": {
+                    "reaction_id": "reaction_peer_private_id",
+                    "owner_id": user_id,
+                    "session_id": peer_session,
+                    "disposition": "ask",
+                    "reason": "PEER_SESSION_SECRET_REACTION",
+                    "what_happened": "PEER_SESSION_SECRET_REACTION_HAPPENED",
+                    "why_it_matters": "PEER_SESSION_SECRET_REACTION_MATTERS",
+                    "why_now": "PEER_SESSION_SECRET_REACTION_NOW",
+                    "suggested_next_step": "PEER_SESSION_SECRET_REACTION_NEXT",
+                    "situation_revision": 9,
+                    "created_at": "2026-01-03T00:00:00+00:00",
+                },
+            },
+            "feedback": {
+                "feedback_own_private_id": {
+                    "feedback_id": "feedback_own_private_id",
+                    "semantics": {
+                        "owner_id": user_id,
+                        "session_id": session_id,
+                        "label": "useful",
+                        "category": "work",
+                    },
+                    "created_at": "2026-01-02T00:00:00+00:00",
+                },
+                "feedback_peer_private_id": {
+                    "feedback_id": "feedback_peer_private_id",
+                    "semantics": {
+                        "owner_id": user_id,
+                        "session_id": peer_session,
+                        "label": "not_useful",
+                        "category": "private",
+                    },
+                    "created_at": "2026-01-03T00:00:00+00:00",
+                },
+            },
         },
     )
 
@@ -881,6 +1063,30 @@ def test_admitted_bridge_crash_recovery() -> None:
 def main() -> int:
     test_cognitive_brief_attention_bridge()
     test_admitted_bridge_crash_recovery()
+    with tempfile.TemporaryDirectory(prefix="veyra-cognitive-v1-owner-") as tmp:
+        v1_owner_store = WorldStateStore(tmp)
+        v1_owner_store.patch_json(
+            "situation_state.json",
+            {
+                "situations": [
+                    {
+                        "record_kind": "semantic_situation",
+                        "user_id": "v1-only-owner",
+                        "session_id": "v1-only-session",
+                        "status": "active",
+                        "semantic": {"lifecycle": "active"},
+                        "updated_at": "2026-01-01T00:00:00+00:00",
+                    }
+                ]
+            },
+        )
+        v1_owner_runtime = ReadOnlyCognitiveLoopRuntime(
+            state_store=v1_owner_store,
+            reasoning=FakeReasoning(FakeClient()),
+        )
+        assert v1_owner_runtime._owner_scopes(limit=1) == [  # noqa: SLF001
+            ("v1-only-owner", "v1-only-session")
+        ]
     with tempfile.TemporaryDirectory(prefix="veyra-cognitive-loop-") as tmp:
         store = WorldStateStore(tmp)
         cognitive_config = store.read_json("ops_config.json")["cognitive_loop"]
@@ -928,6 +1134,22 @@ def main() -> int:
         assert by_kind["situation_graph"]["attention_parent"] is None
         assert by_kind["external_world_changes"]["summary_count"] == 1
         assert "OWN_EXTERNAL_VISIBLE" in serialized_views
+        living_view = by_kind["living_context"]
+        assert living_view["situation_count"] == 1
+        assert living_view["information_need_count"] == 1
+        assert living_view["source_receipt_count"] == 1
+        assert living_view["reaction_count"] == 1
+        assert living_view["feedback_count"] == 1
+        assert "OWN_CURRENT_SITUATION" in serialized_views
+        assert "OWN_CURRENT_NEED" in serialized_views
+        assert "OWN_RECEIPT_SUCCESS" in serialized_views
+        assert "OWN_REACTION_REASON" in serialized_views
+        assert "PEER_SESSION_SECRET_SITUATION" not in serialized_views
+        assert "PEER_SESSION_SECRET_NEED" not in serialized_views
+        assert "PEER_SESSION_SECRET_RECEIPT_FAILURE" not in serialized_views
+        assert "PEER_SESSION_SECRET_REACTION" not in serialized_views
+        assert "situation_id" not in living_view["situations"][0]
+        assert "need_id" not in living_view["information_needs"][0]
 
         baseline = runtime.run_once(reason="smoke")
         assert baseline["status"] == "observed", baseline
@@ -940,6 +1162,13 @@ def main() -> int:
             "background_cognitive_observation_plan",
             "background_cognitive_brief",
         ]
+        plan_opportunities = client.payloads[0]["opportunities"]
+        living_plan = next(
+            item for item in plan_opportunities if item["kind"] == "living_context"
+        )
+        assert living_plan["view_change"] == "new"
+        assert living_plan["novelty"] is True
+        assert living_plan["changed"] is True
         model_prompts = json.dumps(client.payloads, ensure_ascii=False)
         assert "cognitive-user" not in model_prompts
         assert "cognitive-session" not in model_prompts
@@ -977,6 +1206,17 @@ def main() -> int:
             state["claims"] = claims
 
         store.mutate_json("belief_state.json", change_belief)
+        pre_changed_state = store.read_json("cognitive_loop_state.json")
+        pre_changed_scope = next(iter(pre_changed_state["scopes"].values()))
+        changed_opportunities = runtime._opportunities(  # noqa: SLF001
+            cycle_id="cog_view_change_audit",
+            user_id="cognitive-user",
+            session_id="cognitive-session",
+            previous_view_digests=pre_changed_scope["last_view_digests"],
+        )
+        changed_by_kind = {item["kind"]: item for item in changed_opportunities}
+        assert changed_by_kind["belief_freshness"]["view_change"] == "changed"
+        assert changed_by_kind["living_context"]["view_change"] == "unchanged"
         changed = runtime.run_once(reason="smoke")
         assert changed["status"] == "observed", changed
         assert changed["results"][0]["candidate_recorded"] is True
@@ -1078,6 +1318,12 @@ def main() -> int:
         partial_cycle = partial_scope["cycles"][-1]
         assert partial_cycle["candidate_recorded"] is True, partial_cycle
         assert partial_cycle["ungrounded_claim_count"] == 1, partial_cycle
+        assert partial_cycle["brief"]["summary_if_asked"].startswith(
+            "Grounded material change:"
+        )
+        assert partial_cycle["brief"]["unknown"] == []
+        assert partial_cycle["brief"]["assumptions"] == []
+        assert partial_cycle["brief"]["confidence"] == 0.8
         partial_refs = {
             ref
             for row in [
@@ -1527,6 +1773,8 @@ def main() -> int:
         assert all(
             len(scope["attempts"]) == 1
             and isinstance(scope.get("last_brief"), dict)
+            and {"reason", "disposition", "ungrounded_claim_count"}
+            <= set(scope["attempts"][0])
             for scope in cap_state_after_second_sweep["continuity"].values()
         )
         evicted_scope_key = next(
@@ -1537,6 +1785,8 @@ def main() -> int:
         evicted_continuity = cap_state_after_second_sweep["continuity"][
             evicted_scope_key
         ]
+        evicted_diagnosis = cap_runtime.status()["candidate_diagnosis"]
+        assert evicted_diagnosis["observed_dispositions"].get("quiet") == 55
 
         def allow_second_cycle(config: dict[str, Any]) -> None:
             config["cognitive_loop"]["daily_model_cycle_budget"] = 2

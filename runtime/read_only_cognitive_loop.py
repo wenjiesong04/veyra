@@ -34,7 +34,10 @@ COGNITIVE_PLAN_SYSTEM = (
     "cognitive_plan. You are not chatting with the user and you cannot execute tools, choose a "
     "route, change risk, grant a capability, send a notification, or write facts. Select at most "
     "two exact opportunity_token values supplied by Veyra. A token reveals only a server-prepared, "
-    "read-only, redacted WorldState view; never invent or alter a token. Prefer the smallest view "
+    "read-only, redacted WorldState view; never invent or alter a token. The server supplies a "
+    "view_change/novelty marker for every opportunity. Prefer changed or new views over unchanged "
+    "views, and prefer the Living Context view when it is changed because it contains the current "
+    "Situation, InformationNeed, source receipt, and reaction projection. Select the smallest view "
     "that could show whether something materially changed."
 )
 
@@ -140,6 +143,7 @@ class ReadOnlyCognitiveLoopRuntime:
         "external_world_changes",
         "goals_and_commitments",
         "situation_graph",
+        "living_context",
     }
     CYCLE_STATUSES = {"reserved", "observed", "degraded"}
     BRIDGE_BINDING_SCHEMA_VERSION = "veyra.attention_bridge_binding.v1"
@@ -548,11 +552,17 @@ class ReadOnlyCognitiveLoopRuntime:
             "veyra.cognitive_provider_scope.v1",
             {"cycle_id": cycle_id, "private_scope_key": scope_key},
         )[:20]
+        previous_view_digests = (
+            previous.get("last_view_digests")
+            if isinstance(previous.get("last_view_digests"), dict)
+            else {}
+        )
         try:
             opportunities = self._opportunities(
                 cycle_id=cycle_id,
                 user_id=user_id,
                 session_id=session_id,
+                previous_view_digests=previous_view_digests,
             )
         except (TypeError, ValueError):
             return self._owner_result(
@@ -608,6 +618,13 @@ class ReadOnlyCognitiveLoopRuntime:
                 cycle_id=cycle_id,
                 world_digest=world_digest,
                 reason=reason,
+                view_digests={
+                    item["kind"]: item["view_digest"]
+                    for item in opportunities
+                    if isinstance(item, dict)
+                    and isinstance(item.get("kind"), str)
+                    and isinstance(item.get("view_digest"), str)
+                },
                 expected_config=config,
                 expected_generation=expected_generation,
             )
@@ -646,6 +663,9 @@ class ReadOnlyCognitiveLoopRuntime:
                             "opportunity_token": item["token"],
                             "kind": item["kind"],
                             "summary": item["summary"],
+                            "view_change": item["view_change"],
+                            "novelty": item["novelty"],
+                            "changed": item["changed"],
                         }
                         for item in opportunities
                     ],
@@ -854,6 +874,13 @@ class ReadOnlyCognitiveLoopRuntime:
             "selected_opportunity_tokens": list(
                 plan.selected_opportunity_tokens
             ),
+            "view_digests": {
+                item["kind"]: item["view_digest"]
+                for item in opportunities
+                if isinstance(item, dict)
+                and isinstance(item.get("kind"), str)
+                and isinstance(item.get("view_digest"), str)
+            },
             "selected_kinds": [item["kind"] for item in selected],
             "evidence_refs": sorted(allowed_refs),
             "selected_observations": [
@@ -2040,6 +2067,7 @@ class ReadOnlyCognitiveLoopRuntime:
         cycle_id: str,
         user_id: str,
         session_id: str,
+        previous_view_digests: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         scope_key = tenant_scope_storage_key(user_id, session_id)
         snapshot = self.state_store.read_snapshot(
@@ -2054,6 +2082,10 @@ class ReadOnlyCognitiveLoopRuntime:
                 "context_binding_state.json",
                 "general_situation_state.json",
                 "suggestion_outbox.json",
+                "situation_state.json",
+                "information_need_state.json",
+                "living_source_state.json",
+                "living_reaction_state.json",
             ]
         )
         documents = {
@@ -2067,6 +2099,10 @@ class ReadOnlyCognitiveLoopRuntime:
             "contexts": snapshot["context_binding_state.json"],
             "general": snapshot["general_situation_state.json"],
             "suggestions": snapshot["suggestion_outbox.json"],
+            "living_situation": snapshot["situation_state.json"],
+            "information_needs": snapshot["information_need_state.json"],
+            "living_source": snapshot["living_source_state.json"],
+            "living_reaction": snapshot["living_reaction_state.json"],
         }
         self._validate_source_documents(documents)
         active_loop_semantics = {
@@ -2297,6 +2333,11 @@ class ReadOnlyCognitiveLoopRuntime:
             "content_trust": "untrusted_external_cached_data",
             "external_delivery": False,
         }
+        living_context_payload = self._living_context_payload(
+            documents,
+            user_id=user_id,
+            session_id=session_id,
+        )
         definitions = [
             (
                 "runtime_health",
@@ -2336,6 +2377,12 @@ class ReadOnlyCognitiveLoopRuntime:
                 binding_payload,
                 [self._projection_ref("situation_graph", binding_payload)],
             ),
+            (
+                "living_context",
+                "exact-owner V1 Living Context Situation, InformationNeeds, source receipts, and reactions without locators",
+                living_context_payload,
+                [self._projection_ref("living_context", living_context_payload)],
+            ),
         ]
         output: list[dict[str, Any]] = []
         for kind, summary, payload, _refs in definitions:
@@ -2343,6 +2390,21 @@ class ReadOnlyCognitiveLoopRuntime:
                 redact_sensitive(payload, max_string=300, max_list=24)
             )
             refs = [self._projection_ref(kind, safe_payload)]
+            view_digest = stable_digest(
+                "veyra.cognitive_view_digest.v1",
+                {"kind": kind, "payload": safe_payload},
+            )
+            previous_digest = (
+                previous_view_digests.get(kind)
+                if isinstance(previous_view_digests, dict)
+                else None
+            )
+            if not isinstance(previous_digest, str) or not previous_digest:
+                view_change = "new"
+            elif previous_digest != view_digest:
+                view_change = "changed"
+            else:
+                view_change = "unchanged"
             token = "cogview_" + stable_digest(
                 "veyra.cognitive_observation_opportunity.v1",
                 {
@@ -2361,6 +2423,10 @@ class ReadOnlyCognitiveLoopRuntime:
                     "summary": summary,
                     "payload": safe_payload,
                     "evidence_refs": refs,
+                    "view_digest": view_digest,
+                    "view_change": view_change,
+                    "novelty": view_change in {"new", "changed"},
+                    "changed": view_change in {"new", "changed"},
                 }
             )
         return output
@@ -2410,6 +2476,7 @@ class ReadOnlyCognitiveLoopRuntime:
                         "last_checked_at",
                         "last_checked_world_digest",
                         "last_world_digest",
+                        "last_view_digests",
                         "last_brief",
                     )
                     if key in continuity_current
@@ -2470,6 +2537,9 @@ class ReadOnlyCognitiveLoopRuntime:
             }
             if cycle.get("status") == "observed":
                 current["last_world_digest"] = cycle["world_digest"]
+                current["last_view_digests"] = copy.deepcopy(
+                    cycle.get("view_digests") or {}
+                )
                 current["last_brief"] = copy.deepcopy(cycle.get("brief"))
             scopes[scope_key] = current
             attempts = (
@@ -2486,8 +2556,20 @@ class ReadOnlyCognitiveLoopRuntime:
                     "model_calls",
                     "baseline",
                     "candidate_recorded",
+                    "reason",
+                    "disposition",
+                    "ungrounded_claim_count",
                 )
             }
+            if "disposition" not in attempt_record:
+                attempt_record["disposition"] = None
+            brief = cycle.get("brief")
+            if isinstance(brief, dict):
+                attempt_record["disposition"] = brief.get("disposition")
+            if not isinstance(attempt_record.get("reason"), str):
+                attempt_record["reason"] = ""
+            if not isinstance(attempt_record.get("ungrounded_claim_count"), int):
+                attempt_record["ungrounded_claim_count"] = 0
             attempts = [
                 copy.deepcopy(item)
                 for item in attempts
@@ -2506,6 +2588,9 @@ class ReadOnlyCognitiveLoopRuntime:
             }
             if cycle.get("status") == "observed":
                 continuity_record["last_world_digest"] = cycle["world_digest"]
+                continuity_record["last_view_digests"] = copy.deepcopy(
+                    cycle.get("view_digests") or {}
+                )
                 continuity_record["last_brief"] = copy.deepcopy(
                     cycle.get("brief")
                 )
@@ -2548,6 +2633,7 @@ class ReadOnlyCognitiveLoopRuntime:
         cycle_id: str,
         world_digest: str,
         reason: str,
+        view_digests: dict[str, str] | None = None,
         expected_config: dict[str, Any],
         expected_generation: int,
     ) -> bool:
@@ -2560,6 +2646,7 @@ class ReadOnlyCognitiveLoopRuntime:
             "status": "reserved",
             "mode": "record_only",
             "world_digest": world_digest,
+            "view_digests": copy.deepcopy(view_digests or {}),
             "selected_opportunity_tokens": [],
             "selected_kinds": [],
             "evidence_refs": [],
@@ -2629,6 +2716,7 @@ class ReadOnlyCognitiveLoopRuntime:
                         "session_id",
                         "last_model_at",
                         "last_world_digest",
+                        "last_view_digests",
                         "last_brief",
                     )
                     if key in continuity_current
@@ -2748,6 +2836,17 @@ class ReadOnlyCognitiveLoopRuntime:
         commitment_state = self.state_store.read_json(
             "user_commitments.json"
         )
+        # V1 Living Context is itself an exact owner/session source.  Keep
+        # these rows in the scheduler's owner set so a Situation or receipt
+        # can be observed even when no legacy goal/commitment sidecar exists.
+        living_situation_state = self.state_store.read_json("situation_state.json")
+        information_need_state = self.state_store.read_json(
+            "information_need_state.json"
+        )
+        living_source_state = self.state_store.read_json("living_source_state.json")
+        living_reaction_state = self.state_store.read_json(
+            "living_reaction_state.json"
+        )
         now = datetime.now(timezone.utc)
         candidates: list[dict[str, Any]] = []
         threads = (
@@ -2785,6 +2884,23 @@ class ReadOnlyCognitiveLoopRuntime:
             if isinstance(item, dict)
             and str(item.get("status") or "").strip().lower()
             in {"active", "paused"}
+        )
+        situations = living_situation_state.get("situations")
+        candidates.extend(
+            item
+            for item in (situations if isinstance(situations, list) else [])
+            if isinstance(item, dict)
+            and str(item.get("record_kind") or "") == "semantic_situation"
+            and str(item.get("status") or "").strip().lower()
+            in {"emerging", "active", "waiting"}
+        )
+        needs = information_need_state.get("needs")
+        candidates.extend(
+            item
+            for item in (needs.values() if isinstance(needs, dict) else [])
+            if isinstance(item, dict)
+            and str(item.get("status") or "").strip().lower()
+            in {"open", "asked", "observing", "waiting"}
         )
 
         owners: dict[tuple[str, str], datetime] = {}
@@ -3108,6 +3224,18 @@ class ReadOnlyCognitiveLoopRuntime:
                 last_brief = entry.get("last_brief")
                 if last_brief is not None and not isinstance(last_brief, dict):
                     return False
+                last_view_digests = entry.get("last_view_digests", {})
+                if (
+                    not isinstance(last_view_digests, dict)
+                    or len(last_view_digests) > len(self.VIEW_KINDS)
+                    or any(
+                        kind not in self.VIEW_KINDS
+                        or not isinstance(digest, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                        for kind, digest in last_view_digests.items()
+                    )
+                ):
+                    return False
         if metrics != self._metrics(scopes, continuity):
             return False
         return True
@@ -3261,6 +3389,37 @@ class ReadOnlyCognitiveLoopRuntime:
             or not isinstance(item.get("candidate_recorded"), bool)
         ):
             return False
+        view_digests = item.get("view_digests", {})
+        if (
+            not isinstance(view_digests, dict)
+            or len(view_digests) > len(self.VIEW_KINDS)
+            or any(
+                kind not in self.VIEW_KINDS
+                or not isinstance(digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                for kind, digest in view_digests.items()
+            )
+        ):
+            return False
+        if "reason" in item and (
+            not isinstance(item.get("reason"), str)
+            or len(item.get("reason") or "") > 160
+        ):
+            return False
+        disposition = item.get("disposition")
+        if disposition is not None and disposition not in {
+            "quiet",
+            "record_candidate",
+            "needs_observation",
+        }:
+            return False
+        ungrounded_claim_count = item.get("ungrounded_claim_count", 0)
+        if (
+            isinstance(ungrounded_claim_count, bool)
+            or not isinstance(ungrounded_claim_count, int)
+            or not 0 <= ungrounded_claim_count <= 32
+        ):
+            return False
         if compact:
             return True
         if (
@@ -3330,6 +3489,14 @@ class ReadOnlyCognitiveLoopRuntime:
             "contexts": {"bindings": dict, "threads": dict},
             "general": {"general_situations": dict},
             "suggestions": {"proposals": dict},
+            "living_situation": {"situations": list},
+            "information_needs": {"needs": dict},
+            "living_source": {
+                "bindings": dict,
+                "requests": dict,
+                "receipts": dict,
+            },
+            "living_reaction": {"reactions": dict, "feedback": dict},
         }
         for name in ("executor", "active_loop", *expected_dict_fields):
             document = documents.get(name)
@@ -3502,6 +3669,62 @@ class ReadOnlyCognitiveLoopRuntime:
         selected = str(value or "unknown").strip().lower()
         return selected if selected in cls.SAFE_STATUSES else "unknown"
 
+    @staticmethod
+    def _safe_living_status(value: Any) -> str:
+        selected = str(value or "unknown").strip().lower()
+        allowed = {
+            "active",
+            "admitted",
+            "asked",
+            "completed",
+            "contradicted",
+            "denied",
+            "emerging",
+            "empty",
+            "expired",
+            "failed",
+            "open",
+            "observing",
+            "ok",
+            "pending",
+            "read",
+            "resolved",
+            "revoked",
+            "running",
+            "stale",
+            "timeout",
+            "unknown",
+            "unavailable",
+            "waiting",
+        }
+        return selected if selected in allowed else "unknown"
+
+    @staticmethod
+    def _safe_reaction_disposition(value: Any) -> str:
+        selected = str(value or "unknown").strip().lower()
+        return selected if selected in {"ask", "read", "wait", "silent", "suggest", "unknown"} else "unknown"
+
+    @staticmethod
+    def _safe_source_label(value: Any) -> str:
+        selected = str(value or "unknown").strip().lower()
+        return selected if selected in {"user_answer", "calendar", "weather", "public_web", "agent_research", "unknown"} else "unknown"
+
+    @staticmethod
+    def _safe_feedback_label(value: Any) -> str:
+        selected = str(value or "unknown").strip().lower()
+        allowed = {
+            "ignore",
+            "resolved",
+            "useful",
+            "not_useful",
+            "too_early",
+            "too_late",
+            "too_frequent",
+            "remind_before",
+            "unknown",
+        }
+        return selected if selected in allowed else "unknown"
+
     @classmethod
     def _safe_probe_kind(cls, value: Any) -> str:
         selected = str(value or "").strip().lower()
@@ -3560,6 +3783,236 @@ class ReadOnlyCognitiveLoopRuntime:
             reverse=True,
         )
         return visible[: max(0, int(limit))]
+
+    @classmethod
+    def _living_context_payload(
+        cls,
+        documents: dict[str, Any],
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """Build the bounded, exact-owner V1 Living Context view.
+
+        This projection intentionally reads only the four authoritative V1
+        documents.  It carries semantic state and lifecycle receipts, not
+        identifiers, source parameters, payload facts, locators, or any
+        control input.  The final model-safe pass is still applied by the
+        opportunity builder as a second defensive boundary.
+        """
+
+        def exact_scope(item: Any, *, owner_key: str = "user_id") -> bool:
+            return (
+                isinstance(item, dict)
+                and str(item.get(owner_key) or "") == user_id
+                and str(item.get("session_id") or "") == session_id
+            )
+
+        def bounded_rows(value: Any, limit: int) -> list[dict[str, Any]]:
+            rows = value if isinstance(value, list) else []
+            return [copy.deepcopy(row) for row in rows[:limit] if isinstance(row, dict)]
+
+        situation_rows: list[dict[str, Any]] = []
+        situations = documents["living_situation"].get("situations")
+        for row in situations if isinstance(situations, list) else []:
+            if (
+                not exact_scope(row)
+                or str(row.get("record_kind") or "") != "semantic_situation"
+            ):
+                continue
+            semantic = row.get("semantic")
+            if not isinstance(semantic, dict):
+                continue
+            revision = row.get("observation_revision")
+            situation_rows.append(
+                {
+                    "status": cls._safe_living_status(
+                        row.get("status") or semantic.get("lifecycle")
+                    ),
+                    "revision": (
+                        revision
+                        if isinstance(revision, int) and not isinstance(revision, bool) and revision > 0
+                        else None
+                    ),
+                    "title": semantic.get("title") or semantic.get("label"),
+                    "summary": semantic.get("summary"),
+                    "goal": semantic.get("goal"),
+                    "category": semantic.get("category"),
+                    "progress": copy.deepcopy(semantic.get("progress"))
+                    if isinstance(semantic.get("progress"), dict)
+                    else {},
+                    "deadline_at": semantic.get("deadline_at"),
+                    "known": bounded_rows(semantic.get("known"), 4),
+                    "unknown": [
+                        str(value)[:240]
+                        for value in (semantic.get("unknown") or [])[:6]
+                        if isinstance(value, str) and value.strip()
+                    ]
+                    if isinstance(semantic.get("unknown"), list)
+                    else [],
+                    "assumptions": bounded_rows(semantic.get("assumptions"), 3),
+                    "material_change": semantic.get("material_change"),
+                    "next_step": semantic.get("next_step"),
+                    "updated_at": row.get("updated_at"),
+                }
+            )
+        situation_rows.sort(
+            key=lambda item: str(item.get("updated_at") or ""),
+            reverse=True,
+        )
+        situation_rows = situation_rows[:4]
+
+        need_rows: list[dict[str, Any]] = []
+        needs = documents["information_needs"].get("needs")
+        need_values = needs.values() if isinstance(needs, dict) else []
+        for row in need_values:
+            if not exact_scope(row, owner_key="owner_id"):
+                continue
+            need_rows.append(
+                {
+                    "status": cls._safe_living_status(row.get("status")),
+                    "blocked_judgment": row.get("blocked_judgment"),
+                    "evidence_kind": row.get("evidence_kind"),
+                    "why_now": row.get("why_now"),
+                    "urgency": row.get("urgency"),
+                    "allowed_source_classes": list(
+                        row.get("allowed_source_classes") or []
+                    )[:6],
+                    "fallback_reaction": cls._safe_reaction_disposition(
+                        row.get("fallback_reaction")
+                    ),
+                    "question": row.get("question"),
+                    "generation": row.get("generation")
+                    if isinstance(row.get("generation"), int)
+                    and not isinstance(row.get("generation"), bool)
+                    else None,
+                    "expires_at": row.get("expires_at"),
+                    "updated_at": row.get("updated_at"),
+                }
+            )
+        need_rows.sort(
+            key=lambda item: str(item.get("updated_at") or ""),
+            reverse=True,
+        )
+        need_rows = need_rows[:8]
+
+        source_state = documents["living_source"]
+        requests = source_state.get("requests")
+        request_rows = requests if isinstance(requests, dict) else {}
+        scoped_requests = {
+            str(request_id): row
+            for request_id, row in request_rows.items()
+            if exact_scope(row)
+        }
+        receipts = source_state.get("receipts")
+        receipt_values = receipts.values() if isinstance(receipts, dict) else []
+        receipt_rows: list[dict[str, Any]] = []
+        for row in receipt_values:
+            if not exact_scope(row):
+                continue
+            request = scoped_requests.get(str(row.get("request_id") or ""))
+            receipt_rows.append(
+                {
+                    "status": cls._safe_living_status(row.get("status")),
+                    "source": cls._safe_source_label(row.get("source")),
+                    "reason": row.get("reason"),
+                    "observed_at": row.get("observed_at"),
+                    "fresh_until": row.get("fresh_until"),
+                    "ttl_seconds": row.get("ttl_seconds")
+                    if isinstance(row.get("ttl_seconds"), int)
+                    and not isinstance(row.get("ttl_seconds"), bool)
+                    else 0,
+                    # Keep only the server payload digest so a successful
+                    # receipt's facts can trigger a view change without
+                    # exposing the source payload (which may contain
+                    # locator-shaped data).
+                    "payload_digest": (
+                        row.get("payload_digest")
+                        if isinstance(row.get("payload_digest"), str)
+                        and re.fullmatch(r"[0-9a-f]{64}", row["payload_digest"])
+                        else None
+                    ),
+                    "request_status": cls._safe_living_status(
+                        request.get("status") if isinstance(request, dict) else None
+                    ),
+                    "has_typed_payload": bool(
+                        isinstance(row.get("payload"), dict)
+                        and row.get("status") in {"ok", "empty"}
+                    ),
+                }
+            )
+        receipt_rows.sort(
+            key=lambda item: str(item.get("observed_at") or ""),
+            reverse=True,
+        )
+        receipt_rows = receipt_rows[:8]
+
+        reaction_state = documents["living_reaction"]
+        reactions = reaction_state.get("reactions")
+        reaction_values = reactions.values() if isinstance(reactions, dict) else []
+        reaction_rows: list[dict[str, Any]] = []
+        for row in reaction_values:
+            if not exact_scope(row, owner_key="owner_id"):
+                continue
+            reaction_rows.append(
+                {
+                    "disposition": cls._safe_reaction_disposition(
+                        row.get("disposition")
+                    ),
+                    "reason": row.get("reason"),
+                    "what_happened": row.get("what_happened"),
+                    "why_it_matters": row.get("why_it_matters"),
+                    "why_now": row.get("why_now"),
+                    "suggested_next_step": row.get("suggested_next_step"),
+                    "situation_revision": row.get("situation_revision")
+                    if isinstance(row.get("situation_revision"), int)
+                    and not isinstance(row.get("situation_revision"), bool)
+                    else None,
+                    "created_at": row.get("created_at"),
+                }
+            )
+        reaction_rows.sort(
+            key=lambda item: str(item.get("created_at") or ""),
+            reverse=True,
+        )
+        reaction_rows = reaction_rows[:8]
+
+        feedback = reaction_state.get("feedback")
+        feedback_values = feedback.values() if isinstance(feedback, dict) else []
+        feedback_rows: list[dict[str, Any]] = []
+        for row in feedback_values:
+            semantics = row.get("semantics") if isinstance(row, dict) else None
+            if not exact_scope(semantics, owner_key="owner_id"):
+                continue
+            feedback_rows.append(
+                {
+                    "label": cls._safe_feedback_label(semantics.get("label")),
+                    "category": semantics.get("category"),
+                    "created_at": row.get("created_at"),
+                }
+            )
+        feedback_rows.sort(
+            key=lambda item: str(item.get("created_at") or ""),
+            reverse=True,
+        )
+        feedback_rows = feedback_rows[:8]
+
+        return {
+            "scope": "exact_owner_session",
+            "situation_count": len(situation_rows),
+            "situations": situation_rows,
+            "information_need_count": len(need_rows),
+            "information_needs": need_rows,
+            "source_receipt_count": len(receipt_rows),
+            "source_receipts": receipt_rows,
+            "reaction_count": len(reaction_rows),
+            "reactions": reaction_rows,
+            "feedback_count": len(feedback_rows),
+            "feedback": feedback_rows,
+            "external_delivery": False,
+            "tool_execution": False,
+            "agent_execution": False,
+        }
 
     @staticmethod
     def _belief_summary(claims: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3653,7 +4106,63 @@ class ReadOnlyCognitiveLoopRuntime:
                 else:
                     dropped += 1
             payload[field] = kept
-        if not payload["material_changes"] and payload.get("disposition") == "record_candidate":
+        if dropped:
+            # A nested claim can be the source of every top-level explanation
+            # field.  Once that claim is removed, the original summary,
+            # why_now, confidence, unknowns, and assumptions are no longer
+            # provenance-safe. Rebuild only from material changes whose full
+            # evidence_refs set survived the gate; if none survived, close
+            # quietly with no candidate.
+            grounded_changes = payload.get("material_changes")
+            grounded_changes = (
+                grounded_changes if isinstance(grounded_changes, list) else []
+            )
+            if grounded_changes:
+                summary_parts = [
+                    f"{str(change.get('subject') or '').strip()}: "
+                    f"{str(change.get('statement') or '').strip()}"
+                    for change in grounded_changes
+                    if isinstance(change, dict)
+                ]
+                why_now_parts = [
+                    str(change.get("why_now") or "").strip()
+                    for change in grounded_changes
+                    if isinstance(change, dict)
+                    and str(change.get("why_now") or "").strip()
+                ]
+                confidence_values = [
+                    float(change.get("confidence"))
+                    for change in grounded_changes
+                    if isinstance(change, dict)
+                    and isinstance(change.get("confidence"), (int, float))
+                    and not isinstance(change.get("confidence"), bool)
+                ]
+                summary = "; ".join(part for part in summary_parts if part).strip()
+                why_now = "; ".join(why_now_parts).strip()
+                if not summary or not why_now or not confidence_values:
+                    payload["material_changes"] = []
+                    payload["disposition"] = "quiet"
+                    payload["summary_if_asked"] = (
+                        "No grounded material change survived validation."
+                    )
+                    payload["why_now"] = ""
+                    payload["confidence"] = 0.0
+                else:
+                    payload["summary_if_asked"] = (
+                        f"Grounded material change: {summary}"
+                    )[:1600]
+                    payload["why_now"] = why_now[:800]
+                    payload["confidence"] = min(confidence_values)
+            else:
+                payload["disposition"] = "quiet"
+                payload["summary_if_asked"] = (
+                    "No grounded material change survived validation."
+                )
+                payload["why_now"] = ""
+                payload["confidence"] = 0.0
+            payload["unknown"] = []
+            payload["assumptions"] = []
+        elif not payload["material_changes"] and payload.get("disposition") == "record_candidate":
             payload["disposition"] = "quiet"
             payload["why_now"] = ""
         return CognitiveBrief.model_validate(payload, strict=True), dropped
@@ -3738,9 +4247,19 @@ class ReadOnlyCognitiveLoopRuntime:
                 continue
             if item.get("status") != "observed":
                 continue
-            ungrounded += int(item.get("ungrounded_claim_count") or 0)
+            raw_ungrounded = item.get("ungrounded_claim_count")
+            if (
+                isinstance(raw_ungrounded, int)
+                and not isinstance(raw_ungrounded, bool)
+                and raw_ungrounded >= 0
+            ):
+                ungrounded += raw_ungrounded
             brief = item.get("brief") if isinstance(item.get("brief"), dict) else {}
-            disposition = str(brief.get("disposition") or "unknown")
+            disposition = str(
+                item.get("disposition")
+                or brief.get("disposition")
+                or "unknown"
+            )
             dispositions[disposition] = dispositions.get(disposition, 0) + 1
         return {
             "refused_reasons": dict(sorted(refused.items())),
