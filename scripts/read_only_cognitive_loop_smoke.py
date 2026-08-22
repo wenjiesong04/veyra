@@ -42,6 +42,8 @@ class FakeClient:
         self.invalid_plan = False
         self.empty_plan_unsupported = False
         self.output_locators = False
+        self.extra_ungrounded_claim = False
+        self.only_ungrounded_change = False
 
     def complete_json(self, *, purpose: str, system: str, user: str) -> dict[str, Any]:
         self.calls.append(purpose)
@@ -90,19 +92,28 @@ class FakeClient:
                 if self.output_locators
                 else "The supplied WorldState view has a bounded freshness summary."
             )
+            known_rows = [
+                {
+                    "statement": known_statement,
+                    "evidence_refs": [evidence_ref],
+                    "confidence": 0.9,
+                }
+            ]
+            if self.extra_ungrounded_claim or self.only_ungrounded_change:
+                known_rows.append(
+                    {
+                        "statement": "A view Veyra never selected is also relevant.",
+                        "evidence_refs": ["view:not_selected:invented"],
+                        "confidence": 0.7,
+                    }
+                )
             return {
                 "status": "model_assisted",
                 "cognitive_brief": {
                     "schema_version": "veyra.cognitive_brief.v1",
                     "disposition": "record_candidate" if has_previous else "quiet",
                     "summary_if_asked": summary_if_asked,
-                    "known": [
-                        {
-                            "statement": known_statement,
-                            "evidence_refs": [evidence_ref],
-                            "confidence": 0.9,
-                        }
-                    ],
+                    "known": known_rows,
                     "unknown": ["whether the change is useful enough to interrupt the user"],
                     "assumptions": [],
                     "material_changes": (
@@ -111,7 +122,11 @@ class FakeClient:
                                 "kind": "belief_freshness_change",
                                 "subject": "belief_state",
                                 "statement": "The bounded freshness counts changed since the previous brief.",
-                                "evidence_refs": [evidence_ref],
+                                "evidence_refs": (
+                                    ["view:not_selected:invented"]
+                                    if self.only_ungrounded_change
+                                    else [evidence_ref]
+                                ),
                                 "why_now": "The server supplied a new state revision in this cycle.",
                                 "confidence": 0.8,
                             }
@@ -1045,6 +1060,64 @@ def main() -> int:
         assert recovered_scope["cycles"][-1]["status"] == "observed"
         assert recovered_scope["last_world_digest"] != successful_digest
         assert len(client.calls) == 9
+
+        # One ungrounded claim used to discard the whole brief, so a grounded
+        # material change could never be recorded. The ungrounded claim is
+        # dropped whole; the grounded candidate survives and is counted.
+        client.extra_ungrounded_claim = True
+        age_last_cycle(store)
+        store.patch_json(
+            "executor_state.json",
+            {"selected_agent": "partial-grounding-agent"},
+        )
+        partial = runtime.run_once(reason="smoke")
+        assert partial["status"] == "observed", partial
+        partial_scope = next(
+            iter(store.read_json("cognitive_loop_state.json")["scopes"].values())
+        )
+        partial_cycle = partial_scope["cycles"][-1]
+        assert partial_cycle["candidate_recorded"] is True, partial_cycle
+        assert partial_cycle["ungrounded_claim_count"] == 1, partial_cycle
+        partial_refs = {
+            ref
+            for row in [
+                *partial_cycle["brief"]["known"],
+                *partial_cycle["brief"]["material_changes"],
+            ]
+            for ref in row["evidence_refs"]
+        }
+        assert partial_refs <= set(partial_cycle["evidence_refs"]), partial_refs
+        assert "view:not_selected:invented" not in partial_refs, partial_refs
+
+        # When the only material change is ungrounded, no candidate is
+        # recorded: the disposition is downgraded instead of admitted.
+        client.extra_ungrounded_claim = False
+        client.only_ungrounded_change = True
+        age_last_cycle(store)
+        store.patch_json(
+            "executor_state.json",
+            {"selected_agent": "ungrounded-only-agent"},
+        )
+        ungrounded_only = runtime.run_once(reason="smoke")
+        assert ungrounded_only["status"] == "observed", ungrounded_only
+        ungrounded_cycle = next(
+            iter(store.read_json("cognitive_loop_state.json")["scopes"].values())
+        )["cycles"][-1]
+        assert ungrounded_cycle["candidate_recorded"] is False, ungrounded_cycle
+        assert ungrounded_cycle["brief"]["disposition"] == "quiet", ungrounded_cycle
+        assert ungrounded_cycle["brief"]["material_changes"] == [], ungrounded_cycle
+        assert ungrounded_cycle["ungrounded_claim_count"] == 2, ungrounded_cycle
+        client.only_ungrounded_change = False
+
+        # A zero candidate rate is diagnosable at read time without keeping a
+        # new persisted metric: refusal reasons and dropped claims are named.
+        diagnosis = runtime.status()["candidate_diagnosis"]
+        assert diagnosis["ungrounded_claim_count"] >= 3, diagnosis
+        assert diagnosis["observed_dispositions"].get("quiet"), diagnosis
+        assert diagnosis["refused_reasons"].get(
+            "cognitive_brief_knowledge_without_selected_view"
+        ), diagnosis
+        assert diagnosis["semantics"] == "read_time_projection_not_persisted_metric"
 
         # The shared model trace contains transport evidence only. It must not
         # become a global owner-content log.
