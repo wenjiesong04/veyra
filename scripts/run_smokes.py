@@ -182,6 +182,7 @@ PRODUCT_CAPABILITY_SMOKES = [
     "living_source_smoke.py",
     "living_source_core_integration_smoke.py",
     "living_source_adversarial_smoke.py",
+    "living_source_place_entity_smoke.py",
     "living_calendar_production_smoke.py",
     "v1_backend_blockers_smoke.py",
     "v1_living_context_acceptance_smoke.py",
