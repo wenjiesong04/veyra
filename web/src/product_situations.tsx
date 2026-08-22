@@ -3,7 +3,7 @@ import { ArrowLeft, ArrowRight, CalendarClock, Check, ChevronDown, CircleHelp, E
 import { commandProductSituation, getProductSituation, getProductSituations, type ProductContext, type ProductQuestion, type ProductReaction, type ProductSituation, type SituationCommand } from "./api";
 import { ProductQuestions } from "./product_questions";
 import { ProductReactions, reactionRecords } from "./product_reactions";
-import { dateLabel, epistemicLabel, productContextReadiness, progressLabel, record, records, statusLabel, strings, text, uniqueRecords } from "./product_shared";
+import { categoryLabel, dateLabel, epistemicLabel, productContextReadiness, progressLabel, record, records, statusLabel, strings, text, uniqueRecords } from "./product_shared";
 import { ErrorBlock, Freshness, isEnglish, Language, LoadingBlock, OwnerScope, safeText, StatusBadge, Surface } from "./shared";
 
 type ScopeProps = { scope: OwnerScope; language?: Language; productContext?: ProductContext | null; onChanged?: () => void };
@@ -100,7 +100,7 @@ export function SituationsPage({ scope, productContext, language = "zh", onChang
 
 function SituationListCard({ item, en, terminal = false }: { item: ProductSituation; en: boolean; terminal?: boolean }) {
   const id = text(item.situation_id, "");
-  return <a className="situationListCard" href={id ? `#/situations/${encodeURIComponent(id)}` : "#"} onClick={(event) => { if (!id) event.preventDefault(); }}><div className="situationListIcon"><Eye size={17} /></div><div className="situationListBody"><div className="situationListTop"><h3>{text(item.title ?? item.label, en ? "Untitled Situation" : "未命名 Situation")}</h3><StatusBadge value={item.status ?? (terminal ? "resolved" : "active")} label={statusLabel(item.status ?? (terminal ? "resolved" : "active"), en)} /></div><p>{text(item.summary, en ? "Veyra is maintaining this context." : "Veyra 正在维护这条上下文。")}</p><div className="situationListMeta"><span>{text(item.category, en ? "general" : "一般")}</span>{item.deadline_at ? <span><CalendarClock size={12} />{dateLabel(item.deadline_at, en)}</span> : null}<span>{en ? "Revision" : "观察版本"} {text(item.revision, "1")}</span></div></div><ArrowRight size={16} /></a>;
+  return <a className="situationListCard" href={id ? `#/situations/${encodeURIComponent(id)}` : "#"} onClick={(event) => { if (!id) event.preventDefault(); }}><div className="situationListIcon"><Eye size={17} /></div><div className="situationListBody"><div className="situationListTop"><h3>{text(item.title ?? item.label, en ? "Untitled Situation" : "未命名 Situation")}</h3><StatusBadge value={item.status ?? (terminal ? "resolved" : "active")} label={statusLabel(item.status ?? (terminal ? "resolved" : "active"), en)} /></div><p>{text(item.summary, en ? "Veyra is maintaining this context." : "Veyra 正在维护这条上下文。")}</p><div className="situationListMeta"><span>{categoryLabel(item.category, en)}</span>{item.deadline_at ? <span><CalendarClock size={12} />{dateLabel(item.deadline_at, en)}</span> : null}<span>{en ? "Revision" : "观察版本"} {text(item.revision, "1")}</span></div></div><ArrowRight size={16} /></a>;
 }
 
 export function SituationDetailPage({ situationId, scope, productContext, language = "zh", onChanged }: ScopeProps & { situationId: string }) {

@@ -152,6 +152,7 @@ export function dateLabel(value: unknown, en: boolean): string {
 const STATUS_LABELS: Record<string, [string, string]> = {
   active: ["进行中", "Active"], observed: ["已观察", "Observed"], success: ["可用", "Available"],
   available: ["可用", "Available"], configured: ["已配置", "Configured"], connected: ["已连接", "Connected"],
+  emerging: ["新出现", "Emerging"], "local-first": ["本地优先", "Local-first"], local_first: ["本地优先", "Local-first"],
   receiving: ["接收中", "Receiving"], processing_failed: ["处理失败", "Processing failed"],
   waiting_for_event: ["等待消息", "Waiting for message"], waiting_for_message: ["等待消息", "Waiting for message"],
   connecting: ["连接中", "Connecting"], not_ready: ["未就绪", "Not ready"],
@@ -165,13 +166,25 @@ const STATUS_LABELS: Record<string, [string, string]> = {
   unavailable: ["暂不可用", "Unavailable"], not_configured: ["尚未配置", "Not configured"], unsupported: ["不支持", "Unsupported"],
   denied: ["已拒绝", "Denied"], error: ["错误", "Error"], timeout: ["已超时", "Timed out"], timed_out: ["已超时", "Timed out"],
   stale: ["已过期", "Stale"], fresh: ["新鲜", "Fresh"], expired: ["已过期", "Expired"], dismissed: ["已忽略", "Dismissed"],
-  loading: ["加载中", "Loading"], ready: ["就绪", "Ready"], disabled: ["已停用", "Disabled"], unknown: ["未知", "Unknown"],
+  loading: ["加载中", "Loading"], ready: ["就绪", "Ready"], none: ["无", "None"], disabled: ["已停用", "Disabled"], unknown: ["未知", "Unknown"],
 };
 
 export function statusLabel(value: unknown, en: boolean): string {
   const raw = text(value, "unknown");
   const normalized = raw.toLowerCase();
   return STATUS_LABELS[normalized]?.[en ? 1 : 0] ?? raw;
+}
+
+const CATEGORY_LABELS: Record<string, [string, string]> = {
+  general: ["一般", "General"], personal: ["个人", "Personal"], work: ["工作", "Work"],
+  education: ["教育", "Education"], health: ["健康", "Health"], travel: ["旅行", "Travel"],
+  logistics: ["物流", "Logistics"], finance: ["财务", "Finance"], other: ["其他", "Other"],
+};
+
+/** Translate only the bounded Situation category vocabulary; preserve unknown values. */
+export function categoryLabel(value: unknown, en: boolean): string {
+  const raw = text(value, "general");
+  return CATEGORY_LABELS[raw.toLowerCase()]?.[en ? 1 : 0] ?? raw;
 }
 
 export type ProductContextReadiness = {

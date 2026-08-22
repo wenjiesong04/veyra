@@ -54,9 +54,10 @@ export function ProductQuestions({ questions, scope, language = "zh", onChanged,
     {error ? <ErrorBlock message={error} onRetry={() => { setError(null); onChanged?.(); }} /> : null}
     {!questions.length ? <p className="productMuted">{copy.empty}</p> : <div className="productQuestionList">{questions.slice(0, 8).map((question) => {
       const id = text(question.need_id, "question");
+      const situationId = text(question.situation_id, "");
       const itemBusy = busy?.startsWith(`${id}:`) ?? false;
       return <article className="productQuestion" key={id}>
-        <div className="productQuestionTop"><StatusBadge value={question.status ?? "open"} label={statusLabel(question.status ?? "open", en)} /><span className="productQuestionSituation">{text(question.situation_id, en ? "Linked Situation" : "关联 Situation")}</span></div>
+        <div className="productQuestionTop"><StatusBadge value={question.status ?? "open"} label={statusLabel(question.status ?? "open", en)} />{situationId ? <a className="productQuestionSituation" href={`#/situations/${encodeURIComponent(situationId)}`}>{en ? "Linked Situation" : "关联 Situation"}</a> : null}</div>
         <h3>{text(question.question ?? question.blocked_judgment, en ? "What is still unclear?" : "还有什么没有弄清？")}</h3>
         <p className="productQuestionWhy"><strong>{copy.why}</strong>{text(question.why_now, en ? "The next observation depends on this." : "下一次观察依赖这条信息。")}</p>
         {question.expires_at ? <small className="productMuted">{en ? "Relevant until" : "关注到"} {dateLabel(question.expires_at, en)}</small> : null}

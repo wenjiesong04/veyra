@@ -60,6 +60,9 @@ must(files.shared.includes("freshnessLabel") && files.shared.includes("category?
 must(files.productShared.includes("serverFallbackText") && files.productShared.includes("SERVER_FALLBACK_COPY"), "server fallback copy is not bounded by a shared allow-list");
 for (const fallback of ["The timing has changed and is worth checking while the signal is still timely.", "An unresolved unknown may affect the current understanding."]) must(files.productShared.includes(fallback), `known server fallback is missing from the product copy allow-list: ${fallback}`);
 must(files.productShared.includes("?? raw"), "unknown product copy must remain unchanged");
+for (const value of ["emerging", "local-first", "local_first", "none", "disabled"]) must(files.productShared.includes(value), `bounded status label is missing ${value}`);
+for (const value of ["general", "personal", "work", "education", "health", "travel", "logistics", "finance", "other"]) must(files.productShared.includes(value), `bounded category label is missing ${value}`);
+must(files.productShared.includes("export function categoryLabel") && files.situations.includes("categoryLabel(item.category"), "Situation cards do not use the bounded category label");
 must(files.home.includes("serverFallbackText") && files.home.includes("progressLabel"), "Today does not use bounded fallback/status presentation");
 must(files.situations.includes("progressLabel") && files.situations.includes("epistemicLabel"), "Situation detail does not use friendly progress/epistemic enum labels");
 must(files.conversation.includes("needs_session_link") && files.conversation.includes("disabled={needsConnection}"), "session-link state does not disable First Meeting input");
@@ -101,6 +104,8 @@ must(!files.api.includes("JSON.stringify(payload.detail)"), "API error handling 
 for (const key of ["situations", "attention", "suggestions", "commitments", "questions", "waiting"]) must(files.matters.includes(`key: "${key}"`), `legacy Matters is missing ${key} section mapping`);
 must(files.settings.includes("Promise.allSettled") && files.settings.includes("statusReadable"), "Settings does not separate setup/status failures");
 must(files.settings.includes("Local product boundary") && files.settings.includes("本地产品边界") && files.settings.includes("statusLabel(agent.status") && files.settings.includes("statusLabel(feishu.readiness"), "Settings does not use the bounded local boundary and setup state labels");
+must(files.settings.includes("statusLabel(productScope.mode") && files.settings.includes("statusLabel(externalDelivery") && files.settings.includes("statusLabel(execution"), "Settings exposes raw local boundary enum values");
 for (const value of ["waiting_for_event", "processing_failed", "configured_not_running", "receiving"]) must(files.productShared.includes(value), `setup state allow-list is missing ${value}`);
+must(files.questions.includes("encodeURIComponent(situationId)") && files.questions.includes("Linked Situation") && files.questions.includes("关联 Situation") && !files.questions.includes("text(question.situation_id, en ? \"Linked Situation\""), "Product question cards expose a raw Situation id instead of a neutral link");
 must(files.productCss.includes("@media (max-width:760px)") && files.productCss.includes("grid-template-columns:repeat(6") && files.productCss.includes("productExplainGrid"), "390px product layout contract is incomplete");
 console.log("product frontend contract checks passed");
