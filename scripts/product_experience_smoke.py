@@ -22,7 +22,7 @@ from core.world_state import WorldStateStore  # noqa: E402
 from interface.event_schema import EventSource, EventType, VeyraEvent  # noqa: E402
 from routers.product import build_product_router  # noqa: E402
 from runtime.living_context_runtime import LivingContextRuntime  # noqa: E402
-from runtime.product_experience import ProductExperienceService, _dedupe_bound_need_rows  # noqa: E402
+from runtime.product_experience import ProductExperienceService  # noqa: E402
 
 
 SENSITIVE_VALUES = {"/private/veyra/workspace-secret", "control-token-should-never-leak", "state/path/should-stay-private.json"}
@@ -126,15 +126,16 @@ def need_row(
 
 
 def main() -> int:
-    digest = hashlib.sha256(b"shared endpoint").hexdigest()
-    deduped = _dedupe_bound_need_rows(
+    deduped = ProductExperienceService._dedupe_active_needs(
         [
-            {"need_id": "new-open", "situation_id": "s1", "status": "open", "created_at": "2026-01-02", "unknown_binding_digest": digest},
-            {"need_id": "old-asked", "situation_id": "s1", "status": "asked", "created_at": "2026-01-01", "unknown_binding_digest": digest},
-            {"need_id": "other-situation", "situation_id": "s2", "status": "open", "created_at": "2026-01-01", "unknown_binding_digest": digest},
-            {"need_id": "unbound-a", "situation_id": "s1", "status": "open", "created_at": "2026-01-01"},
-            {"need_id": "unbound-b", "situation_id": "s1", "status": "open", "created_at": "2026-01-01"},
-        ]
+            need_row(need_id="new-open", situation_id="s1", status="open", created_at="2026-01-02T00:00:00+00:00", binding="shared endpoint"),
+            need_row(need_id="old-asked", situation_id="s1", status="asked", created_at="2026-01-01T00:00:00+00:00", binding="shared endpoint"),
+            need_row(need_id="other-situation", situation_id="s2", status="open", binding="shared endpoint"),
+            need_row(need_id="unbound-a", situation_id="s1"),
+            need_row(need_id="unbound-b", situation_id="s1"),
+        ],
+        owner="owner-a",
+        session="session-a",
     )
     expect(
         [row["need_id"] for row in deduped]

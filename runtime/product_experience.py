@@ -60,43 +60,6 @@ TERMINAL_STATUSES = frozenset({"resolved", "expired", "contradicted", "archived"
 ACTIVE_STATUSES = frozenset({"emerging", "active", "waiting", "in_progress", "open"})
 ACTIVE_NEED_STATUSES = frozenset({"open", "asked", "observing", "waiting"})
 DEGRADED_STATUS = "degraded"
-_ACTIVE_NEED_PRIORITY = {"asked": 0, "observing": 1, "waiting": 2, "open": 3}
-
-
-def _dedupe_bound_need_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Project one active Need per exact server-owned semantic endpoint.
-
-    Historical writers could create different Need identities for the same
-    ``unknown_binding`` when their evidence source changed. Product reads may
-    collapse only a valid binding digest inside one Situation; unbound rows
-    and cross-Situation rows remain distinct. Durable state is never mutated.
-    """
-
-    groups: dict[tuple[str, ...], tuple[int, dict[str, Any]]] = {}
-    for index, row in enumerate(rows):
-        situation_id = str(row.get("situation_id") or "")
-        digest = str(row.get("unknown_binding_digest") or "")
-        valid_digest = len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest)
-        key = ("bound", situation_id, digest) if situation_id and valid_digest else (
-            "row",
-            str(row.get("need_id") or index),
-        )
-        current = groups.get(key)
-        if current is None:
-            groups[key] = (index, row)
-            continue
-        first_index, selected = current
-
-        def preference(item: dict[str, Any]) -> tuple[int, str, str]:
-            return (
-                _ACTIVE_NEED_PRIORITY.get(str(item.get("status") or ""), 99),
-                str(item.get("created_at") or ""),
-                str(item.get("need_id") or ""),
-            )
-
-        if preference(row) < preference(selected):
-            groups[key] = (first_index, row)
-    return [row for _index, row in sorted(groups.values(), key=lambda item: item[0])]
 
 
 def _authority() -> dict[str, bool]:
@@ -334,7 +297,6 @@ class ProductExperienceService:
             }
         try:
             needs = self.living_context.needs.list(owner_id=owner, session_id=session, situation_id=str(selected["situation_id"]), limit=32)
-            needs = _dedupe_bound_need_rows(needs)
             reactions = self._reaction_rows(owner, session, situation_id=str(selected["situation_id"]))
         except Exception:
             return {
@@ -385,7 +347,6 @@ class ProductExperienceService:
         owner, session = self._scope_pair(user_id, session_id)
         try:
             rows = self.living_context.needs.list(owner_id=owner, session_id=session, limit=max(1, min(int(limit), 100)))
-            rows = _dedupe_bound_need_rows(rows)
             current_ids = {str(item["situation_id"]) for item in self.living_context.list_situations(owner_id=owner, session_id=session, limit=100)}
         except Exception:
             return {
