@@ -11,6 +11,7 @@ from core.living_context_candidate_extractor import (
     validate_candidate_catalog_binding,
 )
 from core.living_context_need_answer_selector import (
+    StandaloneUnknownResolutionBinding,
     select_living_context_need_answers,
 )
 from core.living_reaction_feedback_extractor import (
@@ -190,6 +191,11 @@ class TurnUnderstanding:
     living_reaction_feedback_issues: list[str] = field(default_factory=list)
     living_reaction_feedback_metrics: dict[str, Any] = field(default_factory=dict)
     model_boundary_metrics: dict[str, Any] = field(default_factory=dict)
+    # Server-only sidecar populated by the bounded Need/Unknown selector.
+    # It is intentionally not part of LivingContextCandidate's public model.
+    living_context_standalone_unknown_resolutions: tuple[
+        StandaloneUnknownResolutionBinding, ...
+    ] = ()
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -1297,7 +1303,7 @@ def _answer_recovery_target(
     *,
     catalog: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    """Return one exact row plus all active Need endpoints for one batch call."""
+    """Return one exact row plus all current Need/Unknown endpoints for one batch call."""
 
     if candidate is None or candidate.disposition not in {"update", "correct", "resolve"}:
         return None
@@ -1357,14 +1363,29 @@ def _answer_recovery_target(
                 "status": status,
             }
         )
-    if not active_open_needs:
+    raw_unknown_endpoints = matched_rows[0].get("unknown_endpoints")
+    if not isinstance(raw_unknown_endpoints, list):
+        # ``TurnContextBuilder`` intentionally preserves the existing bounded
+        # ``unknown`` field.  The runtime catalog replaces its strings with
+        # endpoint objects while retaining this compatibility key.
+        raw_unknown_endpoints = matched_rows[0].get("unknown")
+    standalone_unknown_endpoints = [
+        item
+        for item in (raw_unknown_endpoints or [])
+        if isinstance(item, dict)
+        and set(item) == {"unknown_token", "generation", "statement"}
+    ]
+    if not active_open_needs and not standalone_unknown_endpoints:
+        return None
+    if not active_open_needs and not candidate.known:
         return None
     return {
         "row": matched_rows[0],
         "open_needs": active_open_needs,
-        "candidate_known": [known.statement for known in candidate.known],
+        "candidate_known": [known.model_dump(mode="json") for known in candidate.known],
         "candidate_unknown": list(candidate.unknown),
         "candidate_need_blocked": [need.blocked_judgment for need in candidate.needs],
+        "standalone_unknown_endpoints": standalone_unknown_endpoints,
     }
 
 
@@ -1389,12 +1410,17 @@ def _apply_need_answer_selector(
         candidate_known=target["candidate_known"],
         candidate_unknown=target["candidate_unknown"],
         candidate_need_blocked=target["candidate_need_blocked"],
+        standalone_unknown_endpoints=target["standalone_unknown_endpoints"],
+        semantic_frame=understanding.semantic_frame,
     )
     boundary = dict(understanding.model_boundary_metrics)
     boundary["need_answer_selector"] = dict(selection.metrics)
     understanding.model_boundary_metrics = boundary
     if selection.selection is not None:
         selected = selection.selection
+        understanding.living_context_standalone_unknown_resolutions = (
+            selected.standalone_unknown_resolutions
+        )
         existing_tokens = list(candidate.answered_need_tokens)
         existing_bindings = list(candidate.answered_need_bindings)
         seen_pairs = {
@@ -1428,13 +1454,18 @@ def _apply_need_answer_selector(
                 if need.blocked_judgment not in discarded_need_blocked
             ],
         }
-        if selected.answers:
+        if selected.answers or selected.standalone_unknown_resolutions:
             # The quote is generated from the server-visible turn prefix, not
             # copied from the model response. All answers in one batch share
             # this exact source-bound root quote.
+            root_quote = (
+                selected.answers[0].source_quote
+                if selected.answers
+                else selected.standalone_unknown_resolutions[0].source_quote
+            )
             updates.update(
                 {
-                    "source_quote": selected.answers[0].source_quote,
+                    "source_quote": root_quote,
                     "assertion_mode": "direct_user",
                 }
             )
@@ -1445,6 +1476,7 @@ def _apply_need_answer_selector(
             else "bounded Need-answer selector accepted"
         )
     else:
+        understanding.living_context_standalone_unknown_resolutions = ()
         reason = str(selection.metrics.get("reason") or "rejected")
         understanding.reason = (
             f"{understanding.reason}; bounded Need-answer selector {reason}"

@@ -10,12 +10,15 @@ contract and exact owner/session checks pass.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
+import re
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from core.situation_state_repository import SituationStateRepository
 from core.world_state import StateRevisionConflictError, WorldStateStore
-from core.living_context_information_state_policy import has_clearly_resolved_statement
+from core.living_context_need_answer_selector import StandaloneUnknownResolutionBinding
 from interface.event_schema import EventType, VeyraEvent
 from interface.living_context_contract import (
     CandidateNeed,
@@ -92,10 +95,61 @@ class LivingContextRuntime:
                 statuses={"open", "asked", "observing", "waiting"},
                 limit=8,
             )
-            catalog.append(
-                situation_catalog_projection(situation, open_needs=open_needs)
-            )
+            projection = situation_catalog_projection(situation, open_needs=open_needs)
+            semantic = situation.get("semantic")
+            unknown_values = semantic.get("unknown") if isinstance(semantic, dict) else None
+            if isinstance(unknown_values, list):
+                generation = int(projection.get("observation_revision") or 1)
+                endpoints = [
+                    {
+                        "unknown_token": self._unknown_endpoint_token(
+                            owner_id=selected_owner,
+                            session_id=selected_session,
+                            situation_token=str(projection.get("situation_token") or ""),
+                            statement=str(statement),
+                            index=index,
+                            generation=generation,
+                        ),
+                        "generation": generation,
+                        "statement": str(statement),
+                    }
+                    for index, statement in enumerate(unknown_values[:12])
+                    if isinstance(statement, str) and statement.strip()
+                ]
+                # Keep the existing bounded ``unknown`` strings for clients
+                # that display the catalog.  Endpoint objects remain in a
+                # separate server-owned field; TurnContextBuilder carries
+                # that field through its narrow model projection.
+                projection["unknown_endpoints"] = endpoints
+            catalog.append(projection)
         return catalog
+
+    @staticmethod
+    def _unknown_endpoint_token(
+        *,
+        owner_id: str,
+        session_id: str,
+        situation_token: str,
+        statement: str,
+        index: int,
+        generation: int,
+    ) -> str:
+        """Derive an opaque, exact endpoint token for one catalog revision."""
+
+        payload = json.dumps(
+            {
+                "owner_id": owner_id,
+                "session_id": session_id,
+                "situation_token": situation_token,
+                "statement": statement,
+                "index": index,
+                "generation": generation,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return f"unk_{hashlib.sha256(payload).hexdigest()[:32]}"
 
     def process_user_turn(
         self,
@@ -158,8 +212,11 @@ class LivingContextRuntime:
                     raise
                 catalog_row = admission_recovery.get("catalog_row")
         situation_id = str(existing.get("situation_id") or "") if existing else None
-        candidate, unknown_resolved_count = self._suppress_resolved_unknown_candidates(candidate)
-        candidate, resolved_need_count = self._suppress_resolved_need_candidates(candidate)
+        # Candidate Unknown/Need rows have no server-owned endpoint reference.
+        # Keep them open here; only a validated selector answer carrying the
+        # current Need or Unknown token+generation may authorize deletion.
+        unknown_resolved_count = 0
+        resolved_need_count = 0
         candidate, deduped_need_count = self._dedupe_active_need_candidates(
             candidate,
             situation_id=situation_id,
@@ -202,6 +259,20 @@ class LivingContextRuntime:
             answered_needs=answered_needs,
         )
         semantic_state = self._semantic_snapshot(event, candidate, existing)
+        standalone_unknown_resolutions = self._validated_standalone_unknown_resolutions(
+            event=event,
+            understanding=understanding,
+            candidate=candidate,
+            catalog_row=catalog_row,
+            existing=existing,
+        )
+        if standalone_unknown_resolutions:
+            resolved_unknowns = set(standalone_unknown_resolutions)
+            semantic_state["unknown"] = [
+                value
+                for value in semantic_state.get("unknown", [])
+                if str(value) not in resolved_unknowns
+            ]
         unknown_bindings = self._derive_unknown_bindings(
             candidate=candidate,
             semantic_state=semantic_state,
@@ -263,6 +334,7 @@ class LivingContextRuntime:
             "unknown_candidates_resolved_suppressed": unknown_resolved_count,
             "need_candidates_resolved_suppressed": resolved_need_count,
             "need_candidates_deduped": deduped_need_count,
+            "standalone_unknown_resolved_count": len(standalone_unknown_resolutions),
             "situation": persisted,
             "information_needs": current_needs,
             "reaction_hint": reaction.model_dump(mode="json") if reaction else None,
@@ -277,54 +349,126 @@ class LivingContextRuntime:
         }
         return result
 
-    @staticmethod
-    def _suppress_resolved_unknown_candidates(
+    def _validated_standalone_unknown_resolutions(
+        self,
+        *,
+        event: VeyraEvent,
+        understanding: Any,
         candidate: LivingContextCandidate,
-    ) -> tuple[LivingContextCandidate, int]:
-        """Drop only candidate unknown statements that are clearly resolved.
+        catalog_row: dict[str, Any] | None,
+        existing: dict[str, Any] | None,
+    ) -> tuple[str, ...]:
+        """Validate selector sidecar bindings against the current catalog row.
 
-        The information-state policy is intentionally text-only and generic.
-        Candidate order is retained for every unresolved statement, including
-        mixed statements where an unresolved marker takes precedence.  The
-        contract bounds ``unknown`` to twelve rows, so the returned count is
-        bounded by the candidate contract as well.
+        The sidecar is not a candidate field and cannot authorize a write by
+        itself.  It is accepted only for an existing Situation, only when its
+        opaque token+generation+statement is still the server-issued current
+        endpoint, and only with affirmative evidence quoted from this turn.
         """
 
-        if not candidate.unknown:
-            return candidate, 0
-        retained = [
-            statement
-            for statement in candidate.unknown
-            if not has_clearly_resolved_statement(statement)
-        ]
-        suppressed = len(candidate.unknown) - len(retained)
-        if suppressed == 0:
-            return candidate, 0
-        return candidate.model_copy(update={"unknown": retained}), suppressed
-
-    @staticmethod
-    def _suppress_resolved_need_candidates(
-        candidate: LivingContextCandidate,
-    ) -> tuple[LivingContextCandidate, int]:
-        """Drop only Need rows whose endpoint is explicitly resolved.
-
-        The policy is generic and text-only.  CandidateNeed rows are copied
-        unchanged when retained; only the outer ``needs`` collection is
-        projected.  The contract bounds this collection to eight rows, so the
-        returned count is inherently bounded by the candidate contract.
-        """
-
-        if not candidate.needs:
-            return candidate, 0
-        retained = [
-            need
-            for need in candidate.needs
-            if not has_clearly_resolved_statement(need.blocked_judgment)
-        ]
-        suppressed = len(candidate.needs) - len(retained)
-        if suppressed == 0:
-            return candidate, 0
-        return candidate.model_copy(update={"needs": retained}), suppressed
+        raw = getattr(understanding, "living_context_standalone_unknown_resolutions", ())
+        if not raw:
+            return ()
+        if candidate.disposition not in {"update", "correct", "resolve"}:
+            raise StateRevisionConflictError(
+                "standalone Unknown resolution requires an existing Situation"
+            )
+        if not isinstance(catalog_row, dict) or not isinstance(existing, dict):
+            raise StateRevisionConflictError(
+                "standalone Unknown resolution has no current catalog row"
+            )
+        if candidate.assertion_mode != "direct_user" or candidate.source_quote is None:
+            raise StateRevisionConflictError(
+                "standalone Unknown resolution requires a direct quoted user assertion"
+            )
+        raw_endpoints = catalog_row.get("unknown_endpoints")
+        if not isinstance(raw_endpoints, list):
+            raw_endpoints = catalog_row.get("unknown")
+        endpoint_map: dict[tuple[str, int], str] = {}
+        for item in raw_endpoints or []:
+            if not isinstance(item, dict):
+                continue
+            token = item.get("unknown_token")
+            generation = item.get("generation")
+            statement = item.get("statement")
+            if (
+                not isinstance(token, str)
+                or not re.fullmatch(r"unk_[0-9a-f]{32}", token)
+                or isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 1
+                or not isinstance(statement, str)
+                or not statement
+            ):
+                continue
+            endpoint_map[(token, generation)] = statement
+        previous_unknown = {
+            str(value)
+            for value in (existing.get("semantic") or {}).get("unknown") or []
+            if str(value).strip()
+        }
+        admission = self.admission.get(event.event_id)
+        replay_phase = (
+            isinstance(admission, dict)
+            and str(admission.get("phase") or "")
+            in {"semantic_applied", "needs_applied", "committed"}
+        )
+        selected: list[str] = []
+        seen: set[str] = set()
+        source_text = self._event_text(event)
+        for item in raw:
+            if not isinstance(item, StandaloneUnknownResolutionBinding):
+                raise StateRevisionConflictError(
+                    "standalone Unknown resolution sidecar is invalid"
+                )
+            token = item.unknown_token
+            generation = item.generation
+            statement = item.unknown_text
+            supporting_index = item.supporting_known_index
+            quote = item.source_quote
+            known = candidate.known[supporting_index] if (
+                isinstance(supporting_index, int)
+                and not isinstance(supporting_index, bool)
+                and 0 <= supporting_index < len(candidate.known)
+            ) else None
+            known_quote = known.source_quote if known is not None else None
+            if (
+                not isinstance(token, str)
+                or not re.fullmatch(r"unk_[0-9a-f]{32}", token)
+                or isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or not isinstance(statement, str)
+                or isinstance(supporting_index, bool)
+                or not isinstance(supporting_index, int)
+                or supporting_index < 0
+                or supporting_index >= len(candidate.known)
+                or known is None
+                or known.epistemic_status != "reported"
+                or known_quote is None
+                or quote.text != known_quote.text
+                or quote.start != known_quote.start
+                or quote.end != known_quote.end
+                or quote.end > len(source_text)
+                or source_text[quote.start : quote.end] != quote.text
+                or endpoint_map.get((token, generation)) != statement
+                or statement in seen
+            ):
+                raise StateRevisionConflictError(
+                    "standalone Unknown resolution is stale or outside the current catalog"
+                )
+            if statement not in previous_unknown:
+                # A committed admission replay may carry the original
+                # turn-start catalog after its exact endpoint was already
+                # removed.  It is a no-op, not a new deletion.  Non-replay
+                # stale/missing endpoints remain fail-closed below.
+                if replay_phase:
+                    continue
+                raise StateRevisionConflictError(
+                    "standalone Unknown resolution is stale or already absent"
+                )
+            seen.add(statement)
+            selected.append(statement)
+        return tuple(selected)
 
     def _dedupe_active_need_candidates(
         self,
@@ -1086,7 +1230,10 @@ class LivingContextRuntime:
     @staticmethod
     def _event_text(event: VeyraEvent) -> str:
         payload = event.payload if isinstance(event.payload, dict) else {}
-        return str(payload.get("text") or payload.get("message") or "").strip()[:480]
+        # Keep the raw event text for source-quote validation. Provider/model
+        # prompts may use bounded projections, but quote coordinates are always
+        # checked against the complete user message.
+        return str(payload.get("text") or payload.get("message") or "")
 
     @staticmethod
     def _validate_quotes(candidate: LivingContextCandidate, text: str) -> None:

@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
 
 from core.world_state import StateRevisionConflictError, WorldStateStore  # noqa: E402
 from interface.event_schema import EventSource, EventType, VeyraEvent  # noqa: E402
-from interface.living_context_contract import CandidateNeed, CandidateNeedReference, ContextQuote, LivingReactionFeedback  # noqa: E402
+from interface.living_context_contract import CandidateKnown, CandidateNeed, CandidateNeedReference, ContextQuote, LivingReactionFeedback  # noqa: E402
 from interface.living_source_contract import SourceConsent, canonical_utc  # noqa: E402
 from runtime.calendar_source import CalendarSource  # noqa: E402
 from runtime.living_context_composition import build_living_context_composition  # noqa: E402
@@ -72,6 +72,21 @@ def expect(value: bool, label: str) -> None:
     if not value:
         raise AssertionError(label)
     print(f"PASS {label}")
+
+
+def reported_known(statement: str, source_text: str) -> CandidateKnown:
+    """Build one direct Known row with an exact source-bound quote."""
+
+    start = source_text.index(statement)
+    return CandidateKnown(
+        statement=statement,
+        epistemic_status="reported",
+        source_quote=ContextQuote(
+            text=statement,
+            start=start,
+            end=start + len(statement),
+        ),
+    )
 
 
 def retry_and_consent_checks(root: Path) -> None:
@@ -984,7 +999,7 @@ def need_endpoint_dedupe_checks(root: Path) -> None:
 
 
 def resolved_need_suppression_checks(root: Path) -> None:
-    """Resolved Need endpoints are filtered before admission and replay."""
+    """Lexical state words never close a Need without a server binding."""
 
     store = WorldStateStore(root / "resolved-need-suppression")
     composition = build_living_context_composition(store)
@@ -1001,6 +1016,7 @@ def resolved_need_suppression_checks(root: Path) -> None:
     }
     catalog = composition.orchestrator.model_catalog(owner_id=owner, session_id=session)
     base_candidate = candidate(fixture, catalog)
+    create_text = "旅行日期已确认；待确认的旅行细节"
     unresolved_need = base_candidate.needs[0].model_copy(
         update={"blocked_judgment": "待确认的旅行细节"}
     )
@@ -1008,10 +1024,13 @@ def resolved_need_suppression_checks(root: Path) -> None:
         update={"blocked_judgment": "旅行日期已确认"}
     )
     create_candidate = base_candidate.model_copy(
-        update={"needs": [resolved_need, unresolved_need]}
+        update={
+            "needs": [resolved_need, unresolved_need],
+            "known": [reported_known("旅行日期已确认", create_text)],
+        }
     )
     created = composition.orchestrator.process_user_turn(
-        event("resolved-need-create", owner, session, str(fixture["text"])),
+        event("resolved-need-create", owner, session, create_text),
         SimpleNamespace(living_context_candidate=create_candidate, living_reaction_feedback=None),
         catalog=catalog,
     )
@@ -1023,12 +1042,11 @@ def resolved_need_suppression_checks(root: Path) -> None:
         limit=8,
     )
     expect(
-        created.get("need_candidates_resolved_suppressed") == 1
-        and len(created_needs) == 1
-        and created_needs[0]["blocked_judgment"] == unresolved_need.blocked_judgment
-        and created_needs[0]["evidence_kind"] == unresolved_need.evidence_kind
-        and created_needs[0]["question"] == unresolved_need.question,
-        "create suppresses a clearly resolved Need while retaining the unresolved row fields",
+        created.get("need_candidates_resolved_suppressed") == 0
+        and len(created_needs) == 2
+        and {item["blocked_judgment"] for item in created_needs}
+        == {resolved_need.blocked_judgment, unresolved_need.blocked_judgment},
+        "create keeps every Need when no server-issued answer binding exists",
     )
 
     update_catalog = composition.orchestrator.model_catalog(owner_id=owner, session_id=session)
@@ -1040,6 +1058,7 @@ def resolved_need_suppression_checks(root: Path) -> None:
         "question": "新的旅行信息是什么？",
     }
     update_base = candidate(update_fixture, update_catalog)
+    update_text = "旅行安排已预约；新的待确认旅行信息"
     update_unresolved = update_base.needs[0].model_copy(
         update={"blocked_judgment": "新的待确认旅行信息"}
     )
@@ -1047,13 +1066,16 @@ def resolved_need_suppression_checks(root: Path) -> None:
         update={"blocked_judgment": "旅行安排已预约"}
     )
     update_candidate = update_base.model_copy(
-        update={"needs": [update_resolved, update_unresolved]}
+        update={
+            "needs": [update_resolved, update_unresolved],
+            "known": [reported_known("旅行安排已预约", update_text)],
+        }
     )
     update_event = event(
         "resolved-need-update",
         owner,
         session,
-        str(update_fixture["text"]),
+        update_text,
     )
     updated = composition.orchestrator.process_user_turn(
         update_event,
@@ -1067,10 +1089,11 @@ def resolved_need_suppression_checks(root: Path) -> None:
         limit=8,
     )
     expect(
-        updated.get("need_candidates_resolved_suppressed") == 1
+        updated.get("need_candidates_resolved_suppressed") == 0
         and any(item["blocked_judgment"] == update_unresolved.blocked_judgment for item in updated_needs)
-        and all(item["blocked_judgment"] not in {"旅行安排已预约", "旅行日期已确认"} for item in updated_needs),
-        "update suppresses resolved endpoints and retains one new unresolved Need",
+        and any(item["blocked_judgment"] == update_resolved.blocked_judgment for item in updated_needs)
+        and any(item["blocked_judgment"] == resolved_need.blocked_judgment for item in updated_needs),
+        "update does not turn matching words into Need-closing authority",
     )
 
     state_paths = (
@@ -1090,12 +1113,12 @@ def resolved_need_suppression_checks(root: Path) -> None:
         and replayed.get("need_candidates_resolved_suppressed")
         == updated.get("need_candidates_resolved_suppressed")
         and replay_after == replay_before,
-        "resolved Need suppression count and exact replay remain stable",
+        "zero lexical Need suppression and exact replay remain stable",
     )
 
 
 def resolved_unknown_suppression_checks(root: Path) -> None:
-    """Resolved candidate Unknown rows are filtered before semantic projection."""
+    """Lexical state words never remove a candidate Unknown endpoint."""
 
     store = WorldStateStore(root / "resolved-unknown-suppression")
     composition = build_living_context_composition(store)
@@ -1115,6 +1138,11 @@ def resolved_unknown_suppression_checks(root: Path) -> None:
         owner_id=owner,
         session_id=session,
     )
+    create_text = (
+        "the first detail is confirmed; the second detail is completed; "
+        "a detail remains pending; another detail is unknown; "
+        "a third detail is confirmed but not finalized"
+    )
     create_candidate = candidate(fixture, create_catalog).model_copy(
         update={
             "needs": [],
@@ -1125,10 +1153,14 @@ def resolved_unknown_suppression_checks(root: Path) -> None:
                 unresolved[1],
                 unresolved[2],
             ],
+            "known": [
+                reported_known("the first detail is confirmed", create_text),
+                reported_known("the second detail is completed", create_text),
+            ],
         }
     )
     create_result = composition.orchestrator.process_user_turn(
-        event("resolved-unknown-create", owner, session, str(fixture["text"])),
+        event("resolved-unknown-create", owner, session, create_text),
         SimpleNamespace(
             living_context_candidate=create_candidate,
             living_reaction_feedback=None,
@@ -1139,15 +1171,25 @@ def resolved_unknown_suppression_checks(root: Path) -> None:
         (create_result["situation"].get("semantic") or {}).get("unknown") or []
     )
     expect(
-        create_result.get("unknown_candidates_resolved_suppressed") == 2
-        and 0 <= int(create_result.get("unknown_candidates_resolved_suppressed") or 0) <= 12
-        and created_unknown == unresolved,
-        "create suppresses resolved Unknown rows while retaining unresolved order",
+        create_result.get("unknown_candidates_resolved_suppressed") == 0
+        and created_unknown
+        == [
+            "the first detail is confirmed",
+            unresolved[0],
+            "the second detail is completed",
+            unresolved[1],
+            unresolved[2],
+        ],
+        "create keeps Unknown rows until an exact current endpoint is selected",
     )
 
     update_catalog = composition.orchestrator.model_catalog(
         owner_id=owner,
         session_id=session,
+    )
+    update_text = (
+        "the fourth detail is completed; a new detail remains pending; "
+        "a new detail is confirmed but not finalized"
     )
     update_candidate = candidate(fixture, update_catalog).model_copy(
         update={
@@ -1157,13 +1199,14 @@ def resolved_unknown_suppression_checks(root: Path) -> None:
                 "a new detail remains pending",
                 "a new detail is confirmed but not finalized",
             ],
+            "known": [reported_known("the fourth detail is completed", update_text)],
         }
     )
     update_event = event(
         "resolved-unknown-update",
         owner,
         session,
-        "A bounded update adds unresolved information.",
+        update_text,
     )
     updated = composition.orchestrator.process_user_turn(
         update_event,
@@ -1176,14 +1219,20 @@ def resolved_unknown_suppression_checks(root: Path) -> None:
     updated_unknown = (
         (updated["situation"].get("semantic") or {}).get("unknown") or []
     )
-    expected_updated_unknown = unresolved + [
+    expected_updated_unknown = [
+        "the first detail is confirmed",
+        unresolved[0],
+        "the second detail is completed",
+        unresolved[1],
+        unresolved[2],
+        "the fourth detail is completed",
         "a new detail remains pending",
         "a new detail is confirmed but not finalized",
     ]
     expect(
-        updated.get("unknown_candidates_resolved_suppressed") == 1
+        updated.get("unknown_candidates_resolved_suppressed") == 0
         and updated_unknown == expected_updated_unknown,
-        "update suppresses only newly resolved Unknown rows and preserves all unresolved rows",
+        "update preserves every unbound Unknown regardless of lexical wording",
     )
 
     state_paths = (
@@ -1210,7 +1259,7 @@ def resolved_unknown_suppression_checks(root: Path) -> None:
         == updated.get("unknown_candidates_resolved_suppressed")
         and replayed_unknown == updated_unknown
         and replay_after == replay_before,
-        "resolved Unknown suppression count, ordering, and exact replay remain stable",
+        "zero lexical Unknown suppression, ordering, and exact replay remain stable",
     )
 
 

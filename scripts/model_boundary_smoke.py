@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.living_context_candidate_extractor import extract_living_context_candidate  # noqa: E402
+from core.semantic_frame import SemanticAct, SemanticCondition, SemanticTarget, SourceQuote, TurnSemanticFrame  # noqa: E402
 from core.living_context_information_state_policy import (  # noqa: E402
     INFORMATION_STATE_POLICY_VERSION,
     has_clearly_resolved_statement,
@@ -48,6 +49,65 @@ def expect(condition: bool, label: str) -> None:
     if not condition:
         raise AssertionError(label)
     print(f"PASS {label}")
+
+
+def semantic_support_frame(
+    text: str,
+    *,
+    supported_quotes: tuple[str, ...] | None = None,
+    conditional_quotes: tuple[str, ...] = (),
+    reported_quotes: tuple[str, ...] = (),
+) -> TurnSemanticFrame:
+    """Build a validated semantic frame for selector boundary fixtures."""
+
+    supported = set(supported_quotes if supported_quotes is not None else (text,))
+    conditional = set(conditional_quotes)
+    reported = set(reported_quotes)
+    acts: list[SemanticAct] = []
+    cursor = 0
+    for raw_clause in text.replace("；", ";").replace("，", ";").replace(",", ";").split(";"):
+        clause = raw_clause.strip()
+        if not clause:
+            cursor += len(raw_clause) + 1
+            continue
+        leading = len(raw_clause) - len(raw_clause.lstrip())
+        start = cursor + leading
+        end = start + len(clause)
+        cursor = end + 1
+        quote = SourceQuote(text=clause, start=start, end=end)
+        condition = None
+        if clause in conditional:
+            condition = SemanticCondition(
+                kind="if",
+                expression=clause,
+                source_quote=quote,
+            )
+        acts.append(
+            SemanticAct(
+                act_id=f"a{len(acts) + 1}",
+                kind="statement",
+                goal=clause,
+                operation="report_statement",
+                target=SemanticTarget(type="statement", value=clause),
+                polarity="positive" if clause in supported else "negative",
+                explicitness="explicit",
+                source_quote=quote,
+                speaker="user",
+                authority="reported_speech" if clause in reported else "direct_user",
+                mention_mode="reported_speech" if clause in reported else "normal_use",
+                evidence_need="none",
+                condition=condition,
+                modality="reported" if clause in reported else ("conditional" if condition else "asserted"),
+                arguments={},
+            )
+        )
+    return TurnSemanticFrame(
+        acts=acts,
+        relations=[],
+        ambiguities=[],
+        resolver_status="resolved",
+        source="model",
+    )
 
 
 class FakeModelClient:
@@ -1291,7 +1351,14 @@ def main() -> int:
         "status": "open",
     }
     selector_text = "住宿已经确认"
-    selector_known = ["用户确认住宿已经安排"]
+    selector_known = [
+        {
+            "statement": selector_text,
+            "epistemic_status": "reported",
+            "source_quote": {"text": selector_text, "start": 0, "end": len(selector_text)},
+        }
+    ]
+    selector_frame = semantic_support_frame(selector_text)
     selector_true = {
         "status": "model_assisted",
         "living_context_need_answer_selection": {
@@ -1315,6 +1382,7 @@ def main() -> int:
         candidate_known=selector_known,
         candidate_unknown=["住宿仍未确认", "交通仍未确认"],
         candidate_need_blocked=["住宿待确认", "交通待确认"],
+        semantic_frame=selector_frame,
     )
     selected_answer = selector_true_result.selection.answers[0] if selector_true_result.selection else None
     expect(
@@ -1323,7 +1391,7 @@ def main() -> int:
         and selected_answer.need_token == selector_target["need_token"]
         and selected_answer.supporting_known_index == 0
         and selected_answer.source_quote.text == selector_text
-        and selector_true_client.users[0]["candidate_known"] == selector_known
+        and selector_true_client.users[0]["candidate_known"][0]["statement"] == selector_text
         and selector_true_result.selection.discard_unknown == ("住宿仍未确认",)
         and selector_true_result.selection.discard_need_blocked == ("住宿待确认",)
         and selector_true_client.call_count == 1,
@@ -1381,17 +1449,34 @@ def main() -> int:
             ],
         },
     }
+    policy_text = "The travel date is still unknown；检查结果已经确认；The transfer is pending"
     unresolved_policy_result = select_living_context_need_answers(
         FakeModelClient([unresolved_policy_response]),
-        user_message="补充三项状态",
+        user_message=policy_text,
         open_needs=unresolved_policy_targets,
         candidate_known=[
-            "The travel date is still unknown",
-            "检查结果已经确认",
-            "The transfer is pending",
+            {
+                "statement": "The travel date is still unknown",
+                "epistemic_status": "reported",
+                "source_quote": {"text": "The travel date is still unknown", "start": 0, "end": 32},
+            },
+            {
+                "statement": "检查结果已经确认",
+                "epistemic_status": "reported",
+                "source_quote": {"text": "检查结果已经确认", "start": 33, "end": 41},
+            },
+            {
+                "statement": "The transfer is pending",
+                "epistemic_status": "reported",
+                "source_quote": {"text": "The transfer is pending", "start": 42, "end": 65},
+            },
         ],
         candidate_unknown=["旅行日期尚未确认", "检查结果不确定", "转账状态仍未确认"],
         candidate_need_blocked=["旅行日期待确认", "检查结果待确认", "转账状态待定"],
+        semantic_frame=semantic_support_frame(
+            policy_text,
+            supported_quotes=("检查结果已经确认",),
+        ),
     )
     policy_answers = (
         unresolved_policy_result.selection.answers
@@ -1407,66 +1492,8 @@ def main() -> int:
         and unresolved_policy_result.selection.discard_need_blocked == ("检查结果待确认",)
         and unresolved_policy_result.metrics.get("status") == "accepted"
         and unresolved_policy_result.metrics.get("suppressed_unresolved_support_count") == 2,
-        "versioned policy suppresses unresolved travel and finance support while retaining health",
+        "structured semantic support admits only the direct asserted clause",
     )
-    unresolved_policy_markers = (
-        "the result is still unknown",
-        "the result is unconfirmed",
-        "the result is not yet known",
-        "the result is pending",
-        "we are waiting for confirmation",
-        "the result is TBD",
-        "结果尚未确认",
-        "结果还没确认",
-        "结果仍未确认",
-        "结果未确认",
-        "结果没有确认",
-        "结果未知",
-        "结果待定",
-        "结果待确认",
-        "结果不确定",
-        "结果未完成",
-    )
-    for marker in unresolved_policy_markers:
-        marker_response = {
-            "status": "model_assisted",
-            "living_context_need_answer_selection": {
-                "schema_version": NEED_ANSWER_SCHEMA_VERSION,
-                "answers": [
-                    {
-                        "need_token": "need_policy_marker",
-                        "generation": 1,
-                        "supporting_known_index": 0,
-                        "discard_candidate_unknowns": ["must remain"],
-                        "discard_candidate_need_endpoints": ["must remain"],
-                    }
-                ],
-            },
-        }
-        marker_result = select_living_context_need_answers(
-            FakeModelClient([marker_response]),
-            user_message="状态补充",
-            open_needs=[
-                {
-                    "need_token": "need_policy_marker",
-                    "generation": 1,
-                    "blocked_judgment": "状态",
-                    "question": "状态是什么？",
-                    "status": "open",
-                }
-            ],
-            candidate_known=[marker],
-            candidate_unknown=["must remain"],
-            candidate_need_blocked=["must remain"],
-        )
-        expect(
-            marker_result.selection is not None
-            and marker_result.selection.answers == ()
-            and marker_result.selection.discard_unknown == ()
-            and marker_result.selection.discard_need_blocked == ()
-            and marker_result.metrics.get("suppressed_unresolved_support_count") == 1,
-            f"generic unresolved-support marker is suppressed: {marker}",
-        )
     positive_confirmation = copy.deepcopy(unresolved_policy_response)
     positive_confirmation["living_context_need_answer_selection"]["answers"] = [
         {
@@ -1488,18 +1515,35 @@ def main() -> int:
         FakeModelClient([positive_confirmation]),
         user_message="The travel date is confirmed",
         open_needs=[positive_pair_target],
-        candidate_known=["The travel date is confirmed"],
+        candidate_known=[
+            {
+                "statement": "The travel date is confirmed",
+                "epistemic_status": "reported",
+                "source_quote": {"text": "The travel date is confirmed", "start": 0, "end": 28},
+            }
+        ],
         candidate_unknown=["pair unknown"],
         candidate_need_blocked=["pair pending"],
+        semantic_frame=semantic_support_frame("The travel date is confirmed"),
     )
     negative_pair = copy.deepcopy(positive_confirmation)
     negative_pair_result = select_living_context_need_answers(
         FakeModelClient([negative_pair]),
         user_message="The travel date is still unconfirmed",
         open_needs=[positive_pair_target],
-        candidate_known=["The travel date is still unconfirmed"],
+        candidate_known=[
+            {
+                "statement": "The travel date is still unconfirmed",
+                "epistemic_status": "reported",
+                "source_quote": {"text": "The travel date is still unconfirmed", "start": 0, "end": 36},
+            }
+        ],
         candidate_unknown=["pair unknown"],
         candidate_need_blocked=["pair pending"],
+        semantic_frame=semantic_support_frame(
+            "The travel date is still unconfirmed",
+            supported_quotes=(),
+        ),
     )
     expect(
         positive_pair_result.selection is not None
@@ -1510,118 +1554,275 @@ def main() -> int:
         and negative_pair_result.metrics.get("suppressed_unresolved_support_count") == 1,
         "positive confirmation remains valid beside its unresolved minimal pair",
     )
-    unique_asked_target = {
-        "need_token": "need_unique_asked_fallback",
+    exact_reference_target = {
+        "need_token": "need_exact_reference_only",
         "generation": 4,
         "blocked_judgment": "住宿安排",
         "question": "住宿安排是什么？",
         "status": "asked",
     }
-    unique_asked_unresolved_response = copy.deepcopy(selector_true)
-    unique_asked_unresolved_response["living_context_need_answer_selection"]["answers"] = [
+    exact_reference_response = copy.deepcopy(selector_true)
+    exact_reference_response["living_context_need_answer_selection"]["answers"] = [
         {
-            "need_token": unique_asked_target["need_token"],
-            "generation": unique_asked_target["generation"],
+            "need_token": exact_reference_target["need_token"],
+            "generation": exact_reference_target["generation"],
             "supporting_known_index": 0,
             "discard_candidate_unknowns": [],
             "discard_candidate_need_endpoints": [],
         }
     ]
-    unique_asked_known = ["住宿仍未确认", "住宿已经确认"]
-    unique_asked_source = "补充住宿信息"
-    unique_asked_result = select_living_context_need_answers(
-        FakeModelClient([unique_asked_unresolved_response]),
-        user_message=unique_asked_source,
-        open_needs=[unique_asked_target],
-        candidate_known=unique_asked_known,
+    unbound_known_result = select_living_context_need_answers(
+        FakeModelClient([exact_reference_response]),
+        user_message="补充住宿信息",
+        open_needs=[exact_reference_target],
+        candidate_known=[
+            {
+                "statement": "住宿已经确认",
+                "epistemic_status": "reported",
+                "source_quote": {"text": "住宿已经确认", "start": 0, "end": 6},
+            }
+        ],
+        semantic_frame=semantic_support_frame("补充住宿信息"),
     )
-    unique_asked_answer = (
-        unique_asked_result.selection.answers[0]
-        if unique_asked_result.selection is not None
-        and unique_asked_result.selection.answers
+    expect(
+        unbound_known_result.selection is not None
+        and unbound_known_result.selection.answers == ()
+        and unbound_known_result.metrics.get("unique_asked_fallback_count") == 0,
+        "affirmative keywords never replace an exact source-bound Need answer",
+    )
+    exact_known_source = "住宿已经确认"
+    exact_known_result = select_living_context_need_answers(
+        FakeModelClient([exact_reference_response]),
+        user_message=exact_known_source,
+        open_needs=[exact_reference_target],
+        candidate_known=[
+            {
+                "statement": exact_known_source,
+                "epistemic_status": "reported",
+                "source_quote": {
+                    "text": exact_known_source,
+                    "start": 0,
+                    "end": len(exact_known_source),
+                },
+            }
+        ],
+        semantic_frame=semantic_support_frame(exact_known_source),
+    )
+    exact_known_answer = (
+        exact_known_result.selection.answers[0]
+        if exact_known_result.selection is not None and exact_known_result.selection.answers
         else None
     )
     expect(
-        unique_asked_result.selection is not None
-        and unique_asked_answer is not None
-        and unique_asked_answer.need_token == unique_asked_target["need_token"]
-        and unique_asked_answer.generation == unique_asked_target["generation"]
-        and unique_asked_answer.supporting_known_index == 1
-        and unique_asked_answer.source_quote.text == unique_asked_source
-        and unique_asked_answer.source_quote.start == 0
-        and unique_asked_answer.source_quote.end == len(unique_asked_source)
-        and unique_asked_answer.discard_candidate_unknowns == ()
-        and unique_asked_answer.discard_candidate_need_endpoints == ()
-        and unique_asked_result.metrics.get("answered_count") == 1
-        and unique_asked_result.metrics.get("suppressed_unresolved_support_count") == 1
-        and unique_asked_result.metrics.get("unique_asked_fallback_count") == 1,
-        "unique asked Need fallback binds the only resolved Known with a server quote",
+        exact_known_answer is not None
+        and exact_known_answer.need_token == exact_reference_target["need_token"]
+        and exact_known_answer.generation == exact_reference_target["generation"]
+        and exact_known_answer.source_quote.text == exact_known_source
+        and exact_known_result.metrics.get("unique_asked_fallback_count") == 0,
+        "model-supplied exact Need reference retains a server-bound source clause",
     )
-    second_asked_target = {
-        **unique_asked_target,
-        "need_token": "need_second_asked_fallback",
-        "generation": 1,
+
+    for boundary_name, known_status, frame in (
+        (
+            "inferred Known",
+            "inferred",
+            semantic_support_frame(exact_known_source),
+        ),
+        (
+            "reported speech",
+            "reported",
+            semantic_support_frame(
+                exact_known_source,
+                reported_quotes=(exact_known_source,),
+            ),
+        ),
+        (
+            "conditional act",
+            "reported",
+            semantic_support_frame(
+                f"如果{exact_known_source}",
+                supported_quotes=(f"如果{exact_known_source}",),
+                conditional_quotes=(f"如果{exact_known_source}",),
+            ),
+        ),
+    ):
+        boundary_source = (
+            f"如果{exact_known_source}"
+            if boundary_name == "conditional act"
+            else exact_known_source
+        )
+        boundary_result = select_living_context_need_answers(
+            FakeModelClient([exact_reference_response]),
+            user_message=boundary_source,
+            open_needs=[exact_reference_target],
+            candidate_known=[
+                {
+                    "statement": boundary_source,
+                    "epistemic_status": known_status,
+                    "source_quote": {
+                        "text": boundary_source,
+                        "start": 0,
+                        "end": len(boundary_source),
+                    },
+                }
+            ],
+            semantic_frame=frame,
+        )
+        expect(
+            boundary_result.selection is not None
+            and boundary_result.selection.answers == ()
+            and boundary_result.metrics.get("suppressed_unresolved_support_count") == 1,
+            f"Need answer stays open for {boundary_name} without semantic authority",
+        )
+
+    standalone_token = "unk_" + ("a" * 32)
+    standalone_endpoint = {
+        "unknown_token": standalone_token,
+        "generation": 7,
+        "statement": "搬家日期",
     }
-    multiple_asked_result = select_living_context_need_answers(
-        FakeModelClient([unique_asked_unresolved_response]),
-        user_message=unique_asked_source,
-        open_needs=[unique_asked_target, second_asked_target],
-        candidate_known=unique_asked_known,
+    standalone_response = {
+        "status": "model_assisted",
+        "living_context_need_answer_selection": {
+            "schema_version": NEED_ANSWER_SCHEMA_VERSION,
+            "answers": [],
+            "standalone_unknown_resolutions": [
+                {
+                    "unknown_token": standalone_token,
+                    "generation": 7,
+                    "supporting_known_index": 0,
+                }
+            ],
+        },
+    }
+    standalone_source = "搬家日期是9月12日；网络迁移仍未确认"
+    standalone_result = select_living_context_need_answers(
+        FakeModelClient([standalone_response]),
+        user_message=standalone_source,
+        open_needs=[],
+        candidate_known=[
+            {
+                "statement": "搬家日期是9月12日",
+                "epistemic_status": "reported",
+                "source_quote": {"text": "搬家日期是9月12日", "start": 0, "end": 10},
+            }
+        ],
+        standalone_unknown_endpoints=[standalone_endpoint],
+        semantic_frame=semantic_support_frame(
+            standalone_source,
+            supported_quotes=("搬家日期是9月12日",),
+        ),
+    )
+    standalone_binding = (
+        standalone_result.selection.standalone_unknown_resolutions[0]
+        if standalone_result.selection is not None
+        and standalone_result.selection.standalone_unknown_resolutions
+        else None
     )
     expect(
-        multiple_asked_result.selection is not None
-        and multiple_asked_result.selection.answers == ()
-        and multiple_asked_result.metrics.get("unique_asked_fallback_count") == 0,
-        "unique asked Need fallback stays off when multiple Needs are asked",
+        standalone_binding is not None
+        and standalone_result.selection.answers == ()
+        and standalone_binding.unknown_text == "搬家日期"
+        and standalone_binding.source_quote.text == "搬家日期是9月12日"
+        and standalone_result.metrics.get("standalone_unknown_resolved_count") == 1,
+        "standalone exact Unknown reference binds one affirmative source clause without a Need",
     )
-    multiple_resolved_result = select_living_context_need_answers(
-        FakeModelClient([unique_asked_unresolved_response]),
-        user_message=unique_asked_source,
-        open_needs=[unique_asked_target],
-        candidate_known=["住宿仍未确认", "住宿已经确认", "交通已经安排"],
+    for guarded_source in ("搬家日期仍未确认", "如果搬家日期是9月12日"):
+        guarded_result = select_living_context_need_answers(
+            FakeModelClient([standalone_response]),
+            user_message=guarded_source,
+            open_needs=[],
+            candidate_known=[
+                {
+                    "statement": guarded_source,
+                    "epistemic_status": "reported",
+                    "source_quote": {
+                        "text": guarded_source,
+                        "start": 0,
+                        "end": len(guarded_source),
+                    },
+                }
+            ],
+            standalone_unknown_endpoints=[standalone_endpoint],
+            semantic_frame=semantic_support_frame(
+                guarded_source,
+                supported_quotes=(),
+                conditional_quotes=(guarded_source,) if guarded_source.startswith("如果") else (),
+            ),
+        )
+        expect(
+            guarded_result.selection is not None
+            and guarded_result.selection.standalone_unknown_resolutions == ()
+            and guarded_result.metrics.get("suppressed_unresolved_unknown_support_count") == 1,
+            f"standalone Unknown remains open for non-affirmative source: {guarded_source}",
+        )
+    duplicate_source_result = select_living_context_need_answers(
+        FakeModelClient([standalone_response]),
+        user_message="搬家日期是9月12日，搬家日期是9月12日",
+        open_needs=[],
+        candidate_known=[
+            {
+                "statement": "搬家日期是9月12日",
+                "epistemic_status": "reported",
+                "source_quote": {"text": "搬家日期是9月12日", "start": 0, "end": 10},
+            }
+        ],
+        standalone_unknown_endpoints=[standalone_endpoint],
+        semantic_frame=semantic_support_frame(
+            "搬家日期是9月12日，搬家日期是9月12日",
+            supported_quotes=("搬家日期是9月12日",),
+        ),
     )
     expect(
-        multiple_resolved_result.selection is not None
-        and multiple_resolved_result.selection.answers == ()
-        and multiple_resolved_result.metrics.get("unique_asked_fallback_count") == 0,
-        "unique asked Need fallback stays off when multiple Known items are resolved",
+        duplicate_source_result.selection is not None
+        and len(duplicate_source_result.selection.standalone_unknown_resolutions) == 1
+        and duplicate_source_result.selection.standalone_unknown_resolutions[0].source_quote.start == 0,
+        "exact source_quote coordinates disambiguate repeated Known clauses",
     )
-    no_source_result = select_living_context_need_answers(
-        FakeModelClient([unique_asked_unresolved_response]),
-        user_message="",
-        open_needs=[unique_asked_target],
-        candidate_known=unique_asked_known,
-    )
-    expect(
-        no_source_result.selection is not None
-        and no_source_result.selection.answers == ()
-        and no_source_result.metrics.get("suppressed_unresolved_support_count") == 1
-        and no_source_result.metrics.get("unique_asked_fallback_count") == 0,
-        "unique asked Need fallback stays off without source text",
-    )
-    accepted_unique_asked_response = copy.deepcopy(unique_asked_unresolved_response)
-    accepted_unique_asked_response["living_context_need_answer_selection"]["answers"][0][
+    for field, value in (("unknown_token", "unk_" + ("b" * 32)), ("generation", 8)):
+        stale_response = copy.deepcopy(standalone_response)
+        stale_response["living_context_need_answer_selection"]["standalone_unknown_resolutions"][0][field] = value
+        stale_result = select_living_context_need_answers(
+            FakeModelClient([stale_response]),
+            user_message="搬家日期是9月12日",
+            open_needs=[],
+            candidate_known=[
+                {
+                    "statement": "搬家日期是9月12日",
+                    "epistemic_status": "reported",
+                    "source_quote": {"text": "搬家日期是9月12日", "start": 0, "end": 10},
+                }
+            ],
+            standalone_unknown_endpoints=[standalone_endpoint],
+            semantic_frame=semantic_support_frame("搬家日期是9月12日"),
+        )
+        expect(
+            stale_result.selection is None
+            and stale_result.metrics.get("reason") == "unknown_endpoint_not_current",
+            f"standalone Unknown rejects stale {field}",
+        )
+    out_of_range_response = copy.deepcopy(standalone_response)
+    out_of_range_response["living_context_need_answer_selection"]["standalone_unknown_resolutions"][0][
         "supporting_known_index"
     ] = 1
-    accepted_unique_asked_result = select_living_context_need_answers(
-        FakeModelClient([accepted_unique_asked_response]),
-        user_message=unique_asked_source,
-        open_needs=[unique_asked_target],
-        candidate_known=unique_asked_known,
-    )
-    accepted_unique_asked_answer = (
-        accepted_unique_asked_result.selection.answers[0]
-        if accepted_unique_asked_result.selection is not None
-        and accepted_unique_asked_result.selection.answers
-        else None
+    out_of_range_result = select_living_context_need_answers(
+        FakeModelClient([out_of_range_response]),
+        user_message="搬家日期是9月12日",
+        open_needs=[],
+        candidate_known=[
+            {
+                "statement": "搬家日期是9月12日",
+                "epistemic_status": "reported",
+                "source_quote": {"text": "搬家日期是9月12日", "start": 0, "end": 10},
+            }
+        ],
+        standalone_unknown_endpoints=[standalone_endpoint],
+        semantic_frame=semantic_support_frame("搬家日期是9月12日"),
     )
     expect(
-        accepted_unique_asked_result.selection is not None
-        and accepted_unique_asked_answer is not None
-        and accepted_unique_asked_answer.supporting_known_index == 1
-        and accepted_unique_asked_result.metrics.get("answered_count") == 1
-        and accepted_unique_asked_result.metrics.get("unique_asked_fallback_count") == 0,
-        "unique asked Need fallback stays off when a valid answer already exists",
+        out_of_range_result.selection is None
+        and out_of_range_result.metrics.get("reason") == "supporting_known_index_out_of_range",
+        "standalone Unknown rejects a Known index outside the supplied set",
     )
     direct_policy_cases = tuple(
         ("travel", f"旅行日期{marker}", False, True)
@@ -1642,32 +1843,6 @@ def main() -> int:
             for _category, statement, unresolved, resolved in direct_policy_cases
         ),
         "generic state policy covers travel health finance affirmative and unresolved forms",
-    )
-    non_affirmative_policy_pairs = (
-        ("旅行日期已确认", "旅行日期是否已确认"),
-        ("检查结果已完成", "如果检查结果已完成"),
-        ("转账状态已确定", "若转账状态已确定"),
-        ("搬家安排已预约", "搬家安排将预约"),
-        ("工作计划已安排", "工作计划会安排"),
-        ("体检已完成", "体检需要完成"),
-        ("考试安排已落实", "考试安排应该已落实"),
-        ("会议已确认", "会议可能已确认"),
-        ("the travel date is confirmed", "whether the travel date is confirmed"),
-        ("the health result is completed", "if the health result is completed"),
-        ("the transfer is settled", "once the transfer is settled"),
-        ("the move is booked", "the move will be booked"),
-        ("the work plan is approved", "the work plan needs to be approved"),
-        ("the checkup is completed", "the checkup should be completed"),
-        ("the appointment is scheduled", "the appointment may be scheduled"),
-        ("the date is finalized", "the date is finalized?"),
-    )
-    expect(
-        all(
-            has_clearly_resolved_statement(affirmative)
-            and not has_clearly_resolved_statement(non_affirmative)
-            for affirmative, non_affirmative in non_affirmative_policy_pairs
-        ),
-        "interrogative conditional future modal and requirement guards preserve affirmative state pairs",
     )
     expect(
         has_unresolved_statement("旅行日期已确认但尚未完成")
@@ -1705,6 +1880,7 @@ def main() -> int:
         user_message=selector_text,
         open_needs=[selector_target, selector_second_target],
         candidate_known=["用户确认住宿已经安排", "用户确认交通已经安排"],
+        semantic_frame=selector_frame,
     )
     expect(
         shared_known_result.selection is None
@@ -1720,6 +1896,7 @@ def main() -> int:
         user_message=selector_text,
         open_needs=[selector_target],
         candidate_known=selector_known,
+        semantic_frame=selector_frame,
     )
     expect(
         missing_known_index_result.selection is None
@@ -1735,6 +1912,7 @@ def main() -> int:
         user_message=selector_text,
         open_needs=[selector_target],
         candidate_known=selector_known,
+        semantic_frame=selector_frame,
     )
     expect(
         out_of_range_known_index_result.selection is None
@@ -1750,6 +1928,7 @@ def main() -> int:
         candidate_known=[],
         candidate_unknown=["住宿仍未确认"],
         candidate_need_blocked=["住宿待确认"],
+        semantic_frame=selector_frame,
     )
     expect(
         empty_known_result.selection is None
@@ -1767,6 +1946,7 @@ def main() -> int:
         candidate_known=selector_known,
         candidate_unknown=["住宿仍未确认", "交通仍未确认"],
         candidate_need_blocked=["住宿待确认", "交通待确认"],
+        semantic_frame=selector_frame,
     )
     expect(
         root_batch_result.selection is not None
@@ -1791,6 +1971,7 @@ def main() -> int:
         candidate_known=selector_known,
         candidate_unknown=["住宿仍未确认"],
         candidate_need_blocked=["住宿待确认"],
+        semantic_frame=semantic_support_frame("我还没确认", supported_quotes=()),
     )
     expect(
         selector_false_result.selection is not None
@@ -1816,6 +1997,7 @@ def main() -> int:
             user_message=selector_text,
             open_needs=[selector_target],
             candidate_known=selector_known,
+            semantic_frame=selector_frame,
         )
         expect(
             malformed_result.selection is None
@@ -1833,6 +2015,7 @@ def main() -> int:
         candidate_known=selector_known,
         candidate_unknown=["住宿仍未确认"],
         candidate_need_blocked=["住宿待确认"],
+        semantic_frame=selector_frame,
     )
     expect(
         wrong_token_result.selection is None
@@ -1850,6 +2033,7 @@ def main() -> int:
         candidate_known=selector_known,
         candidate_unknown=["住宿仍未确认"],
         candidate_need_blocked=["住宿待确认"],
+        semantic_frame=selector_frame,
     )
     expect(
         wrong_discard_result.selection is None
@@ -1864,6 +2048,7 @@ def main() -> int:
         candidate_known=selector_known,
         candidate_unknown=["住宿仍未确认"],
         candidate_need_blocked=["住宿待确认"],
+        semantic_frame=semantic_support_frame(""),
     )
     expect(
         empty_true_result.selection is None
@@ -1877,9 +2062,16 @@ def main() -> int:
         long_selector_client,
         user_message=long_text,
         open_needs=[selector_target],
-        candidate_known=selector_known,
+        candidate_known=[
+            {
+                "statement": long_text[:480],
+                "epistemic_status": "reported",
+                "source_quote": {"text": long_text[:480], "start": 0, "end": 480},
+            }
+        ],
         candidate_unknown=["住宿仍未确认"],
         candidate_need_blocked=["住宿待确认"],
+        semantic_frame=semantic_support_frame(long_text[:480]),
     )
     long_selector_request = long_selector_client.users[0]
     long_selected = long_selector_result.selection.answers[0] if long_selector_result.selection else None
@@ -2547,7 +2739,15 @@ def main() -> int:
         "unknown": ["住宿仍未确认", "交通仍未确认"],
         "material_change": "住宿安排已经确认。",
         "known": [
-            {"statement": "本轮保留的用户事实", "epistemic_status": "reported"}
+            {
+                "statement": answer_text,
+                "epistemic_status": "reported",
+                "source_quote": {
+                    "text": answer_text,
+                    "start": 0,
+                    "end": len(answer_text),
+                },
+            }
         ],
         "needs": [
             {
@@ -2612,12 +2812,12 @@ def main() -> int:
         and answer_recovered.living_context_candidate.catalog_token == omitted_answer_candidate["catalog_token"]
         and answer_recovered.living_context_candidate.material_change == omitted_answer_candidate["material_change"]
         and [item.statement for item in answer_recovered.living_context_candidate.known]
-        == ["本轮保留的用户事实"]
+        == [answer_text]
         and answer_recovered.living_context_candidate.unknown == ["交通仍未确认"]
         and [item.blocked_judgment for item in answer_recovered.living_context_candidate.needs]
         == ["交通待确认"]
-        and answer_recovery_reasoning.client.users[1]["candidate_known"]
-        == ["本轮保留的用户事实"]
+        and answer_recovery_reasoning.client.users[1]["candidate_known"][0]["statement"]
+        == answer_text
         and answer_recovery_reasoning.client.purposes
         == ["turn_understanding", "living_context_need_answer_selection"]
         and answer_recovery_reasoning.client.call_count == 2,

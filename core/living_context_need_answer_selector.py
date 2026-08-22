@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from core.living_context_information_state_policy import (
-    UNRESOLVED_SUPPORT_POLICY_VERSION,
-    has_clearly_resolved_statement,
-    has_unresolved_statement,
-)
+from core.living_context_information_state_policy import UNRESOLVED_SUPPORT_POLICY_VERSION
+from core.semantic_frame import TurnSemanticFrame
 from interface.living_context_contract import ContextQuote
 
 
@@ -24,6 +22,7 @@ _MAX_UNKNOWNS = 12
 _MAX_KNOWN = 12
 _MAX_KNOWN_CHARS = 480
 _MAX_SOURCE_CHARS = 480
+_UNKNOWN_TOKEN_RE = re.compile(r"^unk_[0-9a-f]{32}$")
 
 NEED_ANSWER_SELECTOR_SYSTEM = (
     "Return JSON matching required_json_shape. Select a current Need only when "
@@ -36,8 +35,23 @@ NEED_ANSWER_SELECTOR_SYSTEM = (
     "and discard string exactly from the supplied collections. Every answer must "
     "include supporting_known_index as a zero-based index into candidate_known; "
     "use each candidate Known at most once, and never invent or reuse an index. "
-    "Use answers=[] when no Need is affirmatively resolved."
+    "A candidate Known is usable only when its epistemic_status is reported and "
+    "its source_quote is an exact slice of the current user_message; do not treat "
+    "a model summary or inferred Known as direct evidence. "
+    "A standalone Unknown may be resolved only through standalone_unknown_resolutions, "
+    "which must copy an exact unknown_token+generation from unknown_endpoints and point "
+    "to a source-bound, affirmative candidate Known. Never emit the Unknown statement "
+    "itself in a standalone resolution. Use answers=[] and "
+    "standalone_unknown_resolutions=[] when nothing is affirmatively resolved."
 )
+
+
+class _RawStandaloneUnknownResolution(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    unknown_token: str = Field(min_length=1, max_length=240)
+    generation: int = Field(ge=1)
+    supporting_known_index: int = Field(ge=0)
 
 
 class _RawAnswer(BaseModel):
@@ -63,6 +77,10 @@ class _RawBatch(BaseModel):
 
     schema_version: str
     answers: list[_RawAnswer] = Field(default_factory=list, max_length=_MAX_NEEDS)
+    standalone_unknown_resolutions: list[_RawStandaloneUnknownResolution] = Field(
+        default_factory=list,
+        max_length=_MAX_UNKNOWNS,
+    )
 
     @model_validator(mode="after")
     def validate_batch(self) -> "_RawBatch":
@@ -77,6 +95,16 @@ class _RawBatch(BaseModel):
             raise ValueError("candidate unknown discarded more than once")
         if len(need_discards) != len(set(need_discards)):
             raise ValueError("candidate Need discarded more than once")
+        unknown_pairs = [
+            (item.unknown_token, item.generation)
+            for item in self.standalone_unknown_resolutions
+        ]
+        if len(unknown_pairs) != len(set(unknown_pairs)):
+            raise ValueError("standalone Unknown resolved more than once")
+        if len(
+            {item.unknown_token for item in self.standalone_unknown_resolutions}
+        ) != len(unknown_pairs):
+            raise ValueError("standalone Unknown token resolved more than once")
         return self
 
 
@@ -91,16 +119,35 @@ class NeedAnswerBinding:
 
 
 @dataclass(slots=True, frozen=True)
+class StandaloneUnknownResolutionBinding:
+    """A server-validated exact resolution of one prior semantic Unknown."""
+
+    unknown_token: str
+    generation: int
+    unknown_text: str
+    supporting_known_index: int
+    source_quote: ContextQuote
+
+
+@dataclass(slots=True, frozen=True)
 class NeedAnswerSelection:
     answers: tuple[NeedAnswerBinding, ...]
+    standalone_unknown_resolutions: tuple[StandaloneUnknownResolutionBinding, ...] = ()
 
     @property
     def discard_unknown(self) -> tuple[str, ...]:
-        return tuple(value for item in self.answers for value in item.discard_candidate_unknowns)
+        return (
+            tuple(value for item in self.answers for value in item.discard_candidate_unknowns)
+            + tuple(item.unknown_text for item in self.standalone_unknown_resolutions)
+        )
 
     @property
     def discard_need_blocked(self) -> tuple[str, ...]:
         return tuple(value for item in self.answers for value in item.discard_candidate_need_endpoints)
+
+    @property
+    def discard_standalone_unknowns(self) -> tuple[str, ...]:
+        return tuple(item.unknown_text for item in self.standalone_unknown_resolutions)
 
 
 @dataclass(slots=True, frozen=True)
@@ -108,6 +155,23 @@ class NeedAnswerSelectionResult:
     selection: NeedAnswerSelection | None
     issues: list[str]
     metrics: dict[str, Any]
+
+
+@dataclass(slots=True, frozen=True)
+class _ProjectedKnown:
+    """A model Known plus the provenance needed for server-side admission."""
+
+    statement: str
+    source_quote: ContextQuote | None
+    epistemic_status: str | None
+
+    def model_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"statement": self.statement}
+        if self.source_quote is not None:
+            payload["source_quote"] = self.source_quote.model_dump(mode="json")
+        if self.epistemic_status is not None:
+            payload["epistemic_status"] = self.epistemic_status
+        return payload
 
 
 def _issues(code: str) -> list[str]:
@@ -120,6 +184,8 @@ def _project_open_needs(
     open_needs: Sequence[Mapping[str, Any]] | None,
 ) -> tuple[list[dict[str, Any]] | None, list[str]]:
     value: Any = open_needs if open_needs is not None else (row.get("open_needs") if isinstance(row, Mapping) else None)
+    if value is None:
+        value = []
     if not isinstance(value, list) or len(value) > _MAX_NEEDS:
         return None, _issues("open_needs_invalid")
     projected: list[dict[str, Any]] = []
@@ -184,12 +250,173 @@ def _candidate_strings(
     return selected, []
 
 
+def _project_unknown_endpoints(
+    value: Sequence[Mapping[str, Any]] | None,
+) -> tuple[list[dict[str, Any]] | None, list[str]]:
+    """Validate the server-owned Unknown endpoint catalog without rewriting it."""
+
+    selected = list(value or [])
+    if len(selected) > _MAX_UNKNOWNS:
+        return None, _issues("unknown_endpoints_invalid")
+    projected: list[dict[str, Any]] = []
+    seen_pairs: set[tuple[str, int]] = set()
+    seen_tokens: set[str] = set()
+    seen_text: set[str] = set()
+    for raw in selected:
+        if not isinstance(raw, Mapping):
+            return None, _issues("unknown_endpoint_invalid")
+        if set(raw) != {"unknown_token", "generation", "statement"}:
+            return None, _issues("unknown_endpoint_invalid")
+        token = raw.get("unknown_token")
+        generation = raw.get("generation")
+        statement = raw.get("statement")
+        if (
+            not isinstance(token, str)
+            or not _UNKNOWN_TOKEN_RE.fullmatch(token)
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+            or not isinstance(statement, str)
+            or not statement
+            or len(statement) > _MAX_KNOWN_CHARS
+        ):
+            return None, _issues("unknown_endpoint_invalid")
+        pair = (token, generation)
+        if pair in seen_pairs or token in seen_tokens or statement in seen_text:
+            return None, _issues("unknown_endpoint_duplicate")
+        seen_pairs.add(pair)
+        seen_tokens.add(token)
+        seen_text.add(statement)
+        projected.append(
+            {
+                "unknown_token": token,
+                "generation": generation,
+                "statement": statement,
+            }
+        )
+    return projected, []
+
+
+def _project_candidate_known(
+    value: Sequence[str | Mapping[str, Any]] | None,
+) -> tuple[list[_ProjectedKnown] | None, list[str]]:
+    """Project Known statements while retaining provenance, never inventing it.
+
+    The string form is kept only as a narrow compatibility input for old
+    callers, but it is never promoted to direct evidence. Structured mappings
+    must carry an explicit ``reported`` status and a source quote before they
+    can support a write.
+    """
+
+    selected = list(value or [])
+    if len(selected) > _MAX_KNOWN:
+        return None, _issues("candidate_endpoints_invalid")
+    projected: list[_ProjectedKnown] = []
+    for raw in selected:
+        if isinstance(raw, str):
+            statement = raw
+            if not statement or len(statement) > _MAX_KNOWN_CHARS:
+                return None, _issues("candidate_known_invalid")
+            projected.append(
+                _ProjectedKnown(
+                    statement=statement,
+                    source_quote=None,
+                    epistemic_status=None,
+                )
+            )
+            continue
+        elif isinstance(raw, Mapping):
+            if set(raw) - {"statement", "source_quote", "epistemic_status"}:
+                return None, _issues("candidate_known_invalid")
+            statement = raw.get("statement")
+            if not isinstance(statement, str):
+                return None, _issues("candidate_known_invalid")
+            epistemic_status = raw.get("epistemic_status")
+            if epistemic_status is not None and epistemic_status not in {"reported", "inferred"}:
+                return None, _issues("candidate_known_invalid")
+            raw_quote = raw.get("source_quote")
+            if raw_quote is None:
+                quote = None
+            else:
+                try:
+                    quote = ContextQuote.model_validate(raw_quote, strict=True)
+                except ValidationError:
+                    return None, _issues("candidate_known_invalid")
+        else:
+            return None, _issues("candidate_known_invalid")
+        if not statement or len(statement) > _MAX_KNOWN_CHARS:
+            return None, _issues("candidate_known_invalid")
+        projected.append(
+            _ProjectedKnown(
+                statement=statement,
+                source_quote=quote,
+                epistemic_status=epistemic_status,
+            )
+        )
+    return projected, []
+
+
+def _affirmative_source_quote(
+    known: _ProjectedKnown,
+    *,
+    source_text: str,
+    semantic_frame: TurnSemanticFrame | None,
+) -> ContextQuote | None:
+    """Return a quote backed by one resolved, direct semantic act.
+
+    The selector deliberately does not interpret words in the Known statement.
+    Positive support is admitted only when the candidate carries a reported
+    Known with an exact source quote and the already-validated semantic frame
+    contains exactly one matching direct-user positive asserted act in normal
+    use, without a condition.
+    """
+
+    if (
+        known.epistemic_status != "reported"
+        or known.source_quote is None
+        or semantic_frame is None
+        or semantic_frame.resolver_status != "resolved"
+    ):
+        return None
+    quote = known.source_quote
+    if (
+        not source_text
+        or quote.end > len(source_text)
+        or source_text[quote.start : quote.end] != quote.text
+        or known.statement != quote.text
+    ):
+        return None
+    matching_acts = [
+        act
+        for act in semantic_frame.acts
+        if (
+            act.source_quote.text == quote.text
+            and act.source_quote.start == quote.start
+            and act.source_quote.end == quote.end
+            and act.speaker == "user"
+            and act.authority == "direct_user"
+            and act.polarity == "positive"
+            and act.modality == "asserted"
+            and act.mention_mode == "normal_use"
+            and act.condition is None
+        )
+    ]
+    if len(matching_acts) != 1:
+        return None
+    return quote
+
+
 def _parse_envelope(value: Any) -> tuple[Mapping[str, Any] | None, list[str]]:
     if not isinstance(value, Mapping):
         return None, _issues("response_invalid")
     transport = {"status", "model_status", "duration_ms", "_model"}
     envelope_allowed = {*transport, "living_context_need_answer_selection"}
-    root_allowed = {*transport, "schema_version", "answers"}
+    root_allowed = {
+        *transport,
+        "schema_version",
+        "answers",
+        "standalone_unknown_resolutions",
+    }
     keys = set(map(str, value))
     if str(value.get("status") or "") != "model_assisted":
         return None, _issues("response_invalid")
@@ -203,6 +430,7 @@ def _parse_envelope(value: Any) -> tuple[Mapping[str, Any] | None, list[str]]:
         return {
             "schema_version": value.get("schema_version"),
             "answers": value.get("answers"),
+            "standalone_unknown_resolutions": value.get("standalone_unknown_resolutions", []),
         }, []
     return None, _issues("selection_missing")
 
@@ -232,21 +460,43 @@ def select_living_context_need_answers(
     open_needs: Sequence[Mapping[str, Any]] | None = None,
     candidate_unknown: Sequence[str] | None = None,
     candidate_need_blocked: Sequence[str] | None = None,
-    candidate_known: Sequence[str] | None = None,
+    candidate_known: Sequence[str | Mapping[str, Any]] | None = None,
+    standalone_unknown_endpoints: Sequence[Mapping[str, Any]] | None = None,
+    semantic_frame: TurnSemanticFrame | None = None,
 ) -> NeedAnswerSelectionResult:
     """Run one batch decision and validate it entirely against supplied sets."""
 
     needs, need_issues = _project_open_needs(row=row, open_needs=open_needs)
     unknowns, unknown_issues = _candidate_strings(candidate_unknown, limit=_MAX_UNKNOWNS)
     candidate_needs, candidate_need_issues = _candidate_strings(candidate_need_blocked, limit=_MAX_NEEDS)
-    knowns, known_issues = _candidate_strings(
-        candidate_known,
-        limit=_MAX_KNOWN,
-        max_item_chars=_MAX_KNOWN_CHARS,
-        unique=False,
+    knowns, known_issues = _project_candidate_known(candidate_known)
+    raw_unknown_endpoints = standalone_unknown_endpoints
+    if raw_unknown_endpoints is None and isinstance(row, Mapping):
+        selected_row_unknowns = row.get("unknown_endpoints")
+        if not isinstance(selected_row_unknowns, list):
+            selected_row_unknowns = row.get("unknown")
+        if isinstance(selected_row_unknowns, list) and all(
+            isinstance(item, Mapping) for item in selected_row_unknowns
+        ):
+            raw_unknown_endpoints = selected_row_unknowns
+    unknown_endpoints, unknown_endpoint_issues = _project_unknown_endpoints(
+        raw_unknown_endpoints
     )
-    input_issues = [*need_issues, *unknown_issues, *candidate_need_issues, *known_issues]
-    if input_issues or needs is None or unknowns is None or candidate_needs is None or knowns is None or not needs:
+    input_issues = [
+        *need_issues,
+        *unknown_issues,
+        *candidate_need_issues,
+        *known_issues,
+        *unknown_endpoint_issues,
+    ]
+    if (
+        input_issues
+        or needs is None
+        or unknowns is None
+        or candidate_needs is None
+        or knowns is None
+        or (not needs and not unknown_endpoints)
+    ):
         return NeedAnswerSelectionResult(
             selection=None,
             issues=input_issues or _issues("no_active_needs"),
@@ -272,13 +522,21 @@ def select_living_context_need_answers(
                 "unresolved_support_policy_version": UNRESOLVED_SUPPORT_POLICY_VERSION,
             },
         )
-    source_text = str(user_message or "")[:_MAX_SOURCE_CHARS]
+    if (
+        not isinstance(semantic_frame, TurnSemanticFrame)
+        or semantic_frame.resolver_status != "resolved"
+    ):
+        return _rejected("semantic_frame_unavailable")
+    source_text = str(user_message or "")
+    request_source = source_text[:_MAX_SOURCE_CHARS]
     request = {
-        "user_message": source_text,
+        "user_message": request_source,
         "active_open_needs": needs,
-        "candidate_known": knowns,
+        "candidate_known": [known.model_payload() for known in knowns],
         "candidate_unknown": unknowns,
         "candidate_need_endpoints": candidate_needs,
+        "unknown_endpoints": unknown_endpoints or [],
+        "semantic_frame": semantic_frame.compact(),
         "required_json_shape": {
             "schema_version": NEED_ANSWER_SCHEMA_VERSION,
             "answers": [
@@ -288,6 +546,13 @@ def select_living_context_need_answers(
                     "supporting_known_index": "zero-based index into candidate_known",
                     "discard_candidate_unknowns": "exact subset of candidate_unknown",
                     "discard_candidate_need_endpoints": "exact subset of candidate_need_endpoints",
+                }
+            ],
+            "standalone_unknown_resolutions": [
+                {
+                    "unknown_token": "exact token from unknown_endpoints",
+                    "generation": "exact generation from unknown_endpoints",
+                    "supporting_known_index": "zero-based index into candidate_known",
                 }
             ],
         },
@@ -321,6 +586,10 @@ def select_living_context_need_answers(
     active = {(item["need_token"], item["generation"]) for item in needs}
     unknown_set = set(unknowns)
     candidate_need_set = set(candidate_needs)
+    endpoint_by_pair = {
+        (item["unknown_token"], item["generation"]): item
+        for item in (unknown_endpoints or [])
+    }
     for item in raw.answers:
         if (item.need_token, item.generation) not in active:
             return _rejected("answer_not_active")
@@ -330,65 +599,85 @@ def select_living_context_need_answers(
             return _rejected("unknown_discard_not_in_candidate")
         if any(value not in candidate_need_set for value in item.discard_candidate_need_endpoints):
             return _rejected("need_discard_not_in_candidate")
+    for item in raw.standalone_unknown_resolutions:
+        if (item.unknown_token, item.generation) not in endpoint_by_pair:
+            return _rejected("unknown_endpoint_not_current")
+        if item.supporting_known_index >= len(knowns):
+            return _rejected("supporting_known_index_out_of_range")
     supporting_indices = [item.supporting_known_index for item in raw.answers]
+    supporting_indices.extend(
+        item.supporting_known_index for item in raw.standalone_unknown_resolutions
+    )
     if len(supporting_indices) != len(set(supporting_indices)):
         return _rejected("supporting_known_index_duplicate")
-    accepted_raw_answers = tuple(
-        item
-        for item in raw.answers
-        if not has_unresolved_statement(knowns[item.supporting_known_index])
-    )
-    suppressed_count = len(raw.answers) - len(accepted_raw_answers)
-    if accepted_raw_answers and not source_text:
+    if (raw.answers or raw.standalone_unknown_resolutions) and not source_text:
         return _rejected("empty_source")
-    fallback_answer: NeedAnswerBinding | None = None
-    unique_asked_fallback_count = 0
-    if not accepted_raw_answers and source_text.strip():
-        asked_needs = tuple(item for item in needs if item["status"] == "asked")
-        clearly_resolved_known_indices = tuple(
-            index
-            for index, statement in enumerate(knowns)
-            if has_clearly_resolved_statement(statement)
+    accepted_answers: list[NeedAnswerBinding] = []
+    suppressed_count = 0
+    for item in raw.answers:
+        known_index = item.supporting_known_index
+        source_bound_known_quote = _affirmative_source_quote(
+            knowns[known_index],
+            source_text=source_text,
+            semantic_frame=semantic_frame,
         )
-        if len(asked_needs) == 1 and len(clearly_resolved_known_indices) == 1:
-            asked_need = asked_needs[0]
-            fallback_answer = NeedAnswerBinding(
-                need_token=asked_need["need_token"],
-                generation=asked_need["generation"],
-                supporting_known_index=clearly_resolved_known_indices[0],
-                source_quote=ContextQuote(text=source_text, start=0, end=len(source_text)),
+        if source_bound_known_quote is None:
+            suppressed_count += 1
+            continue
+        accepted_answers.append(
+            NeedAnswerBinding(
+                need_token=item.need_token,
+                generation=item.generation,
+                supporting_known_index=known_index,
+                source_quote=source_bound_known_quote,
+                discard_candidate_unknowns=tuple(item.discard_candidate_unknowns),
+                discard_candidate_need_endpoints=tuple(item.discard_candidate_need_endpoints),
             )
-            unique_asked_fallback_count = 1
-    quote = (
-        ContextQuote(text=source_text, start=0, end=len(source_text))
-        if accepted_raw_answers
-        else None
-    )
-    answers = tuple(
-        NeedAnswerBinding(
-            need_token=item.need_token,
-            generation=item.generation,
-            supporting_known_index=item.supporting_known_index,
-            source_quote=quote,  # type: ignore[arg-type]
-            discard_candidate_unknowns=tuple(item.discard_candidate_unknowns),
-            discard_candidate_need_endpoints=tuple(item.discard_candidate_need_endpoints),
         )
-        for item in accepted_raw_answers
+    accepted_unknown_resolutions = []
+    suppressed_unknown_support_count = 0
+    for item in raw.standalone_unknown_resolutions:
+        known_index = item.supporting_known_index
+        endpoint = endpoint_by_pair[(item.unknown_token, item.generation)]
+        known = knowns[known_index]
+        source_bound_known_quote = _affirmative_source_quote(
+            known,
+            source_text=source_text,
+            semantic_frame=semantic_frame,
+        )
+        if (
+            not source_text
+            or source_bound_known_quote is None
+        ):
+            suppressed_unknown_support_count += 1
+            continue
+        accepted_unknown_resolutions.append(
+            StandaloneUnknownResolutionBinding(
+                unknown_token=item.unknown_token,
+                generation=item.generation,
+                unknown_text=endpoint["statement"],
+                supporting_known_index=known_index,
+                source_quote=source_bound_known_quote,
+            )
+        )
+    unique_asked_fallback_count = 0
+    selection = NeedAnswerSelection(
+        answers=tuple(accepted_answers),
+        standalone_unknown_resolutions=tuple(accepted_unknown_resolutions),
     )
-    if fallback_answer is not None:
-        answers = (*answers, fallback_answer)
-    selection = NeedAnswerSelection(answers=answers)
     return NeedAnswerSelectionResult(
         selection=selection,
         issues=[],
         metrics={
             "status": "accepted",
-            "answered_count": len(answers),
+            "answered_count": len(accepted_answers),
             "suppressed_unresolved_support_count": suppressed_count,
+            "suppressed_unresolved_unknown_support_count": suppressed_unknown_support_count,
             "unique_asked_fallback_count": unique_asked_fallback_count,
             "unresolved_support_policy_version": UNRESOLVED_SUPPORT_POLICY_VERSION,
             "discard_unknown_count": len(selection.discard_unknown),
             "discard_need_count": len(selection.discard_need_blocked),
+            "standalone_unknown_resolved_count": len(accepted_unknown_resolutions),
             "issue_codes": [],
         },
     )
@@ -402,5 +691,6 @@ __all__ = [
     "NeedAnswerBinding",
     "NeedAnswerSelection",
     "NeedAnswerSelectionResult",
+    "StandaloneUnknownResolutionBinding",
     "select_living_context_need_answers",
 ]

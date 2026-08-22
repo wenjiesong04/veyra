@@ -192,6 +192,7 @@ class TurnContextBuilder:
                     "deadline_at",
                     "progress",
                     "unknown",
+                    "unknown_endpoints",
                     "entities",
                     "open_needs",
                 )
@@ -205,6 +206,10 @@ class TurnContextBuilder:
             if "open_needs" in item:
                 projection["open_needs"] = TurnContextBuilder._living_context_need_catalog(
                     item.get("open_needs")
+                )
+            if "unknown_endpoints" in item:
+                projection["unknown_endpoints"] = TurnContextBuilder._living_context_unknown_catalog(
+                    item.get("unknown_endpoints")
                 )
             reaction = TurnContextBuilder._living_context_reaction_projection(
                 item.get("reaction")
@@ -263,6 +268,42 @@ class TurnContextBuilder:
             if status in {"open", "asked", "observing", "waiting"}:
                 projection["status"] = status
             output.append(projection)
+        return output
+
+    @staticmethod
+    def _living_context_unknown_catalog(value: Any) -> list[dict[str, Any]]:
+        """Project only opaque Unknown endpoint identity and exact text."""
+
+        if not isinstance(value, list):
+            return []
+        output: list[dict[str, Any]] = []
+        seen: set[tuple[str, int]] = set()
+        for item in value[:12]:
+            if not isinstance(item, dict):
+                continue
+            token = str(item.get("unknown_token") or "").strip()
+            generation = item.get("generation")
+            statement = item.get("statement")
+            if (
+                not re.fullmatch(r"unk_[0-9a-f]{32}", token)
+                or isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 1
+                or not isinstance(statement, str)
+                or not statement.strip()
+            ):
+                continue
+            pair = (token, generation)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            output.append(
+                {
+                    "unknown_token": token,
+                    "generation": generation,
+                    "statement": statement.strip()[:480],
+                }
+            )
         return output
 
     @staticmethod
