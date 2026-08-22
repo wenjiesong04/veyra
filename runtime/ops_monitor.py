@@ -434,30 +434,78 @@ class OpsMonitor:
         pending = [item for item in items if isinstance(item, dict) and item.get("status") == "pending"] if isinstance(items, list) else []
         if not pending:
             return []
-        diagnostics = [self._review_diagnostic_item(item) for item in pending[-10:]]
-        return [
-            {
-                "component": "review",
-                "severity": "warning",
-                "code": "pending_reviews",
-                "message": f"{len(pending)} action review item(s) are pending.",
-                "details": {"count": len(pending), "items": diagnostics},
-            }
-        ]
+        stale_after_seconds = 7 * 86400
+        fresh: list[dict[str, Any]] = []
+        aged: list[dict[str, Any]] = []
+        for item in pending:
+            diagnostic = self._review_diagnostic_item(item)
+            age = diagnostic.get("age_seconds")
+            if isinstance(age, (int, float)) and age > stale_after_seconds:
+                aged.append(diagnostic)
+            else:
+                fresh.append(diagnostic)
+        alerts: list[dict[str, Any]] = []
+        if fresh:
+            alerts.append(
+                {
+                    "component": "review",
+                    "severity": "warning",
+                    "code": "pending_reviews",
+                    "message": f"{len(fresh)} action review item(s) are pending.",
+                    "details": {"count": len(fresh), "aged_count": len(aged), "items": fresh[-10:]},
+                }
+            )
+        if aged:
+            alerts.append(
+                {
+                    "component": "review",
+                    "severity": "info",
+                    "code": "aged_pending_reviews",
+                    "message": f"{len(aged)} action review item(s) have been pending for more than 7 days.",
+                    "details": {
+                        "count": len(aged),
+                        "stale_after_days": 7,
+                        "actions": {
+                            "mark_resolved": "/ops/reviews/{review_id}/resolve",
+                            "archive": "/ops/reviews/{review_id}/archive",
+                        },
+                        "items": aged[-10:],
+                    },
+                }
+            )
+        return alerts
 
     def _belief_alerts(self) -> list[dict[str, Any]]:
-        summary = self.state_store.read_json("belief_state.json").get("summary", {})
+        state = self.state_store.read_json("belief_state.json")
+        summary = state.get("summary", {}) if isinstance(state.get("summary"), dict) else {}
+        claims = state.get("claims", []) if isinstance(state.get("claims"), list) else []
+        conflict_claims = [item for item in claims if isinstance(item, dict) and str(item.get("status") or "") == "conflict"]
+        current_conflicts = [item for item in conflict_claims if not self._belief_claim_is_stale(item)]
+        stale_conflicts = [item for item in conflict_claims if self._belief_claim_is_stale(item)]
         alerts = []
         conflict = int(summary.get("conflict") or 0)
         stale = int(summary.get("stale") or 0)
-        if conflict:
+        if current_conflicts or (conflict and not conflict_claims):
+            # Fail closed when the summary still reports conflicts but claims
+            # cannot be classified: keep the live disagreement visible.
+            count = len(current_conflicts) or conflict
             alerts.append(
                 {
                     "component": "belief",
                     "severity": "critical",
                     "code": "belief_conflicts",
-                    "message": f"{conflict} belief claim(s) are conflicting.",
-                    "details": summary,
+                    "message": f"{count} belief claim(s) are conflicting.",
+                    "details": {**summary, "current_conflict_count": len(current_conflicts), "stale_conflict_count": len(stale_conflicts)},
+                }
+            )
+        elif stale_conflicts:
+            alerts.append(
+                {
+                    "component": "belief",
+                    "severity": "warning",
+                    "code": "stale_belief_conflicts",
+                    "message": f"{len(stale_conflicts)} conflicting belief claim(s) are past TTL and no longer a live disagreement.",
+                    "details": {**summary, "current_conflict_count": 0, "stale_conflict_count": len(stale_conflicts)},
                 }
             )
         if stale:
@@ -524,6 +572,16 @@ class OpsMonitor:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return (datetime.now(timezone.utc) - parsed).total_seconds()
+
+    def _belief_claim_is_stale(self, claim: dict[str, Any]) -> bool:
+        remaining = claim.get("ttl_remaining_seconds")
+        if isinstance(remaining, (int, float)):
+            return remaining <= 0
+        expires_at = str(claim.get("expires_at") or "")
+        age = self._age_seconds(expires_at)
+        if age is not None:
+            return age > 0
+        return str(claim.get("status") or "").lower() in {"stale", "expired"}
 
     def _review_diagnostic_item(self, item: dict[str, Any]) -> dict[str, Any]:
         created_at = str(item.get("created_at") or "")

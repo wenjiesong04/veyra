@@ -102,6 +102,74 @@ def main() -> int:
         stale_alerts = stale_monitor._model_alerts()
         expect(stale_alerts and stale_alerts[0]["severity"] == "info", "stale failure does not masquerade as current degradation", stale_alerts)
 
+        store.write_json(
+            "belief_state.json",
+            {
+                "summary": {"fresh": 0, "stale": 1, "expired": 0, "conflict": 1, "total": 1},
+                "claims": [
+                    {
+                        "key": "local_system:platform",
+                        "status": "conflict",
+                        "expires_at": (now - timedelta(days=8)).isoformat(),
+                        "ttl_remaining_seconds": -700000,
+                        "claim": "stale probe conflict",
+                    }
+                ],
+            },
+        )
+        store.write_json(
+            "review_queue.json",
+            {
+                "items": [
+                    {
+                        "review_id": "rev_aged",
+                        "status": "pending",
+                        "created_at": (now - timedelta(days=47)).isoformat(),
+                        "task_text": "restart selected agent runtime",
+                        "risk_level": "R4",
+                        "event_id": "evt_aged",
+                    },
+                    {
+                        "review_id": "rev_fresh",
+                        "status": "pending",
+                        "created_at": now.isoformat(),
+                        "task_text": "confirm a living-context fact",
+                        "risk_level": "R3",
+                        "event_id": "evt_fresh",
+                    },
+                ]
+            },
+        )
+        honesty = OpsMonitor(
+            store,
+            agent_status_resolver=lambda: {"connected": True, "status": "available", "updated_at": now.isoformat(), "ttl_seconds": 300},
+            retention_policy=EmptyRetention(),
+            safety_validation=PassingSafety(),
+            model_status_resolver=lambda: {"enabled": True, "configured": True, "validation": {"status": "ok"}},
+        )
+        belief_alerts = honesty._belief_alerts()
+        expect(
+            any(item.get("code") == "stale_belief_conflicts" and item.get("severity") == "warning" for item in belief_alerts),
+            "past-TTL belief conflicts are warning, not critical",
+            belief_alerts,
+        )
+        expect(
+            not any(item.get("code") == "belief_conflicts" for item in belief_alerts),
+            "stale conflicts do not keep the live belief_conflicts critical code",
+            belief_alerts,
+        )
+        review_alerts = honesty._review_alerts()
+        expect(
+            any(item.get("code") == "aged_pending_reviews" and item.get("severity") == "info" for item in review_alerts),
+            "reviews older than 7 days are aged info, not a live warning",
+            review_alerts,
+        )
+        expect(
+            any(item.get("code") == "pending_reviews" and item.get("details", {}).get("count") == 1 for item in review_alerts),
+            "fresh pending reviews remain a warning",
+            review_alerts,
+        )
+
     print("model transport truth smoke passed")
     return 0
 
