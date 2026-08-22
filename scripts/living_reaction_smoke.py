@@ -15,9 +15,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.world_state import WorldStateStore  # noqa: E402
-from interface.living_reaction_contract import FEEDBACK_LABELS  # noqa: E402
-from runtime.living_reaction_policy import apply_feedback_effect  # noqa: E402
+from interface.living_reaction_contract import FEEDBACK_LABELS, ReactionInput  # noqa: E402
+from runtime.living_reaction_policy import apply_feedback_effect, decide_reaction  # noqa: E402
 from runtime.living_reaction_runtime import LivingReactionRuntime  # noqa: E402
+
+# A Need-driven disposition must never reuse the no-material-change sentence:
+# saying nothing needs an interruption while asking a question contradicts the
+# question itself.
+NO_MATERIAL_SIGNAL_COPY = "There is no new material signal that needs an interruption right now."
 
 
 class MutableClock:
@@ -454,6 +459,22 @@ def main() -> int:
             futures = [pool.submit(runtime.evaluate, same_input) for _ in range(8)]
             outcomes = [future.result() for future in as_completed(futures)]
         expect(sum(item["status"] == "recorded" for item in outcomes) == 1 and sum(item["status"] == "duplicate" for item in outcomes) == 7, "concurrent reaction replay is idempotent")
+
+        need_driven = payload(SCENARIOS[0], owner=owner, session=session, situation_id="need_why_now", revision=1, now=clock(), source_available=False, consented=False, material=False)
+        need_driven["information_need"].pop("why_now", None)
+        asked = decide_reaction(ReactionInput.from_mapping(need_driven))
+        expect(asked.disposition == "ask", "an unconsented user Need still asks", asked.disposition)
+        expect(asked.why_now != NO_MATERIAL_SIGNAL_COPY, "an ask never claims that nothing needs an interruption", asked.why_now)
+        expect(bool(asked.why_now.strip()), "an ask still explains why now", asked.why_now)
+
+        bound_need = payload(SCENARIOS[1], owner=owner, session=session, situation_id="need_why_now_bound", revision=1, now=clock(), source_available=False, consented=False, material=False)
+        bound_need["information_need"]["why_now"] = "用户需要先确认这一项才能继续。"
+        bound = decide_reaction(ReactionInput.from_mapping(bound_need))
+        expect(bound.why_now == "用户需要先确认这一项才能继续。", "the Need's own why_now reaches the reaction", bound.why_now)
+
+        no_need = payload(SCENARIOS[2], owner=owner, session=session, situation_id="need_why_now_absent", revision=1, now=clock(), need=False, material=False)
+        quiet_decision = decide_reaction(ReactionInput.from_mapping(no_need))
+        expect(quiet_decision.disposition in {"silent", "wait"}, "no open Need stays non-interrupting", quiet_decision.disposition)
         print("RESULT living reaction smoke passed")
     return 0
 

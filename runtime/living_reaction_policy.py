@@ -198,6 +198,33 @@ def _material_why_now(situation: SituationSnapshot, now: datetime) -> str:
     return "There is no new material signal that needs an interruption right now."
 
 
+def _need_why_now(
+    need: InformationNeedSnapshot | None,
+    situation: SituationSnapshot,
+    now: datetime,
+    disposition: str,
+) -> str:
+    """Explain why an open Need is worth surfacing now.
+
+    A Need-driven disposition must never borrow the material-change fallback:
+    telling the user that nothing needs an interruption while asking them a
+    question contradicts the question itself.
+    """
+
+    if need is not None and need.why_now.strip():
+        return need.why_now.strip()
+    urgency = _deadline_urgency(situation, now)
+    if urgency >= 0.88:
+        return "The relevant deadline is close enough that this open question now affects the outcome."
+    if urgency >= 0.62:
+        return "The relevant deadline is approaching while this question is still open."
+    if disposition == "read":
+        return "An authorised source can answer this open question without interrupting you."
+    if disposition == "wait":
+        return "This question stays open until a better observation point arrives."
+    return "This is the open question currently blocking the next step."
+
+
 def _facts_and_inferences(situation: SituationSnapshot, need: InformationNeedSnapshot | None) -> dict[str, list[str]]:
     facts: list[str] = []
     for item in situation.known[:6]:
@@ -361,7 +388,10 @@ def decide_reaction(reaction: ReactionInput, *, feedback_policy: Mapping[str, An
 
     statement = _material_statement(situation)
     why_matters = situation.goal or situation.summary or "This is part of an active Situation."
-    why_now = _material_why_now(situation, reaction.now)
+    if disposition in {"ask", "read", "wait"} and _need_open(need):
+        why_now = _need_why_now(need, situation, reaction.now, disposition)
+    else:
+        why_now = _material_why_now(situation, reaction.now)
     if disposition == "ask":
         what_happened = f"I still need one piece of information about {situation.title or 'this Situation'}."
         suggested = need.question if need and need.question else "Please fill the most important unknown when convenient."

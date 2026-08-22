@@ -297,6 +297,7 @@ class InformationNeedSnapshot:
     due_at: str | None
     evidence_refs: list[str] = field(default_factory=list)
     category: str = "general"
+    why_now: str = ""
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | None) -> "InformationNeedSnapshot | None":
@@ -329,6 +330,7 @@ class InformationNeedSnapshot:
             due_at=due,
             evidence_refs=refs,
             category=_text(value.get("category") or "general", "information_need.category", limit=120),
+            why_now=_text(value.get("why_now") or "", "information_need.why_now", limit=480),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -344,6 +346,7 @@ class InformationNeedSnapshot:
             "due_at": self.due_at,
             "evidence_refs": list(self.evidence_refs),
             "category": self.category,
+            "why_now": self.why_now,
         }
 
 

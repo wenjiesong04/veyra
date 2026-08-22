@@ -25,6 +25,11 @@ const SERVER_FALLBACK_COPY: Record<string, [string, string]> = {
   "The timing crossed a useful threshold.": ["时间已经到了值得关注的节点。", "The timing crossed a useful threshold."],
   "A relevant signal was observed.": ["观察到一项相关信号。", "A relevant signal was observed."],
   "This is the next useful point to review.": ["这是现在值得重新查看的节点。", "This is the next useful point to review."],
+  "This is the open question currently blocking the next step.": ["这是目前阻塞下一步的待回答问题。", "This is the open question currently blocking the next step."],
+  "The relevant deadline is close enough that this open question now affects the outcome.": ["相关截止时间已经临近，这个待回答问题现在会影响结果。", "The relevant deadline is close enough that this open question now affects the outcome."],
+  "The relevant deadline is approaching while this question is still open.": ["相关截止时间正在临近，而这个问题仍未回答。", "The relevant deadline is approaching while this question is still open."],
+  "An authorised source can answer this open question without interrupting you.": ["已授权的来源可以回答这个问题，不需要打扰你。", "An authorised source can answer this open question without interrupting you."],
+  "This question stays open until a better observation point arrives.": ["这个问题会保持开放，直到出现更合适的观察节点。", "This question stays open until a better observation point arrives."],
 };
 
 /** Translate only an exact, known server fallback; preserve all other text. */
