@@ -735,6 +735,18 @@ class LivingContextOrchestrator:
         }
         consented = {name: bool(value.get("granted")) for name, value in consent.items() if isinstance(value, Mapping)}
         now = _now_utc(self._clock)
+        # A permitted source is only a usable read target when the server can
+        # also derive a bounded request for this exact Need.  Without this the
+        # reaction could report ``read`` for a source whose parameters never
+        # resolve, which strands the Need: the read never runs and the user is
+        # never asked.  Masking availability lets the existing policy fall back
+        # to its declared ask/wait disposition instead.
+        if selected_need is not None:
+            candidate_source = self.source_policy.choose_source(selected_need)
+            if candidate_source and availability.get(candidate_source) and not self.source_policy.can_resolve_parameters(
+                candidate_source, situation=situation, need=selected_need, now=now
+            ):
+                availability[candidate_source] = False
         quiet = bool(self._quiet_hours_resolver(owner_id, session_id, now)) if self._quiet_hours_resolver else False
         reaction_situation = deepcopy(dict(situation))
         raw_semantic = reaction_situation.get("semantic")

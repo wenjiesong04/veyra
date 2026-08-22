@@ -343,6 +343,27 @@ def main() -> int:
         expect(weather.calls == 1 and web.calls == 1, "typed weather and web providers each run once")
         expect(any(item.get("status") == "asked" for item in composition.core.needs.list(owner_id=owner, session_id=session, limit=20)), "ask disposition marks the Need asked")
 
+        # A consented source is only a usable read target when the server can
+        # also derive a bounded request for that exact Need.  Reporting a read
+        # for an underivable request would strand the Need: the read never runs
+        # and the user is never asked.
+        weather_need = {"allowed_source_classes": ["weather"], "evidence_kind": "weather", "blocked_judgment": "conditions at the reported place"}
+        placed = {"semantic": {"entities": [{"kind": "place", "value": "Shanghai", "epistemic_status": "reported"}]}}
+        unplaced = {"semantic": {"entities": []}}
+        inferred_place = {"semantic": {"entities": [{"kind": "place", "value": "Shanghai", "epistemic_status": "inferred"}]}}
+        expect(
+            orchestrator.source_policy.can_resolve_parameters("weather", situation=placed, need=weather_need, now=clock()),
+            "a reported place resolves a bounded weather request",
+        )
+        expect(
+            not orchestrator.source_policy.can_resolve_parameters("weather", situation=unplaced, need=weather_need, now=clock()),
+            "no stated place leaves the weather request underivable",
+        )
+        expect(
+            not orchestrator.source_policy.can_resolve_parameters("weather", situation=inferred_place, need=weather_need, now=clock()),
+            "an inferred place is not a weather source target",
+        )
+
         reaction_count_before_replay = composition.reaction.status().get("reaction_count")
         replay_tick = orchestrator.tick(owner_id=owner, session_id=session, limit=20)
         expect(replay_tick["error_count"] == 0, "replayed bounded tick stays healthy")

@@ -39,6 +39,25 @@ class LivingContextSourcePolicy:
                 return source
         return None
 
+    def can_resolve_parameters(
+        self,
+        source: str,
+        *,
+        situation: Mapping[str, Any],
+        need: Mapping[str, Any],
+        now: datetime,
+    ) -> bool:
+        """Report whether a bounded request can be derived for *source*.
+
+        This is the pure half of :meth:`derive_binding`: it answers whether the
+        server owns enough typed context to build a request at all, without
+        requiring the durable digest/generation that a real binding needs.
+        """
+
+        if not source:
+            return False
+        return self._parameters(source, situation=situation, need=need, now=self._aware(now)) is not None
+
     def derive_binding(
         self,
         *,
