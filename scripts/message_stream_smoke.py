@@ -83,6 +83,9 @@ def main() -> int:
 
         delivered = {
             "status": "delivered",
+            "message_id": "stream-smoke-message",
+            "session_id": "mapped-smoke-session",
+            "event": {"event_id": "event-1"},
             "loop_result": {"event_id": "event-1", "route": "record_only", "status": "recorded", "response": "hello", "risk_level": "R0", "artifacts": {}},
         }
         events = run_case(main_module, delivered)
@@ -90,6 +93,13 @@ def main() -> int:
         assert events[2]["payload"] == main_module._public_message_result(delivered)
         assert events[3]["payload"]["status"] == "recorded"
         assert_no_stream_tokens(events)
+        conversation_id = str(events[2]["payload"].get("conversation_id") or "")
+        conversation = main_module.product_conversation_runtime.get_conversation(
+            conversation_id,
+            owner_id="smoke-user",
+            session_id="mapped-smoke-session",
+        )
+        assert conversation is not None and [item["role"] for item in conversation["messages"]] == ["user", "assistant"]
 
         duplicate = {"status": "duplicate", "previous": {"event_id": "event-1"}}
         duplicate_events = run_case(main_module, duplicate)

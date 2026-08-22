@@ -166,6 +166,7 @@ COGNITIVE_CAPABILITY_SMOKES = [
 ]
 
 PRODUCT_CAPABILITY_SMOKES = [
+    "product_conversation_smoke.py",
     "product_experience_smoke.py",
     "information_need_adversarial_smoke.py",
     "model_boundary_smoke.py",

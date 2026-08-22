@@ -109,6 +109,22 @@ must(files.conversation.includes("living_context") && files.conversation.include
 must(!files.conversation.includes("JSON.stringify(result.artifacts"), "Chat response leaks raw artifacts");
 must(!files.api.includes("JSON.stringify(payload.detail)"), "API error handling leaks raw server details");
 
+// Product Conversation is a server-owned ledger. Browser history can only be
+// used as a migration/offline fallback, never as the conversation identity.
+for (const value of ["getProductConversations", "createProductConversation", "getProductConversation", "productConversationMessages", "/product/conversations?", "/product/conversations/${encodeURIComponent(conversationId)}"]) {
+  must(files.api.includes(value), `conversation API contract is missing ${value}`);
+}
+must(files.api.includes("conversation_id: conversationId") && files.api.includes("conversation_id: conversationId }"), "message requests do not carry the bound conversation_id");
+must(files.api.includes("user_id: scope.user_id") && files.api.includes("session_id: scope.session_id"), "conversation reads are not exact owner/session scoped");
+for (const value of ["serverConversationIdRef", "streamMessage(value", "canonicalConversationId", "activeId", "messageId", "mergeMessages", "seen = new Set"]) {
+  must(files.conversation.includes(value), `conversation ledger binding is missing ${value}`);
+}
+must(files.conversation.includes("setInterval(refresh, 12_000)"), "current conversation is not read-only refreshed every 10-15 seconds");
+must(files.conversation.includes("role === \"proactive\"") && files.conversation.includes("assistantTurn") && files.conversation.includes("Veyra · proactive"), "proactive assistant messages are not rendered as assistant messages");
+must(files.main.includes("getProductConversations") && files.main.includes("serverHistory") && files.main.includes("serverBacked"), "history drawer does not use server conversation summaries");
+must(files.main.includes("setInterval(refresh, 12_000)") && files.main.includes("veyra:refresh-conversations"), "conversation summary list lacks read-only refresh");
+must(files.conversation.includes("Server conversation ledger") && files.conversation.includes("cache is fallback only"), "conversation UI does not disclose server-ledger authority");
+
 for (const key of ["situations", "attention", "suggestions", "commitments", "questions", "waiting"]) must(files.matters.includes(`key: "${key}"`), `legacy Matters is missing ${key} section mapping`);
 must(files.settings.includes("Promise.allSettled") && files.settings.includes("statusReadable"), "Settings does not separate setup/status failures");
 must(files.settings.includes("Local product boundary") && files.settings.includes("本地产品边界") && files.settings.includes("statusLabel(agent.status") && files.settings.includes("statusLabel(feishu.readiness"), "Settings does not use the bounded local boundary and setup state labels");

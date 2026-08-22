@@ -26,6 +26,7 @@ from interface.living_context_contract import LivingContextCandidate, LivingReac
 from runtime.calendar_source import CalendarSource  # noqa: E402
 from runtime.active_loop import ActiveRuntimeLoop  # noqa: E402
 from runtime.living_context_composition import build_living_context_composition  # noqa: E402
+from runtime.product_conversation_runtime import ProductConversationRuntime  # noqa: E402
 from core.living_reaction_feedback_extractor import extract_living_reaction_feedback  # noqa: E402
 from routers.product import build_product_router  # noqa: E402
 from runtime.product_experience import ProductExperienceService  # noqa: E402
@@ -202,11 +203,13 @@ def main() -> int:
         store = WorldStateStore(Path(temp) / "state")
         weather = Provider({"status": "ok", "details": {"location": "Shanghai", "current": {"temperature_2m": 22, "weather_description": "clear"}}}, "weather.fixture.v1")
         web = Provider({"status": "ok", "details": {"results": [{"title": "Public result", "url": "https://example.test/item", "snippet": "bounded public snippet"}]}}, "web.fixture.v1")
+        conversation_runtime = ProductConversationRuntime(store)
         composition = build_living_context_composition(
             store,
             clock=clock,
             source_providers={"weather": weather, "public_web": web},
             calendar_source=CalendarSource(CalendarFixture()),
+            conversation_runtime=conversation_runtime,
         )
         orchestrator = composition.orchestrator
         owner, session = "accept-owner", "accept-session"
@@ -256,6 +259,19 @@ def main() -> int:
             calendar_decision.get("disposition") == "suggest"
             and calendar_decision.get("reason") == "actionable_material_observation",
             "Calendar conflict becomes one proactive suggestion after the read",
+        )
+        calendar_conversation = calendar_item.get("conversation") if isinstance(calendar_item.get("conversation"), dict) else {}
+        bound_conversation = conversation_runtime.create_conversation(
+            owner_id=owner,
+            session_id=session,
+            binding_type="situation",
+            binding_id=ids[0],
+        )
+        expect(
+            calendar_conversation.get("status") == "recorded"
+            and len(bound_conversation.get("messages") or []) == 1
+            and (bound_conversation.get("messages") or [])[0].get("kind") == "proactive",
+            "background material suggestion enters the bound Product Conversation once",
         )
         calendar_catalog = orchestrator.model_catalog(owner_id=owner, session_id=session)
         calendar_row = next(

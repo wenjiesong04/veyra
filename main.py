@@ -51,6 +51,7 @@ from routers.debug_audit import build_debug_audit_router
 from routers.local_setup import build_local_setup_router
 from routers.ops_runtime import build_ops_runtime_router
 from routers.product import build_product_router
+from routers.product_conversations import build_product_conversations_router
 from routers.phase5 import build_phase5_router
 from routers.phase6 import build_phase6_router
 from routers.phase6_extensions import (
@@ -118,6 +119,9 @@ from runtime.read_only_agent_collaboration import (
 )
 from runtime.read_only_cognitive_loop import ReadOnlyCognitiveLoopRuntime
 from runtime.product_experience import ProductExperienceService
+from runtime.product_conversation_runtime import (
+    ProductConversationRuntime,
+)
 from runtime.living_context_composition import build_living_context_composition
 from runtime.extension_spec_quarantine import (
     ExtensionSpecQuarantine,
@@ -472,10 +476,12 @@ active_loop = ActiveRuntimeLoop(
     component_health_producer=_component_health_background_tick,
     workspace_observer=trusted_workspace_observer.run_once,
 )
+product_conversation_runtime = ProductConversationRuntime(state_store)
 living_context_composition = build_living_context_composition(
     state_store,
     weather_probe=awareness_loop.probes.get("weather_probe"),
     search_probe=awareness_loop.probes.get("search_probe"),
+    conversation_runtime=product_conversation_runtime,
 )
 awareness_loop.attach_living_context_runtime(living_context_composition.orchestrator)
 active_loop.attach_living_context(living_context_composition.orchestrator)
@@ -715,6 +721,7 @@ class MessageRequest(BaseModel):
     user_id: str = "local-user"
     session_id: str = "local-session"
     message_id: str | None = None
+    conversation_id: str | None = Field(default=None, max_length=240)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 class ShellRequest(BaseModel):
@@ -972,6 +979,9 @@ app.include_router(
     build_product_router(service=product_experience)
 )
 app.include_router(
+    build_product_conversations_router(product_conversation_runtime)
+)
+app.include_router(
     build_runtime_observability_router(
         trace_recorder=awareness_loop.runtime_trace,
         metrics=routing_metrics,
@@ -1178,11 +1188,16 @@ def _public_message_result(receipt: dict[str, Any]) -> dict[str, Any]:
         return {"event_id": receipt.get("previous", {}).get("event_id"), "route": "duplicate", "status": "duplicate", "response": "Duplicate message ignored.", "risk_level": "R0", "artifacts": receipt}
     if receipt.get("status") != "delivered":
         return {"event_id": None, "route": "block", "status": receipt.get("status"), "response": receipt.get("reason", "Channel intake rejected."), "risk_level": "R0", "artifacts": receipt}
-    return receipt["loop_result"]
+    result = dict(receipt["loop_result"])
+    if receipt.get("conversation_id"):
+        result["conversation_id"] = receipt.get("conversation_id")
+    if isinstance(receipt.get("conversation_recording"), dict):
+        result["conversation_recording"] = receipt["conversation_recording"]
+    return result
 
 
 async def _receive_message(request: MessageRequest) -> dict[str, Any]:
-    return await run_in_threadpool(
+    receipt = await run_in_threadpool(
         intake_gateway.receive_message,
         text=request.text,
         channel=request.channel,
@@ -1191,6 +1206,62 @@ async def _receive_message(request: MessageRequest) -> dict[str, Any]:
         message_id=request.message_id,
         metadata=request.metadata,
     )
+    if receipt.get("status") != "delivered":
+        return receipt
+    loop_result = receipt.get("loop_result")
+    if not isinstance(loop_result, dict):
+        return receipt
+    living = (
+        loop_result.get("artifacts", {}).get("living_context")
+        if isinstance(loop_result.get("artifacts"), dict)
+        else None
+    )
+    situation = living.get("situation") if isinstance(living, dict) else None
+    situation_id = (
+        str(situation.get("situation_id") or "") or None
+        if isinstance(situation, dict)
+        else None
+    )
+    response_values: list[str] = []
+    messages = loop_result.get("messages")
+    if isinstance(messages, list):
+        for item in messages:
+            if isinstance(item, dict) and str(item.get("message") or "").strip():
+                response_values.append(str(item["message"]))
+    if not response_values and str(loop_result.get("response") or "").strip():
+        response_values.append(str(loop_result["response"]))
+    try:
+        record_kwargs = {
+            "owner_id": request.user_id,
+            "session_id": str(receipt.get("session_id") or request.session_id),
+            "text": request.text,
+            "message_id": str(receipt.get("message_id") or request.message_id or receipt.get("event", {}).get("event_id") or ""),
+            "responses": response_values,
+            "conversation_id": request.conversation_id,
+            "situation_id": situation_id,
+            "metadata": {"channel": request.channel, "event_id": receipt.get("event", {}).get("event_id")},
+        }
+        recorded = await run_in_threadpool(
+            product_conversation_runtime.record_foreground_turn,
+            **record_kwargs,
+        )
+        receipt["conversation_id"] = recorded.get("conversation_id")
+        receipt["conversation_recording"] = {
+            "status": recorded.get("status"),
+            "message_count": len(recorded.get("messages") or []),
+            "record_only": True,
+        }
+        loop_result["conversation_id"] = recorded.get("conversation_id")
+    except Exception as exc:
+        # Conversation recording is durable product evidence, but it must not
+        # turn an already completed Veyra response into an execution failure.
+        receipt["conversation_recording"] = {
+            "status": "degraded",
+            "reason": "conversation_recording_failed",
+            "error_type": type(exc).__name__,
+            "record_only": True,
+        }
+    return receipt
 
 
 @app.post("/events/message")
@@ -1210,7 +1281,8 @@ async def message_stream(request: MessageRequest):
     This is intentionally a connection-scoped stream. It exposes accepted and
     processing phases, then the same verified final result as /events/message;
     it never fabricates token deltas or exposes model chain-of-thought. Durable
-    turn replay can be layered on top once the conversation store is available.
+    The verified final turn is appended to the Product Conversation ledger;
+    this transport stream itself remains connection-scoped.
     """
     task = asyncio.create_task(_receive_message(request))
 

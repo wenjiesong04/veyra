@@ -61,6 +61,7 @@ class LivingContextOrchestrator:
         source_policy: LivingContextSourcePolicy | None = None,
         clock: Callable[[], datetime] | None = None,
         quiet_hours_resolver: Callable[[str, str, datetime], bool] | None = None,
+        conversation_runtime: Any | None = None,
     ) -> None:
         self.core = core_runtime
         self.reaction_runtime = reaction_runtime
@@ -68,6 +69,7 @@ class LivingContextOrchestrator:
         self.source_policy = source_policy or LivingContextSourcePolicy()
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._quiet_hours_resolver = quiet_hours_resolver
+        self.conversation_runtime = conversation_runtime
 
     @property
     def needs(self) -> Any:
@@ -298,6 +300,8 @@ class LivingContextOrchestrator:
                                 source_status=status,
                                 attention_trigger=str(applied.get("attention_trigger") or "none"),
                             )
+                    conversation_reaction = item.get("reevaluated") or action
+                    item["conversation"] = self._record_suggest_conversation(conversation_reaction)
                     evaluated.append(item)
             except Exception as exc:
                 errors.append({"owner_id": selected_owner, "session_id": selected_session, "error_type": type(exc).__name__})
@@ -707,6 +711,33 @@ class LivingContextOrchestrator:
             raise StateRevisionConflictError("source consent generation is stale or unavailable")
         revoked = self.source_runtime.revoke_consent(str(current["consent_id"]), user_id=str(owner_id), session_id=str(session_id))
         return {"status": "revoked" if revoked else "unchanged", "source": selected, "consent_id": current["consent_id"], "authority": _authority()}
+
+    def _record_suggest_conversation(self, reaction: Any) -> dict[str, Any]:
+        """Record only a server-owned ``suggest`` reaction in Product Chat.
+
+        Ask/read/wait/silent remain ledger-only reaction outcomes.  Any
+        storage failure is returned as a bounded diagnostic so Product Chat
+        cannot alter Living Context routing or execution semantics.
+        """
+
+        runtime = self.conversation_runtime
+        decision = reaction.get("decision") if isinstance(reaction, Mapping) else None
+        if runtime is None or not isinstance(decision, Mapping):
+            return {"status": "skipped", "reason": "conversation_runtime_unavailable"}
+        if str(decision.get("disposition") or "") != "suggest":
+            return {
+                "status": "ignored",
+                "reason": "reaction_disposition_not_suggest",
+                "disposition": str(decision.get("disposition") or ""),
+            }
+        try:
+            return runtime.record_reaction(decision)
+        except Exception as exc:
+            return {
+                "status": "degraded",
+                "reason": "proactive_conversation_record_failed",
+                "error_type": type(exc).__name__,
+            }
 
     def _evaluate_situation(
         self,

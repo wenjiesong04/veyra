@@ -214,10 +214,115 @@ export async function getProductStatus(): Promise<ProductStatus> {
   return fetchJson<ProductStatus>("/product/status");
 }
 
-export async function sendMessage(text: string, userId: string, sessionId: string, messageId?: string, channel = "api"): Promise<MessageResult> {
+/**
+ * Product conversations are server-owned.  The response parsers deliberately
+ * accept the small envelope variations used by the local runtime while
+ * keeping the stable identifiers explicit at the UI boundary.
+ */
+export type ProductConversationSummary = {
+  conversation_id?: string;
+  id?: string;
+  title?: string;
+  preview?: string;
+  last_message?: string;
+  message_count?: number;
+  created_at?: string;
+  updated_at?: string;
+  user_id?: string;
+  session_id?: string;
+  [key: string]: JsonValue | undefined;
+};
+
+export type ProductConversationMessage = {
+  message_id?: string;
+  id?: string;
+  conversation_id?: string;
+  role?: string;
+  kind?: string;
+  text?: string;
+  content?: string;
+  response?: string;
+  created_at?: string;
+  updated_at?: string;
+  user_id?: string;
+  session_id?: string;
+  [key: string]: JsonValue | undefined;
+};
+
+export type ProductConversationCollection = {
+  status?: string;
+  items?: ProductConversationSummary[];
+  conversations?: ProductConversationSummary[];
+  count?: number;
+  [key: string]: unknown;
+};
+
+export type ProductConversationDetail = {
+  status?: string;
+  conversation?: ProductConversationSummary | null;
+  messages?: ProductConversationMessage[];
+  [key: string]: unknown;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function productConversationRecord(value: unknown): ProductConversationSummary | null {
+  return isRecord(value) ? value as ProductConversationSummary : null;
+}
+
+function productConversationMessageRecord(value: unknown): ProductConversationMessage | null {
+  return isRecord(value) ? value as ProductConversationMessage : null;
+}
+
+export function productConversationId(value: unknown): string {
+  if (!isRecord(value)) return "";
+  const id = value.conversation_id ?? value.id ?? value.conversationId;
+  return typeof id === "string" ? id.trim() : "";
+}
+
+export function productConversationSummaries(payload: unknown): ProductConversationSummary[] {
+  if (Array.isArray(payload)) return payload.map(productConversationRecord).filter((item): item is ProductConversationSummary => item !== null);
+  if (!isRecord(payload)) return [];
+  const rows = Array.isArray(payload.items) ? payload.items : Array.isArray(payload.conversations) ? payload.conversations : [];
+  return rows.map(productConversationRecord).filter((item): item is ProductConversationSummary => item !== null);
+}
+
+export function productConversationMessages(payload: unknown): ProductConversationMessage[] {
+  if (!isRecord(payload) || !Array.isArray(payload.messages)) return [];
+  return payload.messages.map(productConversationMessageRecord).filter((item): item is ProductConversationMessage => item !== null);
+}
+
+function productConversationQuery(scope: ProductScope): string {
+  return scopedQuery(scope);
+}
+
+export async function getProductConversations(scope: ProductScope, options: { signal?: AbortSignal } = {}): Promise<ProductConversationCollection> {
+  const payload = await fetchJson<unknown>(`/product/conversations?${productConversationQuery(scope)}`, { signal: options.signal });
+  return { ...(isRecord(payload) ? payload as ProductConversationCollection : {}), items: productConversationSummaries(payload) };
+}
+
+export async function createProductConversation(scope: ProductScope, options: { title?: string; signal?: AbortSignal } = {}): Promise<ProductConversationDetail | ProductConversationSummary> {
+  const body = options.title?.trim() ? { title: options.title.trim() } : {};
+  return fetchJson<ProductConversationDetail | ProductConversationSummary>(`/product/conversations?${productConversationQuery(scope)}`, {
+    method: "POST",
+    signal: options.signal,
+    body: JSON.stringify(body),
+  });
+}
+
+export async function getProductConversation(conversationId: string, scope: ProductScope, options: { signal?: AbortSignal } = {}): Promise<ProductConversationDetail> {
+  if (!conversationId.trim()) throw new Error("Conversation id is required");
+  const payload = await fetchJson<unknown>(`/product/conversations/${encodeURIComponent(conversationId)}?${productConversationQuery(scope)}`, { signal: options.signal });
+  if (!isRecord(payload)) return { messages: [] };
+  return payload as ProductConversationDetail;
+}
+
+export async function sendMessage(text: string, userId: string, sessionId: string, messageId?: string, channel = "api", conversationId?: string): Promise<MessageResult> {
   return fetchJson<MessageResult>("/events/message", {
     method: "POST",
-    body: JSON.stringify({ text, channel, user_id: userId, session_id: sessionId, ...(messageId ? { message_id: messageId } : {}) })
+    body: JSON.stringify({ text, channel, user_id: userId, session_id: sessionId, ...(messageId ? { message_id: messageId } : {}), ...(conversationId ? { conversation_id: conversationId } : {}) })
   });
 }
 
@@ -245,11 +350,12 @@ export async function streamMessage(
   messageId: string,
   onEvent?: (event: MessageStreamEvent) => void,
   channel = "api",
+  conversationId?: string,
 ): Promise<MessageResult> {
   const response = await fetch(streamTarget(), {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-    body: JSON.stringify({ text, channel, user_id: userId, session_id: sessionId, message_id: messageId }),
+    body: JSON.stringify({ text, channel, user_id: userId, session_id: sessionId, message_id: messageId, ...(conversationId ? { conversation_id: conversationId } : {}) }),
   });
   // A desktop sidecar can briefly run an older bundle while it restarts. Keep
   // the conversation usable, but label this as a synchronous compatibility
@@ -257,7 +363,7 @@ export async function streamMessage(
   if (response.status === 404 || response.status === 405) {
     onEvent?.({ type: "accepted", phase: "accepted", status: "compatibility" });
     onEvent?.({ type: "phase", phase: "processing", status: "synchronous" });
-    const result = await sendMessage(text, userId, sessionId, messageId, channel);
+    const result = await sendMessage(text, userId, sessionId, messageId, channel, conversationId);
     onEvent?.({ type: "message", payload: result });
     onEvent?.({ type: "completed", status: safeText(result.status, "completed") });
     return result;
@@ -268,7 +374,7 @@ export async function streamMessage(
     if (!contentType.includes("json") && body.trim().toLowerCase() === "forbidden") {
       onEvent?.({ type: "accepted", phase: "accepted", status: "compatibility" });
       onEvent?.({ type: "phase", phase: "processing", status: "synchronous" });
-      const result = await sendMessage(text, userId, sessionId, messageId, channel);
+      const result = await sendMessage(text, userId, sessionId, messageId, channel, conversationId);
       onEvent?.({ type: "message", payload: result });
       onEvent?.({ type: "completed", status: safeText(result.status, "completed") });
       return result;
