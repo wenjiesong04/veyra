@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from core.living_context_information_state_policy import (
     UNRESOLVED_SUPPORT_POLICY_VERSION,
+    has_clearly_resolved_statement,
     has_unresolved_statement,
 )
 from interface.living_context_contract import ContextQuote
@@ -216,6 +217,7 @@ def _rejected(code: str, *, issues: list[str] | None = None) -> NeedAnswerSelect
             "reason": code,
             "answered_count": 0,
             "suppressed_unresolved_support_count": 0,
+            "unique_asked_fallback_count": 0,
             "unresolved_support_policy_version": UNRESOLVED_SUPPORT_POLICY_VERSION,
             "issue_codes": selected,
         },
@@ -253,6 +255,7 @@ def select_living_context_need_answers(
                 "reason": "invalid_input",
                 "answered_count": 0,
                 "suppressed_unresolved_support_count": 0,
+                "unique_asked_fallback_count": 0,
                 "unresolved_support_policy_version": UNRESOLVED_SUPPORT_POLICY_VERSION,
             },
         )
@@ -265,6 +268,7 @@ def select_living_context_need_answers(
                 "reason": "candidate_known_empty",
                 "answered_count": 0,
                 "suppressed_unresolved_support_count": 0,
+                "unique_asked_fallback_count": 0,
                 "unresolved_support_policy_version": UNRESOLVED_SUPPORT_POLICY_VERSION,
             },
         )
@@ -303,6 +307,7 @@ def select_living_context_need_answers(
                 "reason": "transport_error",
                 "answered_count": 0,
                 "suppressed_unresolved_support_count": 0,
+                "unique_asked_fallback_count": 0,
                 "unresolved_support_policy_version": UNRESOLVED_SUPPORT_POLICY_VERSION,
             },
         )
@@ -336,7 +341,29 @@ def select_living_context_need_answers(
     suppressed_count = len(raw.answers) - len(accepted_raw_answers)
     if accepted_raw_answers and not source_text:
         return _rejected("empty_source")
-    quote = ContextQuote(text=source_text, start=0, end=len(source_text)) if accepted_raw_answers else None
+    fallback_answer: NeedAnswerBinding | None = None
+    unique_asked_fallback_count = 0
+    if not accepted_raw_answers and source_text.strip():
+        asked_needs = tuple(item for item in needs if item["status"] == "asked")
+        clearly_resolved_known_indices = tuple(
+            index
+            for index, statement in enumerate(knowns)
+            if has_clearly_resolved_statement(statement)
+        )
+        if len(asked_needs) == 1 and len(clearly_resolved_known_indices) == 1:
+            asked_need = asked_needs[0]
+            fallback_answer = NeedAnswerBinding(
+                need_token=asked_need["need_token"],
+                generation=asked_need["generation"],
+                supporting_known_index=clearly_resolved_known_indices[0],
+                source_quote=ContextQuote(text=source_text, start=0, end=len(source_text)),
+            )
+            unique_asked_fallback_count = 1
+    quote = (
+        ContextQuote(text=source_text, start=0, end=len(source_text))
+        if accepted_raw_answers
+        else None
+    )
     answers = tuple(
         NeedAnswerBinding(
             need_token=item.need_token,
@@ -348,6 +375,8 @@ def select_living_context_need_answers(
         )
         for item in accepted_raw_answers
     )
+    if fallback_answer is not None:
+        answers = (*answers, fallback_answer)
     selection = NeedAnswerSelection(answers=answers)
     return NeedAnswerSelectionResult(
         selection=selection,
@@ -356,6 +385,7 @@ def select_living_context_need_answers(
             "status": "accepted",
             "answered_count": len(answers),
             "suppressed_unresolved_support_count": suppressed_count,
+            "unique_asked_fallback_count": unique_asked_fallback_count,
             "unresolved_support_policy_version": UNRESOLVED_SUPPORT_POLICY_VERSION,
             "discard_unknown_count": len(selection.discard_unknown),
             "discard_need_count": len(selection.discard_need_blocked),

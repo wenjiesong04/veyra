@@ -1510,6 +1510,119 @@ def main() -> int:
         and negative_pair_result.metrics.get("suppressed_unresolved_support_count") == 1,
         "positive confirmation remains valid beside its unresolved minimal pair",
     )
+    unique_asked_target = {
+        "need_token": "need_unique_asked_fallback",
+        "generation": 4,
+        "blocked_judgment": "住宿安排",
+        "question": "住宿安排是什么？",
+        "status": "asked",
+    }
+    unique_asked_unresolved_response = copy.deepcopy(selector_true)
+    unique_asked_unresolved_response["living_context_need_answer_selection"]["answers"] = [
+        {
+            "need_token": unique_asked_target["need_token"],
+            "generation": unique_asked_target["generation"],
+            "supporting_known_index": 0,
+            "discard_candidate_unknowns": [],
+            "discard_candidate_need_endpoints": [],
+        }
+    ]
+    unique_asked_known = ["住宿仍未确认", "住宿已经确认"]
+    unique_asked_source = "补充住宿信息"
+    unique_asked_result = select_living_context_need_answers(
+        FakeModelClient([unique_asked_unresolved_response]),
+        user_message=unique_asked_source,
+        open_needs=[unique_asked_target],
+        candidate_known=unique_asked_known,
+    )
+    unique_asked_answer = (
+        unique_asked_result.selection.answers[0]
+        if unique_asked_result.selection is not None
+        and unique_asked_result.selection.answers
+        else None
+    )
+    expect(
+        unique_asked_result.selection is not None
+        and unique_asked_answer is not None
+        and unique_asked_answer.need_token == unique_asked_target["need_token"]
+        and unique_asked_answer.generation == unique_asked_target["generation"]
+        and unique_asked_answer.supporting_known_index == 1
+        and unique_asked_answer.source_quote.text == unique_asked_source
+        and unique_asked_answer.source_quote.start == 0
+        and unique_asked_answer.source_quote.end == len(unique_asked_source)
+        and unique_asked_answer.discard_candidate_unknowns == ()
+        and unique_asked_answer.discard_candidate_need_endpoints == ()
+        and unique_asked_result.metrics.get("answered_count") == 1
+        and unique_asked_result.metrics.get("suppressed_unresolved_support_count") == 1
+        and unique_asked_result.metrics.get("unique_asked_fallback_count") == 1,
+        "unique asked Need fallback binds the only resolved Known with a server quote",
+    )
+    second_asked_target = {
+        **unique_asked_target,
+        "need_token": "need_second_asked_fallback",
+        "generation": 1,
+    }
+    multiple_asked_result = select_living_context_need_answers(
+        FakeModelClient([unique_asked_unresolved_response]),
+        user_message=unique_asked_source,
+        open_needs=[unique_asked_target, second_asked_target],
+        candidate_known=unique_asked_known,
+    )
+    expect(
+        multiple_asked_result.selection is not None
+        and multiple_asked_result.selection.answers == ()
+        and multiple_asked_result.metrics.get("unique_asked_fallback_count") == 0,
+        "unique asked Need fallback stays off when multiple Needs are asked",
+    )
+    multiple_resolved_result = select_living_context_need_answers(
+        FakeModelClient([unique_asked_unresolved_response]),
+        user_message=unique_asked_source,
+        open_needs=[unique_asked_target],
+        candidate_known=["住宿仍未确认", "住宿已经确认", "交通已经安排"],
+    )
+    expect(
+        multiple_resolved_result.selection is not None
+        and multiple_resolved_result.selection.answers == ()
+        and multiple_resolved_result.metrics.get("unique_asked_fallback_count") == 0,
+        "unique asked Need fallback stays off when multiple Known items are resolved",
+    )
+    no_source_result = select_living_context_need_answers(
+        FakeModelClient([unique_asked_unresolved_response]),
+        user_message="",
+        open_needs=[unique_asked_target],
+        candidate_known=unique_asked_known,
+    )
+    expect(
+        no_source_result.selection is not None
+        and no_source_result.selection.answers == ()
+        and no_source_result.metrics.get("suppressed_unresolved_support_count") == 1
+        and no_source_result.metrics.get("unique_asked_fallback_count") == 0,
+        "unique asked Need fallback stays off without source text",
+    )
+    accepted_unique_asked_response = copy.deepcopy(unique_asked_unresolved_response)
+    accepted_unique_asked_response["living_context_need_answer_selection"]["answers"][0][
+        "supporting_known_index"
+    ] = 1
+    accepted_unique_asked_result = select_living_context_need_answers(
+        FakeModelClient([accepted_unique_asked_response]),
+        user_message=unique_asked_source,
+        open_needs=[unique_asked_target],
+        candidate_known=unique_asked_known,
+    )
+    accepted_unique_asked_answer = (
+        accepted_unique_asked_result.selection.answers[0]
+        if accepted_unique_asked_result.selection is not None
+        and accepted_unique_asked_result.selection.answers
+        else None
+    )
+    expect(
+        accepted_unique_asked_result.selection is not None
+        and accepted_unique_asked_answer is not None
+        and accepted_unique_asked_answer.supporting_known_index == 1
+        and accepted_unique_asked_result.metrics.get("answered_count") == 1
+        and accepted_unique_asked_result.metrics.get("unique_asked_fallback_count") == 0,
+        "unique asked Need fallback stays off when a valid answer already exists",
+    )
     direct_policy_cases = tuple(
         ("travel", f"旅行日期{marker}", False, True)
         for marker in ("已确认", "已完成", "已预约", "已确定", "已解决")
