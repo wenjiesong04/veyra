@@ -1,4 +1,4 @@
-import type { JsonValue, ProductQuestion, ProductReaction, ProductSituation } from "./api";
+import type { JsonValue, ProductContext, ProductQuestion, ProductReaction, ProductSituation } from "./api";
 
 export function record(value: unknown): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, JsonValue> : {};
@@ -152,6 +152,13 @@ export function dateLabel(value: unknown, en: boolean): string {
 const STATUS_LABELS: Record<string, [string, string]> = {
   active: ["进行中", "Active"], observed: ["已观察", "Observed"], success: ["可用", "Available"],
   available: ["可用", "Available"], configured: ["已配置", "Configured"], connected: ["已连接", "Connected"],
+  receiving: ["接收中", "Receiving"], processing_failed: ["处理失败", "Processing failed"],
+  waiting_for_event: ["等待消息", "Waiting for message"], waiting_for_message: ["等待消息", "Waiting for message"],
+  connecting: ["连接中", "Connecting"], not_ready: ["未就绪", "Not ready"],
+  configured_not_running: ["已配置但未运行", "Configured, stopped"], gateway_up: ["网关已启动", "Gateway up"],
+  needs_setup: ["需要设置", "Needs setup"], skipped: ["已跳过", "Skipped"], unconfigured: ["尚未配置", "Not configured"],
+  validated: ["已验证", "Validated"], validation_pending: ["验证中", "Validation pending"],
+  not_certified: ["未通过验证", "Not certified"], already_running: ["已在运行", "Already running"],
   empty: ["暂无", "Empty"], waiting: ["等待中", "Waiting"], pending: ["待处理", "Pending"], open: ["待补充", "Open"],
   asked: ["已询问", "Asked"], answered: ["已回答", "Answered"], observing: ["观察中", "Observing"], resolved: ["已解决", "Resolved"],
   terminal: ["已结束", "Closed"], closed: ["已关闭", "Closed"], degraded: ["部分可用", "Degraded"], fail_closed: ["暂不可用", "Unavailable"],
@@ -165,6 +172,24 @@ export function statusLabel(value: unknown, en: boolean): string {
   const raw = text(value, "unknown");
   const normalized = raw.toLowerCase();
   return STATUS_LABELS[normalized]?.[en ? 1 : 0] ?? raw;
+}
+
+export type ProductContextReadiness = {
+  status: string;
+  loading: boolean;
+  ready: boolean;
+  internalScope: { user_id: string; session_id: string } | null;
+};
+
+/** A product read is legal only after Context has named one exact scope. */
+export function productContextReadiness(context: ProductContext | null | undefined, scope: { userId: string; sessionId: string }): ProductContextReadiness {
+  const status = text(context?.status, "loading").toLowerCase();
+  const raw = context?.internal_read_scope;
+  const internalScope = raw && typeof raw.user_id === "string" && raw.user_id.trim() && typeof raw.session_id === "string" && raw.session_id.trim()
+    ? { user_id: raw.user_id, session_id: raw.session_id }
+    : null;
+  const ready = Boolean(internalScope && ["ready", "empty"].includes(status) && internalScope.user_id === scope.userId && internalScope.session_id === scope.sessionId);
+  return { status, loading: !context || status === "loading", ready, internalScope };
 }
 
 const PROGRESS_LABELS: Record<string, [string, string]> = {

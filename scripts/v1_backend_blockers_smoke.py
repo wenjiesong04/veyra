@@ -590,6 +590,7 @@ def need_binding_checks(root: Path) -> None:
     update_row = next(
         row for row in update_catalog if str(row.get("situation_token")) == continuation_situation_id
     )
+    followup_text = "日期确定8月29日，搬家公司已经预约好了；只剩网络迁移未确认。"
     update_payload = seed.model_dump(mode="json")
     update_payload.update(
         {
@@ -608,10 +609,11 @@ def need_binding_checks(root: Path) -> None:
                 ).model_dump(mode="json")
             ],
             "material_change": "搬家公司已经预约好了；只剩网络迁移未确认。",
+            "source_quote": {"text": followup_text, "start": 0, "end": len(followup_text)},
+            "assertion_mode": "direct_user",
         }
     )
     update_candidate = seed.__class__.model_validate(update_payload, strict=True)
-    followup_text = "日期确定8月29日，搬家公司已经预约好了；只剩网络迁移未确认。"
     followup_event = event(
         "unknown-reconciliation-update",
         continuation_owner,
@@ -669,7 +671,7 @@ def need_binding_checks(root: Path) -> None:
                 "unknown-reconciliation-stale-cas",
                 continuation_owner,
                 continuation_session,
-                "搬家安排又补充了一条信息。",
+                followup_text,
             ),
             SimpleNamespace(living_context_candidate=update_candidate, living_reaction_feedback=None),
             catalog=update_catalog,
@@ -782,6 +784,433 @@ def need_binding_checks(root: Path) -> None:
         and all(item in unbound_unknown for item in ("first unresolved detail", "second unresolved detail"))
         and unbound_unknown,
         "unbound multi-unknown answer resolves no guessed endpoint",
+    )
+
+
+def need_endpoint_dedupe_checks(root: Path) -> None:
+    """Exact endpoint dedupe is turn-start based and replay-stable."""
+
+    # A create has no catalog row.  Two same-endpoint candidates in one event
+    # still retain the first item, even when the source class differs.
+    create_store = WorldStateStore(root / "need-endpoint-dedupe-create")
+    create_composition = build_living_context_composition(create_store)
+    create_owner, create_session = "need-dedupe-create-owner", "need-dedupe-create-session"
+    create_fixture = {
+        **FIXTURES[2],
+        "id": "need-dedupe-create-same-event",
+        "unknown": "同一创建终点",
+        "question": "这个创建终点是什么？",
+        "source": "user",
+        "category": "logistics",
+    }
+    create_catalog = create_composition.orchestrator.model_catalog(
+        owner_id=create_owner,
+        session_id=create_session,
+    )
+    create_candidate = candidate(create_fixture, create_catalog)
+    first_need = create_candidate.needs[0]
+    second_need = first_need.model_copy(
+        update={"evidence_kind": "calendar", "allowed_source_classes": ["calendar"]}
+    )
+    create_candidate = create_candidate.model_copy(update={"needs": [first_need, second_need]})
+    create_event = event(
+        "need-dedupe-create-same-event",
+        create_owner,
+        create_session,
+        str(create_fixture["text"]),
+    )
+    create_result = create_composition.orchestrator.process_user_turn(
+        create_event,
+        SimpleNamespace(living_context_candidate=create_candidate, living_reaction_feedback=None),
+        catalog=create_catalog,
+    )
+    create_situation_id = str(create_result["situation"]["situation_id"])
+    create_needs = create_composition.core.needs.list(
+        owner_id=create_owner,
+        session_id=create_session,
+        situation_id=create_situation_id,
+        limit=8,
+    )
+    expect(
+        len(create_needs) == 1
+        and create_needs[0]["evidence_kind"] == first_need.evidence_kind
+        and create_result["need_candidates_deduped"] == 1,
+        "create same-endpoint candidates retain the first Need only",
+    )
+
+    store = WorldStateStore(root / "need-endpoint-dedupe")
+    composition = build_living_context_composition(store)
+    owner, session = "need-dedupe-owner", "need-dedupe-session"
+    endpoint = "同一未知终点"
+    base_fixture = {
+        "id": "need-dedupe-create",
+        "text": "搬家安排仍有一个细节待确认。",
+        "subject": "搬家安排",
+        "category": "logistics",
+        "goal": "保持搬家计划准确",
+        "source": "user",
+        "unknown": endpoint,
+        "question": "这个细节是什么？",
+        "entities": [],
+    }
+    create_catalog = composition.orchestrator.model_catalog(
+        owner_id=owner,
+        session_id=session,
+    )
+    created = composition.orchestrator.process_user_turn(
+        event("need-dedupe-create", owner, session, str(base_fixture["text"])),
+        SimpleNamespace(
+            living_context_candidate=candidate(base_fixture, create_catalog),
+            living_reaction_feedback=None,
+        ),
+        catalog=create_catalog,
+    )
+    situation_id = str(created["situation"]["situation_id"])
+    before = composition.core.needs.list(
+        owner_id=owner,
+        session_id=session,
+        situation_id=situation_id,
+        limit=8,
+    )
+    update_fixture = {
+        **base_fixture,
+        "id": "need-dedupe-update",
+        "text": "搬家安排仍有一个细节待确认，改由日历核对。",
+        "source": "calendar",
+    }
+    update_catalog = composition.orchestrator.model_catalog(
+        owner_id=owner,
+        session_id=session,
+    )
+    update_event = event("need-dedupe-update", owner, session, str(update_fixture["text"]))
+    update_candidate = candidate(update_fixture, update_catalog)
+    updated = composition.orchestrator.process_user_turn(
+        update_event,
+        SimpleNamespace(
+            living_context_candidate=update_candidate,
+            living_reaction_feedback=None,
+        ),
+        catalog=update_catalog,
+    )
+    after = composition.core.needs.list(
+        owner_id=owner,
+        session_id=session,
+        situation_id=situation_id,
+        limit=8,
+    )
+    expect(
+        len(before) == 1
+        and len(after) == 1
+        and after[0]["need_id"] == before[0]["need_id"]
+        and updated["need_candidates_deduped"] == 1,
+        "same active Need endpoint is not admitted as a duplicate record",
+    )
+
+    # Replaying the same event after its Need becomes terminal must use the
+    # original turn-start open_needs row, not mutable live state.  The
+    # admission result and Situation projection therefore remain byte-stable.
+    update_need_id = str(after[0]["need_id"])
+    composition.core.needs.resolve(
+        update_need_id,
+        owner_id=owner,
+        session_id=session,
+        answered_by_event_id="need-dedupe-terminal",
+        expected_generation=int(after[0]["generation"]),
+    )
+    replay_state_paths = (
+        "situation_state.json",
+        "information_need_state.json",
+        "situation_admission_ledger.json",
+    )
+    replay_state_before = {
+        name: store.path_for(name).read_bytes()
+        for name in replay_state_paths
+    }
+    replayed = composition.orchestrator.process_user_turn(
+        update_event,
+        SimpleNamespace(living_context_candidate=update_candidate, living_reaction_feedback=None),
+        catalog=update_catalog,
+    )
+    replay_state_after = {
+        name: store.path_for(name).read_bytes()
+        for name in replay_state_paths
+    }
+    updated_projection = dict(updated["situation"])
+    replayed_projection = dict(replayed["situation"])
+    updated_projection.pop("semantic_replayed", None)
+    replayed_projection.pop("semantic_replayed", None)
+    expect(
+        replayed.get("semantic_replayed") is True
+        and replayed.get("need_candidates_deduped") == updated.get("need_candidates_deduped")
+        and replayed_projection == updated_projection
+        and replay_state_after == replay_state_before,
+        "deduped update replay stays byte-stable after Need terminalization",
+    )
+
+    # A genuinely new turn receives a catalog without the terminal Need and
+    # therefore follows InformationNeedRuntime's existing generation+1 reopen
+    # path instead of being suppressed by endpoint dedupe.
+    reopen_catalog = composition.orchestrator.model_catalog(
+        owner_id=owner,
+        session_id=session,
+    )
+    reopen_fixture = {
+        **base_fixture,
+        "id": "need-dedupe-reopen",
+        "text": "搬家安排又补充了一条同一细节。",
+        "source": "user",
+    }
+    reopened = composition.orchestrator.process_user_turn(
+        event("need-dedupe-reopen", owner, session, str(reopen_fixture["text"])),
+        SimpleNamespace(
+            living_context_candidate=candidate(reopen_fixture, reopen_catalog),
+            living_reaction_feedback=None,
+        ),
+        catalog=reopen_catalog,
+    )
+    reopened_needs = composition.core.needs.list(
+        owner_id=owner,
+        session_id=session,
+        situation_id=situation_id,
+        limit=8,
+    )
+    expect(
+        len(reopened_needs) == 1
+        and reopened_needs[0]["status"] == "open"
+        and int(reopened_needs[0]["generation"]) == 2
+        and reopened.get("need_candidates_deduped") == 0,
+        "new catalog terminal Need reopens with the existing generation semantics",
+    )
+
+
+def resolved_need_suppression_checks(root: Path) -> None:
+    """Resolved Need endpoints are filtered before admission and replay."""
+
+    store = WorldStateStore(root / "resolved-need-suppression")
+    composition = build_living_context_composition(store)
+    owner, session = "resolved-need-owner", "resolved-need-session"
+    fixture = {
+        **FIXTURES[0],
+        "id": "resolved-need-create",
+        "text": "旅行安排补充了已确认日期和一个待确认细节。",
+        "subject": "旅行安排",
+        "category": "travel",
+        "unknown": "待确认的旅行细节",
+        "question": "旅行细节是什么？",
+        "source": "user",
+    }
+    catalog = composition.orchestrator.model_catalog(owner_id=owner, session_id=session)
+    base_candidate = candidate(fixture, catalog)
+    unresolved_need = base_candidate.needs[0].model_copy(
+        update={"blocked_judgment": "待确认的旅行细节"}
+    )
+    resolved_need = base_candidate.needs[0].model_copy(
+        update={"blocked_judgment": "旅行日期已确认"}
+    )
+    create_candidate = base_candidate.model_copy(
+        update={"needs": [resolved_need, unresolved_need]}
+    )
+    created = composition.orchestrator.process_user_turn(
+        event("resolved-need-create", owner, session, str(fixture["text"])),
+        SimpleNamespace(living_context_candidate=create_candidate, living_reaction_feedback=None),
+        catalog=catalog,
+    )
+    situation_id = str(created["situation"]["situation_id"])
+    created_needs = composition.core.needs.list(
+        owner_id=owner,
+        session_id=session,
+        situation_id=situation_id,
+        limit=8,
+    )
+    expect(
+        created.get("need_candidates_resolved_suppressed") == 1
+        and len(created_needs) == 1
+        and created_needs[0]["blocked_judgment"] == unresolved_need.blocked_judgment
+        and created_needs[0]["evidence_kind"] == unresolved_need.evidence_kind
+        and created_needs[0]["question"] == unresolved_need.question,
+        "create suppresses a clearly resolved Need while retaining the unresolved row fields",
+    )
+
+    update_catalog = composition.orchestrator.model_catalog(owner_id=owner, session_id=session)
+    update_fixture = {
+        **fixture,
+        "id": "resolved-need-update",
+        "text": "旅行安排更新为已预约，同时还有一项新的待确认信息。",
+        "unknown": "新的待确认旅行信息",
+        "question": "新的旅行信息是什么？",
+    }
+    update_base = candidate(update_fixture, update_catalog)
+    update_unresolved = update_base.needs[0].model_copy(
+        update={"blocked_judgment": "新的待确认旅行信息"}
+    )
+    update_resolved = update_base.needs[0].model_copy(
+        update={"blocked_judgment": "旅行安排已预约"}
+    )
+    update_candidate = update_base.model_copy(
+        update={"needs": [update_resolved, update_unresolved]}
+    )
+    update_event = event(
+        "resolved-need-update",
+        owner,
+        session,
+        str(update_fixture["text"]),
+    )
+    updated = composition.orchestrator.process_user_turn(
+        update_event,
+        SimpleNamespace(living_context_candidate=update_candidate, living_reaction_feedback=None),
+        catalog=update_catalog,
+    )
+    updated_needs = composition.core.needs.list(
+        owner_id=owner,
+        session_id=session,
+        situation_id=situation_id,
+        limit=8,
+    )
+    expect(
+        updated.get("need_candidates_resolved_suppressed") == 1
+        and any(item["blocked_judgment"] == update_unresolved.blocked_judgment for item in updated_needs)
+        and all(item["blocked_judgment"] not in {"旅行安排已预约", "旅行日期已确认"} for item in updated_needs),
+        "update suppresses resolved endpoints and retains one new unresolved Need",
+    )
+
+    state_paths = (
+        "situation_state.json",
+        "information_need_state.json",
+        "situation_admission_ledger.json",
+    )
+    replay_before = {name: store.path_for(name).read_bytes() for name in state_paths}
+    replayed = composition.orchestrator.process_user_turn(
+        update_event,
+        SimpleNamespace(living_context_candidate=update_candidate, living_reaction_feedback=None),
+        catalog=update_catalog,
+    )
+    replay_after = {name: store.path_for(name).read_bytes() for name in state_paths}
+    expect(
+        replayed.get("semantic_replayed") is True
+        and replayed.get("need_candidates_resolved_suppressed")
+        == updated.get("need_candidates_resolved_suppressed")
+        and replay_after == replay_before,
+        "resolved Need suppression count and exact replay remain stable",
+    )
+
+
+def resolved_unknown_suppression_checks(root: Path) -> None:
+    """Resolved candidate Unknown rows are filtered before semantic projection."""
+
+    store = WorldStateStore(root / "resolved-unknown-suppression")
+    composition = build_living_context_composition(store)
+    owner, session = "resolved-unknown-owner", "resolved-unknown-session"
+    fixture = {
+        **FIXTURES[2],
+        "id": "resolved-unknown-create",
+        "text": "A bounded update includes several information states.",
+        "unknown": "a detail remains pending",
+    }
+    unresolved = [
+        "a detail remains pending",
+        "another detail is unknown",
+        "a third detail is confirmed but not finalized",
+    ]
+    create_catalog = composition.orchestrator.model_catalog(
+        owner_id=owner,
+        session_id=session,
+    )
+    create_candidate = candidate(fixture, create_catalog).model_copy(
+        update={
+            "needs": [],
+            "unknown": [
+                "the first detail is confirmed",
+                unresolved[0],
+                "the second detail is completed",
+                unresolved[1],
+                unresolved[2],
+            ],
+        }
+    )
+    create_result = composition.orchestrator.process_user_turn(
+        event("resolved-unknown-create", owner, session, str(fixture["text"])),
+        SimpleNamespace(
+            living_context_candidate=create_candidate,
+            living_reaction_feedback=None,
+        ),
+        catalog=create_catalog,
+    )
+    created_unknown = (
+        (create_result["situation"].get("semantic") or {}).get("unknown") or []
+    )
+    expect(
+        create_result.get("unknown_candidates_resolved_suppressed") == 2
+        and 0 <= int(create_result.get("unknown_candidates_resolved_suppressed") or 0) <= 12
+        and created_unknown == unresolved,
+        "create suppresses resolved Unknown rows while retaining unresolved order",
+    )
+
+    update_catalog = composition.orchestrator.model_catalog(
+        owner_id=owner,
+        session_id=session,
+    )
+    update_candidate = candidate(fixture, update_catalog).model_copy(
+        update={
+            "needs": [],
+            "unknown": [
+                "the fourth detail is completed",
+                "a new detail remains pending",
+                "a new detail is confirmed but not finalized",
+            ],
+        }
+    )
+    update_event = event(
+        "resolved-unknown-update",
+        owner,
+        session,
+        "A bounded update adds unresolved information.",
+    )
+    updated = composition.orchestrator.process_user_turn(
+        update_event,
+        SimpleNamespace(
+            living_context_candidate=update_candidate,
+            living_reaction_feedback=None,
+        ),
+        catalog=update_catalog,
+    )
+    updated_unknown = (
+        (updated["situation"].get("semantic") or {}).get("unknown") or []
+    )
+    expected_updated_unknown = unresolved + [
+        "a new detail remains pending",
+        "a new detail is confirmed but not finalized",
+    ]
+    expect(
+        updated.get("unknown_candidates_resolved_suppressed") == 1
+        and updated_unknown == expected_updated_unknown,
+        "update suppresses only newly resolved Unknown rows and preserves all unresolved rows",
+    )
+
+    state_paths = (
+        "situation_state.json",
+        "information_need_state.json",
+        "situation_admission_ledger.json",
+    )
+    replay_before = {name: store.path_for(name).read_bytes() for name in state_paths}
+    replayed = composition.orchestrator.process_user_turn(
+        update_event,
+        SimpleNamespace(
+            living_context_candidate=update_candidate,
+            living_reaction_feedback=None,
+        ),
+        catalog=update_catalog,
+    )
+    replay_after = {name: store.path_for(name).read_bytes() for name in state_paths}
+    replayed_unknown = (
+        (replayed["situation"].get("semantic") or {}).get("unknown") or []
+    )
+    expect(
+        replayed.get("semantic_replayed") is True
+        and replayed.get("unknown_candidates_resolved_suppressed")
+        == updated.get("unknown_candidates_resolved_suppressed")
+        and replayed_unknown == updated_unknown
+        and replay_after == replay_before,
+        "resolved Unknown suppression count, ordering, and exact replay remain stable",
     )
 
 
@@ -1289,6 +1718,9 @@ def main() -> int:
         observation_reopen_boundary_checks(root)
         answer_preflight_check(root)
         need_binding_checks(root)
+        need_endpoint_dedupe_checks(root)
+        resolved_need_suppression_checks(root)
+        resolved_unknown_suppression_checks(root)
         feedback_revision_checks(root)
         admission_progress_and_reaction_integrity_checks(root)
     print("V1_BACKEND_BLOCKERS_SMOKE_OK")

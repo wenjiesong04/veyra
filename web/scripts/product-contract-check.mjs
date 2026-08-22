@@ -25,6 +25,8 @@ const files = {
 const must = (condition, message) => { if (!condition) throw new Error(message); };
 must(files.proxy.includes('"/product": "http://127.0.0.1:8000"'), "Vite proxy does not forward /product");
 for (const config of [files.vite, files.desktopVite]) must(/\bproxy\s*:\s*apiProxy\b/.test(config), "Vite proxy contract is incomplete");
+must(files.api.includes("payload.detail === \"Not Found\"") && files.api.includes("Runtime version mismatch"), "generic FastAPI 404 does not identify a runtime-version mismatch");
+must(files.api.includes(": payload.detail;"), "resource-specific API 404 details are not preserved");
 
 // Home is the quiet first-meeting surface; Today is a separate projection.
 must(files.main.includes('route.kind === "home" ? <HomePage'), "root does not mount the quiet HomePage");
@@ -66,6 +68,9 @@ must(!files.conversation.includes("ask an Agent") && !files.conversation.include
 
 // Product navigation and semantic Situation detail.
 for (const value of ["today", "situations", "situation", "chat", "status", "settings", "advanced"]) must(files.main.includes(`"${value}"`), `navigation is missing ${value}`);
+must((files.main.match(/productContext=\{productContext\}/g) ?? []).length >= 2, "Product Context is not passed to Situation detail and Settings");
+must(files.situations.includes("productContextReadiness") && files.situations.includes("!context.ready") && files.situations.includes("requestRef.current.controller?.abort"), "Situations reads are not fenced by exact Product Context and stale-request aborts");
+must(files.sources.includes("productContextReadiness") && files.sources.includes("context.ready && data") && files.sources.includes("requestRef.current.controller?.abort"), "Product Sources reads are not fenced by exact Product Context and stale-request aborts");
 for (const value of ["getProductSituations", "getProductSituation", "commandProductSituation", "expected_revision", "known", "unknown", "assumptions", "timeline", "evidence_refs", "evidence", "source", "kind", "status", "epistemic", "freshness", "fresh_until", "ttl_seconds", "snippet", "next_observation_at"]) must(files.situations.includes(value), `Situation contract is missing ${value}`);
 must(files.situations.includes("strings(detail.unknown") && files.situations.includes("Unknown · open questions"), "Situation detail does not render unresolved unknowns");
 must(files.situations.includes("evidenceProjection") && files.situations.includes("safeEvidenceText"), "Situation evidence is not projected through the safe renderer");
@@ -78,6 +83,8 @@ must(files.home.includes("<ProductQuestions") && files.home.includes("<ProductRe
 
 // Sources remain status-first and honest about unsupported consent authority.
 for (const value of ["getProductSources", "consentProductSource", "revokeProductSource", "expected_generation", "calendar", "weather", "public_web"]) must(files.sources.includes(value) || files.api.includes(value), `Sources contract is missing ${value}`);
+must(files.sources.includes("Information source access") && files.sources.includes("信息来源授权"), "Source access card title does not state its consent boundary");
+must(files.sources.includes("Configure first") && files.sources.includes("Permission denied") && files.sources.includes("aria-describedby"), "Disabled source consent lacks a direct label and accessible reason");
 must(files.sources.includes("Agent research is disabled") || files.sources.includes("Agent research"), "Sources does not disclose Agent research boundary");
 must(files.sources.includes("Email") && !files.sources.includes('id: "email"'), "Email must remain outside the supported source list");
 for (const value of ["configured", "system_permission", "consented", "available", "can_request", "Permission denied; revoke consent"]) must(files.sources.includes(value), `Sources UI does not preserve ${value} boundary`);
@@ -93,5 +100,7 @@ must(!files.api.includes("JSON.stringify(payload.detail)"), "API error handling 
 
 for (const key of ["situations", "attention", "suggestions", "commitments", "questions", "waiting"]) must(files.matters.includes(`key: "${key}"`), `legacy Matters is missing ${key} section mapping`);
 must(files.settings.includes("Promise.allSettled") && files.settings.includes("statusReadable"), "Settings does not separate setup/status failures");
+must(files.settings.includes("Local product boundary") && files.settings.includes("本地产品边界") && files.settings.includes("statusLabel(agent.status") && files.settings.includes("statusLabel(feishu.readiness"), "Settings does not use the bounded local boundary and setup state labels");
+for (const value of ["waiting_for_event", "processing_failed", "configured_not_running", "receiving"]) must(files.productShared.includes(value), `setup state allow-list is missing ${value}`);
 must(files.productCss.includes("@media (max-width:760px)") && files.productCss.includes("grid-template-columns:repeat(6") && files.productCss.includes("productExplainGrid"), "390px product layout contract is incomplete");
 console.log("product frontend contract checks passed");

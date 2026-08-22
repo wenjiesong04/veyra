@@ -31,7 +31,12 @@ export async function fetchJson<T>(url: string, options?: RequestInit): Promise<
         if (typeof payload.message === "string" && payload.message.trim()) {
           detail = payload.message;
         } else if (typeof payload.detail === "string" && payload.detail.trim()) {
-          detail = payload.detail;
+          // FastAPI's generic 404 is the one response that does not identify
+          // a product resource. Treat it as a stale frontend/backend pair,
+          // while preserving resource-specific 404 details for the caller.
+          detail = response.status === 404 && contentType.includes("json") && payload.detail === "Not Found"
+            ? "Runtime version mismatch: the frontend and running Veyra backend are different revisions. / 运行版本不匹配：当前前端与正在运行的 Veyra 后端不是同一版本。"
+            : payload.detail;
         } else if (payload.detail !== undefined) {
           // Product surfaces must never render raw server objects, paths, or
           // opaque tokens. Keep the status useful without leaking the body.

@@ -176,6 +176,7 @@ PRODUCT_CAPABILITY_SMOKES = [
     "living_context_adversarial_smoke.py",
     "living_context_awareness_smoke.py",
     "living_context_understanding_smoke.py",
+    "v1_living_context_generalization_smoke.py",
     "living_reaction_smoke.py",
     "living_reaction_retention_smoke.py",
     "living_source_smoke.py",

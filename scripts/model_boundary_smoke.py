@@ -20,11 +20,21 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.living_context_candidate_extractor import extract_living_context_candidate  # noqa: E402
+from core.living_context_information_state_policy import (  # noqa: E402
+    INFORMATION_STATE_POLICY_VERSION,
+    has_clearly_resolved_statement,
+    has_unresolved_statement,
+)
+from core.living_context_need_answer_selector import (  # noqa: E402
+    NEED_ANSWER_SCHEMA_VERSION,
+    select_living_context_need_answers,
+)
 from core.living_reaction_feedback_extractor import (  # noqa: E402
     extract_living_reaction_feedback,
 )
 from core.understanding_core import UnderstandingCore  # noqa: E402
 from interface.living_context_contract import (  # noqa: E402
+    ContextQuote,
     LivingContextCandidate,
     parse_living_context_candidate_detailed,
     parse_living_reaction_feedback_detailed,
@@ -326,6 +336,136 @@ def main() -> int:
         and "situation_revision:create_absent" in aliased_report["repaired_fields"],
         "create aliases receive create transport defaults before strict validation",
     )
+    ordinary_correct_alias = copy.deepcopy(candidate_payload(category="travel"))
+    ordinary_correct_alias.update(
+        {
+            "disposition": "纠正",
+            "situation_token": "sit_child_need_update",
+            "situation_revision": 2,
+            "catalog_token": "cat_child_need_update",
+            "lifecycle": "active",
+        }
+    )
+    ordinary_correct_alias.pop("assertion_mode")
+    downgraded_candidate, downgraded_issues, downgraded_report = (
+        parse_living_context_candidate_detailed(ordinary_correct_alias)
+    )
+    expect(
+        downgraded_candidate is not None
+        and not downgraded_issues
+        and downgraded_candidate.disposition == "update"
+        and downgraded_candidate.lifecycle == "active"
+        and downgraded_candidate.assertion_mode == "inferred"
+        and downgraded_report["repaired_fields"].count(
+            "disposition:lifecycle_authority_downgraded_to_update"
+        )
+        == 1,
+        "ordinary non-terminal correct alias downgrades to update with one fixed repair marker",
+    )
+    missing_reopen_correct = copy.deepcopy(ordinary_correct_alias)
+    missing_reopen_correct.pop("reopen")
+    missing_reopen_candidate, missing_reopen_issues, missing_reopen_report = (
+        parse_living_context_candidate_detailed(missing_reopen_correct)
+    )
+    expect(
+        missing_reopen_candidate is not None
+        and not missing_reopen_issues
+        and missing_reopen_candidate.disposition == "update"
+        and missing_reopen_candidate.reopen is False
+        and missing_reopen_report["repaired_fields"].count(
+            "disposition:lifecycle_authority_downgraded_to_update"
+        )
+        == 1,
+        "ordinary non-terminal correct without reopen field still downgrades to update",
+    )
+    for non_terminal in ("emerging", "waiting"):
+        non_terminal_correct = copy.deepcopy(ordinary_correct_alias)
+        non_terminal_correct["disposition"] = "correct"
+        non_terminal_correct["lifecycle"] = non_terminal
+        non_terminal_candidate, non_terminal_issues, non_terminal_report = (
+            parse_living_context_candidate_detailed(non_terminal_correct)
+        )
+        expect(
+            non_terminal_candidate is not None
+            and not non_terminal_issues
+            and non_terminal_candidate.disposition == "update"
+            and non_terminal_candidate.lifecycle == non_terminal
+            and non_terminal_report["repaired_fields"].count(
+                "disposition:lifecycle_authority_downgraded_to_update"
+            )
+            == 1,
+            f"non-terminal lifecycle {non_terminal} also permits only the bounded correct-to-update downgrade",
+        )
+    resolve_without_assertion = copy.deepcopy(ordinary_correct_alias)
+    resolve_without_assertion["disposition"] = "解决"
+    resolve_candidate, resolve_issues, resolve_report = parse_living_context_candidate_detailed(
+        resolve_without_assertion
+    )
+    expect(
+        resolve_candidate is not None
+        and not resolve_issues
+        and resolve_candidate.disposition == "update"
+        and resolve_report["repaired_fields"].count(
+            "disposition:lifecycle_authority_downgraded_to_update"
+        )
+        == 1,
+        "ordinary non-terminal resolve alias downgrades to update without lifecycle authority",
+    )
+    terminal_correct = copy.deepcopy(ordinary_correct_alias)
+    terminal_correct["disposition"] = "resolve"
+    terminal_correct["lifecycle"] = "resolved"
+    terminal_candidate, terminal_issues, terminal_report = parse_living_context_candidate_detailed(
+        terminal_correct
+    )
+    expect(
+        terminal_candidate is None
+        and any("lifecycle_assertion_missing" in issue for issue in terminal_issues)
+        and "disposition:lifecycle_authority_downgraded_to_update"
+        not in terminal_report["repaired_fields"],
+        "terminal resolve lifecycle is never downgraded without lifecycle authority",
+    )
+    reopen_correct = copy.deepcopy(ordinary_correct_alias)
+    reopen_correct["disposition"] = "correct"
+    reopen_correct["reopen"] = True
+    reopen_correct["reopen_reason"] = "用户明确要求重新打开"
+    reopen_candidate, reopen_issues, reopen_report = parse_living_context_candidate_detailed(
+        reopen_correct
+    )
+    expect(
+        reopen_candidate is None
+        and any("lifecycle_assertion_missing" in issue for issue in reopen_issues)
+        and "disposition:lifecycle_authority_downgraded_to_update"
+        not in reopen_report["repaired_fields"],
+        "reopen candidates are never downgraded by the ordinary lifecycle repair",
+    )
+    null_reopen_correct = copy.deepcopy(ordinary_correct_alias)
+    null_reopen_correct["reopen"] = None
+    null_reopen_candidate, null_reopen_issues, null_reopen_report = (
+        parse_living_context_candidate_detailed(null_reopen_correct)
+    )
+    expect(
+        null_reopen_candidate is None
+        and any("lifecycle_assertion_missing" in issue for issue in null_reopen_issues)
+        and "disposition:lifecycle_authority_downgraded_to_update"
+        not in null_reopen_report["repaired_fields"],
+        "null reopen is not treated as the explicit false value for downgrade",
+    )
+    for assertion_mode in ("server_command", "direct_user"):
+        asserted_correct = copy.deepcopy(ordinary_correct_alias)
+        asserted_correct["disposition"] = "correct"
+        asserted_correct["assertion_mode"] = assertion_mode
+        asserted_candidate, asserted_issues, asserted_report = parse_living_context_candidate_detailed(
+            asserted_correct
+        )
+        expect(
+            asserted_candidate is not None
+            and not asserted_issues
+            and asserted_candidate.disposition == "correct"
+            and asserted_candidate.assertion_mode == assertion_mode
+            and "disposition:lifecycle_authority_downgraded_to_update"
+            not in asserted_report["repaired_fields"],
+            f"{assertion_mode} lifecycle authority prevents lifecycle downgrading",
+        )
     create_with_old_binding = copy.deepcopy(defaulted_create)
     create_with_old_binding.update(
         {
@@ -1126,15 +1266,16 @@ def main() -> int:
         "post-full-repair recovery has no duplicate semantic repair or infinite calls",
     )
 
+    envelope_client = FakeModelClient(
+        [
+            {
+                "status": "model_assisted",
+                "living_context_candidate": candidate_payload(category="travel"),
+            }
+        ]
+    )
     envelope_extraction = extract_living_context_candidate(
-        FakeModelClient(
-            [
-                {
-                    "status": "model_assisted",
-                    "living_context_candidate": candidate_payload(category="travel"),
-                }
-            ]
-        ),
+        envelope_client,
         text=text,
     )
     expect(
@@ -1142,6 +1283,511 @@ def main() -> int:
         and envelope_extraction.metrics.get("status") in {"accepted", "repaired"},
         "candidate extractor accepts its explicit envelope contract",
     )
+    selector_target = {
+        "need_token": "need_selector_target",
+        "generation": 3,
+        "blocked_judgment": "住宿安排",
+        "question": "住宿安排是什么？",
+        "status": "open",
+    }
+    selector_text = "住宿已经确认"
+    selector_known = ["用户确认住宿已经安排"]
+    selector_true = {
+        "status": "model_assisted",
+        "living_context_need_answer_selection": {
+            "schema_version": NEED_ANSWER_SCHEMA_VERSION,
+            "answers": [
+                {
+                    "need_token": selector_target["need_token"],
+                    "generation": selector_target["generation"],
+                    "supporting_known_index": 0,
+                    "discard_candidate_unknowns": ["住宿仍未确认"],
+                    "discard_candidate_need_endpoints": ["住宿待确认"],
+                }
+            ],
+        },
+    }
+    selector_true_client = FakeModelClient([selector_true, selector_true])
+    selector_true_result = select_living_context_need_answers(
+        selector_true_client,
+        user_message=selector_text,
+        open_needs=[selector_target],
+        candidate_known=selector_known,
+        candidate_unknown=["住宿仍未确认", "交通仍未确认"],
+        candidate_need_blocked=["住宿待确认", "交通待确认"],
+    )
+    selected_answer = selector_true_result.selection.answers[0] if selector_true_result.selection else None
+    expect(
+        selector_true_result.selection is not None
+        and selected_answer is not None
+        and selected_answer.need_token == selector_target["need_token"]
+        and selected_answer.supporting_known_index == 0
+        and selected_answer.source_quote.text == selector_text
+        and selector_true_client.users[0]["candidate_known"] == selector_known
+        and selector_true_result.selection.discard_unknown == ("住宿仍未确认",)
+        and selector_true_result.selection.discard_need_blocked == ("住宿待确认",)
+        and selector_true_client.call_count == 1,
+        "Need-answer batch validates exact references, discards, and server quote",
+    )
+    unresolved_policy_targets = [
+        {
+            "need_token": "need_policy_travel",
+            "generation": 1,
+            "blocked_judgment": "旅行日期",
+            "question": "旅行日期是什么？",
+            "status": "open",
+        },
+        {
+            "need_token": "need_policy_health",
+            "generation": 1,
+            "blocked_judgment": "检查结果",
+            "question": "检查结果是什么？",
+            "status": "open",
+        },
+        {
+            "need_token": "need_policy_finance",
+            "generation": 1,
+            "blocked_judgment": "转账状态",
+            "question": "转账状态是什么？",
+            "status": "open",
+        },
+    ]
+    unresolved_policy_response = {
+        "status": "model_assisted",
+        "living_context_need_answer_selection": {
+            "schema_version": NEED_ANSWER_SCHEMA_VERSION,
+            "answers": [
+                {
+                    "need_token": "need_policy_travel",
+                    "generation": 1,
+                    "supporting_known_index": 0,
+                    "discard_candidate_unknowns": ["旅行日期尚未确认"],
+                    "discard_candidate_need_endpoints": ["旅行日期待确认"],
+                },
+                {
+                    "need_token": "need_policy_health",
+                    "generation": 1,
+                    "supporting_known_index": 1,
+                    "discard_candidate_unknowns": ["检查结果不确定"],
+                    "discard_candidate_need_endpoints": ["检查结果待确认"],
+                },
+                {
+                    "need_token": "need_policy_finance",
+                    "generation": 1,
+                    "supporting_known_index": 2,
+                    "discard_candidate_unknowns": ["转账状态仍未确认"],
+                    "discard_candidate_need_endpoints": ["转账状态待定"],
+                },
+            ],
+        },
+    }
+    unresolved_policy_result = select_living_context_need_answers(
+        FakeModelClient([unresolved_policy_response]),
+        user_message="补充三项状态",
+        open_needs=unresolved_policy_targets,
+        candidate_known=[
+            "The travel date is still unknown",
+            "检查结果已经确认",
+            "The transfer is pending",
+        ],
+        candidate_unknown=["旅行日期尚未确认", "检查结果不确定", "转账状态仍未确认"],
+        candidate_need_blocked=["旅行日期待确认", "检查结果待确认", "转账状态待定"],
+    )
+    policy_answers = (
+        unresolved_policy_result.selection.answers
+        if unresolved_policy_result.selection is not None
+        else ()
+    )
+    expect(
+        unresolved_policy_result.selection is not None
+        and len(policy_answers) == 1
+        and policy_answers[0].need_token == "need_policy_health"
+        and policy_answers[0].supporting_known_index == 1
+        and unresolved_policy_result.selection.discard_unknown == ("检查结果不确定",)
+        and unresolved_policy_result.selection.discard_need_blocked == ("检查结果待确认",)
+        and unresolved_policy_result.metrics.get("status") == "accepted"
+        and unresolved_policy_result.metrics.get("suppressed_unresolved_support_count") == 2,
+        "versioned policy suppresses unresolved travel and finance support while retaining health",
+    )
+    unresolved_policy_markers = (
+        "the result is still unknown",
+        "the result is unconfirmed",
+        "the result is not yet known",
+        "the result is pending",
+        "we are waiting for confirmation",
+        "the result is TBD",
+        "结果尚未确认",
+        "结果还没确认",
+        "结果仍未确认",
+        "结果未确认",
+        "结果没有确认",
+        "结果未知",
+        "结果待定",
+        "结果待确认",
+        "结果不确定",
+        "结果未完成",
+    )
+    for marker in unresolved_policy_markers:
+        marker_response = {
+            "status": "model_assisted",
+            "living_context_need_answer_selection": {
+                "schema_version": NEED_ANSWER_SCHEMA_VERSION,
+                "answers": [
+                    {
+                        "need_token": "need_policy_marker",
+                        "generation": 1,
+                        "supporting_known_index": 0,
+                        "discard_candidate_unknowns": ["must remain"],
+                        "discard_candidate_need_endpoints": ["must remain"],
+                    }
+                ],
+            },
+        }
+        marker_result = select_living_context_need_answers(
+            FakeModelClient([marker_response]),
+            user_message="状态补充",
+            open_needs=[
+                {
+                    "need_token": "need_policy_marker",
+                    "generation": 1,
+                    "blocked_judgment": "状态",
+                    "question": "状态是什么？",
+                    "status": "open",
+                }
+            ],
+            candidate_known=[marker],
+            candidate_unknown=["must remain"],
+            candidate_need_blocked=["must remain"],
+        )
+        expect(
+            marker_result.selection is not None
+            and marker_result.selection.answers == ()
+            and marker_result.selection.discard_unknown == ()
+            and marker_result.selection.discard_need_blocked == ()
+            and marker_result.metrics.get("suppressed_unresolved_support_count") == 1,
+            f"generic unresolved-support marker is suppressed: {marker}",
+        )
+    positive_confirmation = copy.deepcopy(unresolved_policy_response)
+    positive_confirmation["living_context_need_answer_selection"]["answers"] = [
+        {
+            "need_token": "need_policy_pair",
+            "generation": 1,
+            "supporting_known_index": 0,
+            "discard_candidate_unknowns": ["pair unknown"],
+            "discard_candidate_need_endpoints": ["pair pending"],
+        }
+    ]
+    positive_pair_target = {
+        "need_token": "need_policy_pair",
+        "generation": 1,
+        "blocked_judgment": "confirmation",
+        "question": "What is the confirmation?",
+        "status": "open",
+    }
+    positive_pair_result = select_living_context_need_answers(
+        FakeModelClient([positive_confirmation]),
+        user_message="The travel date is confirmed",
+        open_needs=[positive_pair_target],
+        candidate_known=["The travel date is confirmed"],
+        candidate_unknown=["pair unknown"],
+        candidate_need_blocked=["pair pending"],
+    )
+    negative_pair = copy.deepcopy(positive_confirmation)
+    negative_pair_result = select_living_context_need_answers(
+        FakeModelClient([negative_pair]),
+        user_message="The travel date is still unconfirmed",
+        open_needs=[positive_pair_target],
+        candidate_known=["The travel date is still unconfirmed"],
+        candidate_unknown=["pair unknown"],
+        candidate_need_blocked=["pair pending"],
+    )
+    expect(
+        positive_pair_result.selection is not None
+        and len(positive_pair_result.selection.answers) == 1
+        and positive_pair_result.metrics.get("suppressed_unresolved_support_count") == 0
+        and negative_pair_result.selection is not None
+        and negative_pair_result.selection.answers == ()
+        and negative_pair_result.metrics.get("suppressed_unresolved_support_count") == 1,
+        "positive confirmation remains valid beside its unresolved minimal pair",
+    )
+    direct_policy_cases = tuple(
+        ("travel", f"旅行日期{marker}", False, True)
+        for marker in ("已确认", "已完成", "已预约", "已确定", "已解决")
+    ) + tuple(
+        ("health", f"the result is {marker}", False, True)
+        for marker in ("confirmed", "completed", "booked", "finalized", "resolved", "done")
+    ) + (
+        ("travel", "旅行日期尚未确认", True, False),
+        ("health", "检查结果 not confirmed", True, False),
+        ("finance", "转账状态 pending", True, False),
+    )
+    expect(
+        INFORMATION_STATE_POLICY_VERSION.endswith(".v1")
+        and all(
+            has_unresolved_statement(statement) == unresolved
+            and has_clearly_resolved_statement(statement) == resolved
+            for _category, statement, unresolved, resolved in direct_policy_cases
+        ),
+        "generic state policy covers travel health finance affirmative and unresolved forms",
+    )
+    non_affirmative_policy_pairs = (
+        ("旅行日期已确认", "旅行日期是否已确认"),
+        ("检查结果已完成", "如果检查结果已完成"),
+        ("转账状态已确定", "若转账状态已确定"),
+        ("搬家安排已预约", "搬家安排将预约"),
+        ("工作计划已安排", "工作计划会安排"),
+        ("体检已完成", "体检需要完成"),
+        ("考试安排已落实", "考试安排应该已落实"),
+        ("会议已确认", "会议可能已确认"),
+        ("the travel date is confirmed", "whether the travel date is confirmed"),
+        ("the health result is completed", "if the health result is completed"),
+        ("the transfer is settled", "once the transfer is settled"),
+        ("the move is booked", "the move will be booked"),
+        ("the work plan is approved", "the work plan needs to be approved"),
+        ("the checkup is completed", "the checkup should be completed"),
+        ("the appointment is scheduled", "the appointment may be scheduled"),
+        ("the date is finalized", "the date is finalized?"),
+    )
+    expect(
+        all(
+            has_clearly_resolved_statement(affirmative)
+            and not has_clearly_resolved_statement(non_affirmative)
+            for affirmative, non_affirmative in non_affirmative_policy_pairs
+        ),
+        "interrogative conditional future modal and requirement guards preserve affirmative state pairs",
+    )
+    expect(
+        has_unresolved_statement("旅行日期已确认但尚未完成")
+        and not has_clearly_resolved_statement("旅行日期已确认但尚未完成")
+        and not has_unresolved_statement("the date is not pending")
+        and has_clearly_resolved_statement("the date is not pending"),
+        "unresolved state takes precedence over resolved markers and direct negation stays affirmative",
+    )
+    selector_second_target = {
+        "need_token": "need_selector_second",
+        "generation": 1,
+        "blocked_judgment": "交通安排",
+        "question": "交通安排是什么？",
+        "status": "open",
+    }
+    shared_known = copy.deepcopy(selector_true)
+    shared_known["living_context_need_answer_selection"]["answers"] = [
+        {
+            "need_token": selector_target["need_token"],
+            "generation": selector_target["generation"],
+            "supporting_known_index": 0,
+            "discard_candidate_unknowns": [],
+            "discard_candidate_need_endpoints": [],
+        },
+        {
+            "need_token": selector_second_target["need_token"],
+            "generation": selector_second_target["generation"],
+            "supporting_known_index": 0,
+            "discard_candidate_unknowns": [],
+            "discard_candidate_need_endpoints": [],
+        },
+    ]
+    shared_known_result = select_living_context_need_answers(
+        FakeModelClient([shared_known]),
+        user_message=selector_text,
+        open_needs=[selector_target, selector_second_target],
+        candidate_known=["用户确认住宿已经安排", "用户确认交通已经安排"],
+    )
+    expect(
+        shared_known_result.selection is None
+        and shared_known_result.metrics.get("reason") == "supporting_known_index_duplicate",
+        "Need-answer batch rejects two answers sharing one Known index",
+    )
+    missing_known_index = copy.deepcopy(selector_true)
+    missing_known_index["living_context_need_answer_selection"]["answers"][0].pop(
+        "supporting_known_index"
+    )
+    missing_known_index_result = select_living_context_need_answers(
+        FakeModelClient([missing_known_index]),
+        user_message=selector_text,
+        open_needs=[selector_target],
+        candidate_known=selector_known,
+    )
+    expect(
+        missing_known_index_result.selection is None
+        and missing_known_index_result.metrics.get("reason") == "selection_invalid",
+        "Need-answer batch rejects an answer missing its Known index",
+    )
+    out_of_range_known_index = copy.deepcopy(selector_true)
+    out_of_range_known_index["living_context_need_answer_selection"]["answers"][0][
+        "supporting_known_index"
+    ] = 1
+    out_of_range_known_index_result = select_living_context_need_answers(
+        FakeModelClient([out_of_range_known_index]),
+        user_message=selector_text,
+        open_needs=[selector_target],
+        candidate_known=selector_known,
+    )
+    expect(
+        out_of_range_known_index_result.selection is None
+        and out_of_range_known_index_result.metrics.get("reason")
+        == "supporting_known_index_out_of_range",
+        "Need-answer batch rejects a Known index outside the candidate list",
+    )
+    empty_known_client = FakeModelClient([selector_true])
+    empty_known_result = select_living_context_need_answers(
+        empty_known_client,
+        user_message=selector_text,
+        open_needs=[selector_target],
+        candidate_known=[],
+        candidate_unknown=["住宿仍未确认"],
+        candidate_need_blocked=["住宿待确认"],
+    )
+    expect(
+        empty_known_result.selection is None
+        and empty_known_result.metrics.get("reason") == "candidate_known_empty"
+        and empty_known_client.call_count == 0,
+        "Need-answer batch refuses selection when the candidate Known list is empty",
+    )
+    root_batch = copy.deepcopy(selector_true)
+    root_payload = root_batch.pop("living_context_need_answer_selection")
+    root_batch.update(root_payload)
+    root_batch_result = select_living_context_need_answers(
+        FakeModelClient([root_batch]),
+        user_message=selector_text,
+        open_needs=[selector_target],
+        candidate_known=selector_known,
+        candidate_unknown=["住宿仍未确认", "交通仍未确认"],
+        candidate_need_blocked=["住宿待确认", "交通待确认"],
+    )
+    expect(
+        root_batch_result.selection is not None
+        and len(root_batch_result.selection.answers) == 1,
+        "Need-answer batch accepts only its exact closed root transport form",
+    )
+    selector_false_client = FakeModelClient(
+        [
+            {
+                "status": "model_assisted",
+                "living_context_need_answer_selection": {
+                    "schema_version": NEED_ANSWER_SCHEMA_VERSION,
+                    "answers": [],
+                },
+            }
+        ]
+    )
+    selector_false_result = select_living_context_need_answers(
+        selector_false_client,
+        user_message="我还没确认",
+        open_needs=[selector_target],
+        candidate_known=selector_known,
+        candidate_unknown=["住宿仍未确认"],
+        candidate_need_blocked=["住宿待确认"],
+    )
+    expect(
+        selector_false_result.selection is not None
+        and selector_false_result.selection.answers == ()
+        and selector_false_result.selection.discard_unknown == ()
+        and selector_false_client.call_count == 1,
+        "Need-answer batch preserves an empty decision without discards",
+    )
+    for malformed in (
+        {"status": "model_assisted", "living_context_need_answer_selection": {"answers": []}},
+        {
+            "status": "model_assisted",
+            "living_context_need_answer_selection": {
+                "schema_version": NEED_ANSWER_SCHEMA_VERSION,
+                "answers": [],
+                "source_quote": {"text": selector_text, "start": 0, "end": len(selector_text)},
+            },
+        },
+    ):
+        malformed_client = FakeModelClient([malformed])
+        malformed_result = select_living_context_need_answers(
+            malformed_client,
+            user_message=selector_text,
+            open_needs=[selector_target],
+            candidate_known=selector_known,
+        )
+        expect(
+            malformed_result.selection is None
+            and malformed_result.metrics.get("status") == "rejected"
+            and malformed_client.call_count == 1,
+            "malformed Need-answer envelopes reject without repair",
+        )
+    wrong_token = copy.deepcopy(selector_true)
+    wrong_token["living_context_need_answer_selection"]["answers"][0]["need_token"] = "need_other_situation"
+    wrong_token_client = FakeModelClient([wrong_token])
+    wrong_token_result = select_living_context_need_answers(
+        wrong_token_client,
+        user_message=selector_text,
+        open_needs=[selector_target],
+        candidate_known=selector_known,
+        candidate_unknown=["住宿仍未确认"],
+        candidate_need_blocked=["住宿待确认"],
+    )
+    expect(
+        wrong_token_result.selection is None
+        and wrong_token_result.metrics.get("reason") == "answer_not_active"
+        and wrong_token_client.call_count == 1,
+        "Need-answer batch cannot select a reference outside current inputs",
+    )
+    wrong_discard = copy.deepcopy(selector_true)
+    wrong_discard["living_context_need_answer_selection"]["answers"][0]["discard_candidate_unknowns"] = ["不在候选中"]
+    wrong_discard_client = FakeModelClient([wrong_discard])
+    wrong_discard_result = select_living_context_need_answers(
+        wrong_discard_client,
+        user_message=selector_text,
+        open_needs=[selector_target],
+        candidate_known=selector_known,
+        candidate_unknown=["住宿仍未确认"],
+        candidate_need_blocked=["住宿待确认"],
+    )
+    expect(
+        wrong_discard_result.selection is None
+        and wrong_discard_client.call_count == 1,
+        "Need-answer batch rejects a discard outside candidate inputs",
+    )
+    empty_true_client = FakeModelClient([selector_true])
+    empty_true_result = select_living_context_need_answers(
+        empty_true_client,
+        user_message="",
+        open_needs=[selector_target],
+        candidate_known=selector_known,
+        candidate_unknown=["住宿仍未确认"],
+        candidate_need_blocked=["住宿待确认"],
+    )
+    expect(
+        empty_true_result.selection is None
+        and empty_true_result.metrics.get("reason") == "empty_source"
+        and empty_true_client.call_count == 1,
+        "Need-answer batch rejects non-empty answers for an empty user message",
+    )
+    long_text = "长" * 5000
+    long_selector_client = FakeModelClient([selector_true])
+    long_selector_result = select_living_context_need_answers(
+        long_selector_client,
+        user_message=long_text,
+        open_needs=[selector_target],
+        candidate_known=selector_known,
+        candidate_unknown=["住宿仍未确认"],
+        candidate_need_blocked=["住宿待确认"],
+    )
+    long_selector_request = long_selector_client.users[0]
+    long_selected = long_selector_result.selection.answers[0] if long_selector_result.selection else None
+    expect(
+        long_selector_result.selection is not None
+        and long_selected is not None
+        and len(long_selected.source_quote.text) == 480
+        and long_selected.source_quote.start == 0
+        and long_selected.source_quote.end == 480
+        and len(str(long_selector_request["user_message"])) == 480
+        and "长" * 5000 not in json.dumps(long_selector_request, ensure_ascii=False)
+        and long_selector_client.call_count == 1,
+        "Need-answer batch bounds request and server quote to 480 characters",
+    )
+    try:
+        ContextQuote(text="长" * 5000, start=0, end=5000)
+    except Exception:
+        oversized_quote_rejected = True
+    else:  # pragma: no cover - strict Field(max_length=480) must reject this.
+        oversized_quote_rejected = False
+    expect(oversized_quote_rejected, "ContextQuote rejects a 5000-character quote")
 
     # Timeline is intentionally strict at the candidate boundary: a mapping,
     # scalar, oversized collection, or malformed row must take the bounded
@@ -1355,6 +2001,7 @@ def main() -> int:
             set(timeline_repair_request).issubset(
                 {
                     "user_message",
+                    "source_binding",
                     "current_time",
                     "living_context_situation_candidates",
                     "validation_issues",
@@ -1757,6 +2404,272 @@ def main() -> int:
         "summary": "现有事项出现新的进展",
         "source": "model",
     }
+
+    # A valid update that omits one current Need endpoint gets one bounded
+    # Need-answer selector opportunity to copy the exact Need binding. Keeping
+    # the endpoint in ``unknown`` must not spend that recovery call.
+    need_token = "need_answer_target"
+    answer_catalog = {
+        **exact_catalog,
+        "open_needs": [
+            {
+                "need_token": need_token,
+                "generation": 2,
+                "blocked_judgment": "住宿安排",
+                "question": "住宿安排是什么？",
+                "status": "open",
+            },
+            {
+                "need_token": "need_answer_other",
+                "generation": 1,
+                "blocked_judgment": "交通安排",
+                "question": "交通安排是什么？",
+                "status": "open",
+            },
+        ],
+    }
+    answer_text = "住宿已经确认了"
+    omitted_answer_candidate = {
+        **update_candidate,
+        "unknown": ["住宿仍未确认", "交通仍未确认"],
+        "material_change": "住宿安排已经确认。",
+        "known": [
+            {"statement": "本轮保留的用户事实", "epistemic_status": "reported"}
+        ],
+        "needs": [
+            {
+                "blocked_judgment": "住宿待确认",
+                "evidence_kind": "user",
+                "why_now": "该细节决定下一步",
+                "urgency": 0.7,
+                "allowed_source_classes": ["user"],
+                "fallback_reaction": "ask",
+                "question": "住宿安排是什么？",
+            },
+            {
+                "blocked_judgment": "交通待确认",
+                "evidence_kind": "user",
+                "why_now": "交通仍影响下一步",
+                "urgency": 0.5,
+                "allowed_source_classes": ["user"],
+                "fallback_reaction": "ask",
+                "question": "交通安排是什么？",
+            },
+        ],
+    }
+    selector_answer = {
+        "status": "model_assisted",
+        "living_context_need_answer_selection": {
+            "schema_version": NEED_ANSWER_SCHEMA_VERSION,
+            "answers": [
+                {
+                    "need_token": need_token,
+                    "generation": 2,
+                    "supporting_known_index": 0,
+                    "discard_candidate_unknowns": ["住宿仍未确认"],
+                    "discard_candidate_need_endpoints": ["住宿待确认"],
+                }
+            ],
+        },
+    }
+    selector_empty = {
+        "status": "model_assisted",
+        "living_context_need_answer_selection": {
+            "schema_version": NEED_ANSWER_SCHEMA_VERSION,
+            "answers": [],
+        },
+    }
+    answer_recovery_reasoning = FakeReasoning(
+        [
+            model_payload(omitted_answer_candidate, text=answer_text),
+            selector_answer,
+        ]
+    )
+    answer_recovered = UnderstandingCore(answer_recovery_reasoning).build(
+        text=answer_text,
+        attention_focus=[],
+        turn_context={"living_context_situation_candidates": [answer_catalog]},
+    )
+    expect(
+        answer_recovered.living_context_candidate is not None
+        and answer_recovered.living_context_candidate.answered_need_tokens == [need_token]
+        and answer_recovered.living_context_candidate.assertion_mode == "direct_user"
+        and answer_recovered.living_context_candidate.situation_token == omitted_answer_candidate["situation_token"]
+        and answer_recovered.living_context_candidate.situation_revision == omitted_answer_candidate["situation_revision"]
+        and answer_recovered.living_context_candidate.catalog_token == omitted_answer_candidate["catalog_token"]
+        and answer_recovered.living_context_candidate.material_change == omitted_answer_candidate["material_change"]
+        and [item.statement for item in answer_recovered.living_context_candidate.known]
+        == ["本轮保留的用户事实"]
+        and answer_recovered.living_context_candidate.unknown == ["交通仍未确认"]
+        and [item.blocked_judgment for item in answer_recovered.living_context_candidate.needs]
+        == ["交通待确认"]
+        and answer_recovery_reasoning.client.users[1]["candidate_known"]
+        == ["本轮保留的用户事实"]
+        and answer_recovery_reasoning.client.purposes
+        == ["turn_understanding", "living_context_need_answer_selection"]
+        and answer_recovery_reasoning.client.call_count == 2,
+        "omitted Need endpoint recovers its exact answer binding with one bounded call",
+    )
+
+    stale_primary_answer = copy.deepcopy(omitted_answer_candidate)
+    stale_primary_answer.update(
+        {
+            "situation_token": "sit_stale_primary",
+            "situation_revision": 99,
+            "catalog_token": "cat_stale_primary",
+        }
+    )
+    extractor_resolve_answer = copy.deepcopy(omitted_answer_candidate)
+    extractor_resolve_answer["disposition"] = "resolve"
+    extractor_resolve_answer["lifecycle"] = "active"
+    extractor_resolve_answer.pop("assertion_mode", None)
+    extractor_resolve_answer.pop("reopen", None)
+    chained_recovery_reasoning = FakeReasoning(
+        [
+            model_payload(stale_primary_answer, text=answer_text),
+            {
+                "status": "model_assisted",
+                "living_context_candidate": extractor_resolve_answer,
+            },
+            selector_answer,
+        ]
+    )
+    chained_recovery = UnderstandingCore(chained_recovery_reasoning).build(
+        text=answer_text,
+        attention_focus=[],
+        turn_context={"living_context_situation_candidates": [answer_catalog]},
+    )
+    expect(
+        chained_recovery.living_context_candidate is not None
+        and chained_recovery.living_context_candidate.disposition == "update"
+        and chained_recovery.living_context_candidate.situation_token
+        == exact_catalog["situation_token"]
+        and chained_recovery.living_context_candidate.answered_need_tokens == [need_token]
+        and chained_recovery.living_context_candidate.assertion_mode == "direct_user"
+        and chained_recovery.model_boundary_metrics.get("need_answer_selector", {}).get(
+            "status"
+        )
+        == "accepted"
+        and chained_recovery_reasoning.client.purposes
+        == [
+            "turn_understanding",
+            "living_context_candidate_extraction",
+            "living_context_need_answer_selection",
+        ]
+        and chained_recovery_reasoning.client.call_count == 3,
+        "stale primary binding recovers through extractor then one Need selector",
+    )
+
+    empty_batch_reasoning = FakeReasoning(
+        [
+            model_payload(omitted_answer_candidate, text=answer_text),
+            selector_empty,
+        ]
+    )
+    empty_batch = UnderstandingCore(empty_batch_reasoning).build(
+        text=answer_text,
+        attention_focus=[],
+        turn_context={"living_context_situation_candidates": [answer_catalog]},
+    )
+    expect(
+        empty_batch.living_context_candidate is not None
+        and not empty_batch.living_context_candidate.answered_need_tokens
+        and not empty_batch.living_context_candidate.answered_need_bindings
+        and empty_batch.living_context_candidate.unknown
+        == omitted_answer_candidate["unknown"]
+        and empty_batch.model_boundary_metrics.get("need_answer_selector", {}).get("status")
+        == "accepted"
+        and empty_batch.model_boundary_metrics.get("need_answer_selector", {}).get(
+            "answered_count"
+        )
+        == 0
+        and empty_batch_reasoning.client.purposes
+        == ["turn_understanding", "living_context_need_answer_selection"]
+        and empty_batch_reasoning.client.call_count == 2,
+        "empty Need-answer batch keeps the original candidate unchanged",
+    )
+
+    retained_endpoint_candidate = {
+        **omitted_answer_candidate,
+        "unknown": ["住宿安排"],
+    }
+    retained_endpoint_reasoning = FakeReasoning(
+        [model_payload(retained_endpoint_candidate, text=answer_text), selector_empty]
+    )
+    retained_endpoint = UnderstandingCore(retained_endpoint_reasoning).build(
+        text=answer_text,
+        attention_focus=[],
+        turn_context={"living_context_situation_candidates": [answer_catalog]},
+    )
+    expect(
+        retained_endpoint.living_context_candidate is not None
+        and "candidate_recovery" not in retained_endpoint.model_boundary_metrics
+        and retained_endpoint.model_boundary_metrics.get("need_answer_selector", {}).get(
+            "answered_count"
+        )
+        == 0
+        and retained_endpoint_reasoning.client.purposes
+        == ["turn_understanding", "living_context_need_answer_selection"]
+        and retained_endpoint_reasoning.client.call_count == 2,
+        "batch Need selector sees active Needs even when a candidate endpoint remains",
+    )
+
+    plain_update_omission = {
+        **omitted_answer_candidate,
+        "material_change": "",
+        "known": [],
+    }
+    plain_update_reasoning = FakeReasoning(
+        [model_payload(plain_update_omission, text=answer_text)]
+    )
+    plain_update = UnderstandingCore(plain_update_reasoning).build(
+        text=answer_text,
+        attention_focus=[],
+        turn_context={"living_context_situation_candidates": [answer_catalog]},
+    )
+    expect(
+        plain_update.living_context_candidate is not None
+        and "candidate_recovery" not in plain_update.model_boundary_metrics
+        and plain_update_reasoning.client.call_count == 1,
+        "ordinary update without material change or Known skips Need recovery",
+    )
+
+    two_omitted_catalog = {
+        **answer_catalog,
+        "open_needs": [
+            *answer_catalog["open_needs"],
+            {
+                "need_token": "need_second_target",
+                "generation": 1,
+                "blocked_judgment": "交通安排",
+                "question": "交通安排是什么？",
+                "status": "open",
+            },
+        ],
+    }
+    two_omitted_reasoning = FakeReasoning(
+        [model_payload(omitted_answer_candidate, text=answer_text), selector_empty]
+    )
+    two_omitted = UnderstandingCore(two_omitted_reasoning).build(
+        text=answer_text,
+        attention_focus=[],
+        turn_context={"living_context_situation_candidates": [two_omitted_catalog]},
+    )
+    expect(
+        two_omitted.living_context_candidate is not None
+        and not two_omitted.living_context_candidate.answered_need_tokens
+        and "candidate_recovery" not in two_omitted.model_boundary_metrics
+        and two_omitted.model_boundary_metrics.get("need_answer_selector", {}).get(
+            "answered_count"
+        )
+        == 0
+        and len(two_omitted_reasoning.client.users[1]["active_open_needs"]) == 3
+        and two_omitted_reasoning.client.purposes
+        == ["turn_understanding", "living_context_need_answer_selection"]
+        and two_omitted_reasoning.client.call_count == 2,
+        "multiple active Need endpoints use one empty batch without guessing",
+    )
+
     invalid_extractor_response = {
         "status": "model_assisted",
         "living_context_candidate": invalid_source_candidate,
@@ -1885,6 +2798,8 @@ def main() -> int:
         "answered_need_bindings": [
             {"need_token": "need_stale_reference", "generation": 1}
         ],
+        "source_quote": {"text": text, "start": 0, "end": len(text)},
+        "assertion_mode": "direct_user",
     }
     unknown_binding_client = FakeModelClient(
         [

@@ -98,7 +98,7 @@ function AppShell() {
         setProductContext(value);
         const internal = value.internal_read_scope;
         const external = value.external_input_scope;
-        if (internal && typeof internal.user_id === "string" && typeof internal.session_id === "string") setScope({ userId: internal.user_id, sessionId: internal.session_id });
+        if (internal && typeof internal.user_id === "string" && internal.user_id.trim() && typeof internal.session_id === "string" && internal.session_id.trim()) setScope({ userId: internal.user_id, sessionId: internal.session_id });
         const inputAllowed = value.status === "ready" || value.status === "empty";
         setInputScope(inputAllowed && external && typeof external.user_id === "string" && typeof external.session_id === "string" && typeof external.channel === "string" ? external : null);
       } catch {
@@ -158,10 +158,10 @@ function AppShell() {
   const body = route.kind === "home" ? <HomePage scope={scope} productContext={productContext} inputScope={inputScope} language={language} onStartChat={startChat} onOpenHistory={() => setHistoryOpen(true)} />
     : route.kind === "today" ? <ProductHome scope={scope} productContext={productContext} inputScope={inputScope} language={language} onStartChat={startChat} onOpenHistory={() => setHistoryOpen(true)} />
     : route.kind === "chat" ? <ChatPage scope={scope} inputScope={inputScope} inputStatus={productContext?.status} language={language} conversationId={route.id} historyEpoch={historyEpoch} pendingText={pendingChat?.id === route.id ? pendingChat.text : null} onPendingConsumed={() => setPendingChat(null)} onOpenHistory={() => setHistoryOpen(true)} onNewConversation={() => openChat(newId())} onBackHome={() => openRoute("home")} onHistoryChange={setHistory} />
-    : route.kind === "situation" ? <SituationDetailPage situationId={route.id} scope={scope} language={language} />
+    : route.kind === "situation" ? <SituationDetailPage situationId={route.id} scope={scope} productContext={productContext} language={language} />
     : route.kind === "situations" || route.kind === "matters" ? <SituationsPage scope={scope} productContext={productContext} language={language} />
     : route.kind === "status" ? <Status scope={scope} language={language} />
-    : route.kind === "settings" ? <SettingsPage scope={scope} theme={theme} language={language} onTheme={setTheme} onLanguage={setLanguage} onOpenSetup={() => setSetupOpen(true)} />
+    : route.kind === "settings" ? <SettingsPage scope={scope} productContext={productContext} theme={theme} language={language} onTheme={setTheme} onLanguage={setLanguage} onOpenSetup={() => setSetupOpen(true)} />
     : <div className="legacyPage"><div className="legacyHeader"><button className="textButton" onClick={() => openRoute("today")}><ChevronLeft size={15} />{en ? "Back to Today" : "返回 Today"}</button><span>Advanced · 旧控制台</span></div><Suspense fallback={<div className="loadingBlock">Loading Advanced…</div>}><LegacyConsole /></Suspense></div>;
   const iconPath = `${import.meta.env.BASE_URL}veyra-icon.png`;
   const clearCurrentHistory = () => { try { const value = JSON.parse(localStorage.getItem("veyra.local-conversations.v1") ?? "[]"); const rows = sanitizeHistory(value); localStorage.setItem("veyra.local-conversations.v1", JSON.stringify(rows.filter((item) => item.ownerId !== scope.userId || item.sessionId !== scope.sessionId))); } catch { /* optional local history */ } setHistory([]); setHistoryEpoch((value) => value + 1); };

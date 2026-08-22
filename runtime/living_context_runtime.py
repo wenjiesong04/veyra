@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 from core.situation_state_repository import SituationStateRepository
 from core.world_state import StateRevisionConflictError, WorldStateStore
+from core.living_context_information_state_policy import has_clearly_resolved_statement
 from interface.event_schema import EventType, VeyraEvent
 from interface.living_context_contract import (
     CandidateNeed,
@@ -124,6 +125,10 @@ class LivingContextRuntime:
         session_id = str(event.source.session_id or "").strip() or "local-session"
         existing: dict[str, Any] | None = None
         catalog_row: dict[str, Any] | None = None
+        # Freeze the exact row supplied at turn start for candidate Need
+        # deduplication.  Admission may read a fresh row for CAS, but Need
+        # identity must not change when live state changes during this event.
+        turn_start_catalog_row = self._turn_start_catalog_row(candidate, catalog)
         admission_recovery: dict[str, Any] | None = None
         if candidate.situation_token:
             existing = self.situations.get_semantic(
@@ -153,6 +158,13 @@ class LivingContextRuntime:
                     raise
                 catalog_row = admission_recovery.get("catalog_row")
         situation_id = str(existing.get("situation_id") or "") if existing else None
+        candidate, unknown_resolved_count = self._suppress_resolved_unknown_candidates(candidate)
+        candidate, resolved_need_count = self._suppress_resolved_need_candidates(candidate)
+        candidate, deduped_need_count = self._dedupe_active_need_candidates(
+            candidate,
+            situation_id=situation_id,
+            catalog_row=turn_start_catalog_row,
+        )
         if candidate.disposition == "create":
             subject_key = stable_subject_digest(
                 f"{owner_id}\0{session_id}",
@@ -248,6 +260,9 @@ class LivingContextRuntime:
             "operation": operation,
             "semantic_replayed": bool(persisted.get("semantic_replayed")),
             "needs_repaired": needs_repaired,
+            "unknown_candidates_resolved_suppressed": unknown_resolved_count,
+            "need_candidates_resolved_suppressed": resolved_need_count,
+            "need_candidates_deduped": deduped_need_count,
             "situation": persisted,
             "information_needs": current_needs,
             "reaction_hint": reaction.model_dump(mode="json") if reaction else None,
@@ -261,6 +276,145 @@ class LivingContextRuntime:
             },
         }
         return result
+
+    @staticmethod
+    def _suppress_resolved_unknown_candidates(
+        candidate: LivingContextCandidate,
+    ) -> tuple[LivingContextCandidate, int]:
+        """Drop only candidate unknown statements that are clearly resolved.
+
+        The information-state policy is intentionally text-only and generic.
+        Candidate order is retained for every unresolved statement, including
+        mixed statements where an unresolved marker takes precedence.  The
+        contract bounds ``unknown`` to twelve rows, so the returned count is
+        bounded by the candidate contract as well.
+        """
+
+        if not candidate.unknown:
+            return candidate, 0
+        retained = [
+            statement
+            for statement in candidate.unknown
+            if not has_clearly_resolved_statement(statement)
+        ]
+        suppressed = len(candidate.unknown) - len(retained)
+        if suppressed == 0:
+            return candidate, 0
+        return candidate.model_copy(update={"unknown": retained}), suppressed
+
+    @staticmethod
+    def _suppress_resolved_need_candidates(
+        candidate: LivingContextCandidate,
+    ) -> tuple[LivingContextCandidate, int]:
+        """Drop only Need rows whose endpoint is explicitly resolved.
+
+        The policy is generic and text-only.  CandidateNeed rows are copied
+        unchanged when retained; only the outer ``needs`` collection is
+        projected.  The contract bounds this collection to eight rows, so the
+        returned count is inherently bounded by the candidate contract.
+        """
+
+        if not candidate.needs:
+            return candidate, 0
+        retained = [
+            need
+            for need in candidate.needs
+            if not has_clearly_resolved_statement(need.blocked_judgment)
+        ]
+        suppressed = len(candidate.needs) - len(retained)
+        if suppressed == 0:
+            return candidate, 0
+        return candidate.model_copy(update={"needs": retained}), suppressed
+
+    def _dedupe_active_need_candidates(
+        self,
+        candidate: LivingContextCandidate,
+        *,
+        situation_id: str | None,
+        catalog_row: dict[str, Any] | None,
+    ) -> tuple[LivingContextCandidate, int]:
+        """Drop only exact active Need endpoint duplicates.
+
+        ``InformationNeedRuntime`` historically includes ``evidence_kind`` in
+        its stable ID.  That can create a second active Need when a model
+        re-emits the same server-owned endpoint with a different source class.
+        The only durable comparison allowed here is the immutable turn-start
+        catalog row's exact active ``blocked_judgment``.  Same-event duplicate
+        endpoints are also reduced in order, retaining the first candidate.
+        Terminal Needs are absent from ``open_needs`` by design, so the normal
+        generation reopen path remains available.
+        """
+
+        if not candidate.needs:
+            return candidate, 0
+        active_endpoint_ids: dict[str, set[str]] = {}
+        if isinstance(catalog_row, dict):
+            open_needs = catalog_row.get("open_needs")
+            if isinstance(open_needs, list):
+                for raw_need in open_needs:
+                    if not isinstance(raw_need, dict):
+                        continue
+                    if str(raw_need.get("status") or "open") not in {"open", "asked", "observing", "waiting"}:
+                        continue
+                    endpoint = str(raw_need.get("blocked_judgment") or "").strip()
+                    need_token = str(raw_need.get("need_token") or "").strip()
+                    if endpoint:
+                        active_endpoint_ids.setdefault(endpoint, set()).add(need_token)
+
+        retained: list[CandidateNeed] = []
+        retained_endpoints: set[str] = set()
+        dropped = 0
+        for need in candidate.needs:
+            endpoint = str(need.blocked_judgment or "").strip()
+            candidate_need_id = self.needs.stable_need_id(
+                situation_id=str(situation_id or ""),
+                blocked_judgment=need.blocked_judgment,
+                evidence_kind=need.evidence_kind,
+            )
+            existing_ids = active_endpoint_ids.get(endpoint, set())
+            duplicate_active_endpoint = bool(
+                endpoint
+                and existing_ids
+                and candidate_need_id not in existing_ids
+            )
+            duplicate_same_turn_endpoint = bool(
+                endpoint
+                and endpoint in retained_endpoints
+            )
+            if duplicate_active_endpoint or duplicate_same_turn_endpoint:
+                dropped += 1
+                continue
+            retained.append(need)
+            if endpoint:
+                retained_endpoints.add(endpoint)
+        if dropped == 0:
+            return candidate, 0
+        return candidate.model_copy(update={"needs": retained}), dropped
+
+    @staticmethod
+    def _turn_start_catalog_row(
+        candidate: LivingContextCandidate,
+        catalog: list[dict[str, Any]] | None,
+    ) -> dict[str, Any] | None:
+        """Return one frozen catalog row matching the candidate's full triple."""
+
+        if candidate.disposition not in {"update", "correct", "resolve"}:
+            return None
+        matches: list[dict[str, Any]] = []
+        for raw_row in catalog or []:
+            if not isinstance(raw_row, dict):
+                continue
+            row_revision = raw_row.get("observation_revision")
+            if row_revision is None:
+                row_revision = raw_row.get("situation_revision")
+            if (
+                str(raw_row.get("situation_token") or "") == str(candidate.situation_token or "")
+                and type(row_revision) is int
+                and int(row_revision) == int(candidate.situation_revision or 0)
+                and str(raw_row.get("catalog_token") or "") == str(candidate.catalog_token or "")
+            ):
+                matches.append(copy.deepcopy(raw_row))
+        return matches[0] if len(matches) == 1 else None
 
     def _persist_semantic_and_needs(
         self,

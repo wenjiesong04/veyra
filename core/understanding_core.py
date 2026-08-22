@@ -10,6 +10,9 @@ from core.living_context_candidate_extractor import (
     extract_living_context_candidate,
     validate_candidate_catalog_binding,
 )
+from core.living_context_need_answer_selector import (
+    select_living_context_need_answers,
+)
 from core.living_reaction_feedback_extractor import (
     extract_living_reaction_feedback,
 )
@@ -28,6 +31,7 @@ from core.semantic_policy import SemanticPolicyCompiler
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent
 from interface.living_context_contract import (
+    CandidateNeedReference,
     LivingContextCandidate,
     LivingReactionFeedback,
     parse_living_context_candidate_detailed,
@@ -119,6 +123,14 @@ TURN_UNDERSTANDING_SYSTEM = (
     "deadline_at may be the timezone-aware end of that bounded window, while a Need or inferred assumption must "
     "preserve that the exact event date is unknown. Never invent a calendar date from unstated facts, and leave "
     "deadline_at null when no time expression is present."
+    " For an existing Situation update that directly answers an open InformationNeed, "
+    "copy the exact need_token and generation from the same current catalog row into "
+    "answered_need_tokens and answered_need_bindings, and include a root source_quote "
+    "that is an exact slice of user_message with assertion_mode=direct_user. If the "
+    "user turn does not uniquely answer that Need, omit both answer-binding fields and "
+    "leave the Need open; never infer a binding from similar wording. Answering one "
+    "sub-Need is still an update/nonterminal Situation change; emit resolve only when "
+    "the user explicitly declares that the entire Situation or goal is finished."
 )
 
 TURN_UNDERSTANDING_REPAIR_SYSTEM = (
@@ -134,7 +146,12 @@ TURN_UNDERSTANDING_REPAIR_SYSTEM = (
     "and quote exist. If the original user_message explicitly reports progress or a change to an existing Situation "
     "or asks to add it to the original Situation, do not emit a quiet candidate: emit one update candidate using "
     "only the exact matching situation_token, situation_revision, and catalog_token from the supplied current "
-    "catalog. This is a strict boundary repair, not permission to invent a Situation or token. Return no prose."
+    "catalog. When the same direct user turn answers an open Need, copy its exact "
+    "need_token+generation pair and include a source-bound root source_quote with "
+    "assertion_mode=direct_user; otherwise omit answer bindings and keep that Need "
+    "open. Answering one sub-Need remains update/nonterminal; use resolve only for an "
+    "explicit statement that the whole Situation or goal is finished. This is a strict "
+    "boundary repair, not permission to invent a Situation or token. Return no prose."
 )
 
 @dataclass(slots=True)
@@ -504,15 +521,22 @@ class UnderstandingCore:
         payload = {
             "user_message": text,
             # This is a source-binding aid, not a semantic fact.  Supplying
-            # the precomputed Python character span prevents providers from
-            # counting UTF-8 bytes when copying a feedback/candidate quote.
+            # only the runtime-visible prefix prevents the model request from
+            # duplicating an unbounded user turn while keeping Python-character
+            # offsets deterministic for a bounded ContextQuote.
             "source_binding": {
                 "python_character_length": len(text),
-                "exact_full_turn_quote": {
-                    "text": text,
-                    "start": 0,
-                    "end": len(text),
-                },
+                **(
+                    {
+                        "bounded_quote": {
+                            "text": text[:480],
+                            "start": 0,
+                            "end": min(len(text), 480),
+                        }
+                    }
+                    if text
+                    else {}
+                ),
             },
             "awareness_snapshot": awareness_snapshot,
             "session_context": {
@@ -568,6 +592,8 @@ class UnderstandingCore:
                 "Use only exact server-issued selectors, tokens, revisions, and Need references from session_context.living_context_situation_candidates.",
                 "For update/correct/resolve copy situation_selector, situation_revision, and catalog_token from the same current catalog row; never infer them.",
                 "For answered_need_tokens copy matching need_token and generation into answered_need_bindings from the same current catalog row.",
+                "A direct user turn that answers an open catalog Need must carry the exact need_token+generation pair, a root source_quote bound to this user_message, and assertion_mode=direct_user; if any part is not proven, omit both answer-binding fields and keep the Need open.",
+                "Answering one sub-Need is still an update/nonterminal Situation change; resolve only when the user explicitly declares the entire Situation or goal finished.",
                 "A correct/resolve candidate requires an exact source_quote and direct_user assertion; otherwise leave it inferred and do not emit the lifecycle disposition.",
                 "A living_reaction_feedback entry requires an exact user source_quote and an exact current reaction_token; never infer either token or quote.",
                 "Feedback changes only the bounded reaction ledger. It never changes route, risk, authority, tools, execution, or delivery.",
@@ -1266,6 +1292,168 @@ def _quiet_candidate_conflicts_with_explicit_continuation(
     return any(marker.replace(" ", "") in compact for marker in continuation_markers)
 
 
+def _answer_recovery_target(
+    candidate: LivingContextCandidate | None,
+    *,
+    catalog: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Return one exact row plus all active Need endpoints for one batch call."""
+
+    if candidate is None or candidate.disposition not in {"update", "correct", "resolve"}:
+        return None
+    if not candidate.situation_token or candidate.situation_revision is None or not candidate.catalog_token:
+        return None
+    if not candidate.material_change.strip() and not candidate.known:
+        return None
+    matched_rows: list[dict[str, Any]] = []
+    for row in catalog:
+        if not isinstance(row, dict):
+            continue
+        row_revision = row.get("observation_revision")
+        if row_revision is None:
+            row_revision = row.get("situation_revision")
+        if (
+            str(row.get("situation_token") or "") == str(candidate.situation_token)
+            and type(row_revision) is int
+            and int(row_revision) == int(candidate.situation_revision)
+            and str(row.get("catalog_token") or "") == str(candidate.catalog_token)
+        ):
+            matched_rows.append(row)
+    if len(matched_rows) != 1:
+        return None
+    raw_open_needs = matched_rows[0].get("open_needs")
+    if not isinstance(raw_open_needs, list):
+        return None
+    active_open_needs: list[dict[str, Any]] = []
+    seen_references: set[tuple[str, int]] = set()
+    for raw_need in raw_open_needs:
+        if not isinstance(raw_need, dict):
+            continue
+        status = str(raw_need.get("status") or "open")
+        if status not in {"open", "asked", "observing", "waiting"}:
+            continue
+        blocked = raw_need.get("blocked_judgment")
+        token = raw_need.get("need_token")
+        generation = raw_need.get("generation")
+        if (
+            not isinstance(blocked, str)
+            or not blocked.strip()
+            or not isinstance(token, str)
+            or not token.strip()
+            or type(generation) is not int
+            or generation < 1
+        ):
+            return None
+        reference = (token, generation)
+        if reference in seen_references:
+            return None
+        seen_references.add(reference)
+        active_open_needs.append(
+            {
+                "need_token": token,
+                "generation": generation,
+                "blocked_judgment": blocked,
+                "question": str(raw_need.get("question") or ""),
+                "status": status,
+            }
+        )
+    if not active_open_needs:
+        return None
+    return {
+        "row": matched_rows[0],
+        "open_needs": active_open_needs,
+        "candidate_known": [known.statement for known in candidate.known],
+        "candidate_unknown": list(candidate.unknown),
+        "candidate_need_blocked": [need.blocked_judgment for need in candidate.needs],
+    }
+
+
+def _apply_need_answer_selector(
+    understanding: TurnUnderstanding,
+    *,
+    candidate: LivingContextCandidate,
+    text: str,
+    catalog: list[dict[str, Any]],
+    client: Any,
+) -> tuple[LivingContextCandidate, bool]:
+    """Run one batch selector and merge only its exact typed decisions."""
+
+    target = _answer_recovery_target(candidate, catalog=catalog)
+    if target is None:
+        return candidate, False
+    selection = select_living_context_need_answers(
+        client,
+        user_message=text,
+        row=target["row"],
+        open_needs=target["open_needs"],
+        candidate_known=target["candidate_known"],
+        candidate_unknown=target["candidate_unknown"],
+        candidate_need_blocked=target["candidate_need_blocked"],
+    )
+    boundary = dict(understanding.model_boundary_metrics)
+    boundary["need_answer_selector"] = dict(selection.metrics)
+    understanding.model_boundary_metrics = boundary
+    if selection.selection is not None:
+        selected = selection.selection
+        existing_tokens = list(candidate.answered_need_tokens)
+        existing_bindings = list(candidate.answered_need_bindings)
+        seen_pairs = {
+            (binding.need_token, binding.generation)
+            for binding in existing_bindings
+        }
+        for answer in selected.answers:
+            pair = (answer.need_token, answer.generation)
+            if pair in seen_pairs:
+                continue
+            existing_bindings.append(
+                CandidateNeedReference(
+                    need_token=answer.need_token,
+                    generation=answer.generation,
+                )
+            )
+            if answer.need_token not in existing_tokens:
+                existing_tokens.append(answer.need_token)
+            seen_pairs.add(pair)
+        discarded_unknown = set(selected.discard_unknown)
+        discarded_need_blocked = set(selected.discard_need_blocked)
+        updates: dict[str, Any] = {
+            "answered_need_tokens": existing_tokens,
+            "answered_need_bindings": existing_bindings,
+            "unknown": [
+                value for value in candidate.unknown
+                if value not in discarded_unknown
+            ],
+            "needs": [
+                need for need in candidate.needs
+                if need.blocked_judgment not in discarded_need_blocked
+            ],
+        }
+        if selected.answers:
+            # The quote is generated from the server-visible turn prefix, not
+            # copied from the model response. All answers in one batch share
+            # this exact source-bound root quote.
+            updates.update(
+                {
+                    "source_quote": selected.answers[0].source_quote,
+                    "assertion_mode": "direct_user",
+                }
+            )
+        candidate = candidate.model_copy(update=updates)
+        understanding.reason = (
+            f"{understanding.reason}; bounded Need-answer selector accepted"
+            if understanding.reason
+            else "bounded Need-answer selector accepted"
+        )
+    else:
+        reason = str(selection.metrics.get("reason") or "rejected")
+        understanding.reason = (
+            f"{understanding.reason}; bounded Need-answer selector {reason}"
+            if understanding.reason
+            else f"bounded Need-answer selector {reason}"
+        )
+    return candidate, True
+
+
 def _recover_candidate_if_needed(
     understanding: TurnUnderstanding,
     *,
@@ -1318,6 +1506,27 @@ def _recover_candidate_if_needed(
         candidate=primary_candidate,
         turn_context=turn_context,
     )
+    # Need-answer recovery is a strictly independent selector seam.  It is
+    # eligible only after the primary candidate has an exact Situation binding;
+    # stale/missing/quiet candidates continue through the ordinary extractor
+    # below. The helper captures the unique turn-start target and is the only
+    # place that can call the selector.
+    if (
+        primary_candidate is not None
+        and not primary_binding_issues
+        and not quiet_conflict
+    ):
+        selected_candidate, selector_called = _apply_need_answer_selector(
+            understanding,
+            candidate=primary_candidate,
+            text=text,
+            catalog=catalog,
+            client=client,
+        )
+        if selector_called:
+            understanding.living_context_candidate = selected_candidate
+            return understanding, True, False
+
     if (
         primary_candidate is not None
         and not quiet_conflict
@@ -1353,6 +1562,16 @@ def _recover_candidate_if_needed(
             understanding.living_context_candidate_issues = [
                 "living_context_candidate:quiet_after_explicit_continuation_extraction",
             ]
+        if not quiet_conflict:
+            selected_candidate, selector_called = _apply_need_answer_selector(
+                understanding,
+                candidate=understanding.living_context_candidate,
+                text=text,
+                catalog=catalog,
+                client=client,
+            )
+            if selector_called:
+                understanding.living_context_candidate = selected_candidate
     else:
         _record_candidate_extraction(understanding, extraction)
         if primary_binding_issues:
@@ -1484,6 +1703,18 @@ def _attach_candidate_to_fallback(
     if extraction.candidate is not None:
         understanding.source = "model_candidate"
         understanding.reason = "bounded model candidate extracted after combined understanding was unavailable"
+        # The ordinary extractor is another entry point into the same
+        # optional candidate seam. Reuse the single batch selector here too;
+        # its helper is called at most once for this turn.
+        selected_candidate, selector_called = _apply_need_answer_selector(
+            understanding,
+            candidate=extraction.candidate,
+            text=text,
+            catalog=catalog,
+            client=client,
+        )
+        if selector_called:
+            understanding.living_context_candidate = selected_candidate
     else:
         understanding.reason = "combined understanding unavailable and bounded model candidate was not admitted"
     return understanding

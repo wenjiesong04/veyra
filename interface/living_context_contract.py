@@ -355,6 +355,10 @@ _CANDIDATE_NULL_DEFAULTS: dict[str, Any] = {
     "reopen": False,
     "assertion_mode": "inferred",
 }
+_LIFECYCLE_AUTHORITY_DOWNGRADED_REPAIRED_FIELD = (
+    "disposition:lifecycle_authority_downgraded_to_update"
+)
+_NON_TERMINAL_LIFECYCLES = frozenset({"active", "emerging", "waiting"})
 _CANDIDATE_NULL_LIST_FIELDS = (
     "entities",
     "known",
@@ -545,6 +549,10 @@ def _normalize_candidate_payload(
         return value, []
     payload = copy.deepcopy(value)
     repaired: list[str] = []
+    missing = object()
+    raw_reopen = payload.get("reopen", missing)
+    raw_lifecycle = payload.get("lifecycle", missing)
+    raw_assertion_mode = payload.get("assertion_mode", missing)
 
     # Some providers place the Need-only evidence_kind at candidate root. It
     # is fixed transport noise: discard this exact field, never move it into
@@ -737,6 +745,28 @@ def _normalize_candidate_payload(
             # coerce the malformed value into a guessed number.
             progress.pop("value", None)
             repaired.append("progress.value:omitted_invalid_transport")
+
+    # A model can describe an ordinary child-Need update as ``correct`` or
+    # ``resolve`` while omitting lifecycle authority. Once exact aliases have
+    # been normalized, downgrade only that non-terminal, non-reopen, inferred
+    # case to the lower-authority ``update`` disposition. Keep every
+    # lifecycle-bearing, terminal, reopen, server-command, and direct-user
+    # candidate fail-closed for the normal strict contract.
+    if (
+        payload.get("disposition") in {"correct", "resolve"}
+        and (raw_reopen is missing or raw_reopen is False)
+        and raw_lifecycle is not missing
+        and payload.get("lifecycle") in _NON_TERMINAL_LIFECYCLES
+        and (
+            raw_assertion_mode is missing
+            or (
+                raw_assertion_mode is not None
+                and payload.get("assertion_mode") == "inferred"
+            )
+        )
+    ):
+        payload["disposition"] = "update"
+        repaired.append(_LIFECYCLE_AUTHORITY_DOWNGRADED_REPAIRED_FIELD)
 
     for collection_name, field_names in _NESTED_NULL_STRING_FIELDS.items():
         rows = payload.get(collection_name)
@@ -1556,6 +1586,19 @@ def parse_living_context_candidate_detailed(
             "dropped_known_count": dropped_known_count,
             "dropped_timeline_count": dropped_timeline_count,
         }
+    answered_need_issues = answered_need_contract_issues(
+        candidate,
+        source_text=source_text,
+    )
+    if answered_need_issues:
+        return None, answered_need_issues, {
+            "status": "rejected",
+            "repair_count": len(repaired_fields),
+            "repaired_fields": repaired_fields,
+            "issue_codes": answered_need_issues,
+            "dropped_known_count": dropped_known_count,
+            "dropped_timeline_count": dropped_timeline_count,
+        }
     if candidate.deadline_at is None and candidate.disposition in {"create", "update"}:
         resolved_deadline = resolve_reported_window_end(source_text, current_time)
         if resolved_deadline is not None:
@@ -1663,6 +1706,37 @@ def _source_bound_candidate_quote_issues(
         if quote.end > len(source_text) or source_text[quote.start : quote.end] != quote.text:
             return [f"living_context_candidate:{location}:not_source_bound"]
     return []
+
+
+def answered_need_contract_issues(
+    candidate: LivingContextCandidate,
+    *,
+    source_text: str,
+) -> list[str]:
+    """Require provenance for a candidate that answers an InformationNeed.
+
+    Answer bindings are a semantic mutation of the Need lifecycle, not merely
+    another model field.  They therefore require both an exact quote from the
+    current user turn and an assertion mode that can make a direct assertion.
+    The exact slice itself is checked by ``_source_bound_candidate_quote_issues``;
+    this helper handles presence and the direct-assertion contract without
+    matching text to a Need or guessing a token.
+
+    ``server_command`` remains valid for the existing bounded command path,
+    where the server owns the command event but the candidate still carries
+    the same source-bound root quote when one is available.
+    """
+
+    if not candidate.answered_need_tokens and not candidate.answered_need_bindings:
+        return []
+    issues: list[str] = []
+    if candidate.source_quote is None:
+        issues.append("living_context_candidate:answered_need:source_quote:required")
+    elif not source_text:
+        issues.append("living_context_candidate:answered_need:source_quote:source_text_missing")
+    if candidate.assertion_mode not in {"direct_user", "server_command"}:
+        issues.append("living_context_candidate:answered_need:assertion_mode:direct_required")
+    return issues
 
 
 def parse_living_reaction_feedback(value: Any) -> tuple[LivingReactionFeedback | None, list[str]]:
