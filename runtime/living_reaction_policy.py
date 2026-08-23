@@ -28,6 +28,7 @@ DEFAULT_FEEDBACK_POLICY: dict[str, Any] = {
     "timing_offset_seconds": 0,
     "remind_before_seconds": 86400,
     "cooldown_until": None,
+    "next_allowed_at": None,
     "suppression_until": None,
     "suppression_reason": "",
 }
@@ -76,9 +77,45 @@ def _parse_optional(value: Any) -> datetime | None:
     return selected.astimezone(timezone.utc)
 
 
+def _newest_known(value: Any, *, limit: int = 6) -> list[Any]:
+    """Return bounded Known records newest-first using structured timestamps.
+
+    Known is persisted as an append-oriented record list in some writers and
+    as a newest-first projection in others.  Reaction facts must not depend on
+    that storage detail.  Use only typed timestamp fields for freshness and
+    retain input order as the deterministic tie-breaker.
+    """
+
+    rows = value if isinstance(value, list) else []
+    minimum = datetime.min.replace(tzinfo=timezone.utc)
+    indexed: list[tuple[int, Any]] = list(enumerate(rows))
+
+    def freshness(item: tuple[int, Any]) -> tuple[datetime, int]:
+        index, row = item
+        timestamps = (
+            _parse_optional(row.get(field))
+            for field in ("recorded_at", "observed_at", "updated_at", "created_at")
+        ) if isinstance(row, Mapping) else ()
+        latest = max(
+            (timestamp for timestamp in timestamps if timestamp is not None),
+            default=minimum,
+        )
+        # reverse=True puts the newest timestamp first; lower original index
+        # wins ties, preserving a stable order for equally-timed records.
+        return latest, -index
+
+    indexed.sort(key=freshness, reverse=True)
+    return [row for _, row in indexed[: max(0, int(limit))]]
+
+
 def _active_until(value: Any, now: datetime) -> bool:
     parsed = _parse_optional(value)
     return parsed is not None and parsed > now
+
+
+def _later_time(*values: Any) -> datetime | None:
+    parsed = [item for item in (_parse_optional(value) for value in values) if item is not None]
+    return max(parsed) if parsed else None
 
 
 def normalise_policy(value: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -227,21 +264,53 @@ def _need_why_now(
 
 def _facts_and_inferences(situation: SituationSnapshot, need: InformationNeedSnapshot | None) -> dict[str, list[str]]:
     facts: list[str] = []
-    for item in situation.known[:6]:
-        if isinstance(item, str) and item.strip():
-            facts.append(item.strip())
-        elif isinstance(item, Mapping):
+    inferences: list[str] = []
+    for item in _newest_known(situation.known, limit=6):
+        epistemic_status = ""
+        if isinstance(item, Mapping):
+            epistemic_status = str(item.get("epistemic_status") or item.get("epistemic") or "").strip().lower()
             statement = str(item.get("statement") or item.get("value") or "").strip()
-            if statement:
-                facts.append(statement)
+        else:
+            statement = str(item or "").strip()
+        if not statement:
+            continue
+        if isinstance(item, Mapping) and epistemic_status in {"inferred", "model_attributed", "hypothesis"}:
+            # Model/context claims remain visible, but are never rendered as
+            # user-reported facts merely because they are present in `known`.
+            inferences.append(statement)
+            continue
+        facts.append(statement)
     change_statement = str(situation.material_change.get("statement") or "").strip()
-    if change_statement and change_statement not in facts:
-        facts.append(change_statement)
-    for row in situation.evidence[:4]:
+    change_status = str(situation.material_change.get("epistemic_status") or "").strip().lower()
+    if change_statement:
+        if change_status in {"hypothesis", "inferred", "model_attributed"}:
+            inferences.append(change_statement)
+        elif change_statement not in facts:
+            facts.append(change_statement)
+    evidence_rows = [row for row in situation.evidence if isinstance(row, Mapping)]
+    minimum = datetime.min.replace(tzinfo=timezone.utc)
+
+    def evidence_freshness(item: tuple[int, Mapping[str, Any]]) -> tuple[datetime, int]:
+        index, row = item
+        latest = max(
+            (
+                timestamp
+                for timestamp in (
+                    _parse_optional(row.get(field))
+                    for field in ("observed_at", "recorded_at", "updated_at", "created_at")
+                )
+                if timestamp is not None
+            ),
+            default=minimum,
+        )
+        return latest, -index
+
+    indexed_evidence = list(enumerate(evidence_rows))
+    indexed_evidence.sort(key=evidence_freshness, reverse=True)
+    for _, row in indexed_evidence[:4]:
         ref = str(row.get("ref") or "").strip()
         if ref:
             facts.append(f"Evidence recorded: {ref}")
-    inferences: list[str] = []
     if situation.goal:
         inferences.append(f"This may matter for the goal: {situation.goal}")
     if need and need.question:
@@ -318,7 +387,7 @@ def decide_reaction(reaction: ReactionInput, *, feedback_policy: Mapping[str, An
     policy = normalise_policy(feedback_policy or reaction.feedback_policy)
     temporal = temporal_phase(reaction, policy)
     suppression_until = _parse_optional(policy.get("suppression_until"))
-    cooldown_until = _parse_optional(policy.get("cooldown_until"))
+    cooldown_until = _later_time(policy.get("cooldown_until"), policy.get("next_allowed_at"))
     suppression_active = suppression_until is not None and suppression_until > reaction.now
     cooldown_active = cooldown_until is not None and cooldown_until > reaction.now
     suppression_reason = str(policy.get("suppression_reason") or "").strip().lower()
@@ -328,8 +397,9 @@ def decide_reaction(reaction: ReactionInput, *, feedback_policy: Mapping[str, An
     authorized_read = False
     if _need_open(need):
         disposition, authorized_read = _select_need_disposition(need, reaction)
+    cognitive_attention = reaction.attention_trigger == "cognitive_hypothesis"
     urgent_attention = (
-        reaction.attention_trigger == "material_observation"
+        reaction.attention_trigger in {"material_observation", "cognitive_hypothesis"}
         or temporal["phase"] in {"in_window", "overdue"}
         or _risk_score(situation.risk) >= 0.8
     )
@@ -345,10 +415,10 @@ def decide_reaction(reaction: ReactionInput, *, feedback_policy: Mapping[str, An
     elif suppression_active and (urgent_attention or not authorized_read or explicit_read_block):
         disposition = "silent"
         reason = str(policy.get("suppression_reason") or "feedback_suppression")
-    elif cooldown_active and (urgent_attention or not authorized_read):
+    elif cooldown_active and (cognitive_attention or urgent_attention or not authorized_read):
         disposition = "silent"
-        reason = "feedback_cooldown"
-    elif reaction.quiet_hours and (urgent_attention or not authorized_read):
+        reason = "cognitive_hypothesis_cooldown" if cognitive_attention else "feedback_cooldown"
+    elif reaction.quiet_hours and (cognitive_attention or urgent_attention or not authorized_read):
         disposition = "silent"
         reason = "quiet_hours"
     elif urgent_attention:
@@ -362,6 +432,8 @@ def decide_reaction(reaction: ReactionInput, *, feedback_policy: Mapping[str, An
             if reaction.attention_trigger == "material_observation"
             else "material_change_or_urgency"
         )
+        if reaction.attention_trigger == "cognitive_hypothesis":
+            reason = "cognitive_hypothesis"
     elif authorized_read and not explicit_read_block:
         disposition = "read"
         reason = "open_information_need"
@@ -387,6 +459,14 @@ def decide_reaction(reaction: ReactionInput, *, feedback_policy: Mapping[str, An
         reason = "missing_information_need"
 
     statement = _material_statement(situation)
+    if reaction.attention_trigger == "cognitive_hypothesis" and not (
+        statement.startswith("Possible signal:")
+        or statement.startswith("可能的变化：")
+    ):
+        # Background cognition is an unverified candidate.  Keep the
+        # tentative epistemic status in the user-facing sentence itself so a
+        # later renderer cannot accidentally present it as a fact.
+        statement = f"Possible signal: {statement}" if statement else "Possible signal detected."
     why_matters = situation.goal or situation.summary or "This is part of an active Situation."
     if disposition in {"ask", "read", "wait"} and _need_open(need):
         why_now = _need_why_now(need, situation, reaction.now, disposition)
@@ -452,6 +532,8 @@ def decide_reaction(reaction: ReactionInput, *, feedback_policy: Mapping[str, An
         external_delivery=False,
         record_only=True,
         schema_version=REACTION_SCHEMA,
+        attention_trigger=reaction.attention_trigger,
+        attention_candidate_id=reaction.attention_candidate_id,
     )
 
 
@@ -490,6 +572,7 @@ def apply_feedback_effect(
         policy["remind_before_seconds"] = max(0, min(30 * 86400, int(remind_before_seconds if remind_before_seconds is not None else 86400)))
     cooldown_at = now + timedelta(seconds=policy["cooldown_seconds"])
     policy["cooldown_until"] = time_iso(cooldown_at)
+    policy["next_allowed_at"] = policy["cooldown_until"]
     if label in {"ignore", "resolved", "too_frequent"}:
         policy["suppression_until"] = time_iso(now + timedelta(seconds=max(policy["cooldown_seconds"], durations[label][0])))
         policy["suppression_reason"] = label

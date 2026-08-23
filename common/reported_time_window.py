@@ -19,6 +19,7 @@ _ZH_DATE_RE = re.compile(r"(?P<year>20\d{2})年(?P<month>\d{1,2})月(?P<day>\d{1
 _MONTH_DAY_RE = re.compile(r"(?<!\d)(?P<month>\d{1,2})月(?P<day>\d{1,2})[日号]")
 _ZH_OFFSET_RE = re.compile(r"(?P<count>[一二两三四五六七八九十\d]+)\s*(?P<unit>天|周|星期|个月|月)后")
 _EN_OFFSET_RE = re.compile(r"\bin\s+(?P<count>\d+)\s+(?P<unit>day|days|week|weeks|month|months)\b", re.IGNORECASE)
+_ZH_WEEKDAY_RE = re.compile(r"下(?:周|星期|个周|个星期)(?P<weekday>[一二三四五六日天])")
 
 _ZH_NUMBERS = {
     "一": 1,
@@ -33,6 +34,33 @@ _ZH_NUMBERS = {
     "九": 9,
     "十": 10,
 }
+_ZH_WEEKDAYS = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+
+
+def resolve_reported_calendar_date(text: str, current_time: Any) -> str | None:
+    """Resolve only an explicit exact calendar day, never a broad window."""
+
+    now = _aware_datetime(current_time)
+    source = str(text or "").strip()
+    if now is None or not source:
+        return None
+    explicit = _explicit_date(source, now)
+    if explicit is not None:
+        return explicit.date().isoformat()
+    match = _ZH_WEEKDAY_RE.search(source)
+    if match:
+        weekday = _ZH_WEEKDAYS.get(match.group("weekday"))
+        if weekday is None:
+            return None
+        start_next_week = _start_of_day(now) + timedelta(days=(7 - now.weekday()))
+        return (start_next_week + timedelta(days=weekday)).date().isoformat()
+    lowered = source.lower()
+    names = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    match = re.search(r"\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", lowered)
+    if match:
+        start_next_week = _start_of_day(now) + timedelta(days=(7 - now.weekday()))
+        return (start_next_week + timedelta(days=names.index(match.group(1)))).date().isoformat()
+    return None
 
 
 def resolve_reported_window_end(text: str, current_time: Any) -> str | None:
@@ -60,6 +88,14 @@ def resolve_reported_window_end(text: str, current_time: Any) -> str | None:
         return _daypart_end(now + timedelta(days=1), source).isoformat(timespec="seconds")
     if _contains_any(source, ("今天", "今日")) or re.search(r"\btoday\b", lowered):
         return _daypart_end(now, source).isoformat(timespec="seconds")
+
+    exact_calendar_date = resolve_reported_calendar_date(source, now)
+    if exact_calendar_date is not None and (
+        _ZH_WEEKDAY_RE.search(source)
+        or re.search(r"\bnext\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", lowered)
+    ):
+        exact_datetime = datetime.fromisoformat(exact_calendar_date).replace(tzinfo=now.tzinfo)
+        return _end_of_day(exact_datetime).isoformat(timespec="seconds")
 
     if _contains_any(source, ("下周", "下星期")) or "next week" in lowered:
         start_next_week = _start_of_day(now) + timedelta(days=(7 - now.weekday()))

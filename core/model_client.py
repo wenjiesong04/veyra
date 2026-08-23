@@ -10,8 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+
+import httpx
 
 from core.env_loader import runtime_env_status
 from core.world_state import WorldStateStore
@@ -310,19 +310,45 @@ class CoreModelClient:
         if config.api_key:
             headers["Authorization"] = f"Bearer {config.api_key}"
 
-        request = Request(self._chat_completions_url(config), data=data, headers=headers, method="POST")
-        context, ca_bundle = self._ssl_context(config)
+        ca_bundle = self._ca_bundle_path(config)
         last_error: Exception | None = None
-        for attempt in range(config.retries + 1):
-            try:
-                with urlopen(request, timeout=config.timeout, context=context) as response:
-                    body = response.read().decode("utf-8")
-                break
-            except HTTPError as exc:
-                return finish({"status": "http_error", "purpose": purpose, "status_code": exc.code, "error": str(exc), "ca_bundle": _public_ca_bundle_path(ca_bundle)})
-            except (URLError, TimeoutError, OSError, ssl.SSLError) as exc:
-                last_error = exc
-                if attempt >= config.retries:
+        body: str | None = None
+        with self._http_client(config=config, headers=headers, ca_bundle=ca_bundle) as client:
+            for attempt in range(config.retries + 1):
+                try:
+                    # Build a fresh request for every attempt. A retry is only
+                    # allowed for failures that happen before a request can
+                    # reach the provider; read/write/protocol failures are
+                    # never replayed.
+                    response = client.post(self._chat_completions_url(config), content=data)
+                    response.raise_for_status()
+                    body = response.text
+                    break
+                except httpx.HTTPStatusError as exc:
+                    return finish({
+                        "status": "http_error",
+                        "purpose": purpose,
+                        "status_code": exc.response.status_code,
+                        "error": str(exc),
+                        "ca_bundle": _public_ca_bundle_path(ca_bundle),
+                    })
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError, httpx.PoolTimeout) as exc:
+                    # These failures occur before a response/request body can
+                    # be delivered to the provider. Do not retry read/write
+                    # or protocol failures: the provider may have received
+                    # the request and a replay could duplicate a model call.
+                    last_error = exc
+                    if attempt >= config.retries:
+                        return finish({
+                            "status": "error",
+                            "purpose": purpose,
+                            "error": str(last_error),
+                            "ca_bundle": _public_ca_bundle_path(ca_bundle),
+                            "proxy": _proxy_summary(),
+                            "attempts": attempt + 1,
+                        })
+                    time.sleep(min(0.25 * (attempt + 1), 1.0))
+                except (httpx.RequestError, TimeoutError, OSError, ssl.SSLError) as exc:
                     return finish({
                         "status": "error",
                         "purpose": purpose,
@@ -331,9 +357,16 @@ class CoreModelClient:
                         "proxy": _proxy_summary(),
                         "attempts": attempt + 1,
                     })
-                time.sleep(min(0.25 * (attempt + 1), 1.0))
-        else:
-            return finish({"status": "error", "purpose": purpose, "error": str(last_error or "unknown model transport error")})
+
+        if body is None:
+            return finish({
+                "status": "error",
+                "purpose": purpose,
+                "error": str(last_error or "unknown model transport error"),
+                "ca_bundle": _public_ca_bundle_path(ca_bundle),
+                "proxy": _proxy_summary(),
+                "attempts": config.retries + 1,
+            })
 
         try:
             raw = json.loads(body or "{}")
@@ -387,11 +420,21 @@ class CoreModelClient:
         host = (parsed.hostname or "").lower()
         return host not in {"", "localhost", "127.0.0.1", "::1"}
 
-    def _ssl_context(self, config: CoreModelConfig) -> tuple[ssl.SSLContext, str]:
-        ca_bundle = self._ca_bundle_path(config)
-        if ca_bundle:
-            return ssl.create_default_context(cafile=ca_bundle), ca_bundle
-        return ssl.create_default_context(), ""
+    def _http_client(self, *, config: CoreModelConfig, headers: dict[str, str], ca_bundle: str) -> httpx.Client:
+        timeout_seconds = max(float(config.timeout), 0.1)
+        timeout = httpx.Timeout(
+            connect=timeout_seconds,
+            read=timeout_seconds,
+            write=timeout_seconds,
+            pool=timeout_seconds,
+        )
+        return httpx.Client(
+            headers=headers,
+            timeout=timeout,
+            verify=ca_bundle or True,
+            trust_env=True,
+            follow_redirects=True,
+        )
 
     def _ca_bundle_path(self, config: CoreModelConfig) -> str:
         candidates = [

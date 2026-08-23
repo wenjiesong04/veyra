@@ -14,7 +14,7 @@ import hashlib
 import json
 import math
 import re
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal, Mapping
 
 from common.reported_time_window import resolve_reported_window_end
@@ -104,6 +104,8 @@ _BOUNDARY_LOCATION_FIELDS = frozenset(
         "needs",
         "blocked_judgment",
         "evidence_kind",
+        "observation_mode",
+        "observation_requirement",
         "why_now",
         "urgency",
         "expires_at",
@@ -344,6 +346,8 @@ _SINGLETON_COLLECTION_ITEM_KEYS: dict[str, frozenset[str]] = {
             "allowed_source_classes",
             "fallback_reaction",
             "question",
+            "observation_mode",
+            "observation_requirement",
         }
     ),
 }
@@ -853,6 +857,31 @@ def _normalize_candidate_payload(
                 if after != before:
                     row["allowed_source_classes"][source_index] = after
                     repaired.append(f"needs[{index}].allowed_source_classes[{source_index}]")
+        # ``evidence_kind`` is the typed endpoint of an InformationNeed.  For
+        # every concrete registered kind, derive the only matching source
+        # class instead of trusting a provider's stale/competing class list.
+        # ``other`` intentionally remains open to its bounded, validated list
+        # because it has no typed source endpoint to derive.
+        for index, row in enumerate(needs):
+            if not isinstance(row, dict):
+                continue
+            evidence_kind = row.get("evidence_kind")
+            if (
+                evidence_kind in INFORMATION_NEED_SOURCE_CLASSES
+                and evidence_kind != "other"
+                and isinstance(row.get("allowed_source_classes"), list)
+                and bool(row.get("allowed_source_classes"))
+                and any(
+                    source in INFORMATION_NEED_SOURCE_CLASSES
+                    for source in row.get("allowed_source_classes", [])
+                )
+            ):
+                expected_sources = [evidence_kind]
+                if row.get("allowed_source_classes") != expected_sources:
+                    row["allowed_source_classes"] = expected_sources
+                    repaired.append(
+                        f"needs[{index}].allowed_source_classes:from_evidence_kind"
+                    )
 
     return payload, repaired[:32]
 
@@ -1083,6 +1112,51 @@ class SituationProgress(StrictLivingContextModel):
     value: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
+class ObservationRequirement(StrictLivingContextModel):
+    """Typed provider coverage required before a Need can resolve.
+
+    This is deliberately a small data contract.  It is not a natural-language
+    description and is never interpreted by matching text.  The source
+    adapter validates the same exact metric names against the returned typed
+    facts.
+    """
+
+    coverage: Literal["any", "current", "forecast_day", "window", "results"] = "any"
+    # A forecast day is an explicit calendar-date endpoint, never a date
+    # reconstructed from prose, event receipt time, or a broad deadline.
+    target_date: str | None = Field(default=None, max_length=10)
+    metrics: list[
+        Literal[
+            "temperature_2m",
+            "temperature_2m_max",
+            "temperature_2m_min",
+            "temperature",
+            "weather_code",
+            "weather_description",
+            "precipitation_probability_max",
+            "precipitation",
+            "conditions",
+            "events",
+            "results",
+            "answer",
+        ]
+    ] = Field(default_factory=list, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_target_date(self) -> "ObservationRequirement":
+        if self.target_date is None:
+            return self
+        if self.coverage != "forecast_day":
+            raise ValueError("target_date is only valid for forecast_day coverage")
+        try:
+            parsed = date.fromisoformat(self.target_date)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("target_date must be an ISO calendar date") from exc
+        if parsed.isoformat() != self.target_date:
+            raise ValueError("target_date must be a canonical ISO calendar date")
+        return self
+
+
 class CandidateNeed(StrictLivingContextModel):
     blocked_judgment: str = Field(min_length=1, max_length=480)
     evidence_kind: Literal[
@@ -1096,6 +1170,11 @@ class CandidateNeed(StrictLivingContextModel):
         "time",
         "other",
     ]
+    # ``once`` describes a one-off evidence gap. ``watch`` describes a
+    # durable observation that may be reconsidered when new typed evidence
+    # arrives. This is semantic lifecycle metadata, not a source selector.
+    observation_mode: Literal["once", "watch"] = "once"
+    observation_requirement: ObservationRequirement | None = None
     why_now: str = Field(min_length=1, max_length=480)
     urgency: float = Field(default=0.0, ge=0.0, le=1.0)
     expires_at: str | None = Field(default=None, max_length=80)
@@ -1325,6 +1404,58 @@ def quarantine_typed_known_rows(
     return candidate.model_copy(update={"known": retained}), dropped
 
 
+def quarantine_invalid_entity_quotes(
+    value: Any,
+    *,
+    source_text: str,
+) -> tuple[Any, int]:
+    """Remove invalid optional entity spans without discarding the entity.
+
+    Entity values are intentionally not searched for or re-anchored.  A model
+    may report a value without a trustworthy character span; the runtime can
+    retain that bounded statement at message provenance instead.  Only an
+    explicitly supplied quote that fails the existing exact source-slice
+    contract is cleared here.
+    """
+
+    if not source_text or not isinstance(value, Mapping):
+        return value, 0
+    entities = value.get("entities")
+    if not isinstance(entities, list) or len(entities) > 8:
+        return value, 0
+    retained: list[Any] = []
+    cleared = 0
+    for row in entities:
+        if not isinstance(row, Mapping) or row.get("source_quote") is None:
+            retained.append(row)
+            continue
+        quote = row.get("source_quote")
+        valid = bool(
+            source_text
+            and isinstance(quote, Mapping)
+            and set(quote) == {"text", "start", "end"}
+            and isinstance(quote.get("text"), str)
+            and isinstance(quote.get("start"), int)
+            and not isinstance(quote.get("start"), bool)
+            and isinstance(quote.get("end"), int)
+            and not isinstance(quote.get("end"), bool)
+            and quote.get("text") == row.get("value")
+            and source_text[quote["start"] : quote["end"]] == quote["text"]
+        )
+        if valid:
+            retained.append(row)
+            continue
+        replacement = dict(row)
+        replacement["source_quote"] = None
+        retained.append(replacement)
+        cleared += 1
+    if cleared == 0:
+        return value, 0
+    payload = copy.deepcopy(dict(value))
+    payload["entities"] = retained
+    return payload, cleared
+
+
 class InformationNeedRecord(StrictLivingContextModel):
     """Durable need projection; it is not an instruction to call a source."""
 
@@ -1345,6 +1476,8 @@ class InformationNeedRecord(StrictLivingContextModel):
         "time",
         "other",
     ]
+    observation_mode: Literal["once", "watch"] = "once"
+    observation_requirement: ObservationRequirement | None = None
     why_now: str = Field(min_length=1, max_length=480)
     urgency: float = Field(default=0.0, ge=0.0, le=1.0)
     expires_at: str | None = Field(default=None, max_length=80)
@@ -1362,6 +1495,15 @@ class InformationNeedRecord(StrictLivingContextModel):
     # readable but cannot claim a successful unknown projection.
     unknown_binding: str | None = Field(default=None, max_length=480)
     unknown_binding_digest: str | None = Field(default=None, max_length=64)
+    # Provider-neutral, server-derived target. It is intentionally separate
+    # from the model candidate: source adapters receive this typed projection
+    # rather than arbitrary model arguments.
+    evidence_target: dict[str, Any] | None = None
+    evidence_target_digest: str | None = Field(default=None, max_length=64)
+    # Provider coverage digest intentionally excludes Need-only requirement
+    # fields; it is used only to validate the returned provider target.
+    provider_target_digest: str | None = Field(default=None, max_length=64)
+    need_identity_digest: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode="after")
     def validate_times(self) -> "InformationNeedRecord":
@@ -1376,6 +1518,24 @@ class InformationNeedRecord(StrictLivingContextModel):
             r"[0-9a-f]{64}", self.unknown_binding_digest
         ):
             raise ValueError("unknown_binding_digest must be a lowercase SHA-256 digest")
+        if (self.evidence_target is None) != (self.evidence_target_digest is None):
+            raise ValueError("evidence_target and evidence_target_digest must be paired")
+        if self.evidence_target_digest is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", self.evidence_target_digest
+        ):
+            raise ValueError("evidence_target_digest must be a lowercase SHA-256 digest")
+        if self.provider_target_digest is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", self.provider_target_digest
+        ):
+            raise ValueError("provider_target_digest must be a lowercase SHA-256 digest")
+        if self.need_identity_digest is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", self.need_identity_digest
+        ):
+            raise ValueError("need_identity_digest must be a lowercase SHA-256 digest")
+        if self.evidence_target is not None:
+            forbidden = {"blocked_judgment", "question"}
+            if any(str(key) in forbidden for key in self.evidence_target):
+                raise ValueError("evidence_target cannot contain display-only Need wording")
         return self
 
 
@@ -1477,6 +1637,25 @@ def stable_subject_digest(owner_id: str, subject: str) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def stable_evidence_target_digest(target: Mapping[str, Any] | None) -> str | None:
+    """Return a stable digest for a server-derived typed evidence target.
+
+    Targets are canonical JSON projections.  The digest is used for Need
+    identity and replay checks; it never includes human-facing Need wording.
+    """
+
+    if target is None:
+        return None
+    payload = json.dumps(
+        dict(target),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def parse_living_context_candidate_detailed(
     value: Any,
     *,
@@ -1533,11 +1712,17 @@ def parse_living_context_candidate_detailed(
         value,
         source_text=source_text,
     )
+    value, cleared_entity_quote_count = quarantine_invalid_entity_quotes(
+        value,
+        source_text=source_text,
+    )
     normalized, repaired_fields = _normalize_candidate_payload(value, catalog=catalog)
     if dropped_known_count:
         repaired_fields.append("known:quarantined")
     if dropped_timeline_count:
         repaired_fields.append("timeline:quarantined")
+    if cleared_entity_quote_count:
+        repaired_fields.append("entities:source_quote_quarantined")
     if "situation_selector:rejected" in repaired_fields:
         issues = ["living_context_candidate:binding:situation_selector_not_unique"]
         return None, issues, {

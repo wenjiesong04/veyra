@@ -16,6 +16,7 @@ from core.cognition_pipeline import (  # noqa: E402
     cognition_mode,
 )
 from core.decision_core import DecisionCore  # noqa: E402
+from core.semantic_frame import TurnSemanticFrame  # noqa: E402
 from core.understanding_core import TurnUnderstanding  # noqa: E402
 from core.world_state import WorldStateStore  # noqa: E402
 from probes.weather_probe import WeatherProbe  # noqa: E402
@@ -168,6 +169,137 @@ def test_governance_lock_before_pipeline() -> None:
     assert decision.intent == "identity"
 
 
+def _typed_understanding(text: str, *, operation: str, target: dict[str, object], evidence_need: str = "none") -> TurnUnderstanding:
+    frame = TurnSemanticFrame.from_payload(
+        {
+            "schema_version": "veyra.semantic_frame.v1",
+            "acts": [
+                {
+                    "act_id": "act_1",
+                    "kind": "information" if evidence_need != "none" else "conversation",
+                    "goal": text,
+                    "operation": operation,
+                    "target": target,
+                    "polarity": "positive",
+                    "explicitness": "explicit",
+                    "source_quote": {"text": text, "start": 0, "end": len(text)},
+                    "speaker": "direct_user",
+                    "authority": "direct_user",
+                    "mention_mode": "normal_use",
+                    "evidence_need": evidence_need,
+                    "referent": {"surface": "", "resolved": "", "status": "not_applicable", "candidates": []},
+                    "condition": None,
+                    "modality": "asserted",
+                    "arguments": {},
+                }
+            ],
+            "relations": [],
+            "ambiguities": [],
+            "resolver_status": "resolved",
+            "source": "model",
+        },
+        source_text=text,
+    )
+    return TurnUnderstanding(
+        intent="information" if evidence_need != "none" else "conversation",
+        task_type="chat",
+        source="model",
+        confidence=0.95,
+        semantic_frame=frame,
+    )
+
+
+def test_typed_policy_skips_planner_for_direct_and_probe() -> None:
+    reasoning = FakeReasoning()
+    core = DecisionCore(reasoning=reasoning)  # type: ignore[arg-type]
+    direct_text = "下周六户外团建在上海。"
+    direct = core.decide(
+        direct_text,
+        attention_focus=[],
+        turn_understanding=_typed_understanding(
+            direct_text,
+            operation="share_context",
+            target={"type": "event", "value": "户外团建"},
+        ),
+    )
+    assert direct.route.value == "direct_answer"
+    assert reasoning.calls == []
+
+    probe_text = "上海的情况怎么样？"
+    probe = core.decide(
+        probe_text,
+        attention_focus=[],
+        turn_understanding=_typed_understanding(
+            probe_text,
+            operation="query_weather",
+            target={"type": "weather", "value": "上海"},
+            evidence_need="weather",
+        ),
+    )
+    assert probe.route.value == "probe"
+    assert probe.selected_probe == "weather_probe"
+    assert probe.model_assist["semantic_policy"]["capability_arguments"] == {"location": "上海"}
+    assert reasoning.calls == []
+
+    typed_read = core.decide(
+        "读取上海天气",
+        attention_focus=[],
+        turn_understanding=_typed_understanding(
+            "读取上海天气",
+            operation="read",
+            target={"type": "weather", "value": "上海"},
+        ),
+    )
+    assert typed_read.route.value == "probe"
+    assert typed_read.selected_probe == "weather_probe"
+
+    process_status = core.decide(
+        "读取当前进程状态",
+        attention_focus=[],
+        turn_understanding=_typed_understanding(
+            "读取当前进程状态",
+            operation="query_current_process_status",
+            target={"type": "process", "value": "current"},
+        ),
+    )
+    assert process_status.route.value == "probe"
+    assert process_status.selected_probe == "process"
+
+
+def test_text_marker_does_not_grant_probe() -> None:
+    text = "天气"
+    decision = DecisionCore(reasoning=FakeReasoning()).decide(
+        text,
+        attention_focus=[],
+        turn_understanding=_typed_understanding(
+            text,
+            operation="discuss_topic",
+            target={"type": "topic", "value": "天气"},
+        ),
+    )
+    assert decision.route.value == "direct_answer"
+    assert decision.selected_probe is None
+
+
+def test_fresh_evidence_without_observer_asks_instead_of_stale_direct() -> None:
+    reasoning = FakeReasoning()
+    text = "这个主题需要最新证据。"
+    decision = DecisionCore(reasoning=reasoning).decide(
+        text,
+        attention_focus=[],
+        turn_understanding=_typed_understanding(
+            text,
+            operation="discuss_topic",
+            target={"type": "topic", "value": "这个主题"},
+            evidence_need="fresh_external",
+        ),
+    )
+    assert decision.route.value == "ask_user"
+    assert decision.model_assist["semantic_policy"]["requires_clarification"] is True
+    assert "semantic_policy:unresolved_observer" in decision.model_assist["semantic_policy"]["policy_signals"]
+    assert reasoning.calls == []
+
+
 def test_precomputed_understanding_skips_orientation_call() -> None:
     reasoning = FakeReasoning()
     pipeline = CognitionPipeline(reasoning)  # type: ignore[arg-type]
@@ -199,6 +331,9 @@ def main() -> int:
     test_awareness_assembler_fresh_claim_match()
     test_weather_probe_accepts_model_location()
     test_governance_lock_before_pipeline()
+    test_typed_policy_skips_planner_for_direct_and_probe()
+    test_text_marker_does_not_grant_probe()
+    test_fresh_evidence_without_observer_asks_instead_of_stale_direct()
     test_precomputed_understanding_skips_orientation_call()
     print("cognition_pipeline_smoke: ok")
     return 0

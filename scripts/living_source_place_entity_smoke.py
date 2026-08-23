@@ -99,6 +99,10 @@ def candidate(*, place: str, epistemic_status: str) -> LivingContextCandidate:
             CandidateNeed(
                 blocked_judgment="当天天气未确认",
                 evidence_kind="weather",
+                observation_requirement={
+                    "coverage": "current",
+                    "metrics": ["weather_description", "temperature_2m"],
+                },
                 why_now="团建前需要确认天气是否影响户外安排",
                 urgency=0.7,
                 allowed_source_classes=["weather"],

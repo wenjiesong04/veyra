@@ -10,12 +10,19 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Mapping
 
 from core.world_state import StateRevisionConflictError
+from common.living_source_primitives import stable_digest
 from interface.event_schema import VeyraEvent
-from interface.living_context_contract import CandidateNeed, ReactionPlan
+from interface.living_context_contract import CandidateNeed, ReactionPlan, stable_evidence_target_digest
 from interface.living_source_contract import SourceReceipt
+from interface.living_source_payload import (
+    weather_coverage_matches,
+    weather_material_digest,
+    weather_target,
+    weather_target_digest,
+)
 
 
 _SOURCE_RECEIPT_PROJECTION_STATUSES = frozenset(
@@ -28,6 +35,19 @@ _SOURCE_POLICY_CLASSES = {
     "public_web": "public_web",
     "agent_research": "agent",
 }
+
+
+def _source_material_digest(source: str, facts: Mapping[str, Any]) -> str | None:
+    """Return a provider-material digest independent of receipt identity/time."""
+
+    if not isinstance(facts, Mapping) or not facts:
+        return None
+    if source == "weather":
+        return weather_material_digest(facts)
+    return stable_digest(
+        dict(facts),
+        namespace=f"veyra.living_context.{source}.material.v1",
+    )
 
 
 def _calendar_time(value: Any) -> datetime | None:
@@ -112,6 +132,24 @@ def _is_calendar_attention_marker(value: Any) -> bool:
         and value.get("source") == "calendar"
         and value.get("attention_trigger") == "material_observation"
     )
+
+
+def _weather_need_target(need: Mapping[str, Any]) -> tuple[dict[str, str | None] | None, str | None]:
+    """Return the typed weather target and its optional authoritative digest."""
+
+    raw_target = need.get("evidence_target")
+    if not isinstance(raw_target, Mapping):
+        return None, None
+    target = weather_target(raw_target.get("location"), raw_target.get("target_date"))
+    if target is None:
+        return None, None
+    explicit_digest = str(
+        need.get("provider_target_digest")
+        or raw_target.get("target_digest")
+        or raw_target.get("digest")
+        or ""
+    ).strip() or None
+    return target, explicit_digest or weather_target_digest(target["location"], target["target_date"])
 
 
 def _authoritative_source_receipt(
@@ -512,7 +550,7 @@ def apply_source_receipt(
         if receipt_source == "calendar" and str(receipt_dict.get("status") or "") == "ok"
         else []
     )
-    attention_trigger = "material_observation" if calendar_observations else "none"
+    attention_trigger = "none"
     if admission_event is not None and str(admission_event.get("phase") or "") == "committed":
         if str(admission_event.get("situation_id") or "") != situation_id:
             raise StateRevisionConflictError("source receipt event is bound to another Situation")
@@ -524,7 +562,8 @@ def apply_source_receipt(
             "attention_trigger": attention_trigger,
         }
 
-    current = copy.deepcopy(situation.get("semantic") or {})
+    original_semantic = copy.deepcopy(situation.get("semantic") or {})
+    current = copy.deepcopy(original_semantic)
     source = str(receipt_dict.get("source") or "other")
     receipt_status = str(receipt_dict.get("status") or "unknown")
     fresh_until = receipt_dict.get("fresh_until")
@@ -532,15 +571,38 @@ def apply_source_receipt(
     facts = receipt_dict.get("payload", {}).get("facts", {}) if isinstance(receipt_dict.get("payload"), dict) else {}
     facts = copy.deepcopy(facts) if isinstance(facts, dict) else {}
     successful = receipt_status in {"ok", "empty"}
-    blocked = str(need.get("blocked_judgment") or "").strip()
+    coverage_ok = True
+    coverage_reason = ""
+    if source == "weather" and successful:
+        weather_target_row, expected_target_digest = _weather_need_target(need)
+        if weather_target_row is not None:
+            coverage_ok, coverage_reason = weather_coverage_matches(
+                facts,
+                location=weather_target_row.get("location"),
+                target_date=weather_target_row.get("target_date"),
+                expected_digest=expected_target_digest,
+                observation_requirement=(
+                    need.get("observation_requirement")
+                    if isinstance(need.get("observation_requirement"), Mapping)
+                    else None
+                ),
+            )
+        elif need.get("evidence_target") is not None or need.get("evidence_target_digest"):
+            coverage_ok, coverage_reason = False, "weather_target_invalid"
+        # Weather ``empty`` means the provider did not produce a forecast
+        # fact.  It is an honest receipt but cannot resolve an information
+        # target.  Calendar empty (no events) may still resolve its Need.
+        if receipt_status == "empty":
+            coverage_ok, coverage_reason = False, "weather_observation_empty"
+    resolves_need = successful and coverage_ok
     unknown_binding = str(need.get("unknown_binding") or "").strip() or None
     binding_status = "not_applicable"
     unknown = [str(item) for item in current.get("unknown") or [] if str(item).strip()]
-    if successful:
+    if resolves_need:
         if unknown_binding is None:
-            # Legacy Needs did not persist a server-owned binding.  Keep the
-            # unknown and surface degradation; guessing by matching the
-            # blocked-judgment text can delete an unrelated paraphrase.
+            # Legacy rows have no server-owned semantic endpoint. A
+            # successful receipt may resolve the Need, but it cannot clear an
+            # Unknown until structural migration supplies that binding.
             binding_status = "unbound"
         elif unknown_binding not in unknown:
             # The binding is authoritative, but its endpoint is no longer in
@@ -551,12 +613,79 @@ def apply_source_receipt(
             unknown = [item for item in unknown if item != unknown_binding]
             binding_status = "cleared"
     else:
-        reason = str(receipt_dict.get("reason") or "source observation unavailable")[:240]
-        if reason and reason not in unknown:
-            unknown.append(reason)
+        # Provider prose is not a semantic unknown.  Keep the original
+        # server-owned binding stable; otherwise every retry appends another
+        # spelling of the same transient failure and the UI reports a new
+        # blocker forever.
+        pass
     current["unknown"] = dedupe_text(unknown, limit=12)
 
     known = list(current.get("known") or [])
+    material_digest = (
+        _source_material_digest(source, facts)
+        if receipt_status == "ok" and resolves_need
+        else None
+    )
+    prior_material_digests = current.get("source_material_digests")
+    if not isinstance(prior_material_digests, dict):
+        prior_material_digests = {}
+    weather_digest = weather_material_digest(facts) if source == "weather" and resolves_need else ""
+    prior_weather_digests = current.get("source_observation_digests")
+    if not isinstance(prior_weather_digests, dict):
+        prior_weather_digests = {}
+    weather_target_row, _ = _weather_need_target(need) if source == "weather" else (None, None)
+    weather_coverage_row = facts.get("coverage") if isinstance(facts.get("coverage"), Mapping) else {}
+    weather_target_key = (
+        weather_target_digest(
+            weather_target_row.get("location"),
+            weather_target_row.get("target_date"),
+        )
+        if weather_target_row is not None
+        else str(weather_coverage_row.get("target_digest") or "")
+    )
+    material_key = (
+        str(need.get("evidence_target_digest") or "").strip()
+        or weather_target_key
+        or str(need_id)
+    )
+    repeated_weather_observation = bool(
+        weather_digest
+        and weather_target_key
+        and str(prior_weather_digests.get(weather_target_key) or "") == weather_digest
+    )
+    observation_key = weather_target_key or str(need.get("evidence_target_digest") or "").strip()
+    observation_digest = weather_digest or material_digest
+    prior_observation_digest = (
+        str(prior_weather_digests.get(observation_key) or "")
+        if observation_key
+        else ""
+    )
+    # The first typed observation establishes the server material checkpoint;
+    # later identical receipts are audit-only. Exact digests, rather than
+    # wording, define the boundary.
+    material_observed = bool(observation_digest and observation_key and observation_digest != prior_observation_digest)
+    # The first exact observation establishes availability and the durable
+    # novelty checkpoint. It is not a change from prior evidence; only a
+    # different digest after that checkpoint is material_changed.
+    material_changed = bool(material_observed and prior_observation_digest)
+    if observation_digest and observation_key:
+        prior_weather_digests[observation_key] = observation_digest
+        current["source_observation_digests"] = {
+            str(key): str(value)
+            for key, value in list(prior_weather_digests.items())[-8:]
+            if str(key) and str(value)
+        }
+    if material_digest and material_key:
+        prior_material_digests[f"{source}:{material_key}"] = material_digest
+        current["source_material_digests"] = {
+            str(key): str(value)
+            for key, value in list(prior_material_digests.items())[-16:]
+            if str(key) and str(value)
+        }
+        current["material_digest"] = material_digest
+        current["material_revision"] = int(current.get("material_revision") or 0) + (1 if material_changed else 0)
+    if calendar_observations and material_changed:
+        attention_trigger = "material_observation"
     # Remove the previous source-owned trigger before applying the current
     # receipt.  A normal/empty/unavailable read therefore clears stale
     # Calendar attention without touching unrelated user assumptions.
@@ -574,8 +703,11 @@ def apply_source_receipt(
         location = str(facts.get("location") or "").strip()
         current_weather = facts.get("current") if isinstance(facts.get("current"), dict) else {}
         details = ", ".join(f"{key}={value}" for key, value in list(current_weather.items())[:6])
-        if successful and (location or details):
-            known.append({"statement": f"Weather observation for {location or 'the reported place'}: {details}"[:480], "epistemic_status": "inferred", "source_event_id": source_event_id, "recorded_at": observed_at})
+        if resolves_need and not repeated_weather_observation and (location or details):
+            forecast = facts.get("forecast") if isinstance(facts.get("forecast"), dict) else {}
+            forecast_details = ", ".join(f"{key}={value}" for key, value in list(forecast.items())[:6])
+            selected_details = details or forecast_details
+            known.append({"statement": f"Weather observation for {location or 'the reported place'}: {selected_details}"[:480], "epistemic_status": "inferred", "source_event_id": source_event_id, "recorded_at": observed_at})
     elif source == "calendar":
         events = facts.get("events") if isinstance(facts.get("events"), list) else []
         for item in events[:6]:
@@ -611,7 +743,7 @@ def apply_source_receipt(
     current["known"] = dedupe_records(known, key="statement", limit=12)
     current["assumptions"] = dedupe_records(assumptions, key="statement", limit=8)
     timeline = list(current.get("timeline") or [])
-    timeline.append({"statement": f"{source} observation: {receipt_status}"[:480], "occurred_at": observed_at, "source_event_id": source_event_id, "recorded_at": observed_at, "material": bool(calendar_observations)})
+    timeline.append({"statement": f"{source} observation: {receipt_status}"[:480], "occurred_at": observed_at, "source_event_id": source_event_id, "recorded_at": observed_at, "material": bool(calendar_observations) or (source == "weather" and resolves_need and not repeated_weather_observation)})
     current["timeline"] = dedupe_records(timeline, key="source_event_id", limit=24)
     # A valid empty or failed observation resolves/updates the Need lifecycle,
     # but it is not itself a user-worthy change.  Clearing the latest material
@@ -621,7 +753,15 @@ def apply_source_receipt(
     # change.  Calendar is promoted only when the server-owned parser found a
     # concrete overlap or short cross-location gap; empty/unavailable and
     # ordinary Calendar reads remain quiet.
-    current["material_change"] = calendar_observations[0]["statement"] if calendar_observations else ""
+    current["material_change"] = (
+        calendar_observations[0]["statement"]
+        if calendar_observations and material_changed
+        else (
+            f"Weather observation changed for {str(facts.get('location') or 'the reported place')}"
+            if source == "weather" and material_changed
+            else ""
+        )
+    )
     if successful and isinstance(fresh_until, str) and fresh_until.strip():
         # The receipt TTL is the server-owned lower bound for the next
         # observation.  Preserve an earlier explicit schedule, but never let
@@ -655,6 +795,16 @@ def apply_source_receipt(
     evidence.append({"ref": str(receipt_dict.get("receipt_id") or source_event_id), "source": source, "status": receipt_status, "observed_at": observed_at, "fresh_until": fresh_until, "ttl_seconds": ttl_seconds})
     current["evidence"] = dedupe_records(evidence, key="ref", limit=16)
 
+    semantic_needs_write = bool(
+        material_observed
+        or current.get("unknown") != original_semantic.get("unknown")
+    )
+    if not semantic_needs_write:
+        # Source runtime retains the complete receipt audit.  A duplicate or
+        # failed receipt must not advance Situation/material revision or wake
+        # cognition merely because its receipt ID/time differs.
+        current = original_semantic
+
     with runtime.state_store.writer_transaction():
         semantic_digest = runtime.admission.digest(current)
         need_plan_digest = runtime.admission.digest([])
@@ -666,7 +816,7 @@ def apply_source_receipt(
             operation="source_receipt",
             semantic_digest=semantic_digest,
             need_plan_digest=need_plan_digest,
-            answered_need_generations={need_id: int(expected_generation)} if successful else {},
+            answered_need_generations={need_id: int(expected_generation)} if resolves_need else {},
             event_timestamp=event.timestamp,
             expected_situation_revision=(
                 int(admission_event.get("expected_situation_revision"))
@@ -704,6 +854,15 @@ def apply_source_receipt(
         if semantic_already_applied:
             persisted = copy.deepcopy(fresh_situation)
             persisted["semantic_replayed"] = True
+        elif not semantic_needs_write:
+            persisted = copy.deepcopy(fresh_situation)
+            runtime.admission.mark_phase(
+                event_id=event.event_id,
+                phase="semantic_applied",
+                semantic_digest=semantic_digest,
+                need_plan_digest=need_plan_digest,
+                result_situation_revision=int(persisted.get("observation_revision") or 0),
+            )
         else:
             persisted = runtime.situations.record_semantic(
                 event,
@@ -723,7 +882,7 @@ def apply_source_receipt(
                 result_situation_revision=int(persisted.get("observation_revision") or 0),
             )
         if phase_rank < 2:
-            if successful:
+            if resolves_need:
                 resolved = runtime.needs.resolve(
                     need_id,
                     owner_id=owner_id,
@@ -732,13 +891,17 @@ def apply_source_receipt(
                     expected_generation=int(expected_generation),
                 )
             else:
-                resolved = runtime.needs.mark_waiting(
+                # A failed/empty receipt is source audit, not a semantic
+                # lifecycle change. Keep the Need's current status so the
+                # failed attempt cannot itself create a cognitive wake-up;
+                # the scheduler/source policy may retry it later.
+                resolved = runtime.needs.get(
                     need_id,
                     owner_id=owner_id,
                     session_id=session_id,
-                    event_id=event.event_id,
-                    expected_generation=int(expected_generation),
                 )
+                if resolved is None:
+                    raise StateRevisionConflictError("source receipt Need disappeared before retry")
             runtime.admission.mark_phase(
                 event_id=event.event_id,
                 phase="needs_applied",
@@ -749,16 +912,28 @@ def apply_source_receipt(
             )
         else:
             resolved = runtime.needs.get(need_id, owner_id=owner_id, session_id=session_id)
-            expected_status = "resolved" if successful else "waiting"
+            expected_status = "resolved" if resolves_need else str(need.get("status") or "open")
             if resolved is None or str(resolved.get("status") or "") != expected_status:
                 raise StateRevisionConflictError("source admission Need phase does not match current Need")
         runtime.admission.mark_committed(event_id=event.event_id, semantic_digest=semantic_digest, need_plan_digest=need_plan_digest)
-    result_status = "recorded" if (not successful or binding_status == "cleared") else "degraded"
+    result_status = "recorded" if (resolves_need and binding_status in {"cleared", "unbound", "not_applicable"}) else "degraded"
     return {
         "status": result_status,
         "situation": persisted,
         "need": resolved,
         "receipt": receipt_dict,
+        "material_changed": material_changed,
+        "observation_status": (
+            "changed"
+            if material_changed
+            else "available"
+            if material_observed
+            else "unchanged"
+        ),
+        "coverage": {
+            "status": "exact" if coverage_ok else "mismatch",
+            "reason": coverage_reason or "not_required",
+        },
         "unknown_binding": {
             "status": binding_status,
             "bound": bool(unknown_binding),
@@ -929,6 +1104,8 @@ def preflight_need_scope(
     situation_id: str | None,
     needs: list[CandidateNeed],
     answered_needs: list[dict[str, Any]],
+    unknown_bindings: Mapping[str, str | None] | None = None,
+    evidence_targets: list[Mapping[str, Any] | None] | None = None,
 ) -> None:
     """Reject predictable Need capacity/scope failures before Situation write."""
 
@@ -942,13 +1119,23 @@ def preflight_need_scope(
         situation_id=situation_id,
         limit=runtime.needs.max_needs_per_situation,
     )
+    selected_bindings = unknown_bindings or {}
+    selected_targets = evidence_targets or [None] * len(needs)
+    if len(selected_targets) != len(needs):
+        raise ValueError("InformationNeed evidence_targets must align with candidate Needs")
     existing_ids = {
         runtime.needs.stable_need_id(
             situation_id=situation_id,
             blocked_judgment=str(item.blocked_judgment),
             evidence_kind=str(item.evidence_kind),
+            evidence_target_digest=stable_evidence_target_digest(selected_targets[index]),
+            unknown_binding_digest=runtime.needs._unknown_binding_digest(
+                selected_bindings.get(item.blocked_judgment)
+            ),
+            typed_endpoint=True,
+            observation_mode=str(item.observation_mode),
         )
-        for item in needs
+        for index, item in enumerate(needs)
     }
     projected = len({str(item.get("need_id") or "") for item in current} | existing_ids)
     if projected > runtime.needs.max_needs_per_situation:

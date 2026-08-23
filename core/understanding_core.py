@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -52,6 +53,26 @@ TURN_UNDERSTANDING_SYSTEM_FALLBACK = (
     "Do not execute probes or agents, do not write the final user reply, and do not treat missing evidence as fact."
 )
 
+# Keep the foreground discourse contract beside the understanding prompt so
+# the model cannot mistake a Living Context proposal for the user's immediate
+# conversational act. ``kind`` remains open-world everywhere else;
+# ``assertion`` is the one exact marker consumed by the typed state fast path.
+SEMANTIC_DISCOURSE_KIND_CONTRACT = (
+    "Foreground semantic-act discourse contract: use the exact JSON value "
+    'kind="assertion" only when the foreground act is purely the user reporting '
+    "or updating a state, with no independent question, information request, "
+    "instruction, action, execution objective, or answer to provide. A turn "
+    "may produce a Living Context candidate or background InformationNeed while "
+    'the foreground act remains kind="assertion"; those artifacts do not change '
+    "the act's discourse kind. Whenever an act asks a question or requests an "
+    "answer, action, or execution, that act must not be marked assertion: use "
+    "the existing open-world kind that best describes its communicative role. "
+    "For mixed turns, keep the report and the question/request as separate acts; "
+    "only the report act may be assertion, and never use assertion for the act "
+    "carrying the requested answer or action. Do not decide this from candidate "
+    "disposition, Need presence, surface vocabulary, or a keyword list."
+)
+
 TURN_UNDERSTANDING_SYSTEM = (
     load_prompt("core/turn_understanding.md", TURN_UNDERSTANDING_SYSTEM_FALLBACK)
     + "\n\nThe semantic_frame records meaning only. It must never contain route, risk, state_effect, "
@@ -78,6 +99,15 @@ TURN_UNDERSTANDING_SYSTEM = (
     "path, query, command, tool arguments, credentials, recipient, route, risk, state_effect, authority, or "
     "capability fields anywhere in the candidate. User statements are reported, not verified. "
     "InformationNeed describes missing evidence and a fallback reaction; it is not a tool call. "
+    "For calendar/weather/public_web Needs, observation_requirement is required and is exactly "
+    "{coverage:any|current|forecast_day|window|results,metrics:[temperature|precipitation|conditions|"
+    "temperature_2m|temperature_2m_max|temperature_2m_min|weather_code|weather_description|"
+    "precipitation_probability_max|events|results|answer],target_date?:YYYY-MM-DD}; target_date is "
+    "allowed only for forecast_day, and current must omit it. Metrics are typed fact requirements, never "
+    "keywords or source-query text. "
+    "Set Need observation_mode=once for a one-time evidence gap and observation_mode=watch only when the "
+    "semantic Situation requires ongoing observation across future typed observations; this is a lifecycle "
+    "decision, not a keyword or source-name heuristic. "
     "The JSON boundary is strict: every non-optional string must be a JSON string, and an empty value must be "
     "\"\" rather than null, an object, or an array. This includes create_subject, label, title, summary, goal, "
     "material_change, next_step, reopen_reason, nested statement/value fields, and Need blocked_judgment, "
@@ -132,6 +162,8 @@ TURN_UNDERSTANDING_SYSTEM = (
     "leave the Need open; never infer a binding from similar wording. Answering one "
     "sub-Need is still an update/nonterminal Situation change; emit resolve only when "
     "the user explicitly declares that the entire Situation or goal is finished."
+    "\n\n"
+    + SEMANTIC_DISCOURSE_KIND_CONTRACT
 )
 
 TURN_UNDERSTANDING_REPAIR_SYSTEM = (
@@ -206,6 +238,7 @@ class TurnUnderstanding:
         source_text: str = "",
         current_time: Any = None,
         catalog: list[dict[str, Any]] | None = None,
+        conversation_binding: dict[str, str] | None = None,
     ) -> "TurnUnderstanding":
         root_payload = payload
         if isinstance(payload.get("turn_understanding"), dict):
@@ -244,6 +277,11 @@ class TurnUnderstanding:
             living_candidate_payload = payload.get("living_context_candidate")
         if living_candidate_payload is None:
             living_candidate_payload = root_payload.get("living_context_candidate")
+        living_candidate_payload = _bind_unbound_continuation_candidate(
+            living_candidate_payload,
+            conversation_binding=conversation_binding,
+            catalog=catalog or [],
+        )
         (
             living_candidate,
             living_candidate_issues,
@@ -524,6 +562,9 @@ class UnderstandingCore:
             if isinstance(short_memory.get("conversation_slots"), dict)
             else {}
         )
+        conversation_binding = _safe_conversation_binding(
+            turn_context.get("conversation_binding")
+        )
         payload = {
             "user_message": text,
             # This is a source-binding aid, not a semantic fact.  Supplying
@@ -552,6 +593,7 @@ class UnderstandingCore:
                 "persona": active.get("persona"),
                 "conversation_tail": conversation_tail[-6:],
                 "conversation_slots": conversation_slots,
+                "conversation_binding": conversation_binding,
                 "anchor_candidates": (
                     turn_context.get("anchor_candidates")
                     if isinstance(turn_context.get("anchor_candidates"), list)
@@ -588,15 +630,18 @@ class UnderstandingCore:
                     "confidence": "number 0.0..1.0",
                     "reason": "short string",
                 },
-                "living_context_candidate": "If this message introduces or changes a real-life Situation, emit one compact object; otherwise emit {schema_version, disposition=quiet, source=model}. For create use {schema_version, disposition=create, create_subject, category, summary, goal, progress, deadline_at, known:[{statement,epistemic_status}], unknown:[string], assumptions:[{statement,epistemic_status}], entities:[{kind,value,epistemic_status,source_quote}], needs:[{blocked_judgment,evidence_kind,why_now,urgency,allowed_source_classes,fallback_reaction,question}], requested_reaction, source}. When the user states an objective, goal is required and must be grounded in the direct user wording; progress.status reflects explicit wording and progress.value, when present, must be a JSON number from 0 to 1 or null (never a string, percentage, object, or NaN). Resolve next-week/end-of-month windows only from the server current_time into a timezone-aware bounded deadline_at; keep the exact event date as an unknown/Need, and never invent an exact date. Omit deadline_at only when the user gives no time expression. Emit an entities row only for a concrete thing the user named in this message, with kind=place|person|organization|item|other and a source_quote that is an exact user_message slice; use epistemic_status=reported only when the user stated it directly, otherwise inferred. A place entity is how a weather or location-bound source is later resolved, so name the place exactly as the user wrote it and never invent, translate, or normalise it. Exact enums: category=general|personal|work|education|health|travel|logistics|finance|other; epistemic_status=reported|inferred; evidence_kind=user|calendar|email|message|weather|public_web|agent|time|other; fallback_reaction/requested_reaction=ask|read|wait|silent; urgency is a JSON number 0..1. For update/correct/resolve copy exact situation_selector, situation_token, situation_revision, catalog_token from one current catalog row; situation_selector is a short opaque row selector and never replaces the final binding triple; never invent server-issued values.",
+                "living_context_candidate": "If this message introduces or changes a real-life Situation, emit one compact object; otherwise emit {schema_version, disposition=quiet, source=model}. For create use {schema_version, disposition=create, create_subject, category, summary, goal, progress, deadline_at, known:[{statement,epistemic_status}], unknown:[string], assumptions:[{statement,epistemic_status}], entities:[{kind,value,epistemic_status,source_quote}], needs:[{blocked_judgment,evidence_kind,observation_mode,observation_requirement,why_now,urgency,allowed_source_classes,fallback_reaction,question}], requested_reaction, source}. Set observation_mode=once for a one-time evidence gap; use observation_mode=watch only when the Situation needs repeated future observation. For calendar/weather/public_web Needs, observation_requirement is required and must be {coverage:any|current|forecast_day|window|results,metrics:[exact typed metric enums]}; never infer it from question prose. This is a semantic lifecycle field, not a keyword or source-name heuristic. When the user states an objective, goal is required and must be grounded in the direct user wording; progress.status reflects explicit wording and progress.value, when present, must be a JSON number from 0 to 1 or null (never a string, percentage, object, or NaN). Resolve next-week/end-of-month windows only from the server current_time into a timezone-aware bounded deadline_at; keep the exact event date as an unknown/Need, and never invent an exact date. Omit deadline_at only when the user gives no time expression. Emit an entities row only for a concrete thing the user named in this message, with kind=place|person|organization|item|other and a source_quote that is an exact user_message slice; use epistemic_status=reported only when the user stated it directly, otherwise inferred. A place entity is how a weather or location-bound source is later resolved, so name the place exactly as the user wrote it and never invent, translate, or normalise it. Exact enums: category=general|personal|work|education|health|travel|logistics|finance|other; epistemic_status=reported|inferred; evidence_kind=user|calendar|email|message|weather|public_web|agent|time|other; fallback_reaction/requested_reaction=ask|read|wait|silent; urgency is a JSON number 0..1. For update/correct/resolve copy exact situation_selector, situation_token, situation_revision, catalog_token from one current catalog row; situation_selector is a short opaque row selector and never replaces the final binding triple; never invent server-issued values.",
                 "living_reaction_feedback": "Emit when the user directly evaluates the current reaction; otherwise omit. Shape: {schema_version:'veyra.living_reaction_feedback.v1', reaction_token copied exactly from the current catalog, label=ignore|resolved|useful|not_useful|too_early|too_late|too_frequent|remind_before, remind_before_seconds:number only for remind_before, source_quote:{text,start,end} exact}. source_quote is an object, never a string; its text must be an exact user_message slice. Candidate and feedback are independent.",
                 "semantic_frame": "Compact exact object: {schema_version:'veyra.semantic_frame.v1', acts:[{act_id,kind,goal,operation,target:{type,value,attributes:{}},polarity,explicitness,source_quote:{text,start,end},speaker:'user',authority:'direct_user',mention_mode:'normal_use',evidence_need:'none',referent:{surface:'',resolved:'',status:'not_applicable',candidates:[]},condition:null,modality:'asserted',arguments:{}}], relations:[], ambiguities:[], resolver_status:'resolved'|'ambiguous', source:'model'}. Every source_quote must be an exact user_message slice; keep one act per independent assertion. condition is null or an object {kind,expression,source_quote}, never a string; arguments is an object, never a list.",
                 "retrieval_hints": "optional list of strings",
             },
             "model_rules": [
-                "Never emit a Situation revision or invent a Situation/InformationNeed token.",
+                "For calendar/weather/public_web Needs, observation_requirement must be a typed object with coverage, metrics, and optional target_date; target_date is canonical YYYY-MM-DD only for forecast_day and must agree with the server-resolved local time window. Do not infer it from question or blocked prose.",
+                "Never invent a Situation revision or Situation/InformationNeed token.",
                 "Use only exact server-issued selectors, tokens, revisions, and Need references from session_context.living_context_situation_candidates.",
                 "For update/correct/resolve copy situation_selector, situation_revision, and catalog_token from the same current catalog row; never infer them.",
+                "When session_context.conversation_binding is present, treat its situation_selector as the default continuation thread for this turn. Preserve it unless the user's semantic act resolves to a different exact catalog row; never choose a thread from text matching or keywords.",
+                "A direct continuation may select another exact catalog Situation when the semantic act clearly refers to that row. Copy only that row's server-issued selector and binding fields; never emit or derive a raw conversation or Situation ID.",
                 "For answered_need_tokens copy matching need_token and generation into answered_need_bindings from the same current catalog row.",
                 "A direct user turn that answers an open catalog Need must carry the exact need_token+generation pair, a root source_quote bound to this user_message, and assertion_mode=direct_user; if any part is not proven, omit both answer-binding fields and keep the Need open.",
                 "Answering one sub-Need is still an update/nonterminal Situation change; resolve only when the user explicitly declares the entire Situation or goal finished.",
@@ -606,7 +651,7 @@ class UnderstandingCore:
                 "For all non-optional strings, emit \"\" when empty, never null. Keep assumptions as objects and copy only exact server-issued tokens, revisions, and Need generations.",
                 "Do not emit URL, path, query, command, tool, tool_args, authority, route, risk, or capability fields.",
                 "answered_need_tokens is a JSON list of strings; answered_need_bindings is a JSON list of {need_token, generation} objects. Do not use an object or string for either list.",
-                "Keep model output compact: at most one entity, one known item, one timeline item, and one InformationNeed. timeline is always a JSON list of bounded objects {statement,occurred_at,source_quote,material}; use [] when no valid timeline item is grounded in the user turn. If no exact source class is clear, use evidence_kind=other; never use a category such as travel or logistics as evidence_kind.",
+                "Keep model output compact: at most one entity, one known item, one timeline item, and one InformationNeed. timeline is always a JSON list of bounded objects {statement,occurred_at,source_quote,material}; use [] when no valid timeline item is grounded in the user turn. If no exact source class is clear, use evidence_kind=other; never use a category such as travel or logistics as evidence_kind. A Need with observation_mode=watch must describe a genuinely ongoing observation; otherwise use once.",
             ],
         }
         result = _complete_model_json_safe(
@@ -621,6 +666,7 @@ class UnderstandingCore:
             source_text=text,
             current_time=active.get("current_time"),
             catalog=catalog,
+            conversation_binding=conversation_binding,
         )
         initial_candidate = candidate
         initial_issues = list(issues)
@@ -701,6 +747,7 @@ class UnderstandingCore:
                 source_text=text,
                 current_time=active.get("current_time"),
                 catalog=catalog,
+                conversation_binding=conversation_binding,
             )
             repaired_quiet_conflict = False
             if repaired_candidate is not None and not _has_semantic_boundary_issues(repaired_issues):
@@ -1881,7 +1928,65 @@ def _with_situation_catalog_selectors(
                 row.pop("situation_selector", None)
         catalog.append(row)
     context["living_context_situation_candidates"] = catalog
+    context["conversation_binding"] = _safe_conversation_binding(
+        context.get("conversation_binding")
+    )
     return context
+
+
+def _safe_conversation_binding(value: Any) -> dict[str, str] | None:
+    """Keep only the opaque server-derived continuation selector."""
+
+    if not isinstance(value, dict):
+        return None
+    if str(value.get("binding_type") or "").strip().lower() != "situation":
+        return None
+    selector = str(value.get("situation_selector") or "").strip()
+    if not re.fullmatch(r"sitref_[0-9a-f]{16}", selector):
+        return None
+    return {
+        "binding_type": "situation",
+        "situation_selector": selector,
+    }
+
+
+def _bind_unbound_continuation_candidate(
+    value: Any,
+    *,
+    conversation_binding: dict[str, str] | None,
+    catalog: list[dict[str, Any]],
+) -> Any:
+    """Add one server-selected Situation binding before strict parsing."""
+
+    if not isinstance(value, dict) or str(value.get("disposition") or "") not in {"update", "correct", "resolve"}:
+        return value
+    fields = ("situation_selector", "situation_token", "situation_revision", "catalog_token")
+    if any(field in value for field in fields):
+        return value
+    binding = _safe_conversation_binding(conversation_binding)
+    if binding is None:
+        return value
+    selector = binding["situation_selector"]
+    matches: list[dict[str, Any]] = []
+    for row in catalog:
+        if not isinstance(row, dict) or row.get("situation_selector") != selector:
+            continue
+        revision = row.get("observation_revision", row.get("situation_revision"))
+        token = row.get("situation_token")
+        catalog_token = row.get("catalog_token")
+        if isinstance(token, str) and token and type(revision) is int and revision >= 1 and isinstance(catalog_token, str) and catalog_token:
+            matches.append(row)
+    if len(matches) != 1:
+        return value
+    row = matches[0]
+    repaired = deepcopy(value)
+    repaired.update({
+        "situation_selector": selector,
+        "situation_token": row["situation_token"],
+        "situation_revision": row.get("observation_revision", row.get("situation_revision")),
+        "catalog_token": row["catalog_token"],
+    })
+    return repaired
 
 
 def _validated_model_understanding(
@@ -1890,6 +1995,7 @@ def _validated_model_understanding(
     source_text: str,
     current_time: Any = None,
     catalog: list[dict[str, Any]] | None = None,
+    conversation_binding: dict[str, str] | None = None,
 ) -> tuple[TurnUnderstanding | None, list[str]]:
     if payload.get("status") != "model_assisted":
         status = _safe_status_marker(payload.get("status"))
@@ -1899,6 +2005,7 @@ def _validated_model_understanding(
         source_text=source_text,
         current_time=current_time,
         catalog=catalog,
+        conversation_binding=conversation_binding,
     )
     frame = candidate.semantic_frame
     if frame is None:

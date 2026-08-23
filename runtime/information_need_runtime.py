@@ -19,7 +19,10 @@ from interface.living_context_contract import (
     InformationNeedRecord,
     INFORMATION_NEED_SOURCE_CLASSES,
     INFORMATION_NEED_SCHEMA_VERSION,
+    ObservationRequirement,
+    stable_evidence_target_digest,
 )
+from interface.living_source_payload import weather_target_digest
 
 
 ALLOWED_SOURCE_CLASSES = frozenset(
@@ -61,6 +64,7 @@ class InformationNeedRuntime:
 
     STATE_FILE = "information_need_state.json"
     SCHEMA_VERSION = "veyra.information_need_state.v1"
+    INDEX_SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -95,6 +99,7 @@ class InformationNeedRuntime:
         source_event_id: str,
         expected_state_revision: int | None = None,
         unknown_bindings: Mapping[str, str | None] | None = None,
+        evidence_targets: Iterable[Mapping[str, Any] | None] | None = None,
         expected_generation: int | None = None,
         expected_status: str | None = None,
         expected_record_digest: str | None = None,
@@ -124,6 +129,7 @@ class InformationNeedRuntime:
         else:
             selected_expected_digest = None
         parsed = self.validate_candidates(needs)
+        selected_targets = self._validate_evidence_targets(evidence_targets, len(parsed))
         selected_bindings = self._validate_unknown_bindings(unknown_bindings)
         candidate_blocked = {str(item.blocked_judgment) for item in parsed}
         if set(selected_bindings) - candidate_blocked:
@@ -152,10 +158,13 @@ class InformationNeedRuntime:
                 situation_id=selected_situation,
                 candidates=parsed,
                 unknown_bindings=selected_bindings,
+                evidence_targets=selected_targets,
+                existing_needs=needs_map,
+                typed_endpoint=evidence_targets is not None,
             )
 
             changed = False
-            for need_id, (candidate, digest, unknown_binding) in candidate_rows.items():
+            for need_id, (candidate, digest, unknown_binding, evidence_target) in candidate_rows.items():
                 current = needs_map.get(need_id)
                 event_map = fingerprints.setdefault(need_id, {})
                 if current is not None:
@@ -171,7 +180,7 @@ class InformationNeedRuntime:
                     if known_digest is None and str(current.get("source_event_id") or "") == selected_event:
                         known_digest = self._record_replay_fingerprint(current)
                     if known_digest is not None:
-                        if str(known_digest) != self._candidate_event_fingerprint(candidate, unknown_binding):
+                        if str(known_digest) != self._candidate_event_fingerprint(candidate, unknown_binding, evidence_target):
                             raise InformationNeedEventConflict(
                                 "source_event_id is already bound to different InformationNeed content"
                             )
@@ -202,7 +211,10 @@ class InformationNeedRuntime:
                         status=status,
                         current=current,
                         unknown_binding=unknown_binding,
-                        reset_unknown_binding=reopened_generation,
+                        # A scheduler reopen starts a new generation, but it
+                        # must not erase the prior semantic binding/target.
+                        reset_unknown_binding=False,
+                        evidence_target=evidence_target,
                     )
                 else:
                     if expected_generation is not None or selected_expected_status is not None or selected_expected_digest is not None:
@@ -225,12 +237,14 @@ class InformationNeedRuntime:
                         status="open",
                         current=None,
                         unknown_binding=unknown_binding,
+                        evidence_target=evidence_target,
                     )
                 needs_map[need_id] = record
                 event_map[selected_event] = digest
                 replay_evidence.setdefault(need_id, {})[selected_event] = self._candidate_event_fingerprint(
                     candidate,
                     unknown_binding,
+                    evidence_target,
                 )
                 self._trim_event_map(event_map)
                 changed = True
@@ -260,6 +274,7 @@ class InformationNeedRuntime:
         source_event_id: str,
         expected_state_revision: int | None = None,
         unknown_bindings: Mapping[str, str | None] | None = None,
+        evidence_targets: Iterable[Mapping[str, Any] | None] | None = None,
     ) -> int:
         """Check one upsert against both bounded Need capacities.
 
@@ -279,12 +294,8 @@ class InformationNeedRuntime:
         selected_session = self._required(session_id, "session_id")
         selected_event = self._required(source_event_id, "source_event_id")
         parsed = self.validate_candidates(needs)
+        selected_targets = self._validate_evidence_targets(evidence_targets, len(parsed))
         selected_bindings = self._validate_unknown_bindings(unknown_bindings)
-        candidate_rows = self._candidate_rows(
-            situation_id=selected_situation,
-            candidates=parsed,
-            unknown_bindings=selected_bindings,
-        )
         state = self.state_store.read_json(self.state_file)
         self._assert_state(state)
         self._prepare_indexes(state)
@@ -299,9 +310,17 @@ class InformationNeedRuntime:
             )
 
         needs_map = self._needs_map(state)
+        candidate_rows = self._candidate_rows(
+            situation_id=selected_situation,
+            candidates=parsed,
+            unknown_bindings=selected_bindings,
+            evidence_targets=selected_targets,
+            existing_needs=needs_map,
+            typed_endpoint=evidence_targets is not None,
+        )
         fingerprints = state.get("event_fingerprints") or {}
         replay_evidence = state.get("event_replay_evidence") or {}
-        for need_id, (candidate, digest, unknown_binding) in candidate_rows.items():
+        for need_id, (candidate, digest, unknown_binding, evidence_target) in candidate_rows.items():
             current = needs_map.get(need_id)
             if current is None:
                 self._assert_replay_write_capacity(
@@ -314,7 +333,7 @@ class InformationNeedRuntime:
             known_digest = event_map.get(selected_event)
             if known_digest is None and str(current.get("source_event_id") or "") == selected_event:
                 known_digest = self._record_replay_fingerprint(current)
-            if known_digest is not None and str(known_digest) != self._candidate_event_fingerprint(candidate, unknown_binding):
+            if known_digest is not None and str(known_digest) != self._candidate_event_fingerprint(candidate, unknown_binding, evidence_target):
                 raise InformationNeedEventConflict(
                     "source_event_id is already bound to different InformationNeed content"
                 )
@@ -346,18 +365,49 @@ class InformationNeedRuntime:
         situation_id: str,
         candidates: Iterable[CandidateNeed],
         unknown_bindings: Mapping[str, str | None],
-    ) -> dict[str, tuple[CandidateNeed, str, str | None]]:
+        evidence_targets: Iterable[Mapping[str, Any] | None] | None = None,
+        existing_needs: Mapping[str, Mapping[str, Any]] | None = None,
+        typed_endpoint: bool | None = None,
+    ) -> dict[str, tuple[CandidateNeed, str, str | None, dict[str, Any] | None]]:
         """Normalize candidate identity once for preflight and commit."""
 
-        rows: dict[str, tuple[CandidateNeed, str, str | None]] = {}
-        for candidate in candidates:
+        rows: dict[str, tuple[CandidateNeed, str, str | None, dict[str, Any] | None]] = {}
+        selected_typed_endpoint = evidence_targets is not None if typed_endpoint is None else bool(typed_endpoint)
+        selected_targets = list(evidence_targets or [])
+        for index, candidate in enumerate(candidates):
+            raw_target = selected_targets[index] if index < len(selected_targets) else None
+            evidence_target = copy.deepcopy(dict(raw_target)) if isinstance(raw_target, Mapping) else None
+            target_digest = stable_evidence_target_digest(evidence_target)
+            unknown_binding = unknown_bindings.get(candidate.blocked_judgment)
+            need_identity_digest = cls.need_identity_digest_for_candidate(
+                candidate,
+                evidence_target,
+            )
             need_id = cls.stable_need_id(
                 situation_id=situation_id,
-                blocked_judgment=candidate.blocked_judgment,
+                evidence_target_digest=target_digest,
+                need_identity_digest=need_identity_digest,
+                unknown_binding_digest=cls._unknown_binding_digest(unknown_binding),
+                typed_endpoint=selected_typed_endpoint,
                 evidence_kind=candidate.evidence_kind,
+                blocked_judgment=candidate.blocked_judgment,
+                observation_mode=candidate.observation_mode,
             )
-            digest = cls._candidate_fingerprint(candidate)
-            unknown_binding = unknown_bindings.get(candidate.blocked_judgment)
+            # During schema migration, preserve the legacy ID when this typed
+            # target is the sole legacy Need for the same Situation/source.
+            if target_digest and existing_needs and need_id not in existing_needs:
+                legacy = [
+                    (str(key), row)
+                    for key, row in existing_needs.items()
+                    if str(row.get("situation_id") or "") == str(situation_id)
+                    and str(row.get("evidence_kind") or "") == str(candidate.evidence_kind)
+                    and str(row.get("observation_mode") or "once") == str(candidate.observation_mode)
+                    and str(row.get("blocked_judgment") or "") == str(candidate.blocked_judgment)
+                    and not str(row.get("evidence_target_digest") or "").strip()
+                ]
+                if len(legacy) == 1:
+                    need_id = legacy[0][0]
+            digest = cls._candidate_fingerprint(candidate, evidence_target)
             previous = rows.get(need_id)
             if previous is not None and previous[1] != digest:
                 raise InformationNeedEventConflict(
@@ -367,7 +417,11 @@ class InformationNeedRuntime:
                 raise InformationNeedEventConflict(
                     "one source event contains conflicting InformationNeed unknown binding"
                 )
-            rows[need_id] = (candidate, digest, unknown_binding)
+            if previous is not None and previous[3] != evidence_target:
+                raise InformationNeedEventConflict(
+                    "one source event contains conflicting InformationNeed evidence target"
+                )
+            rows[need_id] = (candidate, digest, unknown_binding, evidence_target)
         return rows
 
     @staticmethod
@@ -443,6 +497,15 @@ class InformationNeedRuntime:
             "generation": int(row["generation"]),
             "record_digest": self.record_digest_for_row(row),
             "allowed_source_classes": list(row.get("allowed_source_classes") or []),
+            "evidence_kind": str(row.get("evidence_kind") or "other"),
+            "observation_mode": str(row.get("observation_mode") or "once"),
+            "observation_requirement": copy.deepcopy(row.get("observation_requirement")),
+            "evidence_target": copy.deepcopy(row.get("evidence_target")),
+            "evidence_target_digest": row.get("evidence_target_digest"),
+            "provider_target_digest": row.get("provider_target_digest"),
+            "need_identity_digest": row.get("need_identity_digest"),
+            "blocked_judgment": str(row.get("blocked_judgment") or ""),
+            "expires_at": row.get("expires_at"),
         }
 
     def authoritative_projections(
@@ -549,13 +612,88 @@ class InformationNeedRuntime:
         )
 
     @staticmethod
-    def stable_need_id(*, situation_id: str, blocked_judgment: str, evidence_kind: str) -> str:
-        payload = json.dumps(
+    def need_identity_digest_for_candidate(
+        candidate: CandidateNeed,
+        evidence_target: Mapping[str, Any] | None,
+    ) -> str:
+        """Digest provider target and Need-only requirement separately."""
+
+        provider_target = None
+        requirement = (
+            candidate.observation_requirement.model_dump(mode="json")
+            if candidate.observation_requirement is not None
+            else None
+        )
+        if isinstance(evidence_target, Mapping):
+            provider_target = {
+                str(key): copy.deepcopy(value)
+                for key, value in evidence_target.items()
+                if str(key) != "observation_requirement"
+            }
+            if requirement is None and isinstance(evidence_target.get("observation_requirement"), Mapping):
+                requirement = copy.deepcopy(evidence_target["observation_requirement"])
+        return InformationNeedRuntime._fingerprint_payload(
             {
+                "evidence_kind": candidate.evidence_kind,
+                "observation_mode": candidate.observation_mode,
+                "provider_target": provider_target,
+                "observation_requirement": requirement,
+            }
+        )
+
+    @staticmethod
+    def stable_need_id(
+        *,
+        situation_id: str,
+        blocked_judgment: str = "",
+        evidence_kind: str = "",
+        evidence_target_digest: str | None = None,
+        unknown_binding_digest: str | None = None,
+        need_identity_digest: str | None = None,
+        typed_endpoint: bool = False,
+        observation_mode: str = "once",
+    ) -> str:
+        # A typed source target is the primary durable endpoint.  Where no
+        # source target is safe to derive, a server-owned Unknown binding is
+        # the only other semantic endpoint.  Display prose never identifies a
+        # newly typed Need; it is retained solely for legacy rows without an
+        # admitted endpoint.
+        identity = (
+            {
+                "situation_id": str(situation_id),
+                "need_identity_digest": str(need_identity_digest),
+            }
+            if need_identity_digest
+            else {
+                "situation_id": str(situation_id),
+                "evidence_target_digest": str(evidence_target_digest),
+                "evidence_kind": str(evidence_kind),
+                "observation_mode": str(observation_mode or "once"),
+            }
+            if evidence_target_digest
+            else {
+                "situation_id": str(situation_id),
+                "unknown_binding_digest": str(unknown_binding_digest),
+                "evidence_kind": str(evidence_kind),
+                "observation_mode": str(observation_mode or "once"),
+            }
+            if unknown_binding_digest
+            else {
+                "situation_id": str(situation_id),
+                "evidence_target_digest": None,
+                "evidence_kind": str(evidence_kind),
+                "observation_mode": str(observation_mode or "once"),
+            }
+            if typed_endpoint
+            else {
                 "situation_id": str(situation_id),
                 "blocked_judgment": " ".join(str(blocked_judgment).split())[:480],
                 "evidence_kind": str(evidence_kind),
-            },
+                "observation_mode": str(observation_mode or "once"),
+            }
+        )
+        payload = json.dumps(
+            identity,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -635,6 +773,7 @@ class InformationNeedRuntime:
         current: dict[str, Any] | None,
         unknown_binding: str | None = None,
         reset_unknown_binding: bool = False,
+        evidence_target: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         raw_current_binding = (current or {}).get("unknown_binding")
         current_binding = (
@@ -648,6 +787,36 @@ class InformationNeedRuntime:
             else None
         )
         selected_binding_digest = self._unknown_binding_digest(selected_binding)
+        current_target = (current or {}).get("evidence_target")
+        selected_target = (
+            copy.deepcopy(dict(evidence_target))
+            if isinstance(evidence_target, Mapping)
+            else copy.deepcopy(current_target)
+            if isinstance(current_target, Mapping)
+            else None
+        )
+        selected_target_digest = stable_evidence_target_digest(selected_target)
+        provider_target_digest = (
+            weather_target_digest(
+                selected_target.get("location"),
+                selected_target.get("target_date"),
+            )
+            if isinstance(selected_target, Mapping)
+            and str(candidate.evidence_kind) == "weather"
+            else (current or {}).get("provider_target_digest")
+        )
+        need_identity_digest = self.need_identity_digest_for_candidate(
+            candidate,
+            selected_target,
+        )
+        # Scheduler/reopen candidates built against an older catalog may not
+        # carry a newly derived target. Preserve the durable target and mode in
+        # that case; a typed target supplied by the current candidate wins.
+        raw_mode = (current or {}).get("observation_mode")
+        current_mode = raw_mode if raw_mode in {"once", "watch"} else None
+        candidate_mode = str(candidate.observation_mode)
+        mode_explicit = "observation_mode" in getattr(candidate, "model_fields_set", set())
+        selected_mode = candidate_mode if current is None or mode_explicit else (current_mode or candidate_mode)
         record = InformationNeedRecord(
             schema_version=INFORMATION_NEED_SCHEMA_VERSION,
             need_id=need_id,
@@ -656,6 +825,8 @@ class InformationNeedRuntime:
             session_id=session_id,
             blocked_judgment=candidate.blocked_judgment,
             evidence_kind=candidate.evidence_kind,
+            observation_mode=selected_mode,  # type: ignore[arg-type]
+            observation_requirement=self._observation_requirement(candidate, selected_target),
             why_now=candidate.why_now,
             urgency=candidate.urgency,
             expires_at=candidate.expires_at,
@@ -670,6 +841,10 @@ class InformationNeedRuntime:
             updated_at=now,
             unknown_binding=selected_binding,
             unknown_binding_digest=selected_binding_digest,
+            evidence_target=selected_target,
+            evidence_target_digest=selected_target_digest,
+            provider_target_digest=provider_target_digest,
+            need_identity_digest=need_identity_digest,
         )
         return record.model_dump(mode="json")
 
@@ -679,6 +854,21 @@ class InformationNeedRuntime:
         if invalid:
             raise ValueError(f"unsupported InformationNeed source class: {sorted(invalid)!r}")
         return candidate
+
+    @staticmethod
+    def _observation_requirement(
+        candidate: CandidateNeed,
+        evidence_target: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Return one canonical, typed requirement for the durable Need."""
+
+        raw = evidence_target.get("observation_requirement") if isinstance(evidence_target, Mapping) else None
+        if raw is None:
+            raw = candidate.observation_requirement
+        if raw is None:
+            return None
+        requirement = raw if isinstance(raw, ObservationRequirement) else ObservationRequirement.model_validate(raw, strict=True)
+        return requirement.model_dump(mode="json")
 
     @classmethod
     def record_digest_for_row(cls, row: Mapping[str, Any]) -> str:
@@ -740,6 +930,40 @@ class InformationNeedRuntime:
         return result
 
     @staticmethod
+    def _validate_evidence_targets(
+        targets: Iterable[Mapping[str, Any] | None] | None,
+        candidate_count: int,
+    ) -> list[dict[str, Any] | None]:
+        """Validate the bounded server-derived target sidecar.
+
+        This sidecar is positional and never model-authored. Keeping it
+        separate from ``CandidateNeed`` prevents arbitrary provider fields
+        from becoming source arguments while allowing legacy callers to omit
+        targets entirely.
+        """
+
+        if targets is None:
+            return [None] * max(0, int(candidate_count))
+        if isinstance(targets, (str, bytes, Mapping)):
+            raise ValueError("InformationNeed evidence_targets must be an iterable of objects")
+        selected = list(targets)
+        if len(selected) > 8:
+            raise ValueError("InformationNeed evidence_targets exceed the bounded candidate limit")
+        if len(selected) != int(candidate_count):
+            raise ValueError("InformationNeed evidence_targets must align with candidate Needs")
+        result: list[dict[str, Any] | None] = []
+        for target in selected:
+            if target is None:
+                result.append(None)
+                continue
+            if not isinstance(target, Mapping):
+                raise ValueError("InformationNeed evidence target must be an object")
+            if any(str(key) in {"blocked_judgment", "question"} for key in target):
+                raise ValueError("InformationNeed evidence target cannot contain display-only Need wording")
+            result.append(copy.deepcopy(dict(target)))
+        return result
+
+    @staticmethod
     def _unknown_binding_digest(value: str | None) -> str | None:
         if value is None:
             return None
@@ -772,12 +996,27 @@ class InformationNeedRuntime:
                 raise InformationNeedStateError(f"InformationNeed row {key!r} has an unsupported source class")
             if record.unknown_binding is not None and self._unknown_binding_digest(record.unknown_binding) != record.unknown_binding_digest:
                 raise InformationNeedStateError(f"InformationNeed row {key!r} unknown binding digest is invalid")
-        self._validate_fingerprint_index(state.get("event_fingerprints"), set(raw))
+            if record.evidence_target is not None and stable_evidence_target_digest(record.evidence_target) != record.evidence_target_digest:
+                raise InformationNeedStateError(f"InformationNeed row {key!r} evidence target digest is invalid")
+        index_version = state.get("index_schema_version", 1)
+        if isinstance(index_version, bool) or not isinstance(index_version, int) or not 1 <= index_version <= self.INDEX_SCHEMA_VERSION:
+            raise InformationNeedStateError("InformationNeed index schema is unsupported")
+        fingerprints_value = state.get("event_fingerprints")
+        if not (fingerprints_value is None and index_version <= 1):
+            self._validate_fingerprint_index(fingerprints_value, set(raw))
         self._validate_replay_index(state.get("event_replay_evidence"), set(raw))
-        fingerprints = state.get("event_fingerprints")
+        fingerprints = fingerprints_value
         if fingerprints is not None:
             for key, value in raw.items():
-                if fingerprints[key].get(str(value["source_event_id"])) != self._record_fingerprint(value):
+                actual = fingerprints[key].get(str(value["source_event_id"]))
+                expected = self._record_fingerprint(value)
+                if actual == expected:
+                    continue
+                # Pre-typed rows used exactly this original presentation
+                # payload: no observation mode, requirement, or target. This
+                # is a read-only compatibility seam; a writer transaction
+                # migrates the index to ``_record_fingerprint``.
+                if actual != self._pre_typed_legacy_record_fingerprint(value):
                     raise InformationNeedStateError("InformationNeed current event fingerprint does not match its row")
         self._validate_retention(state)
 
@@ -792,7 +1031,10 @@ class InformationNeedRuntime:
             event_map = fingerprints.setdefault(need_id, {})
             if not isinstance(event_map, dict):
                 raise InformationNeedStateError("InformationNeed event fingerprint row is invalid")
-            event_map.setdefault(str(row["source_event_id"]), self._record_fingerprint(row))
+            # This assignment is the explicit idempotent migration of the
+            # current presentation fingerprint.  It is performed only in a
+            # writer transaction; read-only projections remain unchanged.
+            event_map[str(row["source_event_id"])] = self._record_fingerprint(row)
             self._trim_event_map(event_map)
             replay_map = replay_evidence.setdefault(need_id, {})
             if not isinstance(replay_map, dict):
@@ -812,6 +1054,7 @@ class InformationNeedRuntime:
             replay_map[str(row["source_event_id"])] = self._record_replay_fingerprint(row)
         state.setdefault("retention_events", [])
         state.setdefault("retention_event_count", len(state["retention_events"]))
+        state["index_schema_version"] = self.INDEX_SCHEMA_VERSION
 
     @staticmethod
     def _needs_map(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -883,49 +1126,102 @@ class InformationNeedRuntime:
         return rows
 
     @staticmethod
-    def _candidate_fingerprint(candidate: CandidateNeed) -> str:
-        return InformationNeedRuntime._fingerprint_payload(
-            {
+    def _candidate_fingerprint(
+        candidate: CandidateNeed,
+        evidence_target: Mapping[str, Any] | None = None,
+    ) -> str:
+        payload = {
                 "blocked_judgment": candidate.blocked_judgment,
                 "evidence_kind": candidate.evidence_kind,
+                "observation_mode": candidate.observation_mode,
                 "why_now": candidate.why_now,
                 "urgency": candidate.urgency,
                 "expires_at": candidate.expires_at,
                 "allowed_source_classes": list(candidate.allowed_source_classes),
                 "fallback_reaction": candidate.fallback_reaction,
                 "question": candidate.question,
+                "evidence_target": dict(evidence_target) if isinstance(evidence_target, Mapping) else None,
+                "need_identity_digest": InformationNeedRuntime.need_identity_digest_for_candidate(
+                    candidate,
+                    evidence_target,
+                ),
             }
+        requirement = (
+            evidence_target.get("observation_requirement")
+            if isinstance(evidence_target, Mapping)
+            else None
+        ) or (
+            candidate.observation_requirement.model_dump(mode="json")
+            if candidate.observation_requirement is not None
+            else None
         )
+        if requirement is not None:
+            payload["observation_requirement"] = copy.deepcopy(requirement)
+        return InformationNeedRuntime._fingerprint_payload(payload)
 
     @staticmethod
     def _record_fingerprint(record: dict[str, Any]) -> str:
-        return InformationNeedRuntime._fingerprint_payload(
-            {
+        payload = {
                 "blocked_judgment": record["blocked_judgment"],
                 "evidence_kind": record["evidence_kind"],
+                "observation_mode": record.get("observation_mode", "once"),
                 "why_now": record["why_now"],
                 "urgency": record["urgency"],
                 "expires_at": record.get("expires_at"),
                 "allowed_source_classes": list(record.get("allowed_source_classes") or []),
                 "fallback_reaction": record["fallback_reaction"],
                 "question": record.get("question") or "",
+                "evidence_target": record.get("evidence_target"),
             }
-        )
+        if record.get("observation_requirement") is not None:
+            payload["observation_requirement"] = record.get("observation_requirement")
+        if record.get("need_identity_digest") is not None:
+            payload["need_identity_digest"] = record.get("need_identity_digest")
+        return InformationNeedRuntime._fingerprint_payload(payload)
+
+    @staticmethod
+    def _pre_typed_legacy_record_fingerprint(record: Mapping[str, Any]) -> str:
+        """Digest the exact pre-typed presentation index for read migration."""
+
+        payload = {
+            "blocked_judgment": record["blocked_judgment"],
+            "evidence_kind": record["evidence_kind"],
+            "why_now": record["why_now"],
+            "urgency": record["urgency"],
+            "expires_at": record.get("expires_at"),
+            "allowed_source_classes": list(record.get("allowed_source_classes") or []),
+            "fallback_reaction": record["fallback_reaction"],
+            "question": record.get("question") or "",
+        }
+        return InformationNeedRuntime._fingerprint_payload(payload)
+
+    @staticmethod
+    def _legacy_record_fingerprint(record: Mapping[str, Any]) -> str:
+        """Compatibility name for the exact pre-typed migration digest."""
+
+        return InformationNeedRuntime._pre_typed_legacy_record_fingerprint(record)
 
     @staticmethod
     def _record_replay_fingerprint(record: dict[str, Any]) -> str:
+        candidate_payload = {
+            "blocked_judgment": record["blocked_judgment"],
+            "evidence_kind": record["evidence_kind"],
+            "observation_mode": record.get("observation_mode", "once"),
+            "why_now": record["why_now"],
+            "urgency": record["urgency"],
+            "expires_at": record.get("expires_at"),
+            "allowed_source_classes": list(record.get("allowed_source_classes") or []),
+            "fallback_reaction": record["fallback_reaction"],
+            "question": record.get("question") or "",
+            "evidence_target": record.get("evidence_target"),
+        }
+        if record.get("observation_requirement") is not None:
+            candidate_payload["observation_requirement"] = record.get("observation_requirement")
+        if record.get("need_identity_digest") is not None:
+            candidate_payload["need_identity_digest"] = record.get("need_identity_digest")
         return InformationNeedRuntime._fingerprint_payload(
             {
-                "candidate": {
-                    "blocked_judgment": record["blocked_judgment"],
-                    "evidence_kind": record["evidence_kind"],
-                    "why_now": record["why_now"],
-                    "urgency": record["urgency"],
-                    "expires_at": record.get("expires_at"),
-                    "allowed_source_classes": list(record.get("allowed_source_classes") or []),
-                    "fallback_reaction": record["fallback_reaction"],
-                    "question": record.get("question") or "",
-                },
+                "candidate": candidate_payload,
                 "unknown_binding": record.get("unknown_binding"),
             }
         )
@@ -934,19 +1230,38 @@ class InformationNeedRuntime:
     def _candidate_event_fingerprint(
         candidate: CandidateNeed,
         unknown_binding: str | None,
+        evidence_target: Mapping[str, Any] | None = None,
     ) -> str:
+        candidate_payload = {
+            "blocked_judgment": candidate.blocked_judgment,
+            "evidence_kind": candidate.evidence_kind,
+            "observation_mode": candidate.observation_mode,
+            "why_now": candidate.why_now,
+            "urgency": candidate.urgency,
+            "expires_at": candidate.expires_at,
+            "allowed_source_classes": list(candidate.allowed_source_classes),
+            "fallback_reaction": candidate.fallback_reaction,
+            "question": candidate.question,
+            "evidence_target": dict(evidence_target) if isinstance(evidence_target, Mapping) else None,
+            "need_identity_digest": InformationNeedRuntime.need_identity_digest_for_candidate(
+                candidate,
+                evidence_target,
+            ),
+        }
+        requirement = (
+            evidence_target.get("observation_requirement")
+            if isinstance(evidence_target, Mapping)
+            else None
+        ) or (
+            candidate.observation_requirement.model_dump(mode="json")
+            if candidate.observation_requirement is not None
+            else None
+        )
+        if requirement is not None:
+            candidate_payload["observation_requirement"] = copy.deepcopy(requirement)
         return InformationNeedRuntime._fingerprint_payload(
             {
-                "candidate": {
-                    "blocked_judgment": candidate.blocked_judgment,
-                    "evidence_kind": candidate.evidence_kind,
-                    "why_now": candidate.why_now,
-                    "urgency": candidate.urgency,
-                    "expires_at": candidate.expires_at,
-                    "allowed_source_classes": list(candidate.allowed_source_classes),
-                    "fallback_reaction": candidate.fallback_reaction,
-                    "question": candidate.question,
-                },
+                "candidate": candidate_payload,
                 "unknown_binding": unknown_binding,
             }
         )
@@ -955,7 +1270,10 @@ class InformationNeedRuntime:
         self,
         state: dict[str, Any],
         needs_map: dict[str, dict[str, Any]],
-        candidate_rows: Mapping[str, tuple[CandidateNeed, str, str | None]],
+        candidate_rows: Mapping[
+            str,
+            tuple[CandidateNeed, str, str | None, dict[str, Any] | None],
+        ],
         *,
         owner_id: str,
         session_id: str,
@@ -1105,6 +1423,7 @@ class InformationNeedRuntime:
             "need_count": 0,
             "event_fingerprints": {},
             "event_replay_evidence": {},
+            "index_schema_version": InformationNeedRuntime.INDEX_SCHEMA_VERSION,
             "retention_events": [],
             "retention_event_count": 0,
         }

@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from pydantic import ValidationError
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -20,7 +22,12 @@ if str(ROOT) not in sys.path:
 from core.world_state import WorldStateStore  # noqa: E402
 from core.context_scope import tenant_scope_storage_key  # noqa: E402
 from awareness.general_attention_scheduler import GeneralAttentionScheduler  # noqa: E402
-from interface.cognitive_brief_contract import CognitiveBrief  # noqa: E402
+from interface.cognitive_brief_contract import (  # noqa: E402
+    CognitiveBrief,
+    COGNITIVE_BRIEF_MAX_LIVING_SITUATION_ROWS,
+    COGNITIVE_BRIEF_MAX_UNKNOWN,
+    COGNITIVE_BRIEF_MAX_UNKNOWN_PER_SITUATION,
+)
 from runtime.attention_hypothesis_runtime import AttentionHypothesisRuntime  # noqa: E402
 from scripts.attention_hypothesis_smoke import (  # noqa: E402
     CONFIRMING_VALUES,
@@ -44,6 +51,7 @@ class FakeClient:
         self.output_locators = False
         self.extra_ungrounded_claim = False
         self.only_ungrounded_change = False
+        self.quiet_next = False
 
     def complete_json(self, *, purpose: str, system: str, user: str) -> dict[str, Any]:
         self.calls.append(purpose)
@@ -78,6 +86,8 @@ class FakeClient:
             ]
             evidence_ref = refs[0] if refs else "view:fabricated:unsupported"
             has_previous = isinstance(payload.get("previous_brief"), dict)
+            quiet_now = self.quiet_next
+            self.quiet_next = False
             summary_if_asked = (
                 "Review https://model.example/private?q=secret"
                 if self.output_locators
@@ -111,7 +121,7 @@ class FakeClient:
                 "status": "model_assisted",
                 "cognitive_brief": {
                     "schema_version": "veyra.cognitive_brief.v1",
-                    "disposition": "record_candidate" if has_previous else "quiet",
+                    "disposition": "quiet" if quiet_now else ("record_candidate" if has_previous else "quiet"),
                     "summary_if_asked": summary_if_asked,
                     "known": known_rows,
                     "unknown": ["whether the change is useful enough to interrupt the user"],
@@ -131,12 +141,12 @@ class FakeClient:
                                 "confidence": 0.8,
                             }
                         ]
-                        if has_previous
+                        if has_previous and not quiet_now
                         else []
                     ),
                     "why_now": (
                         "The evidence signature changed after the baseline."
-                        if has_previous
+                        if has_previous and not quiet_now
                         else ""
                     ),
                     "confidence": 0.82,
@@ -176,6 +186,96 @@ class MalformedConfigStore(WorldStateStore):
         if self._malformed_config_enabled and name == "ops_config.json":
             payload["_state_revision"] = {"not": "an integer"}
         return payload
+
+
+def test_cognitive_brief_capacity_and_failure_projection() -> None:
+    """The model boundary matches the bounded Living Context projection."""
+
+    base = {
+        "schema_version": "veyra.cognitive_brief.v1",
+        "disposition": "quiet",
+        "summary_if_asked": "bounded cognitive context",
+        "assumptions": [],
+        "material_changes": [],
+        "why_now": "",
+        "confidence": 0.0,
+        "source": "model",
+    }
+    accepted = CognitiveBrief.model_validate(
+        {
+            **base,
+            "unknown": [f"unknown-{index}" for index in range(COGNITIVE_BRIEF_MAX_UNKNOWN)],
+        },
+        strict=True,
+    )
+    assert len(accepted.unknown) == COGNITIVE_BRIEF_MAX_UNKNOWN
+
+    try:
+        CognitiveBrief.model_validate(
+            {
+                **base,
+                "unknown": [
+                    f"unknown-{index}" for index in range(COGNITIVE_BRIEF_MAX_UNKNOWN + 1)
+                ],
+            },
+            strict=True,
+        )
+    except ValidationError as exc:
+        reason = ReadOnlyCognitiveLoopRuntime._brief_failure_reason(exc)  # noqa: SLF001
+    else:
+        raise AssertionError("brief unknown capacity must remain bounded")
+    assert reason == "cognitive_brief_validation:unknown:too_long"
+    assert len(reason) <= 160
+
+    with tempfile.TemporaryDirectory(prefix="veyra-brief-capacity-") as tmp:
+        runtime = ReadOnlyCognitiveLoopRuntime(
+            state_store=WorldStateStore(tmp),
+            reasoning=None,
+        )
+        documents = {
+            "living_situation": {
+                "situations": [
+                    {
+                        "record_kind": "semantic_situation",
+                        "user_id": "capacity-owner",
+                        "session_id": "capacity-session",
+                        "situation_id": f"capacity-{index}",
+                        "observation_revision": 1,
+                        "status": "active",
+                        "updated_at": f"2026-08-23T00:0{index}:00+00:00",
+                        "semantic": {
+                            "title": f"Situation {index}",
+                            "unknown": [
+                                f"row-{index}-unknown-{item}"
+                                for item in range(
+                                    COGNITIVE_BRIEF_MAX_UNKNOWN_PER_SITUATION + 2
+                                )
+                            ],
+                        },
+                    }
+                    for index in range(COGNITIVE_BRIEF_MAX_LIVING_SITUATION_ROWS + 1)
+                ]
+            },
+            "information_needs": {"needs": {}},
+            "living_source": {"requests": {}, "receipts": {}},
+            "living_reaction": {"reactions": {}, "feedback": {}},
+        }
+        projection = runtime._living_context_payload(  # noqa: SLF001
+            documents,
+            user_id="capacity-owner",
+            session_id="capacity-session",
+        )
+        assert len(projection["situations"]) == COGNITIVE_BRIEF_MAX_LIVING_SITUATION_ROWS
+        assert all(
+            len(row["unknown"]) == COGNITIVE_BRIEF_MAX_UNKNOWN_PER_SITUATION
+            for row in projection["situations"]
+        )
+        assert runtime._brief_unknowns_within_bound(  # noqa: SLF001
+            {"unknown": accepted.unknown}
+        )
+        assert not runtime._brief_unknowns_within_bound(  # noqa: SLF001
+            {"unknown": ["overflow"] * (COGNITIVE_BRIEF_MAX_UNKNOWN + 1)}
+        )
 
 
 def make_owner_scope(store: WorldStateStore) -> None:
@@ -1061,6 +1161,7 @@ def test_admitted_bridge_crash_recovery() -> None:
 
 
 def main() -> int:
+    test_cognitive_brief_capacity_and_failure_projection()
     test_cognitive_brief_attention_bridge()
     test_admitted_bridge_crash_recovery()
     with tempfile.TemporaryDirectory(prefix="veyra-cognitive-v1-owner-") as tmp:
@@ -1175,6 +1276,9 @@ def main() -> int:
         assert "PEER_SESSION_SECRET" not in model_prompts
         assert "internal.example" not in model_prompts
         assert "https://" not in model_prompts
+        baseline_state = store.read_json("cognitive_loop_state.json")
+        baseline_scope = next(iter(baseline_state["scopes"].values()))
+        baseline_digest = baseline_scope["last_world_digest"]
 
         # The interval budget is enforced before a model call.
         too_soon = runtime.run_once(reason="smoke")
@@ -1223,6 +1327,8 @@ def main() -> int:
         assert changed["results"][0]["reason"] == "record_candidate"
         assert changed["results"][0]["attention_bridge"]["status"] == "rejected"
         assert changed["results"][0]["attention_bridge"]["reason"] == "material_change_not_bound_to_parent"
+        assert changed["results"][0]["v1_suggestion_bridge"]["status"] == "rejected"
+        assert changed["results"][0]["novelty_ack"]["status"] == "not_acked"
         assert changed["external_delivery"] is False
         state = store.read_json("cognitive_loop_state.json")
         assert state["metrics"]["cycle_count"] == 2
@@ -1242,6 +1348,15 @@ def main() -> int:
             )
             assert selected_observation["evidence_refs"] == [expected_ref]
             assert expected_ref in candidate_cycle["evidence_refs"]
+        # A rejected V1 bridge must not consume the changed world.  A later
+        # quiet result is the explicit server/model ACK that advances it.
+        assert scope["last_world_digest"] == baseline_digest
+        client.quiet_next = True
+        age_last_cycle(store)
+        quiet_ack = runtime.run_once(reason="smoke")
+        assert quiet_ack["status"] == "observed", quiet_ack
+        assert quiet_ack["results"][0]["novelty_ack"]["status"] == "acked"
+        scope = next(iter(store.read_json("cognitive_loop_state.json")["scopes"].values()))
         successful_digest = scope["last_world_digest"]
         successful_brief = scope["last_brief"]
 
@@ -1250,7 +1365,7 @@ def main() -> int:
         age_last_cycle(store)
         unchanged = runtime.run_once(reason="smoke")
         assert unchanged["status"] == "unchanged", unchanged
-        assert len(client.calls) == 4
+        assert len(client.calls) == 6
 
         # An invented observation token fails closed and records no brief or
         # candidate.  It cannot escape into an effect path.
@@ -1298,8 +1413,8 @@ def main() -> int:
         recovered_state = store.read_json("cognitive_loop_state.json")
         recovered_scope = next(iter(recovered_state["scopes"].values()))
         assert recovered_scope["cycles"][-1]["status"] == "observed"
-        assert recovered_scope["last_world_digest"] != successful_digest
-        assert len(client.calls) == 9
+        assert recovered_scope["last_world_digest"] == successful_digest
+        assert len(client.calls) == 11
 
         # One ungrounded claim used to discard the whole brief, so a grounded
         # material change could never be recorded. The ungrounded claim is

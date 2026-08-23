@@ -14,6 +14,7 @@ from core.context_drift_detector import ContextDriftDetector
 from core.model_client import redact_sensitive
 from core.world_state import WorldStateStore
 from interface.event_schema import VeyraEvent
+from interface.living_context_contract import situation_catalog_selector
 
 
 class TurnContextBuilder:
@@ -60,6 +61,20 @@ class TurnContextBuilder:
         safe_anchor_candidates = self._anchor_candidate_catalog(
             anchor_candidates or []
         )
+        safe_living_context_catalog = self._living_context_catalog(
+            living_context_situation_candidates or []
+        )
+        product_conversation_tail = self._product_conversation_tail(event, limit=6)
+        conversation_binding = self._product_conversation_binding(
+            event,
+            validated_tail=product_conversation_tail,
+            catalog=safe_living_context_catalog,
+        )
+        conversation_tail = (
+            product_conversation_tail
+            if product_conversation_tail is not None
+            else self._conversation_tail(event, limit=6)
+        )
         context = redact_sensitive(
             {
                 "active_context": {
@@ -76,7 +91,7 @@ class TurnContextBuilder:
                     "rule_decision": self._rule_decision_summary(rule_decision or {}),
                 },
                 "short_memory": {
-                    "conversation_tail": self._conversation_tail(event, limit=6),
+                    "conversation_tail": conversation_tail,
                     "conversation_slots": self._conversation_slots(
                         state.get("task_state", {}),
                         user_id=event.source.user_id if event else None,
@@ -120,9 +135,11 @@ class TurnContextBuilder:
             max_list=6,
         )
         context["anchor_candidates"] = safe_anchor_candidates
-        context["living_context_situation_candidates"] = self._living_context_catalog(
-            living_context_situation_candidates or []
-        )
+        context["living_context_situation_candidates"] = safe_living_context_catalog
+        # This is a server-derived continuation hint.  It deliberately
+        # contains only the opaque catalog selector; the durable
+        # conversation/situation IDs never enter the model context.
+        context["conversation_binding"] = conversation_binding
         context, drift_report = self.drift_detector.apply(context, decision=rule_decision or {})
         context["_context_metrics"] = {
             "context_chars": drift_report["remediated_context_chars"],
@@ -487,6 +504,174 @@ class TurnContextBuilder:
             )
         tail.sort(key=lambda item: str(item.get("received_at") or ""))
         return tail[-limit:]
+
+    def _product_conversation_tail(
+        self,
+        event: VeyraEvent | None,
+        limit: int,
+    ) -> list[dict[str, Any]] | None:
+        """Read the selected Product Conversation without crossing scope.
+
+        ``None`` means the server-owned conversation reference is unavailable
+        or failed validation, so callers can use the legacy channel tail.  An
+        empty list is a valid, verified conversation with no prior turns.
+        The current user message is pre-written before cognition and is
+        explicitly excluded by its server-owned message ID.
+        """
+
+        if not event or not isinstance(event.payload, dict):
+            return None
+        payload_metadata = event.payload.get("metadata")
+        if not isinstance(payload_metadata, dict):
+            return None
+        internal = payload_metadata.get("_internal")
+        if not isinstance(internal, dict):
+            return None
+        conversation_id = str(internal.get("conversation_id") or "").strip()
+        current_message_id = str(internal.get("message_id") or "").strip()
+        canonical_session_id = str(internal.get("canonical_session_id") or "").strip()
+        owner_id = str(event.source.user_id or "").strip()
+        session_id = str(event.source.session_id or "").strip()
+        current_text = event.payload.get("text")
+        if not conversation_id or not current_message_id or not owner_id or not session_id:
+            return None
+        if not isinstance(current_text, str) or not current_text.strip():
+            return None
+        if canonical_session_id and canonical_session_id != session_id:
+            return None
+
+        try:
+            state = self.state_store.read_json("product_conversation_state.json")
+        except Exception:
+            return None
+        if not isinstance(state, dict):
+            return None
+        conversations = state.get("conversations")
+        row = conversations.get(conversation_id) if isinstance(conversations, dict) else None
+        if not isinstance(row, dict):
+            return None
+        if (
+            str(row.get("conversation_id") or "") != conversation_id
+            or str(row.get("owner_id") or "") != owner_id
+            or str(row.get("session_id") or "") != session_id
+        ):
+            return None
+        messages = row.get("messages")
+        if not isinstance(messages, list):
+            return None
+
+        tail: list[dict[str, Any]] = []
+        current_index: int | None = None
+        for item in messages:
+            if not isinstance(item, dict):
+                return None
+            item_id = str(item.get("message_id") or "").strip()
+            role = str(item.get("role") or "").strip().lower()
+            text = item.get("text")
+            if (
+                not item_id
+                or role not in {"user", "assistant"}
+                or not isinstance(text, str)
+                or not text.strip()
+                or str(item.get("conversation_id") or "") != conversation_id
+                or str(item.get("owner_id") or "") != owner_id
+                or str(item.get("session_id") or "") != session_id
+            ):
+                return None
+            if item_id == current_message_id:
+                if (
+                    current_index is not None
+                    or role != "user"
+                    or self._canonical_text_identity(text)
+                    != self._canonical_text_identity(current_text)
+                ):
+                    return None
+                current_index = len(tail)
+                continue
+            if current_index is None:
+                tail.append(
+                    {
+                        "direction": "inbound" if role == "user" else "outbound",
+                        "received_at": item.get("created_at") or item.get("updated_at"),
+                        "text": self._clip(text, 220),
+                        "message_type": "text",
+                        "source": "product_conversation",
+                        "message_id": item_id,
+                    }
+                )
+        if current_index is None:
+            return None
+        return tail[-max(1, int(limit)) :]
+
+    def _product_conversation_binding(
+        self,
+        event: VeyraEvent | None,
+        *,
+        validated_tail: list[dict[str, Any]] | None,
+        catalog: list[dict[str, Any]],
+    ) -> dict[str, str] | None:
+        """Project the server-selected thread binding without exposing IDs.
+
+        ``validated_tail`` is produced by ``_product_conversation_tail``.  A
+        non-``None`` value therefore proves the internal conversation row,
+        owner/session scope, and current user message all matched before this
+        projection is made.  The durable binding ID is used only on the
+        server to derive the selector consumed by the model boundary.
+        """
+
+        if validated_tail is None or event is None or not isinstance(event.payload, dict):
+            return None
+        metadata = event.payload.get("metadata")
+        internal = metadata.get("_internal") if isinstance(metadata, dict) else None
+        if not isinstance(internal, dict):
+            return None
+        conversation_id = str(internal.get("conversation_id") or "").strip()
+        owner_id = str(event.source.user_id or "").strip()
+        session_id = str(event.source.session_id or "").strip()
+        if not conversation_id or not owner_id or not session_id:
+            return None
+        try:
+            state = self.state_store.read_json("product_conversation_state.json")
+        except Exception:
+            return None
+        conversations = state.get("conversations") if isinstance(state, dict) else None
+        row = conversations.get(conversation_id) if isinstance(conversations, dict) else None
+        if not isinstance(row, dict):
+            return None
+        if (
+            str(row.get("conversation_id") or "") != conversation_id
+            or str(row.get("owner_id") or "") != owner_id
+            or str(row.get("session_id") or "") != session_id
+        ):
+            return None
+        binding_type = str(row.get("binding_type") or "").strip().lower()
+        binding_id = str(row.get("binding_id") or "").strip()
+        if not binding_type and not binding_id:
+            return None
+        if binding_type != "situation" or not binding_id:
+            return None
+
+        selector = situation_catalog_selector(owner_id, session_id, binding_id)
+        # Keep the hint useful when the Situation is temporarily absent from
+        # the bounded catalog, but never accept an injected catalog row as the
+        # binding authority.  The catalog is only used to confirm the selector
+        # is represented by a current server projection when one is available.
+        catalog_matches = [
+            item
+            for item in catalog
+            if isinstance(item, dict)
+            and str(item.get("owner_id") or "") == owner_id
+            and str(item.get("session_id") or "") == session_id
+            and str(item.get("situation_token") or "") == binding_id
+        ]
+        if catalog_matches:
+            advertised = catalog_matches[0].get("situation_selector")
+            if advertised and advertised != selector:
+                return None
+        return {
+            "binding_type": "situation",
+            "situation_selector": selector,
+        }
 
     def _conversation_slots(
         self,
@@ -863,3 +1048,16 @@ class TurnContextBuilder:
         if not isinstance(value, str):
             return value
         return value if len(value) <= limit else value[:limit] + "..."
+
+    @staticmethod
+    def _canonical_text_identity(value: Any) -> str:
+        """Match the Product Conversation storage text identity.
+
+        Product Conversation canonicalizes text by trimming transport-only
+        edge whitespace before indexing a message.  Context selection must
+        use that same identity; otherwise a browser-added newline makes a
+        valid selected thread look unbound and silently falls back to the
+        session-wide tail.
+        """
+
+        return str(value or "").strip()

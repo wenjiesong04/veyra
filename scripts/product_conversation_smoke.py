@@ -63,6 +63,48 @@ def main() -> int:
         expect(first["status"] == "recorded", "first proactive creates a conversation message")
         expect(first_conversation["binding_type"] == "situation", "proactive binding is typed")
         expect(len(first_conversation["messages"]) == 1, "first proactive has one assistant message")
+        first_message = first_conversation["messages"][0]
+        expect(
+            first_message["metadata"]["record_only"] is True
+            and first_message["metadata"]["external_delivery"] is False
+            and first_message["metadata"]["reaction_id"] == "reaction-1"
+            and first_message["metadata"]["feedback_available"] is True,
+            "proactive metadata preserves record-only feedback boundary",
+        )
+
+        feedback_update = runtime.update_reaction_feedback(
+            "reaction-1",
+            owner_id="owner-a",
+            session_id="session-a",
+            label="useful",
+            feedback_at="2026-08-24T00:00:00+00:00",
+        )
+        expect(
+            feedback_update["status"] == "recorded"
+            and feedback_update["message"]["metadata"]["feedback_available"] is False
+            and feedback_update["message"]["metadata"]["feedback_label"] == "useful"
+            and feedback_update["message"]["metadata"]["feedback_at"] == "2026-08-24T00:00:00+00:00",
+            "feedback closes the proactive message affordance",
+        )
+        feedback_replay = runtime.update_reaction_feedback(
+            "reaction-1",
+            owner_id="owner-a",
+            session_id="session-a",
+            label="useful",
+            feedback_at="2026-08-24T00:00:00+00:00",
+        )
+        expect(feedback_replay["status"] == "duplicate", "same feedback label is idempotent")
+        try:
+            runtime.update_reaction_feedback(
+                "reaction-1",
+                owner_id="owner-a",
+                session_id="session-a",
+                label="not_useful",
+            )
+        except ProductConversationConflict:
+            print("PASS feedback label cannot be replaced")
+        else:
+            raise AssertionError("feedback label replacement unexpectedly succeeded")
 
         second = runtime.record_reaction(
             {
@@ -178,6 +220,130 @@ def main() -> int:
             session_id="atomic-session",
         )
         expect(atomic_after is not None and atomic_after["messages"] == [], "foreground user and assistant messages commit atomically")
+
+        admitted = runtime.record_foreground_turn(
+            owner_id="admit-owner",
+            session_id="admit-session",
+            text="Save this before cognition finishes.",
+            message_id="admit-message",
+            responses=[],
+        )
+        expect(
+            [item["role"] for item in admitted["messages"]] == ["user"],
+            "admission records the user turn without a response",
+        )
+        completed_admission = runtime.record_foreground_turn(
+            owner_id="admit-owner",
+            session_id="admit-session",
+            text="Save this before cognition finishes.",
+            message_id="admit-message",
+            responses=["The turn completed after admission."],
+            conversation_id=str(admitted["conversation_id"]),
+        )
+        expect(completed_admission["status"] == "recorded", "assistant append after admission is not a conflict")
+        expect(
+            [item["role"] for item in completed_admission["conversation"]["messages"]] == ["user", "assistant"],
+            "admission then completion yields one user turn and one response",
+        )
+
+        existing_situation_store = WorldStateStore(Path(temporary) / "existing-situation-state")
+        existing_situation_runtime = ProductConversationRuntime(existing_situation_store)
+        proactive = existing_situation_runtime.record_reaction(
+            {
+                "owner_id": "identity-owner",
+                "session_id": "identity-session",
+                "situation_id": "identity-situation",
+                "reaction_id": "identity-reaction-1",
+                "disposition": "suggest",
+                "suggested_next_step": "Existing proactive thread.",
+            }
+        )
+        proactive_id = str(proactive["conversation"]["conversation_id"])
+        foreground = existing_situation_runtime.record_foreground_turn(
+            owner_id="identity-owner",
+            session_id="identity-session",
+            text="Foreground stays in A.",
+            message_id="identity-user-message",
+            responses=[],
+        )
+        foreground_id = str(foreground["conversation_id"])
+        completed_foreground = existing_situation_runtime.record_foreground_turn(
+            owner_id="identity-owner",
+            session_id="identity-session",
+            text="Foreground stays in A.",
+            message_id="identity-user-message",
+            response="Assistant stays with the user turn.",
+            conversation_id=foreground_id,
+            situation_id="identity-situation",
+        )
+        expect(completed_foreground["conversation_id"] == foreground_id, "explicit foreground conversation identity is preserved")
+        foreground_detail = existing_situation_runtime.get_conversation(
+            foreground_id,
+            owner_id="identity-owner",
+            session_id="identity-session",
+        )
+        proactive_detail = existing_situation_runtime.get_conversation(
+            proactive_id,
+            owner_id="identity-owner",
+            session_id="identity-session",
+        )
+        expect(
+            foreground_detail is not None
+            and [item["role"] for item in foreground_detail["messages"]] == ["user", "assistant"]
+            and foreground_detail["binding_id"] is None,
+            "foreground A remains unbound with its assistant completion",
+        )
+        expect(
+            proactive_detail is not None
+            and len(proactive_detail["messages"]) == 1
+            and proactive_detail["messages"][0]["text"] == "Existing proactive thread.",
+            "existing proactive B remains an independent thread",
+        )
+        related_proactive = existing_situation_runtime.record_reaction(
+            {
+                "owner_id": "identity-owner",
+                "session_id": "identity-session",
+                "situation_id": "identity-situation",
+                "reaction_id": "identity-reaction-2",
+                "disposition": "suggest",
+                "suggested_next_step": "Later proactive stays in B.",
+            }
+        )
+        expect(related_proactive["conversation"]["conversation_id"] == proactive_id, "later proactive reuses the unique B thread")
+        expect(len(related_proactive["conversation"]["messages"]) == 2, "later proactive appends to B only")
+
+        no_target_store = WorldStateStore(Path(temporary) / "no-target-state")
+        no_target_runtime = ProductConversationRuntime(no_target_store)
+        no_target_pending = no_target_runtime.record_foreground_turn(
+            owner_id="bind-owner",
+            session_id="bind-session",
+            text="Bind this foreground thread.",
+            message_id="bind-user-message",
+            responses=[],
+        )
+        no_target_id = str(no_target_pending["conversation_id"])
+        no_target_completed = no_target_runtime.record_foreground_turn(
+            owner_id="bind-owner",
+            session_id="bind-session",
+            text="Bind this foreground thread.",
+            message_id="bind-user-message",
+            response="Bound response.",
+            conversation_id=no_target_id,
+            situation_id="bind-situation",
+        )
+        expect(no_target_completed["conversation_id"] == no_target_id, "without B the explicit A thread is retained")
+        no_target_proactive = no_target_runtime.record_reaction(
+            {
+                "owner_id": "bind-owner",
+                "session_id": "bind-session",
+                "situation_id": "bind-situation",
+                "reaction_id": "bind-reaction",
+                "disposition": "suggest",
+                "suggested_next_step": "Proactive reuses bound A.",
+            }
+        )
+        expect(no_target_proactive["conversation"]["conversation_id"] == no_target_id, "first Situation proactive reuses bound A")
+        expect(len(no_target_proactive["conversation"]["messages"]) == 3, "bound A contains the foreground turn and proactive message")
 
         for disposition in ("ask", "read", "wait", "silent"):
             ignored = runtime.record_reaction(

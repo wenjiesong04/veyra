@@ -467,6 +467,18 @@ def main() -> int:
         expect(asked.why_now != NO_MATERIAL_SIGNAL_COPY, "an ask never claims that nothing needs an interruption", asked.why_now)
         expect(bool(asked.why_now.strip()), "an ask still explains why now", asked.why_now)
 
+        newest_evidence_input = payload(
+            SCENARIOS[0], owner=owner, session=session, situation_id="newest_evidence", now=clock(), need=False
+        )
+        newest_evidence_input["situation"]["evidence"] = [
+            {"ref": "evidence-old", "observed_at": "2026-08-01T00:00:00Z"},
+            {"ref": "evidence-new", "observed_at": "2026-08-23T00:00:00Z"},
+        ]
+        newest_evidence = decide_reaction(ReactionInput.from_mapping(newest_evidence_input)).fact_vs_inference["facts"]
+        newest_ref_index = newest_evidence.index("Evidence recorded: evidence-new")
+        oldest_ref_index = newest_evidence.index("Evidence recorded: evidence-old")
+        expect(newest_ref_index < oldest_ref_index, "fact_vs_inference orders evidence refs newest-first", newest_evidence)
+
         bound_need = payload(SCENARIOS[1], owner=owner, session=session, situation_id="need_why_now_bound", revision=1, now=clock(), source_available=False, consented=False, material=False)
         bound_need["information_need"]["why_now"] = "用户需要先确认这一项才能继续。"
         bound = decide_reaction(ReactionInput.from_mapping(bound_need))

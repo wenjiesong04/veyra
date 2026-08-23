@@ -1014,6 +1014,38 @@ class SuggestionOutbox:
             "authority": self._authority_boundary(),
         }
 
+    def in_quiet_hours(
+        self,
+        user_id: str,
+        session_id: str,
+        now: datetime | None = None,
+    ) -> bool:
+        """Return the configured quiet-hours state for one exact scope.
+
+        This is a read-only seam for other record-only surfaces.  It reads an
+        existing policy and never creates one, advances a budget, or treats a
+        missing/corrupt policy as permission to interrupt.  A scope without a
+        policy therefore returns ``False``.
+        """
+
+        _user, _session, scope_key = self._owner(user_id, session_id)
+        try:
+            state = self.state_store.read_json(self.STATE_FILE)
+            policies = state.get("policies") if isinstance(state, dict) else None
+            raw = policies.get(scope_key) if isinstance(policies, dict) else None
+            if not isinstance(raw, dict):
+                return False
+            policy = self._effective_policy(raw)
+            selected_now = now or self._now()
+            if selected_now.tzinfo is None or selected_now.utcoffset() is None:
+                return False
+            return self._in_quiet_hours(
+                selected_now.astimezone(timezone.utc),
+                policy,
+            )
+        except (TypeError, ValueError, KeyError, ZoneInfoNotFoundError):
+            return False
+
     def list_inbox(
         self,
         *,

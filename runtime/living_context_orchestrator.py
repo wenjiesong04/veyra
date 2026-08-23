@@ -17,7 +17,13 @@ from typing import Any, Callable, Iterable, Mapping
 from core.world_state import StateRevisionConflictError
 from interface.event_schema import EventSource, EventType, VeyraEvent
 from interface.living_context_contract import CandidateNeed
-from interface.living_reaction_contract import ReactionInput, stable_digest as reaction_digest
+from interface.living_reaction_contract import (
+    CognitiveSuggestionCandidate,
+    FEEDBACK_LABELS,
+    LivingReactionValidationError,
+    ReactionInput,
+    stable_digest as reaction_digest,
+)
 from interface.living_source_contract import SourceConsent, canonical_utc
 from runtime.living_context_source_policy import LivingContextSourcePolicy
 from runtime.information_need_runtime import InformationNeedStaleReopen
@@ -284,7 +290,16 @@ class LivingContextOrchestrator:
                             source_status=status,
                         )
                         applied = item["source"].get("applied") if isinstance(item["source"], dict) else None
-                        if isinstance(applied, dict) and isinstance(applied.get("situation"), dict):
+                        if (
+                            isinstance(applied, dict)
+                            and isinstance(applied.get("situation"), dict)
+                            # A source receipt never directly turns weather
+                            # novelty into a suggestion. Weather is surfaced
+                            # through the cognitive bridge; only an actionable
+                            # Calendar material observation gets this direct
+                            # reaction re-evaluation.
+                            and str(applied.get("attention_trigger") or "") == "material_observation"
+                        ):
                             current_needs = self.core.needs.list(
                                 owner_id=selected_owner,
                                 session_id=selected_session,
@@ -336,6 +351,9 @@ class LivingContextOrchestrator:
         semantic = situation.get("semantic") if isinstance(situation.get("semantic"), Mapping) else {}
         now = _now_utc(self._clock)
         scheduled = self._parse_time(semantic.get("next_observation_at"))
+        situation_deadline = self._parse_time(semantic.get("deadline_at"))
+        if situation_deadline is not None and situation_deadline <= now:
+            return None
         all_needs = self.core.needs.list(
             owner_id=owner_id,
             session_id=session_id,
@@ -347,6 +365,11 @@ class LivingContextOrchestrator:
             if isinstance(row, Mapping)
             and str(row.get("status") or "") == "resolved"
             and str(row.get("evidence_kind") or "") in READABLE_SOURCES
+            # A one-shot observation is terminal by design.  Only an
+            # explicitly typed watch Need can be reopened by the scheduler;
+            # this prevents every successful source read from becoming an
+            # endless new blocker.
+            and str(row.get("observation_mode") or "once").strip().lower() == "watch"
         ]
         if not candidates:
             return None
@@ -397,11 +420,35 @@ class LivingContextOrchestrator:
                     receipt_due = observed + timedelta(seconds=min(ttl, 604800))
             if receipt_due is None:
                 continue
-            if due_at is None or receipt_due < due_at:
-                due_at = receipt_due
-            if receipt_due <= now or (scheduled is not None and scheduled <= now):
+            # Receipt freshness is an evidence-cache bound, not the watch
+            # schedule. The typed source policy owns cadence; the orchestrator
+            # only passes the source and Need projection through.
+            cadence_seconds = self.source_policy.watch_cadence_seconds(
+                str(need.get("evidence_kind") or ""),
+                need=need,
+            )
+            if cadence_seconds is not None:
+                observed = self._parse_time(receipt.get("observed_at"))
+                if observed is not None:
+                    receipt_due = max(receipt_due, observed + timedelta(seconds=cadence_seconds))
+            receipt_payload = receipt.get("payload") if isinstance(receipt.get("payload"), Mapping) else {}
+            receipt_facts = receipt_payload.get("facts") if isinstance(receipt_payload, Mapping) else {}
+            next_eligible = self._parse_time(
+                receipt_facts.get("next_eligible_at")
+                if isinstance(receipt_facts, Mapping)
+                else None
+            )
+            if next_eligible is not None:
+                receipt_due = max(receipt_due, next_eligible)
+            if scheduled is not None:
+                receipt_due = max(receipt_due, scheduled)
+            need_deadline = self._parse_time(need.get("expires_at"))
+            if need_deadline is not None and receipt_due > need_deadline:
+                continue
+            if receipt_due <= now:
                 selected = need
                 selected_receipt = receipt
+                due_at = receipt_due
                 break
         if selected is None or due_at is None or due_at > now:
             return None
@@ -419,19 +466,29 @@ class LivingContextOrchestrator:
         )[:32]
         try:
             record_digest = self.core.needs.record_digest_for_row(selected)
-            candidate = CandidateNeed.model_validate(
-                {
-                    "blocked_judgment": str(selected.get("blocked_judgment") or "")[:480],
-                    "evidence_kind": str(selected.get("evidence_kind") or "other"),
-                    "why_now": str(selected.get("why_now") or "A fresh observation boundary has arrived.")[:480],
-                    "urgency": float(selected.get("urgency") or 0.0),
-                    "expires_at": selected.get("expires_at"),
-                    "allowed_source_classes": list(selected.get("allowed_source_classes") or []),
-                    "fallback_reaction": str(selected.get("fallback_reaction") or "wait"),
-                    "question": str(selected.get("question") or "")[:360],
-                },
-                strict=True,
-            )
+            # Preserve the typed target and observation mode across the
+            # generation bump.  The model does not get a chance to recreate a
+            # binding from prose during a background reopen.
+            candidate_payload = {
+                "blocked_judgment": str(selected.get("blocked_judgment") or "")[:480],
+                "evidence_kind": str(selected.get("evidence_kind") or "other"),
+                "why_now": str(selected.get("why_now") or "A fresh observation boundary has arrived.")[:480],
+                "urgency": float(selected.get("urgency") or 0.0),
+                "expires_at": selected.get("expires_at"),
+                "allowed_source_classes": list(selected.get("allowed_source_classes") or []),
+                "fallback_reaction": str(selected.get("fallback_reaction") or "wait"),
+                "question": str(selected.get("question") or "")[:360],
+            }
+            model_fields = getattr(CandidateNeed, "model_fields", {})
+            if "observation_mode" in model_fields:
+                candidate_payload["observation_mode"] = str(selected.get("observation_mode") or "watch")
+            if "evidence_target" in model_fields and isinstance(selected.get("evidence_target"), Mapping):
+                candidate_payload["evidence_target"] = deepcopy(selected.get("evidence_target"))
+            if "evidence_target_digest" in model_fields:
+                digest = str(selected.get("evidence_target_digest") or "").strip()
+                if digest:
+                    candidate_payload["evidence_target_digest"] = digest
+            candidate = CandidateNeed.model_validate(candidate_payload, strict=True)
             reopened = self.core.needs.upsert_for_situation(
                 situation_id=situation_id,
                 owner_id=owner_id,
@@ -441,6 +498,16 @@ class LivingContextOrchestrator:
                 expected_generation=int(selected.get("generation") or 0),
                 expected_status="resolved",
                 expected_record_digest=record_digest,
+                unknown_bindings={
+                    str(selected.get("blocked_judgment") or ""): (
+                        str(selected.get("unknown_binding") or "").strip() or None
+                    )
+                },
+                evidence_targets=[
+                    deepcopy(selected.get("evidence_target"))
+                    if isinstance(selected.get("evidence_target"), Mapping)
+                    else None
+                ],
             )
             return reopened[0] if reopened else None
         except InformationNeedStaleReopen:
@@ -482,45 +549,236 @@ class LivingContextOrchestrator:
             feedback,
             catalog if isinstance(catalog, list) else self.model_catalog(owner_id=owner, session_id=session, limit=16),
         )
-        # The catalog is a turn-start binding aid, not a write lease.  A
-        # Situation may have advanced between catalog construction and this
-        # optional feedback write.  Re-read the authoritative revision before
-        # touching the reaction ledger so an old token cannot alter cooldown,
-        # ranking, suppression, or timing for a newer Situation revision.
-        # Revision validation and the reaction write must share the same root
-        # writer fence.  A read followed by ``record_feedback`` as two
-        # independent transactions admits a race in which another turn
-        # advances the Situation between the two operations and stale feedback
-        # still changes cooldown/suppression for the old revision.
+        # The catalog is a turn-start binding aid, not a write lease.  Reuse
+        # the same exact-reaction writer used by the Product API so control
+        # labels cannot target a stale policy row and historical usefulness
+        # remains descriptive only.
+        return self.record_feedback_for_reaction(
+            owner_id=owner,
+            session_id=session,
+            reaction_id=str(target["reaction_id"]),
+            situation_revision=int(target["situation_revision"]),
+            label=str(feedback.label),
+            remind_before_seconds=feedback.remind_before_seconds,
+            evidence_refs=[event.event_id],
+            feedback_id=self._feedback_id(event.event_id, feedback.reaction_token, feedback.label),
+            now=_now_utc(self._clock),
+            apply_situation=apply_situation,
+        )
+
+    def record_feedback_for_reaction(
+        self,
+        *,
+        owner_id: str,
+        session_id: str,
+        reaction_id: str,
+        situation_revision: int,
+        label: str,
+        remind_before_seconds: int | None = None,
+        evidence_refs: Iterable[str] | None = None,
+        feedback_id: str | None = None,
+        now: datetime | None = None,
+        apply_situation: bool = True,
+    ) -> dict[str, Any]:
+        """Record Product feedback against a freshly re-read reaction.
+
+        Product tokens are a hint, not a write lease.  The current Situation
+        and reaction are re-read under the root writer fence, and both owner /
+        session and revision must still match.  ``resolved`` then uses the
+        existing Situation command path so the feedback and terminal update
+        are returned together without rebinding a stale target.
+        """
+
+        owner = str(owner_id or "local-user")
+        session = str(session_id or "local-session")
+        selected_reaction_id = str(reaction_id or "")
+        if not selected_reaction_id:
+            raise ValueError("reaction_id is required")
+        if isinstance(situation_revision, bool) or not isinstance(situation_revision, int) or situation_revision < 1:
+            raise ValueError("situation_revision must be a positive integer")
+        selected_label = str(label or "").strip().lower()
+        if selected_label == "remind_offset":
+            selected_label = "remind_before"
+        if selected_label not in FEEDBACK_LABELS:
+            raise ValueError("feedback label is unsupported")
+        selected_refs = [str(item) for item in (evidence_refs or []) if str(item)]
+        selected_now = now or _now_utc(self._clock)
+        selected_feedback_id = feedback_id or (
+            "product_feedback_"
+            + reaction_digest(
+                "veyra.product_feedback.v1",
+                {
+                    "owner_id": owner,
+                    "session_id": session,
+                    "reaction_id": selected_reaction_id,
+                    "label": selected_label,
+                    "situation_revision": situation_revision,
+                },
+            )[:32]
+        )
         with self._root_writer_transaction():
+            exact_getter = getattr(self.reaction_runtime, "get_reaction", None)
+            reaction = (
+                exact_getter(
+                    selected_reaction_id,
+                    owner_id=owner,
+                    session_id=session,
+                )
+                if callable(exact_getter)
+                else None
+            )
+            if not isinstance(reaction, Mapping):
+                raise StateRevisionConflictError("reaction target is stale or unavailable")
+            situation_id = str(reaction.get("situation_id") or "")
             current_situation = self.core.get_situation(
-                str(target.get("situation_id") or ""),
+                situation_id,
                 owner_id=owner,
                 session_id=session,
             )
-            if current_situation is None:
-                raise StateRevisionConflictError("feedback target Situation is unavailable")
+            if not isinstance(current_situation, Mapping):
+                raise StateRevisionConflictError("reaction target Situation is unavailable")
             current_revision = int(current_situation.get("observation_revision") or 0)
-            target_revision = int(target.get("situation_revision") or 0)
-            if current_revision < 1 or target_revision < 1 or current_revision != target_revision:
-                raise StateRevisionConflictError("feedback target reaction is stale after Situation advancement")
-            now = _now_utc(self._clock)
+            reaction_revision = int(reaction.get("situation_revision") or 0)
+            if current_revision < 1 or reaction_revision < 1 or situation_revision != reaction_revision:
+                raise StateRevisionConflictError("reaction is stale for the requested Situation revision")
+
+            current_getter = getattr(self.reaction_runtime, "get_current_reaction", None)
+            if not callable(current_getter):
+                raise RuntimeError("current reaction reader is unavailable")
+            current_reaction = current_getter(
+                owner_id=owner,
+                session_id=session,
+                situation_id=situation_id,
+                situation_revision=current_revision,
+            )
+            is_current_reaction = (
+                isinstance(current_reaction, Mapping)
+                and str(current_reaction.get("reaction_id") or "") == selected_reaction_id
+                and reaction_revision == current_revision
+            )
+            historical_evaluation = not is_current_reaction
+            if historical_evaluation and selected_label not in {"useful", "not_useful"}:
+                raise StateRevisionConflictError("control feedback requires the current reaction")
+            # Product Conversation is only a display mirror.  The durable
+            # reaction feedback ledger—not a chat message—fences duplicate
+            # labels and remains writable when the optional message is absent
+            # or its ledger is incompatible.
+            feedback_reader = getattr(self.reaction_runtime, "read_state", None)
+            if not callable(feedback_reader):
+                raise RuntimeError("reaction feedback reader is unavailable")
+            feedback_state = feedback_reader()
+            feedback_rows = feedback_state.get("feedback") if isinstance(feedback_state, Mapping) else None
+            if not isinstance(feedback_rows, Mapping):
+                raise RuntimeError("reaction feedback state is unavailable")
+            existing_feedback = next(
+                (
+                    row
+                    for row in feedback_rows.values()
+                    if isinstance(row, Mapping)
+                    and isinstance(row.get("semantics"), Mapping)
+                    and str(row["semantics"].get("owner_id") or "") == owner
+                    and str(row["semantics"].get("session_id") or "") == session
+                    and str(row["semantics"].get("reaction_id") or "") == selected_reaction_id
+                ),
+                None,
+            )
+            if isinstance(existing_feedback, Mapping):
+                existing_semantics = existing_feedback.get("semantics") or {}
+                prior_label = str(existing_semantics.get("label") or "").strip().lower()
+                if prior_label and prior_label != selected_label:
+                    raise StateRevisionConflictError("feedback label is already bound to this reaction")
             payload = {
-                "feedback_id": self._feedback_id(event.event_id, feedback.reaction_token, feedback.label),
+                "feedback_id": selected_feedback_id,
                 "owner_id": owner,
                 "session_id": session,
-                "situation_id": str(target["situation_id"]),
-                "reaction_id": str(target["reaction_id"]),
-                "label": feedback.label,
-                "category": str(target.get("category") or "general"),
-                "remind_before_seconds": feedback.remind_before_seconds,
-                "evidence_refs": [event.event_id],
-                "now": now.isoformat(),
+                "situation_id": situation_id,
+                "reaction_id": selected_reaction_id,
+                "label": selected_label,
+                # Category is server-owned.  Client category is deliberately
+                # not accepted as a learning key.
+                "category": str(reaction.get("category") or "general"),
+                "remind_before_seconds": remind_before_seconds,
+                "evidence_refs": selected_refs,
+                "now": selected_now.isoformat(),
             }
-            recorded = self.reaction_runtime.record_feedback(payload)
-            result: dict[str, Any] = {"status": "recorded", "feedback": recorded, "authority": _authority()}
-            if feedback.label == "resolved" and apply_situation:
-                result["situation"] = self._apply_resolved_feedback(event, target)
+            recorded = self.reaction_runtime.record_feedback(
+                payload,
+                apply_situation_effect=not historical_evaluation,
+                historical_evaluation=historical_evaluation,
+            )
+            result: dict[str, Any] = {
+                **(dict(recorded) if isinstance(recorded, Mapping) else {"status": "recorded", "feedback": recorded}),
+                "authority": _authority(),
+                "historical_evaluation": historical_evaluation,
+            }
+            conversation_runtime = self.conversation_runtime
+            feedback_writer = getattr(conversation_runtime, "update_reaction_feedback", None)
+            if callable(feedback_writer):
+                try:
+                    conversation_result = feedback_writer(
+                        selected_reaction_id,
+                        owner_id=owner,
+                        session_id=session,
+                        label=selected_label,
+                        feedback_at=selected_now.isoformat(),
+                    )
+                    if not isinstance(conversation_result, Mapping) or str(conversation_result.get("status") or "") in {"unavailable", "degraded", "error"}:
+                        raise RuntimeError("conversation feedback mirror is unavailable")
+                    result["conversation"] = conversation_result
+                except Exception:
+                    result["conversation"] = {
+                        "status": "degraded",
+                        "degraded": {
+                            "status": "degraded",
+                            "code": "product_conversation_feedback_mirror_unavailable",
+                            "read_only": True,
+                        },
+                    }
+            else:
+                result["conversation"] = {
+                    "status": "degraded",
+                    "degraded": {
+                        "status": "degraded",
+                        "code": "product_conversation_feedback_mirror_unavailable",
+                        "read_only": True,
+                    },
+                }
+            if selected_label == "resolved" and apply_situation:
+                command_event = self._event(
+                    owner,
+                    session,
+                    EventType.USER_FEEDBACK,
+                    {
+                        "reaction_feedback": "resolved",
+                        "reaction_id": selected_reaction_id,
+                        "source_event_id": selected_feedback_id,
+                    },
+                    prefix="reaction_resolve",
+                )
+                result["situation"] = self._apply_resolved_feedback(command_event, dict(reaction))
+            # Return a refreshable, server-owned reaction snapshot alongside
+            # the feedback and updated Product Conversation message.  A
+            # resolved Situation may advance its revision and therefore have
+            # no current reaction yet; retain the target as the historical
+            # reference in that case.
+            refreshed_situation = result.get("situation") if isinstance(result.get("situation"), Mapping) else current_situation
+            refreshed_revision = int(refreshed_situation.get("observation_revision") or current_revision) if isinstance(refreshed_situation, Mapping) else current_revision
+            refreshed = current_getter(
+                owner_id=owner,
+                session_id=session,
+                situation_id=situation_id,
+                situation_revision=refreshed_revision,
+            )
+            returned_reaction = deepcopy(dict(refreshed if isinstance(refreshed, Mapping) else reaction))
+            returned_reaction["feedback_available"] = False
+            returned_reaction["feedback_label"] = selected_label
+            returned_reaction["feedback_at"] = selected_now.isoformat()
+            result["reaction"] = returned_reaction
+            result["updated"] = {
+                "message": result.get("conversation", {}).get("message") if isinstance(result.get("conversation"), Mapping) else None,
+                "reaction": returned_reaction,
+                "situation": result.get("situation") if isinstance(result.get("situation"), Mapping) else None,
+            }
             return result
 
     def _feedback_target(
@@ -644,6 +902,346 @@ class LivingContextOrchestrator:
     def source_status(self, *, owner_id: str, session_id: str) -> dict[str, Any]:
         return self._source_status(owner_id, session_id)
 
+    def record_cognitive_suggestion(
+        self,
+        candidate: CognitiveSuggestionCandidate | Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Project one cognitive hypothesis into Living Reaction/Product Chat.
+
+        This path deliberately does not call a Situation writer.  It binds the
+        candidate to the current exact semantic revision, evaluates an
+        ephemeral Situation-shaped reaction input, and then records only the
+        reaction plus its optional Product Conversation message.  A stale
+        candidate is a normal scheduler outcome and is never rebound to the
+        latest revision.
+        """
+
+        try:
+            if isinstance(candidate, CognitiveSuggestionCandidate):
+                payload: Any = candidate.to_dict()
+            elif isinstance(candidate, Mapping):
+                payload = candidate
+            else:
+                model_dump = getattr(candidate, "model_dump", None)
+                payload = model_dump(mode="json") if callable(model_dump) else candidate
+            selected = CognitiveSuggestionCandidate.from_mapping(payload)
+        except LivingReactionValidationError as exc:
+            return {
+                "status": "rejected",
+                "reason": "invalid_cognitive_suggestion_candidate",
+                "error_type": type(exc).__name__,
+                "authority": _authority(),
+                "record_only": True,
+                "external_delivery": False,
+                "reaction": None,
+                "conversation": None,
+            }
+
+        owner = selected.owner_id
+        session = selected.session_id
+
+        # A cheap first read gives callers an immediate stale/rejected answer,
+        # but it is only an admission hint.  The authoritative validation is
+        # repeated after taking the root writer fence below.  This matters for
+        # a background candidate racing a foreground Situation update.
+        initial = self.core.get_situation(
+            selected.situation_id,
+            owner_id=owner,
+            session_id=session,
+        )
+        initial_failure = self._validate_cognitive_candidate(selected, initial)
+        if initial_failure is not None:
+            return initial_failure
+
+        # Situation, Living Reaction, and Product Conversation share one
+        # state-root writer fence.  The reaction runtime and conversation
+        # runtime use nested re-entrant mutations, so a reaction can remain
+        # durable if the later chat append fails; the returned degraded result
+        # is then safe for the bridge to replay with this exact candidate.
+        try:
+            with self._root_writer_transaction():
+                current = self.core.get_situation(
+                    selected.situation_id,
+                    owner_id=owner,
+                    session_id=session,
+                )
+                failure = self._validate_cognitive_candidate(selected, current)
+                if failure is not None:
+                    return failure
+
+                semantic = current.get("semantic") if isinstance(current.get("semantic"), Mapping) else {}
+                # This copy is intentionally never passed to a Situation
+                # writer.  It is an explicitly prefixed hypothesis, so the
+                # reaction explanation cannot render it as a user-reported
+                # fact even when the candidate is surfaced as a suggestion.
+                ephemeral = deepcopy(dict(current))
+                ephemeral_semantic = deepcopy(dict(semantic))
+                ephemeral_semantic["material_change"] = {
+                    "statement": self._cognitive_hypothesis_statement(selected.statement),
+                    "why_now": selected.why_now,
+                    "epistemic_status": "hypothesis",
+                    "is_fact": False,
+                    "evidence_refs": list(selected.evidence_refs),
+                    "candidate_id": selected.candidate_id,
+                    "confidence": selected.confidence,
+                    "revision": 1,
+                }
+                ephemeral["semantic"] = ephemeral_semantic
+                reaction = self._evaluate_situation(
+                    ephemeral,
+                    [],
+                    owner_id=owner,
+                    session_id=session,
+                    source_status={"capabilities": {}, "consent": {}},
+                    attention_trigger="cognitive_hypothesis",
+                    attention_candidate_id=selected.candidate_id,
+                    next_step_override=selected.suggested_next_step,
+                )
+                decision = reaction.get("decision") if isinstance(reaction, Mapping) else None
+                result = self._cognitive_candidate_result(
+                    selected,
+                    status=self._cognitive_reaction_status(reaction),
+                    reason=str(reaction.get("reason") or "reaction_evaluated"),
+                    reaction=reaction,
+                )
+                if not isinstance(decision, Mapping):
+                    result["status"] = "degraded"
+                    result["reason"] = "cognitive_reaction_unavailable"
+                    return result
+
+                disposition = str(decision.get("disposition") or "")
+                if disposition == "suggest":
+                    conversation = self._record_suggest_conversation(reaction)
+                    result["conversation"] = conversation
+                    conversation_status = str(conversation.get("status") or "")
+                    if conversation_status not in {"recorded", "duplicate"}:
+                        result["status"] = "degraded"
+                        result["reason"] = "proactive_conversation_record_failed"
+                        result["retryable"] = True
+                    else:
+                        # Preserve the reaction ledger's outcome.  A replay
+                        # that only repairs a missing chat row is still a
+                        # duplicate reaction, while append_message remains
+                        # idempotent for a chat row that already exists.
+                        result["status"] = (
+                            "recorded"
+                            if str(reaction.get("status") or "") == "recorded"
+                            else "duplicate"
+                        )
+                elif disposition == "silent":
+                    result["status"] = self._cognitive_silent_status(decision)
+                    result["reason"] = str(decision.get("reason") or "suggestion_suppressed")
+                else:
+                    result["status"] = "degraded"
+                    result["reason"] = "cognitive_candidate_did_not_produce_suggest"
+                return result
+        except Exception as exc:
+            # Keep a durable reaction result visible when Product Conversation
+            # fails after Living Reaction has committed.  The bridge/retry
+            # caller can invoke this handler again; reaction idempotency then
+            # finds the same row and record_reaction fills the missing chat.
+            if "result" in locals() and isinstance(result, dict):
+                result["status"] = "degraded"
+                result["reason"] = "cognitive_delivery_failed"
+                result["error_type"] = type(exc).__name__
+                result["retryable"] = True
+                conversation = result.get("conversation")
+                if not isinstance(conversation, dict):
+                    result["conversation"] = {
+                        "status": "degraded",
+                        "reason": "proactive_conversation_record_failed",
+                        "error_type": type(exc).__name__,
+                        "retryable": True,
+                    }
+                return result
+            return self._cognitive_candidate_result(
+                selected,
+                status="degraded",
+                reason="cognitive_delivery_failed",
+            ) | {
+                "error_type": type(exc).__name__,
+                "retryable": True,
+            }
+
+    def _validate_cognitive_candidate(
+        self,
+        candidate: CognitiveSuggestionCandidate,
+        current: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Validate exact owner/session/revision/digest/token binding."""
+
+        if not isinstance(current, Mapping):
+            return self._cognitive_candidate_result(
+                candidate,
+                status="rejected",
+                reason="situation_not_found",
+            )
+        if (
+            str(current.get("situation_id") or "") != candidate.situation_id
+            or str(current.get("user_id") or "") != candidate.owner_id
+            or str(current.get("session_id") or "") != candidate.session_id
+        ):
+            return self._cognitive_candidate_result(
+                candidate,
+                status="rejected",
+                reason="candidate_scope_mismatch",
+            )
+        raw_revision = current.get("observation_revision")
+        if isinstance(raw_revision, bool) or not isinstance(raw_revision, int) or raw_revision < 1:
+            return self._cognitive_candidate_result(
+                candidate,
+                status="rejected",
+                reason="situation_revision_invalid",
+            )
+        current_revision = raw_revision
+        semantic = current.get("semantic")
+        if not isinstance(semantic, Mapping):
+            return self._cognitive_candidate_result(
+                candidate,
+                status="rejected",
+                reason="situation_semantic_invalid",
+                current_revision=current_revision,
+            )
+        current_digest = reaction_digest(
+            "veyra.cognitive_living_context.semantic.v1",
+            semantic,
+        )
+        digest_reader = getattr(getattr(self.core, "admission", None), "digest", None)
+        compatibility_digest = digest_reader(semantic) if callable(digest_reader) else None
+        accepted_digests = {str(current_digest)}
+        if compatibility_digest:
+            accepted_digests.add(str(compatibility_digest))
+        if current_revision != candidate.situation_revision or candidate.semantic_digest not in accepted_digests:
+            return self._cognitive_candidate_result(
+                candidate,
+                status="rejected",
+                reason="situation_revision_or_digest_mismatch",
+                current_revision=current_revision,
+                current_digest=str(current_digest),
+            )
+        raw_material_revision = semantic.get("material_revision")
+        material_revision = (
+            int(raw_material_revision)
+            if isinstance(raw_material_revision, int)
+            and not isinstance(raw_material_revision, bool)
+            and raw_material_revision >= 0
+            else 0
+        )
+        raw_material_digest = semantic.get("material_digest")
+        material_digest = (
+            str(raw_material_digest)
+            if isinstance(raw_material_digest, str)
+            and len(raw_material_digest) == 64
+            else str(current_digest)
+        )
+        if (
+            candidate.material_revision is not None
+            and candidate.material_revision != material_revision
+        ) or (
+            candidate.material_digest is not None
+            and candidate.material_digest != material_digest
+        ):
+            return self._cognitive_candidate_result(
+                candidate,
+                status="rejected",
+                reason="situation_material_checkpoint_mismatch",
+                current_revision=current_revision,
+                current_digest=str(current_digest),
+            )
+        expected_tokens = {
+            self._cognitive_change_token(candidate, material_revision, material_digest),
+        }
+        if compatibility_digest:
+            expected_tokens.add(self._cognitive_change_token(candidate, material_revision, material_digest))
+        if candidate.change_token not in expected_tokens:
+            return self._cognitive_candidate_result(
+                candidate,
+                status="rejected",
+                reason="situation_change_token_mismatch",
+                current_revision=current_revision,
+                current_digest=str(current_digest),
+            )
+        return None
+
+    @staticmethod
+    def _cognitive_change_token(
+        candidate: CognitiveSuggestionCandidate,
+        material_revision: int,
+        material_digest: str,
+    ) -> str:
+        return "lcchg_" + reaction_digest(
+            "veyra.cognitive_living_context.change_token.v1",
+            {
+                "owner_id": candidate.owner_id,
+                "session_id": candidate.session_id,
+                "situation_id": candidate.situation_id,
+                "material_revision": material_revision,
+                "material_digest": material_digest,
+            },
+        )[:32]
+
+    @staticmethod
+    def _cognitive_hypothesis_statement(statement: str) -> str:
+        selected = str(statement or "").strip()
+        prefix = "可能的变化："
+        if selected.startswith(prefix):
+            return selected[:1200]
+        return f"{prefix}{selected}"[:1200]
+
+    @staticmethod
+    def _cognitive_silent_status(decision: Mapping[str, Any]) -> str:
+        reason = str(decision.get("reason") or "").strip().lower()
+        if reason in {
+            "cognitive_hypothesis_cooldown",
+            "quiet_hours",
+            "feedback_cooldown",
+            "feedback_suppression",
+            "ignore",
+            "resolved",
+            "too_frequent",
+        }:
+            return "suppressed"
+        return "silent"
+
+    @classmethod
+    def _cognitive_reaction_status(cls, reaction: Mapping[str, Any]) -> str:
+        decision = reaction.get("decision") if isinstance(reaction.get("decision"), Mapping) else None
+        if isinstance(decision, Mapping) and str(decision.get("disposition") or "") == "silent":
+            return cls._cognitive_silent_status(decision)
+        status = str(reaction.get("status") or "degraded")
+        return status if status in {"recorded", "duplicate", "degraded"} else "degraded"
+
+    @staticmethod
+    def _cognitive_candidate_result(
+        candidate: CognitiveSuggestionCandidate,
+        *,
+        status: str,
+        reason: str,
+        reaction: Mapping[str, Any] | None = None,
+        current_revision: int | None = None,
+        current_digest: str | None = None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "status": status,
+            "reason": reason,
+            "candidate_id": candidate.candidate_id,
+            "situation_id": candidate.situation_id,
+            "situation_revision": candidate.situation_revision,
+            "candidate": candidate.to_dict(),
+            "authority": _authority(),
+            "record_only": True,
+            "external_delivery": False,
+            "reaction": None,
+            "conversation": None,
+        }
+        if reaction is not None:
+            result["reaction"] = deepcopy(dict(reaction))
+        if current_revision is not None:
+            result["current_situation_revision"] = current_revision
+        if current_digest is not None:
+            result["current_situation_digest"] = current_digest
+        return result
+
     def grant_source_consent(
         self,
         source: str,
@@ -723,7 +1321,11 @@ class LivingContextOrchestrator:
         runtime = self.conversation_runtime
         decision = reaction.get("decision") if isinstance(reaction, Mapping) else None
         if runtime is None or not isinstance(decision, Mapping):
-            return {"status": "skipped", "reason": "conversation_runtime_unavailable"}
+            return {
+                "status": "degraded",
+                "reason": "conversation_runtime_unavailable",
+                "retryable": True,
+            }
         if str(decision.get("disposition") or "") != "suggest":
             return {
                 "status": "ignored",
@@ -748,6 +1350,8 @@ class LivingContextOrchestrator:
         session_id: str,
         source_status: Mapping[str, Any] | None = None,
         attention_trigger: str = "none",
+        attention_candidate_id: str | None = None,
+        next_step_override: str | None = None,
     ) -> dict[str, Any]:
         rows = [dict(row) for row in (needs or []) if isinstance(row, Mapping) and str(row.get("status") or "") in ACTIVE_NEED_STATUSES]
         selected_need = max(rows, key=lambda item: (float(item.get("urgency") or 0.0), str(item.get("updated_at") or "")), default=None)
@@ -780,6 +1384,14 @@ class LivingContextOrchestrator:
                 availability[candidate_source] = False
         quiet = bool(self._quiet_hours_resolver(owner_id, session_id, now)) if self._quiet_hours_resolver else False
         reaction_situation = deepcopy(dict(situation))
+        if next_step_override:
+            raw_next_semantic = reaction_situation.get("semantic")
+            if isinstance(raw_next_semantic, dict):
+                raw_next_semantic = deepcopy(raw_next_semantic)
+                raw_next_semantic["next_step"] = str(next_step_override)[:600]
+                reaction_situation["semantic"] = raw_next_semantic
+            else:
+                reaction_situation["next_step"] = str(next_step_override)[:600]
         raw_semantic = reaction_situation.get("semantic")
         # ``next_observation_at`` is a scheduler boundary, not a user-facing
         # deadline.  The reaction policy accepts it as a deadline fallback for
@@ -816,6 +1428,7 @@ class LivingContextOrchestrator:
                 # model/material_change alone must not outrank an ordinary
                 # remaining InformationNeed.
                 "attention_trigger": selected_attention_trigger,
+                "attention_candidate_id": attention_candidate_id,
             }
         )
         evaluated = self.reaction_runtime.evaluate(value)
@@ -842,6 +1455,18 @@ class LivingContextOrchestrator:
         if projection is None:
             return {"status": "degraded", "reason": "need_projection_unavailable"}
         selected_need = {**current_need, **projection}
+        next_eligible = self._next_eligible_at(
+            need_id=str(current_need.get("need_id") or ""),
+            owner_id=owner_id,
+            session_id=session_id,
+        )
+        now = _now_utc(self._clock)
+        if next_eligible is not None and next_eligible > now:
+            return {
+                "status": "waiting",
+                "reason": "next_eligible_at",
+                "next_eligible_at": next_eligible.isoformat(),
+            }
         binding = self.source_policy.derive_binding(situation=situation, need=selected_need, now=_now_utc(self._clock))
         if binding is None:
             return {"status": "waiting", "reason": "no_safe_source_binding"}
@@ -860,6 +1485,38 @@ class LivingContextOrchestrator:
             return result
         except Exception as exc:
             return {"status": "degraded", "reason": "source_read_failed", "error_type": type(exc).__name__}
+
+    def _next_eligible_at(
+        self,
+        *,
+        need_id: str,
+        owner_id: str,
+        session_id: str,
+    ) -> datetime | None:
+        """Read a typed empty-result retry boundary for one exact Need."""
+
+        snapshot = self.source_runtime.state_snapshot()
+        receipts = snapshot.get("receipts") if isinstance(snapshot, Mapping) else None
+        latest: Mapping[str, Any] | None = None
+        for raw in receipts.values() if isinstance(receipts, Mapping) else []:
+            if not isinstance(raw, Mapping):
+                continue
+            if (
+                str(raw.get("need_id") or "") != need_id
+                or str(raw.get("user_id") or "") != owner_id
+                or str(raw.get("session_id") or "") != session_id
+                or str(raw.get("status") or "") != "empty"
+            ):
+                continue
+            if latest is None or str(raw.get("observed_at") or "") > str(latest.get("observed_at") or ""):
+                latest = raw
+        if latest is None:
+            return None
+        payload = latest.get("payload") if isinstance(latest.get("payload"), Mapping) else {}
+        facts = payload.get("facts") if isinstance(payload, Mapping) else {}
+        return self._parse_time(
+            facts.get("next_eligible_at") if isinstance(facts, Mapping) else None
+        )
 
     def _mark_asked(self, needs: list[Mapping[str, Any]], situation: Mapping[str, Any], owner: str, session: str) -> dict[str, Any] | None:
         selected = max(needs, key=lambda item: (float(item.get("urgency") or 0.0), str(item.get("updated_at") or "")), default=None)

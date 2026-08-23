@@ -24,15 +24,20 @@ def capability_registry() -> dict[str, SourceCapability]:
             description="Read-only events from an explicitly configured calendar source.",
             default_ttl_seconds=300,
             max_timeout_seconds=5.0,
+            watch_cadence_seconds=900,
             allowed_parameter_keys=("window_start", "window_end"),
         ),
         "weather": SourceCapability(
             source="weather",
             provider_id="weather.open_meteo.v1",
-            description="Read-only weather observation for a server-bound place.",
-            default_ttl_seconds=900,
+            description="Read-only current or bounded forecast weather for a server-bound place.",
+            # The provider chooses a shorter current TTL (15m) or the
+            # forecast watch cadence (6h).  The capability ceiling must allow
+            # the latter while keeping the actual receipt TTL provider-typed.
+            default_ttl_seconds=21600,
             max_timeout_seconds=8.0,
-            allowed_parameter_keys=("location",),
+            watch_cadence_seconds=21600,
+            allowed_parameter_keys=("location", "target_date"),
         ),
         "public_web": SourceCapability(
             source="public_web",
@@ -40,6 +45,7 @@ def capability_registry() -> dict[str, SourceCapability]:
             description="Read-only public web search through the configured SearchProbe.",
             default_ttl_seconds=1800,
             max_timeout_seconds=10.0,
+            watch_cadence_seconds=1800,
             allowed_parameter_keys=("query", "max_results"),
         ),
         "agent_research": SourceCapability(

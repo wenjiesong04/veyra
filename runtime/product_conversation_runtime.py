@@ -153,10 +153,112 @@ class ProductConversationRuntime:
         self._assert_scope(row, owner, session)
         return self._detail(row)
 
+    def get_reaction_message(
+        self,
+        reaction_id: str,
+        *,
+        owner_id: str | None = None,
+        user_id: str | None = None,
+        session_id: str,
+    ) -> dict[str, Any] | None:
+        """Read the exact-scope proactive message for one reaction.
+
+        This is intentionally a read-only lookup used to distinguish a
+        historical Product Chat evaluation from feedback on the current
+        reaction.  It does not repair indexes or mutate legacy rows.
+        """
+
+        owner = self._owner(owner_id if owner_id is not None else user_id)
+        session = self._scope(session_id, "session_id")
+        selected_reaction = self._text(reaction_id, "reaction_id", limit=240, required=True)
+        state = self._read_state()
+        reaction_key = self.reaction_key(
+            owner_id=owner,
+            session_id=session,
+            reaction_id=selected_reaction,
+        )
+        indexed_message_id = state["reaction_index"].get(reaction_key)
+        message_index = state["message_index"].get(
+            self.message_key(
+                owner_id=owner,
+                session_id=session,
+                message_id=str(indexed_message_id or ""),
+            )
+        ) if indexed_message_id else None
+        conversation_id = message_index.get("conversation_id") if isinstance(message_index, Mapping) else None
+        candidates: list[Mapping[str, Any]] = []
+        if conversation_id:
+            row = state["conversations"].get(str(conversation_id))
+            if isinstance(row, Mapping):
+                candidates.append(row)
+        else:
+            candidates.extend(
+                row
+                for row in state["conversations"].values()
+                if isinstance(row, Mapping)
+                and str(row.get("owner_id") or "") == owner
+                and str(row.get("session_id") or "") == session
+            )
+        for row in candidates:
+            self._assert_scope(row, owner, session)
+            message = next(
+                (
+                    item
+                    for item in row.get("messages") or []
+                    if isinstance(item, Mapping)
+                    and str(item.get("reaction_id") or "") == selected_reaction
+                    and item.get("kind") == "proactive"
+                    and item.get("source") == "living_reaction"
+                ),
+                None,
+            )
+            if isinstance(message, Mapping):
+                return {
+                    "conversation": self._detail(row),
+                    "message": copy.deepcopy(dict(message)),
+                    "reaction_id": selected_reaction,
+                }
+        return None
+
     # Explicit aliases make the storage boundary convenient for callers that
     # use the product vocabulary rather than the internal owner vocabulary.
     list = list_conversations
     get = get_conversation
+
+    def binding_for_conversation(
+        self,
+        conversation_id: str,
+        *,
+        owner_id: str | None = None,
+        user_id: str | None = None,
+        session_id: str,
+    ) -> dict[str, str] | None:
+        """Read one exact-scope conversation binding without mutating state.
+
+        The durable ``binding_id`` is an internal server value.  Callers that
+        cross into model context must translate it to a catalog selector first;
+        this helper intentionally returns the raw value only at the server
+        runtime boundary.
+        """
+
+        conversation = self.get_conversation(
+            conversation_id,
+            owner_id=owner_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        if not isinstance(conversation, Mapping):
+            return None
+        binding_type = str(conversation.get("binding_type") or "").strip().lower()
+        binding_id = str(conversation.get("binding_id") or "").strip()
+        if not binding_type and not binding_id:
+            return None
+        if binding_type != "situation" or not binding_id:
+            raise ProductConversationStorageError("conversation binding is invalid")
+        return {
+            "binding_type": binding_type,
+            "binding_id": binding_id,
+        }
 
     def status(self) -> dict[str, Any]:
         """Return a pure, bounded health projection of the ledger."""
@@ -418,6 +520,155 @@ class ProductConversationRuntime:
         self._mutate(update)
         return result
 
+    def update_reaction_feedback(
+        self,
+        reaction_id: str,
+        *,
+        owner_id: str,
+        session_id: str,
+        label: str,
+        feedback_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Close the feedback affordance on one proactive message.
+
+        The reaction ledger owns the meaning of feedback.  This method only
+        updates the already-recorded Product Conversation projection so a
+        refresh cannot offer a second choice for the same message.  The
+        message identity and digest are kept in sync, making the update
+        idempotent and preventing a later label from silently replacing the
+        first one.
+        """
+
+        owner = self._owner(owner_id)
+        session = self._scope(session_id, "session_id")
+        selected_reaction = self._text(reaction_id, "reaction_id", limit=240, required=True)
+        selected_label = self._text(label, "feedback.label", limit=40, required=True).lower()
+        selected_at = self._text(feedback_at or self._now(), "feedback_at", limit=80, required=True)
+        result: dict[str, Any] = {}
+
+        def update(state: dict[str, Any]) -> dict[str, Any]:
+            self._prepare_state(state)
+            reaction_key = self.reaction_key(
+                owner_id=owner,
+                session_id=session,
+                reaction_id=selected_reaction,
+            )
+            indexed_message_id = state["reaction_index"].get(reaction_key)
+            message_index = state["message_index"].get(
+                self.message_key(
+                    owner_id=owner,
+                    session_id=session,
+                    message_id=str(indexed_message_id or ""),
+                )
+            ) if indexed_message_id else None
+            conversation_id = message_index.get("conversation_id") if isinstance(message_index, Mapping) else None
+            row: dict[str, Any] | None = None
+            message: dict[str, Any] | None = None
+            if conversation_id:
+                candidate = state["conversations"].get(str(conversation_id))
+                if not isinstance(candidate, dict):
+                    raise ProductConversationStorageError(
+                        "reaction index points to a missing conversation"
+                    )
+                self._assert_scope(candidate, owner, session)
+                row = candidate
+                message = next(
+                    (
+                        item
+                        for item in candidate.get("messages") or []
+                        if isinstance(item, dict)
+                        and str(item.get("reaction_id") or "") == selected_reaction
+                    ),
+                    None,
+                )
+            else:
+                # Legacy rows may predate the secondary reaction index.  A
+                # scoped scan repairs only the index, never the message
+                # identity, and keeps historical feedback addressable.
+                for candidate in state["conversations"].values():
+                    if not isinstance(candidate, dict):
+                        continue
+                    if str(candidate.get("owner_id") or "") != owner or str(candidate.get("session_id") or "") != session:
+                        continue
+                    found = next(
+                        (
+                            item
+                            for item in candidate.get("messages") or []
+                            if isinstance(item, dict)
+                            and str(item.get("reaction_id") or "") == selected_reaction
+                        ),
+                        None,
+                    )
+                    if found is not None:
+                        row = candidate
+                        message = found
+                        state["reaction_index"][reaction_key] = str(found.get("message_id") or "")
+                        break
+            if row is None or message is None:
+                result.update(
+                    status="unavailable",
+                    reason="proactive_message_not_found",
+                    reaction_id=selected_reaction,
+                )
+                return state
+
+            metadata = message.get("metadata")
+            metadata = copy.deepcopy(metadata) if isinstance(metadata, Mapping) else {}
+            prior_label = str(metadata.get("feedback_label") or "").strip().lower()
+            feedback_available = metadata.get("feedback_available")
+            if feedback_available is False:
+                if prior_label == selected_label:
+                    result.update(
+                        status="duplicate",
+                        message=copy.deepcopy(message),
+                        conversation=self._detail(row),
+                        reaction_id=selected_reaction,
+                    )
+                    return state
+                raise ProductConversationConflict(
+                    "proactive message feedback is already bound to a different label"
+                )
+
+            metadata["feedback_available"] = False
+            metadata["feedback_label"] = selected_label
+            metadata["feedback_at"] = selected_at
+            message["metadata"] = metadata
+            message["updated_at"] = self._now()
+            conversation_id = str(row.get("conversation_id") or "")
+            message_id = str(message.get("message_id") or "")
+            state["message_index"][self.message_key(
+                owner_id=owner,
+                session_id=session,
+                message_id=message_id,
+            )] = {
+                "conversation_id": conversation_id,
+                "message_id": message_id,
+                "digest": self._message_digest(
+                    conversation_id=conversation_id,
+                    owner_id=owner,
+                    session_id=session,
+                    message_id=message_id,
+                    role=message.get("role"),
+                    text=message.get("text"),
+                    kind=message.get("kind"),
+                    source=message.get("source"),
+                    reaction_id=message.get("reaction_id"),
+                    metadata=metadata,
+                ),
+            }
+            row["updated_at"] = self._now()
+            row["revision"] = self._revision(row.get("revision"), "conversation.revision") + 1
+            result.update(
+                status="recorded",
+                message=copy.deepcopy(message),
+                conversation=self._detail(row),
+                reaction_id=selected_reaction,
+            )
+            return state
+
+        self._mutate(update)
+        return result
+
     def _append_message_in_state(
         self,
         state: dict[str, Any],
@@ -563,11 +814,52 @@ class ProductConversationRuntime:
             ),
         )
         conversation_id = str(conversation["conversation_id"])
-        suggested = text or reaction.get("suggested_next_step") or reaction.get("what_happened") or reaction.get("why_now")
-        selected_text = self._text(suggested, "suggested_next_step", limit=self.MAX_TEXT_CHARS, required=True)
+        what_happened = self._text(reaction.get("what_happened"), "what_happened", limit=1600)
+        why_it_matters = self._text(reaction.get("why_it_matters"), "why_it_matters", limit=1200)
+        why_now = self._text(reaction.get("why_now"), "why_now", limit=1000)
+        suggested = self._text(reaction.get("suggested_next_step"), "suggested_next_step", limit=1000)
+        rendered = text
+        if not rendered:
+            # Keep the legacy sparse reaction shape byte-compatible while the
+            # full V1 reaction renders the complete explanation for Product
+            # Chat.  Cognitive candidates always populate all four fields.
+            if what_happened or why_it_matters or why_now:
+                rendered = "\n".join(
+                    value
+                    for value in (
+                        what_happened,
+                        f"为什么重要：{why_it_matters}" if why_it_matters else "",
+                        f"为什么现在：{why_now}" if why_now else "",
+                        f"建议下一步：{suggested}" if suggested else "",
+                    )
+                    if value
+                )
+            else:
+                rendered = suggested
+        selected_text = self._text(rendered, "suggested_next_step", limit=self.MAX_TEXT_CHARS, required=True)
         message_id = "proactive_" + hashlib.sha256(
             f"veyra.product_conversation.reaction.v1\0{owner}\0{session}\0{reaction_id}".encode("utf-8")
         ).hexdigest()[:32]
+        proactive_metadata = {
+            "disposition": "suggest",
+            "reaction_id": reaction_id,
+            "situation_id": situation_id,
+            "situation_revision": int(reaction.get("situation_revision") or 1),
+            "category": self._text(reaction.get("category"), "category", limit=120),
+            "attention_candidate_id": self._text(
+                reaction.get("attention_candidate_id"),
+                "attention_candidate_id",
+                limit=240,
+            ) or None,
+            "fact_vs_inference": copy.deepcopy(reaction.get("fact_vs_inference") or {"facts": [], "inferences": []}),
+            "feedback_token": reaction.get("reaction_token"),
+            "attention_trigger": self._text(reaction.get("attention_trigger"), "none", limit=64),
+            "feedback_available": True,
+            "record_only": True,
+            "external_delivery": False,
+        }
+        if str(reaction.get("attention_trigger") or "") == "cognitive_hypothesis":
+            proactive_metadata["epistemic_status"] = "hypothesis"
         result = self.append_message(
             conversation_id,
             owner_id=owner,
@@ -578,11 +870,7 @@ class ProductConversationRuntime:
             kind="proactive",
             source="living_reaction",
             reaction_id=reaction_id,
-            metadata={
-                "disposition": "suggest",
-                "situation_id": situation_id,
-                "record_only": True,
-            },
+            metadata=proactive_metadata,
         )
         # append_message owns the single atomic idempotency decision.  Avoid a
         # separate read-before-write reaction check, which can race with an
@@ -618,6 +906,22 @@ class ProductConversationRuntime:
         selected_message_id = self._message_id(message_id)
         selected_situation = self._scope(situation_id, "binding_id") if situation_id else None
         selected_conversation_id = self._conversation_id(conversation_id) if conversation_id else None
+        selected_text = self._text(text, "text", limit=self.MAX_TEXT_CHARS, required=True)
+        selected_metadata = self._metadata(metadata)
+        response_values = list(responses or ([] if response is None else [response]))
+        response_values = [
+            value_text
+            for value in response_values
+            if (value_text := self._text(value, "response", limit=self.MAX_TEXT_CHARS))
+        ]
+        if selected_conversation_id is None:
+            selected_conversation_id = self._existing_foreground_conversation_id(
+                owner=owner,
+                session=session,
+                message_id=selected_message_id,
+                text=selected_text,
+                metadata=selected_metadata,
+            )
         if selected_conversation_id:
             current = self.get_conversation(
                 selected_conversation_id,
@@ -648,16 +952,23 @@ class ProductConversationRuntime:
                         binding_id=selected_situation,
                     )
                 except ProductConversationConflict:
-                    # A proactive first signal may have already claimed this
-                    # Situation.  Reuse that exact typed conversation instead
-                    # of creating a second thread for a browser-local id.
-                    current = self.create_conversation(
+                    # The user chose this conversation explicitly.  If a
+                    # proactive worker won the Situation binding race, keep
+                    # the foreground turn in A instead of switching identity
+                    # to another thread.
+                    current = self.get_conversation(
+                        selected_conversation_id,
                         owner_id=owner,
                         session_id=session,
-                        binding_type="situation",
-                        binding_id=selected_situation,
-                    )
-                    selected_conversation_id = str(current["conversation_id"])
+                    ) or current
+                    if current.get("binding_type") and not self._same_binding(
+                        current,
+                        "situation",
+                        selected_situation,
+                    ):
+                        raise ProductConversationConflict(
+                            "conversation was bound to a different Situation"
+                        )
         else:
             current = self.ensure_conversation(
                 owner_id=owner,
@@ -667,25 +978,24 @@ class ProductConversationRuntime:
                 title=self._text(text, "title", limit=self.MAX_TITLE_CHARS),
             )
         selected_conversation_id = str(current["conversation_id"])
-        response_values = list(responses or ([] if response is None else [response]))
         message_specs: list[dict[str, Any]] = [
             {
                 "message_id": selected_message_id,
                 "role": "user",
-                "text": self._text(text, "text", limit=self.MAX_TEXT_CHARS, required=True),
+                "text": selected_text,
                 "kind": "foreground",
                 "source": "user",
                 "reaction_id": None,
-                "metadata": self._metadata(metadata),
+                "metadata": selected_metadata,
             }
         ]
-        for index, value in enumerate(response_values):
-            value_text = self._text(value, "response", limit=self.MAX_TEXT_CHARS)
-            if not value_text:
-                continue
-            response_id = "response_" + hashlib.sha256(
-                f"veyra.product_conversation.response.v1\0{owner}\0{session}\0{selected_message_id}\0{index}".encode("utf-8")
-            ).hexdigest()[:32]
+        for index, value_text in enumerate(response_values):
+            response_id = self.foreground_response_message_id(
+                owner_id=owner,
+                session_id=session,
+                message_id=selected_message_id,
+                index=index,
+            )
             message_specs.append(
                 {
                     "message_id": response_id,
@@ -729,9 +1039,161 @@ class ProductConversationRuntime:
             "authority": _authority(),
         }
 
+    def record_foreground_completion(
+        self,
+        *,
+        owner_id: str,
+        session_id: str,
+        text: str,
+        message_id: str,
+        conversation_id: str,
+        response: str | None = None,
+        responses: Sequence[str] | None = None,
+        situation_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Append only the assistant tail for an already admitted user turn.
+
+        This is intentionally narrower than ``record_foreground_turn``: a
+        completion hook must carry the server-selected conversation identity
+        and may never create a new user message if the admission ledger is
+        missing.  The underlying turn mutation remains idempotent, so a retry
+        after a hook or delivery failure appends the assistant tail once.
+        """
+
+        selected_conversation_id = self._conversation_id(conversation_id)
+        owner = self._owner(owner_id)
+        session = self._scope(session_id, "session_id")
+        selected_text = self._text(text, "text", limit=self.MAX_TEXT_CHARS, required=True)
+        selected_message_id = self._message_id(message_id)
+        selected_metadata = self._metadata(metadata)
+        admitted_conversation_id = self._existing_foreground_conversation_id(
+            owner=owner,
+            session=session,
+            message_id=selected_message_id,
+            text=selected_text,
+            metadata=selected_metadata,
+        )
+        if admitted_conversation_id != selected_conversation_id:
+            raise ProductConversationConflict(
+                "foreground completion requires the server-admitted conversation"
+            )
+        binding = self.binding_for_conversation(
+            selected_conversation_id,
+            owner_id=owner,
+            session_id=session,
+        )
+        server_diagnostic: dict[str, Any] | None = None
+        public_diagnostic: dict[str, str] | None = None
+        if (
+            situation_id
+            and isinstance(binding, Mapping)
+            and binding.get("binding_type") == "situation"
+            and str(binding.get("binding_id") or "") != str(situation_id)
+        ):
+            expected_binding = str(binding.get("binding_id") or "")
+            observed_binding = str(situation_id)
+            # Keep the admitted thread identity authoritative.  The model's
+            # Situation projection is still retained in its own state path;
+            # it must not rebind a Product Conversation during completion.
+            situation_id = None
+            public_diagnostic = {
+                "code": "conversation_binding_mismatch",
+                "status": "assistant_recorded_on_admitted_conversation",
+            }
+            server_diagnostic = {
+                **public_diagnostic,
+                "binding_type": "situation",
+                "expected_digest": self._binding_digest(expected_binding),
+                "observed_digest": self._binding_digest(observed_binding),
+            }
+        result = self.record_foreground_turn(
+            owner_id=owner,
+            session_id=session,
+            text=selected_text,
+            message_id=selected_message_id,
+            response=response,
+            responses=responses,
+            conversation_id=selected_conversation_id,
+            situation_id=situation_id,
+            metadata=selected_metadata,
+        )
+        result["assistant_message_count"] = sum(
+            1
+            for message in result.get("messages") or []
+            if isinstance(message, Mapping) and message.get("role") == "assistant"
+        )
+        if public_diagnostic is not None:
+            result["diagnostic"] = public_diagnostic
+        if server_diagnostic is not None:
+            # This field is for server-side tracing only.  API adapters must
+            # not forward it to the browser or external channel.
+            result["_server_diagnostic"] = server_diagnostic
+        return result
+
+
     # Friendly aliases for integration callers.
     record_user_turn = record_foreground_turn
     append_foreground_turn = record_foreground_turn
+
+    def _existing_foreground_conversation_id(
+        self,
+        *,
+        owner: str,
+        session: str,
+        message_id: str,
+        text: str,
+        metadata: dict[str, Any],
+    ) -> str | None:
+        """Recover a prior user-first admission for an idempotent retry."""
+
+        state = self._read_state()
+        message_key = self.message_key(
+            owner_id=owner,
+            session_id=session,
+            message_id=message_id,
+        )
+        prior = state["message_index"].get(message_key)
+        if prior is None:
+            return None
+        if not isinstance(prior, dict) or prior.get("message_id") != message_id:
+            raise ProductConversationConflict("message index identity is invalid")
+        conversation_id = str(prior.get("conversation_id") or "")
+        row = state["conversations"].get(conversation_id)
+        if not isinstance(row, dict):
+            raise ProductConversationStorageError("message index points to a missing conversation")
+        self._assert_scope(row, owner, session)
+        existing = self._find_message(row, message_id)
+        if not isinstance(existing, dict):
+            raise ProductConversationStorageError("message index points to a missing message")
+        if (
+            existing.get("role") != "user"
+            or existing.get("kind") != "foreground"
+            or existing.get("source") != "user"
+            or existing.get("reaction_id") is not None
+            or existing.get("text") != text
+            or existing.get("metadata") != metadata
+        ):
+            raise ProductConversationConflict(
+                "message_id is already bound to different foreground semantics"
+            )
+        digest = self._message_digest(
+            conversation_id=conversation_id,
+            owner_id=owner,
+            session_id=session,
+            message_id=message_id,
+            role="user",
+            text=text,
+            kind="foreground",
+            source="user",
+            reaction_id=None,
+            metadata=metadata,
+        )
+        if prior.get("digest") != digest:
+            raise ProductConversationConflict(
+                "message_id foreground digest does not match the stored admission"
+            )
+        return conversation_id
 
     # ---------- deterministic typed identities ----------
 
@@ -779,6 +1241,55 @@ class ProductConversationRuntime:
             owner_id,
             session_id,
             message_id,
+        )
+
+    @classmethod
+    def foreground_response_message_id(
+        cls,
+        *,
+        owner_id: str,
+        session_id: str,
+        message_id: str,
+        index: int,
+    ) -> str:
+        return "response_" + hashlib.sha256(
+            f"veyra.product_conversation.response.v1\0{owner_id}\0{session_id}\0{message_id}\0{index}".encode("utf-8")
+        ).hexdigest()[:32]
+
+    def has_foreground_completion(
+        self,
+        conversation_id: str,
+        *,
+        owner_id: str,
+        session_id: str,
+        message_id: str,
+    ) -> bool:
+        """Return whether one foreground assistant response already exists."""
+
+        owner = self._owner(owner_id)
+        session = self._scope(session_id, "session_id")
+        selected_conversation = self._conversation_id(conversation_id)
+        selected_message = self._message_id(message_id)
+        conversation = self.get_conversation(
+            selected_conversation,
+            owner_id=owner,
+            session_id=session,
+        )
+        if conversation is None:
+            return False
+        response_id = self.foreground_response_message_id(
+            owner_id=owner,
+            session_id=session,
+            message_id=selected_message,
+            index=0,
+        )
+        return any(
+            isinstance(item, Mapping)
+            and str(item.get("message_id") or "") == response_id
+            and item.get("role") == "assistant"
+            and item.get("kind") == "foreground"
+            and item.get("source") == "veyra"
+            for item in conversation.get("messages") or []
         )
 
     @staticmethod
@@ -971,6 +1482,16 @@ class ProductConversationRuntime:
     def _message_digest(**values: Any) -> str:
         encoded = json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _binding_digest(binding_id: str) -> str:
+        """Return a bounded diagnostic digest without exposing a binding ID."""
+
+        return hashlib.sha256(
+            f"veyra.product_conversation.binding-diagnostic.v1\0{binding_id}".encode(
+                "utf-8"
+            )
+        ).hexdigest()[:16]
 
     def _assert_scope(self, row: Mapping[str, Any], owner: str, session: str) -> None:
         if str(row.get("owner_id") or "") != owner or str(row.get("session_id") or "") != session:

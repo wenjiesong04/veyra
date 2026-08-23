@@ -7,7 +7,7 @@ providers still receive only this validated scalar projection.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Any, Mapping
 
 from common.living_source_primitives import (
@@ -64,6 +64,22 @@ def validate_parameters(source: str, parameters: Mapping[str, Any]) -> dict[str,
         if not location or len(location) > 160:
             raise LivingSourceContractError("weather location is required")
         selected["location"] = location
+        target_date = selected.get("target_date")
+        if target_date in (None, ""):
+            selected.pop("target_date", None)
+        else:
+            # A source binding carries a calendar day, not an arbitrary
+            # provider query.  Accept date-like ISO input but canonicalize it
+            # once at the server boundary so current/forecast comparisons are
+            # stable across retries and time zones.
+            raw_date = str(target_date).strip()
+            try:
+                parsed_date = date.fromisoformat(raw_date[:10])
+            except (TypeError, ValueError) as exc:
+                raise LivingSourceContractError("weather target_date must be an ISO date") from exc
+            if raw_date != parsed_date.isoformat():
+                raise LivingSourceContractError("weather target_date must be an ISO date")
+            selected["target_date"] = parsed_date.isoformat()
     if source == "public_web":
         query = " ".join(str(selected.get("query") or "").split())
         if not query or len(query) > 300:

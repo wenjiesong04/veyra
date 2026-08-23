@@ -512,6 +512,7 @@ class AwarenessLoop:
             turn_context=turn_context,
             turn_understanding=turn_understanding,
         )
+        self._attach_typed_living_context_response(decision, living_context)
         route_trace.append(
             {
                 "phase": "core_cognition",
@@ -1278,8 +1279,6 @@ class AwarenessLoop:
             }
         result.artifacts.setdefault("living_context", living_context)
         followup = self._living_context_followup(living_context)
-        if followup and followup not in result.followup_messages:
-            result.followup_messages.append(followup)
         context_metrics = context_observability.get("context_metrics") if isinstance(context_observability.get("context_metrics"), dict) else {}
         context_drift = context_observability.get("context_drift") if isinstance(context_observability.get("context_drift"), dict) else {}
         result.artifacts.setdefault("context_metrics", context_metrics)
@@ -1355,6 +1354,29 @@ class AwarenessLoop:
                     "status": profile_state_change.get("status"),
                 }
             )
+        if self._living_context_can_own_primary(result, living_context):
+            decision_payload = result.artifacts.get("decision") if isinstance(result.artifacts.get("decision"), dict) else {}
+            decision_assist = decision_payload.get("model_assist") if isinstance(decision_payload.get("model_assist"), dict) else {}
+            primary = str(decision_assist.get("living_context_primary_response") or "").strip()
+            if primary:
+                original_response = str(result.response or "").strip()
+                result.artifacts["living_context_primary_replacement"] = {
+                    "status": "applied",
+                    "reason": "recorded_or_replayed_typed_state_ack_is_the_only_user-facing outcome",
+                    "original_response": original_response[:4000],
+                    "replacement": primary,
+                }
+                result.response = primary
+                # The server-owned primary replaces only an identical LC
+                # follow-up. Other follow-ups (for example commitment or
+                # profile receipts) remain visible.
+                result.followup_messages = [
+                    message
+                    for message in result.followup_messages
+                    if str(message or "").strip() != primary
+                ]
+        elif followup and followup not in result.followup_messages:
+            result.followup_messages.append(followup)
         self._apply_state_change_response_truth(result)
         self._finalize_result_response_authority(result)
         self._persist_conversation_slots(event, result)
@@ -1526,6 +1548,107 @@ class AwarenessLoop:
         next_step = str(decision.get("suggested_next_step") or "看看下一步安排").strip()[:180]
         return f"{prefix}「{label}」：发生了{happened} → 因为{matters} → 现在值得关注：{why_now} → 建议：{next_step}。"
 
+    @staticmethod
+    def _living_context_label(artifact: dict[str, Any]) -> str:
+        situation = artifact.get("situation") if isinstance(artifact.get("situation"), dict) else {}
+        semantic = situation.get("semantic") if isinstance(situation.get("semantic"), dict) else {}
+        return str(
+            semantic.get("label") or semantic.get("title") or semantic.get("summary") or "这件事"
+        ).strip()[:120]
+
+    @classmethod
+    def _living_context_foreground_response(cls, artifact: dict[str, Any]) -> str:
+        """Return the bounded foreground response for a typed state turn.
+
+        Ask/suggest retain their existing reaction copy. Read/wait/silent are
+        background dispositions, so a typed state assertion gets only a
+        server-owned admission/reconnection acknowledgement.
+        """
+
+        followup = cls._living_context_followup(artifact)
+        if followup:
+            return followup
+        if str(artifact.get("status") or "") not in {"recorded", "replayed"}:
+            return ""
+        reaction = artifact.get("current_reaction")
+        if not isinstance(reaction, dict):
+            reaction_payload = artifact.get("reaction")
+            reaction = reaction_payload.get("decision") if isinstance(reaction_payload, dict) else None
+        if not isinstance(reaction, dict):
+            return ""
+        disposition = str(reaction.get("disposition") or "").strip().lower()
+        if disposition not in {"read", "wait", "silent"}:
+            return ""
+        prefix = "已记录" if str(artifact.get("status")) == "recorded" else "已接上"
+        return f"{prefix}「{cls._living_context_label(artifact)}」。"
+
+    @classmethod
+    def _living_context_watch_acknowledgement(cls, artifact: dict[str, Any]) -> str:
+        """Acknowledge only a durable, already-bound watch Need."""
+
+        if str(artifact.get("status") or "") not in {"recorded", "replayed"}:
+            return ""
+        needs = artifact.get("information_needs")
+        if not isinstance(needs, list):
+            return ""
+        active_watch = next(
+            (
+                item for item in needs
+                if isinstance(item, dict)
+                and str(item.get("status") or "") in {"open", "asked", "observing", "waiting"}
+                and str(item.get("observation_mode") or "") == "watch"
+                and isinstance(item.get("evidence_target"), dict)
+                and bool(item.get("evidence_target"))
+            ),
+            None,
+        )
+        if active_watch is None:
+            return ""
+        prefix = "已记录" if str(artifact.get("status")) == "recorded" else "已接上"
+        return f"{prefix}「{cls._living_context_label(artifact)}」的持续观察，观测目标已绑定。"
+
+    def _attach_typed_living_context_response(
+        self,
+        decision: Decision,
+        artifact: dict[str, Any],
+    ) -> None:
+        response = self._typed_living_context_response_for_artifact(decision, artifact)
+        if not response:
+            return
+        assist = dict(decision.model_assist or {})
+        assist["living_context_primary_response"] = response
+        assist["living_context_primary_only"] = True
+        decision.model_assist = assist
+
+    @classmethod
+    def _typed_living_context_response_for_artifact(
+        cls,
+        decision: Decision,
+        artifact: dict[str, Any],
+    ) -> str:
+        assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
+        if decision.route not in {Route.DIRECT_ANSWER, Route.ASK_USER}:
+            return ""
+        if str(artifact.get("status") or "") not in {"recorded", "replayed"}:
+            return ""
+        authority = artifact.get("authority") if isinstance(artifact.get("authority"), dict) else {}
+        if any(bool(authority.get(key)) for key in ("route", "tool", "execution", "delivery")):
+            return ""
+        if assist.get("typed_state_assertion_fast_path") is True:
+            policy = assist.get("semantic_policy") if isinstance(assist.get("semantic_policy"), dict) else {}
+            if str(policy.get("preferred_route") or "") == Route.DIRECT_ANSWER.value:
+                return cls._living_context_foreground_response(artifact)
+        if assist.get("typed_policy_fast_path") is True:
+            return cls._living_context_watch_acknowledgement(artifact)
+        return ""
+
+    @staticmethod
+    def _typed_living_context_response(decision: Decision) -> str:
+        assist = decision.model_assist if isinstance(decision.model_assist, dict) else {}
+        if assist.get("living_context_primary_only") is not True:
+            return ""
+        return str(assist.get("living_context_primary_response") or "").strip()
+
     def _result_execution_tier(self, result: LoopResult) -> str:
         direct_tier = str(result.artifacts.get("execution_tier") or "").strip()
         if direct_tier:
@@ -1534,6 +1657,50 @@ class AwarenessLoop:
         assist = decision.get("model_assist") if isinstance(decision.get("model_assist"), dict) else {}
         plan = assist.get("decision_plan") if isinstance(assist.get("decision_plan"), dict) else {}
         return str(plan.get("execution_tier") or assist.get("execution_tier") or "").strip()
+
+    @classmethod
+    def _living_context_can_own_primary(
+        cls,
+        result: LoopResult,
+        artifact: dict[str, Any],
+    ) -> bool:
+        """Allow a typed, state-only Living Context reaction to replace narration.
+
+        Mixed turns, real observations, Agent dispatches, state commits, and
+        delivery receipts keep their own response and followups.
+        """
+
+        if str(artifact.get("status") or "") not in {"recorded", "replayed"}:
+            return False
+        decision_payload = result.artifacts.get("decision") if isinstance(result.artifacts.get("decision"), dict) else {}
+        decision_assist = decision_payload.get("model_assist") if isinstance(decision_payload.get("model_assist"), dict) else {}
+        if decision_assist.get("living_context_primary_only") is not True:
+            return False
+        expected = (
+            cls._living_context_foreground_response(artifact)
+            if decision_assist.get("typed_state_assertion_fast_path") is True
+            else cls._living_context_watch_acknowledgement(artifact)
+        )
+        if str(decision_assist.get("living_context_primary_response") or "").strip() != expected:
+            return False
+        if result.route not in {Route.DIRECT_ANSWER, Route.ASK_USER}:
+            return False
+        authority = artifact.get("authority") if isinstance(artifact.get("authority"), dict) else {}
+        if any(bool(authority.get(key)) for key in ("route", "tool", "execution", "delivery")):
+            return False
+        if cls._execution_trace_refs(result.artifacts):
+            return False
+        if any(
+            isinstance(result.artifacts.get(key), dict) and result.artifacts.get(key)
+            for key in ("probe_result", "probe_results", "execution_result", "execution_trace", "execution_traces", "delivery_receipt")
+        ):
+            return False
+        pending = result.artifacts.get("pending_task") if isinstance(result.artifacts.get("pending_task"), dict) else {}
+        if pending and str(pending.get("status") or "").strip() not in {"", "not_started", "skipped", "none"}:
+            return False
+        if cls._committed_state_change_refs(result.artifacts):
+            return False
+        return True
 
     def _finalize_result_response_authority(self, result: LoopResult) -> None:
         """Derive response claims from terminal server-owned evidence.
@@ -1592,6 +1759,7 @@ class AwarenessLoop:
                 not early_read_only
                 and not inherited_nonexecution
                 and not claimable_state_change_refs
+                and not result.artifacts.get("living_context_primary_replacement")
             ):
                 result.response = self._server_no_execution_response(projected)
                 result.primary_response = result.response
@@ -2007,6 +2175,9 @@ class AwarenessLoop:
         return decision.route in {Route.AGENT, Route.NATIVE_TOOL, Route.HUMAN_REVIEW, Route.ROLLBACK}
 
     def _ask_user_response(self, decision: Decision) -> str:
+        living_context_response = self._typed_living_context_response(decision)
+        if living_context_response:
+            return living_context_response
         semantic_policy = self._semantic_policy_from_decision(decision)
         clarification = str(semantic_policy.get("clarification_reason") or "").strip()
         if bool(semantic_policy.get("requires_clarification")) and clarification:
@@ -2425,6 +2596,9 @@ class AwarenessLoop:
 
     def _direct_answer(self, event: VeyraEvent, decision: Decision, attention_focus: list[str], *, persona_patch: dict[str, Any]) -> str:
         text = str(event.payload.get("text", ""))
+        living_context_response = self._typed_living_context_response(decision)
+        if living_context_response:
+            return living_context_response
         if decision.intent == "identity" or "source:governance_identity" in decision.signals:
             return "我是 Veyra。OpenClaw 是我可以在需要执行复杂任务时治理和调用的 Agent Runtime，不是当前对话身份。"
         if (decision.intent == "preference" or "memory:preference" in decision.signals) and self._semantic_effect_allowed(

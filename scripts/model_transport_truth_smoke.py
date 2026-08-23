@@ -6,6 +6,9 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
+
+import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -13,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 from core.world_state import WorldStateStore
 from core.model_client import CoreModelClient
+import core.model_client as model_client_module
 from runtime.ops_monitor import OpsMonitor
 
 
@@ -31,7 +35,119 @@ def expect(condition: bool, label: str, details: Any = None) -> None:
         raise AssertionError(f"{label}: {details!r}")
 
 
+def transport_contract_smoke() -> None:
+    """Exercise the synchronous HTTPX seam without making an external call."""
+
+    with tempfile.TemporaryDirectory(prefix="veyra-model-transport-") as temp_root:
+        def configured_client(timeout: float = 0.25, retries: int = 2) -> CoreModelClient:
+            store = WorldStateStore(Path(temp_root) / "state")
+            store.write_json(
+                "agent_config.json",
+                {
+                    "core_model": {
+                        "enabled": True,
+                        "provider": "openai_compatible",
+                        "base_url": "http://127.0.0.1:11434/v1",
+                        "model": "transport-smoke",
+                        "timeout": timeout,
+                        "retries": retries,
+                    }
+                },
+            )
+            return CoreModelClient(store)
+
+        real_client = model_client_module.httpx.Client
+
+        observed: dict[str, Any] = {}
+        calls = 0
+
+        def json_client(**kwargs: Any) -> httpx.Client:
+            observed.update(kwargs)
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                nonlocal calls
+                calls += 1
+                return httpx.Response(
+                    200,
+                    json={"choices": [{"message": {"content": '{"answer":"ok"}'}}]},
+                    request=request,
+                )
+
+            return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+        with patch.object(model_client_module.httpx, "Client", json_client):
+            result = configured_client().complete_json(system="Return JSON.", user="{}", purpose="transport_smoke")
+        timeout = observed.get("timeout")
+        expect(result.get("status") == "model_assisted" and result.get("answer") == "ok", "HTTPX JSON response contract", result)
+        expect(calls == 1, "successful model request is sent once", calls)
+        expect(
+            timeout is not None
+            and timeout.connect == 0.25
+            and timeout.read == 0.25
+            and timeout.write == 0.25
+            and timeout.pool == 0.25,
+            "HTTPX exposes explicit phase timeouts",
+            timeout,
+        )
+        expect(observed.get("trust_env") is True and bool(observed.get("verify")), "proxy and CA trust are explicit", observed)
+
+        observed = {}
+        calls = 0
+
+        def status_client(**kwargs: Any) -> httpx.Client:
+            observed.update(kwargs)
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                nonlocal calls
+                calls += 1
+                return httpx.Response(429, json={"error": "rate limited"}, request=request)
+
+            return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+        with patch.object(model_client_module.httpx, "Client", status_client):
+            result = configured_client().complete_json(system="Return JSON.", user="{}", purpose="transport_http_error")
+        expect(result.get("status") == "http_error" and result.get("status_code") == 429, "HTTP status is preserved as http_error", result)
+        expect(calls == 1, "HTTP status is not retried", calls)
+
+        observed = {}
+        calls = 0
+
+        def connect_timeout_client(**kwargs: Any) -> httpx.Client:
+            observed.update(kwargs)
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                nonlocal calls
+                calls += 1
+                raise httpx.ConnectTimeout("synthetic connect timeout", request=request)
+
+            return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+        with patch.object(model_client_module.httpx, "Client", connect_timeout_client):
+            result = configured_client().complete_json(system="Return JSON.", user="{}", purpose="transport_connect_timeout")
+        expect(result.get("status") == "error" and result.get("attempts") == 3, "connect timeout uses bounded retries", result)
+        expect(calls == 3, "connect timeout retries exactly retries plus one", calls)
+
+        observed = {}
+        calls = 0
+
+        def timeout_client(**kwargs: Any) -> httpx.Client:
+            observed.update(kwargs)
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                nonlocal calls
+                calls += 1
+                raise httpx.ReadTimeout("synthetic read timeout", request=request)
+
+            return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+        with patch.object(model_client_module.httpx, "Client", timeout_client):
+            result = configured_client().complete_json(system="Return JSON.", user="{}", purpose="transport_timeout")
+        expect(result.get("status") == "error" and result.get("attempts") == 1, "read timeout remains a single error", result)
+        expect(calls == 1, "read timeout is never retried", calls)
+
+
 def main() -> int:
+    transport_contract_smoke()
     now = datetime.now(timezone.utc)
     with tempfile.TemporaryDirectory(prefix="veyra-model-truth-") as temp_dir:
         store = WorldStateStore(Path(temp_dir) / "state")

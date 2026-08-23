@@ -46,15 +46,190 @@ FEEDBACK_LABELS = frozenset(
 FEEDBACK_LABEL_ALIASES = {"remind_offset": "remind_before"}
 REACTION_SCHEMA = "veyra.living_reaction.v1"
 FEEDBACK_SCHEMA = "veyra.living_reaction_feedback.v1"
+COGNITIVE_SUGGESTION_SCHEMA = "veyra.cognitive_suggestion_candidate.v1"
 # This is deliberately a small server-owned seam.  A model-provided
-# ``material_change`` remains an ordinary Situation field; only a trusted
-# source receipt may promote a bounded observation into an interruptible
-# attention trigger.
-ATTENTION_TRIGGERS = frozenset({"none", "material_observation"})
+# ``material_change`` remains an ordinary Situation field; only a validated
+# source receipt or an exact, revision-bound cognitive candidate may promote
+# a bounded signal into an interruptible attention trigger.
+ATTENTION_TRIGGERS = frozenset({"none", "material_observation", "cognitive_hypothesis"})
 
 
 class LivingReactionValidationError(ValueError):
     """A reaction input or output violates its bounded contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class CognitiveSuggestionCandidate:
+    """A server-bound, record-only hypothesis produced by background cognition.
+
+    The cognitive loop may propose wording, but it must carry the exact
+    Situation revision/digest selected by the server.  The orchestrator
+    re-reads that row before evaluating the suggestion, so this contract is a
+    binding and replay boundary rather than a second Situation writer.
+    """
+
+    candidate_id: str
+    change_token: str
+    cycle_id: str
+    owner_id: str
+    session_id: str
+    situation_id: str
+    situation_revision: int
+    semantic_digest: str
+    statement: str
+    why_now: str
+    suggested_next_step: str
+    evidence_refs: list[str]
+    confidence: float
+    epistemic_status: str = "hypothesis"
+    is_fact: bool = False
+    authority: bool = False
+    material_revision: int | None = None
+    material_digest: str | None = None
+    schema_version: str = COGNITIVE_SUGGESTION_SCHEMA
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "CognitiveSuggestionCandidate":
+        if not isinstance(value, Mapping):
+            raise LivingReactionValidationError("cognitive suggestion candidate must be an object")
+        allowed_fields = {
+            "schema_version",
+            "candidate_id",
+            "change_token",
+            "cycle_id",
+            "owner_id",
+            "session_id",
+            "situation_id",
+            "situation_revision",
+            "situation_digest",
+            "semantic_digest",
+            "material_revision",
+            "material_digest",
+            "statement",
+            "why_now",
+            "suggested_next_step",
+            "evidence_refs",
+            "confidence",
+            "epistemic_status",
+            "is_fact",
+            "authority",
+        }
+        unknown_fields = sorted(str(key) for key in value if str(key) not in allowed_fields)
+        if unknown_fields:
+            raise LivingReactionValidationError("candidate contains unsupported fields")
+        schema = _text(
+            value.get("schema_version"),
+            "candidate.schema_version",
+            required=True,
+            limit=80,
+        )
+        if schema != COGNITIVE_SUGGESTION_SCHEMA:
+            raise LivingReactionValidationError("candidate.schema_version is unsupported")
+        confidence = value.get("confidence")
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            raise LivingReactionValidationError("candidate.confidence must be numeric")
+        confidence = float(confidence)
+        if not 0.65 <= confidence <= 1.0:
+            raise LivingReactionValidationError("candidate.confidence must be between 0.65 and 1")
+        evidence = _bounded_list(value.get("evidence_refs"), "candidate.evidence_refs", limit=16)
+        refs = [_text(item, f"candidate.evidence_refs[{index}]", required=True, limit=240) for index, item in enumerate(evidence)]
+        if not refs:
+            raise LivingReactionValidationError("candidate.evidence_refs is required")
+        digest_value = value.get("semantic_digest")
+        digest_field = "candidate.semantic_digest"
+        legacy_digest = value.get("situation_digest")
+        if digest_value is not None and legacy_digest is not None and str(digest_value).lower() != str(legacy_digest).lower():
+            raise LivingReactionValidationError("candidate semantic digests disagree")
+        if digest_value is None:
+            digest_value = legacy_digest
+            digest_field = "candidate.situation_digest"
+        digest = _text(digest_value, digest_field, required=True, limit=64).lower()
+        try:
+            decoded = bytes.fromhex(digest)
+        except (TypeError, ValueError) as exc:
+            raise LivingReactionValidationError(f"{digest_field} must be a SHA-256 digest") from exc
+        if len(decoded) != 32:
+            raise LivingReactionValidationError(f"{digest_field} must be a SHA-256 digest")
+        material_revision = value.get("material_revision")
+        if material_revision is not None and (
+            isinstance(material_revision, bool)
+            or not isinstance(material_revision, int)
+            or material_revision < 0
+        ):
+            raise LivingReactionValidationError("candidate.material_revision must be non-negative")
+        material_digest = value.get("material_digest")
+        if material_digest is not None:
+            material_digest = _text(material_digest, "candidate.material_digest", required=True, limit=64).lower()
+            try:
+                if len(bytes.fromhex(material_digest)) != 32:
+                    raise ValueError
+            except (TypeError, ValueError) as exc:
+                raise LivingReactionValidationError("candidate.material_digest must be a SHA-256 digest") from exc
+        is_fact = value.get("is_fact", False)
+        authority = value.get("authority", False)
+        if is_fact is not False:
+            raise LivingReactionValidationError("candidate.is_fact must be false")
+        if authority is not False:
+            raise LivingReactionValidationError("candidate.authority must be false")
+        epistemic_status = _text(value.get("epistemic_status") or "", "candidate.epistemic_status", required=True, limit=40).lower()
+        if epistemic_status != "hypothesis":
+            raise LivingReactionValidationError("candidate.epistemic_status must be hypothesis")
+        return cls(
+            candidate_id=_identity(value.get("candidate_id"), "candidate.candidate_id"),
+            change_token=_identity(value.get("change_token"), "candidate.change_token"),
+            cycle_id=_identity(value.get("cycle_id"), "candidate.cycle_id"),
+            owner_id=_identity(value.get("owner_id"), "candidate.owner_id"),
+            session_id=_identity(value.get("session_id"), "candidate.session_id"),
+            situation_id=_identity(value.get("situation_id"), "candidate.situation_id"),
+            situation_revision=_revision(value.get("situation_revision"), "candidate.situation_revision"),
+            semantic_digest=digest,
+            material_revision=material_revision,
+            material_digest=material_digest,
+            statement=_text(value.get("statement"), "candidate.statement", required=True, limit=1200),
+            why_now=_text(value.get("why_now"), "candidate.why_now", required=True, limit=800),
+            suggested_next_step=_text(value.get("suggested_next_step"), "candidate.suggested_next_step", required=True, limit=1000),
+            evidence_refs=refs,
+            confidence=confidence,
+            epistemic_status=epistemic_status,
+            is_fact=False,
+            authority=False,
+            schema_version=schema,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "candidate_id": self.candidate_id,
+            "change_token": self.change_token,
+            "cycle_id": self.cycle_id,
+            "owner_id": self.owner_id,
+            "session_id": self.session_id,
+            "situation_id": self.situation_id,
+            "situation_revision": self.situation_revision,
+            "semantic_digest": self.semantic_digest,
+            "material_revision": self.material_revision,
+            "material_digest": self.material_digest,
+            "statement": self.statement,
+            "why_now": self.why_now,
+            "suggested_next_step": self.suggested_next_step,
+            "evidence_refs": list(self.evidence_refs),
+            "confidence": self.confidence,
+            "epistemic_status": self.epistemic_status,
+            "is_fact": self.is_fact,
+            "authority": self.authority,
+        }
+
+    @property
+    def digest(self) -> str:
+        """Short compatibility accessor for callers using the binding term."""
+
+        return self.semantic_digest
+
+    @property
+    def situation_digest(self) -> str:
+        """Compatibility accessor for callers using Situation terminology."""
+
+        return self.semantic_digest
 
 
 def stable_digest(namespace: str, value: Any) -> str:
@@ -361,6 +536,7 @@ class ReactionInput:
     consent: dict[str, bool]
     source_availability: dict[str, bool]
     attention_trigger: str = "none"
+    attention_candidate_id: str | None = None
     feedback_policy: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -377,6 +553,13 @@ class ReactionInput:
         attention_trigger = _text(value.get("attention_trigger") or "none", "attention_trigger", limit=64).lower()
         if attention_trigger not in ATTENTION_TRIGGERS:
             raise LivingReactionValidationError("attention_trigger is unsupported")
+        attention_candidate_id = _text(
+            value.get("attention_candidate_id") or "",
+            "attention_candidate_id",
+            limit=240,
+        ) or None
+        if attention_trigger == "cognitive_hypothesis" and attention_candidate_id is None:
+            raise LivingReactionValidationError("cognitive_hypothesis requires attention_candidate_id")
         return cls(
             owner_id=owner,
             session_id=session,
@@ -387,6 +570,7 @@ class ReactionInput:
             consent=consent,
             source_availability=availability,
             attention_trigger=attention_trigger,
+            attention_candidate_id=attention_candidate_id,
             feedback_policy=_bounded_mapping(value.get("feedback_policy"), "feedback_policy"),
         )
 
@@ -401,6 +585,7 @@ class ReactionInput:
             "consent": dict(self.consent),
             "source_availability": dict(self.source_availability),
             "attention_trigger": self.attention_trigger,
+            "attention_candidate_id": self.attention_candidate_id,
             "feedback_policy": dict(self.feedback_policy),
         }
 
@@ -427,7 +612,21 @@ class ReactionInput:
                 "consent": self.consent,
                 "source_availability": self.source_availability,
                 "attention_trigger": self.attention_trigger,
-                "policy_revision": self.feedback_policy.get("policy_revision", 0),
+                "attention_candidate_id": self.attention_candidate_id,
+                # These booleans are injected by LivingReactionRuntime from
+                # the server-owned policy at evaluation time.  Including the
+                # phase boundary lets an expired cooldown/suppression be
+                # reconsidered without trusting a client-provided timestamp.
+                "cooldown_active": bool(self.feedback_policy.get("cooldown_active", False)),
+                "suppression_active": bool(self.feedback_policy.get("suppression_active", False)),
+                # A cognitive candidate is immutable evidence for one
+                # suggestion attempt.  Persisting its cooldown must not turn
+                # an exact replay into a second silent row; the candidate ID
+                # already supplies the stable identity.  Feedback/policy
+                # boundaries still participate in ordinary reactions.
+                "policy_revision": 0
+                if self.attention_trigger == "cognitive_hypothesis"
+                else self.feedback_policy.get("policy_revision", 0),
                 # The policy layer supplies a stable phase boundary (for
                 # example before_window -> in_window).  Never key on now:
                 # repeated ticks in one phase must replay idempotently.
@@ -482,6 +681,8 @@ class ReactionDecision:
     record_only: bool = True
     ledger_status: str = "recorded"
     schema_version: str = REACTION_SCHEMA
+    attention_trigger: str = "none"
+    attention_candidate_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -510,6 +711,8 @@ class ReactionDecision:
             "external_delivery": self.external_delivery,
             "record_only": self.record_only,
             "ledger_status": self.ledger_status,
+            "attention_trigger": self.attention_trigger,
+            "attention_candidate_id": self.attention_candidate_id,
         }
 
 

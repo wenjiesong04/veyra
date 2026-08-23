@@ -226,6 +226,36 @@ def recurring_and_today_checks(root: Path) -> None:
             "material_change": "The plan changed.",
             "unknown": ["The next decision is not yet known."],
         },
+        {
+            "situation_id": "controlled-unknown-only",
+            "revision": 1,
+            "title": "An unresolved item",
+            "summary": "Only an unknown signal is present.",
+            "status": "active",
+            "deadline_at": None,
+            "material_change": "",
+            "unknown": ["The next decision is not yet known."],
+        },
+        {
+            "situation_id": "controlled-wait-only",
+            "revision": 1,
+            "title": "A waiting item",
+            "summary": "Only a wait reaction is present.",
+            "status": "active",
+            "deadline_at": None,
+            "material_change": "",
+            "unknown": [],
+        },
+        {
+            "situation_id": "controlled-suggest-only",
+            "revision": 1,
+            "title": "A suggested item",
+            "summary": "Only a current suggestion is present.",
+            "status": "active",
+            "deadline_at": None,
+            "material_change": "",
+            "unknown": [],
+        },
     ]
     controlled_reactions = [
         {
@@ -242,10 +272,30 @@ def recurring_and_today_checks(root: Path) -> None:
             "rank": 0.2,
             "why_now": "The next decision is still unclear.",
         },
+        {
+            "situation_id": "controlled-wait-only",
+            "situation_revision": 1,
+            "disposition": "wait",
+            "rank": 0.99,
+            "why_now": "The next decision is still unclear.",
+        },
+        {
+            "situation_id": "controlled-suggest-only",
+            "situation_revision": 1,
+            "disposition": "suggest",
+            "why_now": "A current suggestion is available.",
+        },
     ]
     attention = ProductExperienceService._attention_rows(controlled_situations, controlled_reactions, limit=8)
     expect(attention and all(attention[i]["rank"] >= attention[i + 1]["rank"] for i in range(len(attention) - 1)), "Today attention projection ranks controlled signals in descending order")
-    expect(len(attention) == 2 and set(attention[0]["signals"]) != set(attention[1]["signals"]), "Today attention projection preserves distinct signal sources")
+    attention_ids = {item["situation_id"] for item in attention}
+    expect(
+        attention_ids == {"controlled-deadline", "controlled-unknown", "controlled-suggest-only"}
+        and "controlled-unknown-only" not in attention_ids
+        and "controlled-wait-only" not in attention_ids,
+        "Today attention requires a deadline, material change, or current suggestion",
+    )
+    expect(set(attention[0]["signals"]) != set(attention[1]["signals"]), "Today attention projection preserves distinct signal sources")
     expect(all(item["disposition"] == "suggest" for item in today["suggestions"]), "Today suggestions contain only suggest reactions")
 
 

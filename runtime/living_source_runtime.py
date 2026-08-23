@@ -44,6 +44,7 @@ from interface.living_source_contract import (
     stable_digest,
     utc_now,
 )
+from interface.living_source_payload import inject_weather_coverage
 from probes.search_probe import SearchProbe
 from probes.weather_probe import WeatherProbe
 from runtime.calendar_source import CalendarSource, DisabledCalendarProvider
@@ -88,7 +89,12 @@ class _WeatherProvider:
         self.probe = probe or WeatherProbe()
 
     def read(self, context: SourceContext) -> dict[str, Any]:
-        return self.probe.run(location=str(context.parameters.get("location") or "").strip())
+        return self.probe.run(
+            location=str(context.parameters.get("location") or "").strip(),
+            target_date=(
+                str(context.parameters.get("target_date") or "").strip() or None
+            ),
+        )
 
 
 class _PublicWebProvider:
@@ -183,7 +189,24 @@ class LivingSourceRuntime:
         allowed = raw.get("allowed_source_classes", raw.get("source_classes"))
         if not isinstance(allowed, (list, tuple, set)):
             raise SourceAdmissionError("current InformationNeed source policy is unavailable")
-        return {"owner_id": owner, "session_id": session, "need_id": need_id, "situation_id": str(raw.get("situation_id") or ""), "revision": revision_raw, "record_digest": digest, "status": str(raw.get("status") or ""), "allowed": {str(item) for item in allowed}}
+        return {
+            "owner_id": owner,
+            "session_id": session,
+            "need_id": need_id,
+            "situation_id": str(raw.get("situation_id") or ""),
+            "revision": revision_raw,
+            "record_digest": digest,
+            "status": str(raw.get("status") or ""),
+            "allowed": {str(item) for item in allowed},
+            "evidence_kind": str(raw.get("evidence_kind") or "other"),
+            "observation_mode": str(raw.get("observation_mode") or "once"),
+            "observation_requirement": raw.get("observation_requirement"),
+            "evidence_target": raw.get("evidence_target"),
+            "evidence_target_digest": raw.get("evidence_target_digest"),
+            "provider_target_digest": raw.get("provider_target_digest"),
+            "blocked_judgment": str(raw.get("blocked_judgment") or ""),
+            "expires_at": raw.get("expires_at"),
+        }
 
     def _assert_current_binding(self, binding: SourceNeedBinding) -> dict[str, Any] | None:
         current = self._current_need(binding)
@@ -208,7 +231,18 @@ class LivingSourceRuntime:
             if existing is not None:
                 current = self._binding_from_dict(existing)
                 if current.to_dict() != binding.to_dict():
-                    raise SourceAdmissionError("binding id is already bound to another core need revision")
+                    same_core_binding = (
+                        current.need_id == binding.need_id
+                        and current.need_revision == binding.need_revision
+                        and current.need_digest == binding.need_digest
+                        and current.user_id == binding.user_id
+                        and current.session_id == binding.session_id
+                        and current.situation_id == binding.situation_id
+                        and current.source == binding.source
+                        and current.parameters == binding.parameters
+                    )
+                    if not same_core_binding or parse_time(current.expires_at) <= parse_time(binding.issued_at):
+                        raise SourceAdmissionError("binding id is already bound to another core need revision")
                 result["binding"] = current
                 return state
             if len(state["bindings"]) >= MAX_BINDINGS:
@@ -655,6 +689,20 @@ class LivingSourceRuntime:
                 }[raw_status]
             if status not in {"ok", "empty"}:
                 payload, ttl_seconds = {}, 0
+            elif request.source == "weather":
+                # Coverage is a server-owned receipt invariant.  A provider
+                # that omits it receives the exact binding target; a provider
+                # that supplies a wrong claim remains visible and is rejected
+                # later by the core apply seam.
+                payload = inject_weather_coverage(
+                    payload,
+                    location=binding.parameters.get("location") if isinstance(binding.parameters, Mapping) else None,
+                    target_date=binding.parameters.get("target_date") if isinstance(binding.parameters, Mapping) else None,
+                    target_digest=(
+                        str((self._current_need(binding) or {}).get("provider_target_digest") or "").strip()
+                        or None
+                    ),
+                )
             final = self._receipt_in_state(state, current_request, status=status, reason=reason, now=completion_now, payload=payload, ttl_seconds=ttl_seconds, generation=request.generation, receipt_id=receipt_id, replace_existing=True)
             state["requests"][request.request_id] = replace(current_request, status="completed" if status in {"ok", "empty"} else status, receipt_id=receipt_id).to_dict()
             result["receipt"] = final
@@ -690,8 +738,15 @@ class LivingSourceRuntime:
         if selected_status not in {"ok", "empty"}:
             selected_payload = {}
             ttl_seconds = 0
-        fresh_until = canonical_utc(min(now + timedelta(seconds=ttl_seconds), parse_time(request.expires_at))) if ttl_seconds > 0 and selected_status in {"ok", "empty"} else None
-        receipt = SourceReceipt(receipt_id=selected_id, request_id=request.request_id, need_id=request.need_id, user_id=request.user_id, workspace_id=request.workspace_id, session_id=request.session_id, source=request.source, status=selected_status, observed_at=canonical_utc(now), fresh_until=fresh_until, ttl_seconds=max(0, min(int(ttl_seconds), 604800)), payload=selected_payload, reason=str(reason or "")[:600], generation=generation, binding_id=request.binding_id, consent_id=request.consent_id, consent_generation=request.consent_generation, consent_digest=request.consent_digest)
+        bounded_ttl = max(0, min(int(ttl_seconds), 604800))
+        if bounded_ttl > 0 and selected_status in {"ok", "empty"}:
+            # Keep the numeric TTL and fresh_until as the same server-owned
+            # boundary.  A short-lived Need/binding must not advertise a
+            # six-hour provider TTL while becoming stale after one hour.
+            remaining = max(0, int((parse_time(request.expires_at) - now).total_seconds()))
+            bounded_ttl = min(bounded_ttl, remaining)
+        fresh_until = canonical_utc(now + timedelta(seconds=bounded_ttl)) if bounded_ttl > 0 and selected_status in {"ok", "empty"} else None
+        receipt = SourceReceipt(receipt_id=selected_id, request_id=request.request_id, need_id=request.need_id, user_id=request.user_id, workspace_id=request.workspace_id, session_id=request.session_id, source=request.source, status=selected_status, observed_at=canonical_utc(now), fresh_until=fresh_until, ttl_seconds=bounded_ttl, payload=selected_payload, reason=str(reason or "")[:600], generation=generation, binding_id=request.binding_id, consent_id=request.consent_id, consent_generation=request.consent_generation, consent_digest=request.consent_digest)
         state["receipts"][receipt.receipt_id] = receipt.to_dict()
         return receipt
 

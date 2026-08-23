@@ -117,6 +117,56 @@ def _weather_facts(raw: Mapping[str, Any]) -> dict[str, Any]:
     source_facts = _mapping(raw.get("facts"))
     details = _mapping(raw.get("details"))
     location = _text(source_facts.get("location", raw.get("location", details.get("location"))), limit=160, required=True)
+    coverage_present = (
+        "coverage" in source_facts
+        or "coverage" in raw
+        or "coverage" in details
+    )
+    coverage = source_facts.get("coverage", raw.get("coverage", details.get("coverage")))
+    selected_coverage: dict[str, Any] | None = None
+    if isinstance(coverage, Mapping):
+        kind = str(coverage.get("kind") or "").strip().lower()
+        coverage_location = _text(coverage.get("location"), limit=160)
+        target_date = coverage.get("target_date")
+        target_date = str(target_date).strip() if target_date not in (None, "") else None
+        target_digest = str(
+            coverage.get("target_digest")
+            or coverage.get("evidence_target_digest")
+            or ""
+        ).strip()
+        # Preserve malformed provider coverage as a bounded typed object so
+        # the core apply seam can reject it.  Do not silently drop it and let
+        # the runtime inject the binding target as if the provider omitted
+        # coverage altogether.
+        selected_coverage = {
+            "kind": kind,
+            "location": coverage_location,
+            "target_date": target_date,
+            "target_digest": target_digest,
+        }
+        resolved_place = coverage.get("resolved_place")
+        if isinstance(resolved_place, Mapping):
+            selected_coverage["resolved_place"] = {
+                str(key): value
+                for key, value in resolved_place.items()
+                if str(key) in {
+                    "name",
+                    "provider_id",
+                    "feature_code",
+                    "population",
+                    "latitude",
+                    "longitude",
+                    "timezone",
+                    "country",
+                    "admin1",
+                }
+                and isinstance(value, (str, int, float))
+                and not isinstance(value, bool)
+            }
+    elif coverage_present:
+        # Keep a malformed scalar/list claim visible; the receipt contract is
+        # JSON-shaped, while ``weather_coverage_matches`` will reject it.
+        selected_coverage = {"invalid": coverage}
     current = source_facts.get("current", raw.get("current", details.get("current")))
     current_map = _mapping(current)
     selected_current: dict[str, Any] = {}
@@ -124,12 +174,38 @@ def _weather_facts(raw: Mapping[str, Any]) -> dict[str, Any]:
         value = current_map.get(key)
         if isinstance(value, (str, int, float)) and not isinstance(value, bool):
             selected_current[key] = value
-    if not selected_current:
-        raise SourceProjectionError("weather current facts are required")
-    facts: dict[str, Any] = {"location": location, "current": selected_current}
     forecast = source_facts.get("forecast", raw.get("forecast", details.get("forecast")))
-    if isinstance(forecast, (Mapping, list)) and forecast:
-        facts["forecast"] = forecast
+    selected_forecast: dict[str, Any] | None = None
+    if isinstance(forecast, Mapping):
+        selected_forecast = {}
+        for key in (
+            "date",
+            "weather_code",
+            "weather_description",
+            "temperature_2m_max",
+            "temperature_2m_min",
+            "precipitation_probability_max",
+        ):
+            value = forecast.get(key)
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                selected_forecast[key] = value
+        if not selected_forecast:
+            selected_forecast = None
+    if not selected_current and selected_forecast is None and selected_coverage is None:
+        raise SourceProjectionError("weather typed facts are required")
+    facts: dict[str, Any] = {"location": location}
+    if selected_current:
+        facts["current"] = selected_current
+    if selected_forecast is not None:
+        facts["forecast"] = selected_forecast
+    if selected_coverage is not None:
+        facts["coverage"] = selected_coverage
+    next_eligible_at = source_facts.get(
+        "next_eligible_at",
+        raw.get("next_eligible_at", details.get("next_eligible_at")),
+    )
+    if isinstance(next_eligible_at, str) and next_eligible_at.strip():
+        facts["next_eligible_at"] = next_eligible_at.strip()[:80]
     return facts
 
 

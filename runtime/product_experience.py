@@ -312,14 +312,19 @@ class ProductExperienceService:
                 "authority": _authority(),
             }
         current_revision = int(selected["observation_revision"])
-        reactions = [row for row in reactions if row.get("situation_revision") == current_revision]
+        reactions = self._current_reaction_rows(
+            owner,
+            session,
+            {str(selected["situation_id"]): current_revision},
+        )
+        reactions, feedback_degraded = self._decorate_reaction_feedback(reactions, owner=owner, session=session)
         needs = self._dedupe_active_needs(
             needs,
             owner=owner,
             session=session,
             situation_id=str(selected["situation_id"]),
         )
-        return {
+        result = {
             "schema_version": PRODUCT_SITUATION_SCHEMA,
             "status": "success",
             "scope": {"user_id": owner, "session_id": session},
@@ -329,6 +334,11 @@ class ProductExperienceService:
             "freshness": self._projection_freshness(),
             "authority": _authority(),
         }
+        if feedback_degraded is not None:
+            # Product Conversation is an optional mirror of reaction
+            # feedback.  Its state must never hide a valid Situation row.
+            result["feedback_degraded"] = feedback_degraded
+        return result
 
     def command_situation(self, situation_id: str, *, user_id: str, session_id: str, request: SituationCommandRequest) -> dict[str, Any]:
         owner, session = self._scope_pair(user_id, session_id)
@@ -446,9 +456,12 @@ class ProductExperienceService:
             }
         # This comparison intentionally precedes disposition filtering and
         # every output limit, including the suggestions route.
-        rows = [row for row in rows if current_revisions.get(str(row.get("situation_id"))) == int(row.get("situation_revision") or 0)]
+        rows = self._current_reaction_rows(owner, session, current_revisions)
+        if situation_id is not None:
+            rows = [row for row in rows if str(row.get("situation_id") or "") == str(situation_id)]
         if situation_revision is not None:
-            rows = [row for row in rows if row.get("situation_revision") == situation_revision]
+            rows = [row for row in rows if int(row.get("situation_revision") or 0) == situation_revision]
+        rows, feedback_degraded = self._decorate_reaction_feedback(rows, owner=owner, session=session)
         silent_count = sum(str(row.get("disposition") or "") == "silent" for row in rows)
         visible = [self._reaction_projection(row) for row in rows if str(row.get("disposition") or "") != "silent"]
         if visible_dispositions is not None:
@@ -466,9 +479,123 @@ class ProductExperienceService:
             "freshness": self._projection_freshness(),
             "authority": _authority(),
         }
+        if feedback_degraded is not None:
+            # Fail closed on the optional feedback affordance, while keeping
+            # the independently valid reaction ledger projection readable.
+            result["status"] = DEGRADED_STATUS
+            result["feedback_degraded"] = feedback_degraded
+        return result
+
+    def suggestions(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        situation_id: str | None = None,
+        situation_revision: int | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Project active suggestion cards independently from latest reactions.
+
+        ``reactions()`` intentionally exposes the newest policy boundary for
+        each current Situation, which is the right answer for focus and
+        diagnostics.  A scheduler's later ``silent``/cooldown row must not
+        remove a suggestion that was already admitted to the product.  This
+        route therefore uses the reaction runtime's lifecycle-aware selector
+        and only supplies it the exact active Situation scope.
+        """
+
+        owner, session = self._scope_pair(user_id, session_id)
+        bound = max(1, min(int(limit), 200))
+        situation_rows, situation_status = self._semantic_rows(owner, session, limit=100)
+        if situation_status == DEGRADED_STATUS:
+            return {
+                "schema_version": PRODUCT_REACTIONS_SCHEMA,
+                "status": DEGRADED_STATUS,
+                "reason": "situation_state_integrity_unavailable",
+                "degraded": _degraded_meta("situation_state_integrity_unavailable"),
+                "scope": {"user_id": owner, "session_id": session},
+                "items": [],
+                "silent_items": [],
+                "silent_count": 0,
+                "freshness": self._projection_freshness(),
+                "authority": _authority(),
+            }
+        situations = {
+            str(row.get("situation_id") or ""): row
+            for row in situation_rows
+            if isinstance(row, dict)
+            and str(row.get("situation_id") or "")
+            and self._status(row) in ACTIVE_STATUSES
+        }
+        if situation_id is not None and str(situation_id) not in situations:
+            # Keep the existing product route's exact-scope behavior: a
+            # missing or terminal Situation is not observable as a catalog.
+            current = self.living_context.get_situation(situation_id, owner_id=owner, session_id=session)
+            if current is None:
+                raise KeyError(f"unknown Situation: {situation_id}")
+            situations = {}
+        getter = getattr(self.reaction_runtime, "list_active_suggestions", None)
+        if not callable(getter):
+            raise LivingReactionStorageError("active suggestion selector is unavailable")
+        try:
+            rows = getter(
+                owner_id=owner,
+                session_id=session,
+                situation_ids=set(situations),
+                limit=bound,
+                now=_now(),
+            )
+        except Exception:
+            return {
+                "schema_version": PRODUCT_REACTIONS_SCHEMA,
+                "status": DEGRADED_STATUS,
+                "reason": "reaction_state_integrity_unavailable",
+                "degraded": _degraded_meta("reaction_state_integrity_unavailable"),
+                "scope": {"user_id": owner, "session_id": session},
+                "items": [],
+                "silent_items": [],
+                "silent_count": 0,
+                "freshness": self._projection_freshness(),
+                "authority": _authority(),
+            }
+        if situation_id is not None:
+            rows = [row for row in rows if str(row.get("situation_id") or "") == str(situation_id)]
+        if situation_revision is not None:
+            rows = [row for row in rows if int(row.get("situation_revision") or 0) == int(situation_revision)]
+        rows, feedback_degraded = self._decorate_reaction_feedback(rows, owner=owner, session=session)
+        items = [self._reaction_projection(row) for row in rows[:bound]]
+        result = {
+            "schema_version": PRODUCT_REACTIONS_SCHEMA,
+            "status": "success" if items else "empty",
+            "scope": {"user_id": owner, "session_id": session},
+            "items": items,
+            "silent_items": [],
+            "silent_count": 0,
+            "freshness": self._projection_freshness(),
+            "authority": _authority(),
+        }
+        if feedback_degraded is not None:
+            result["status"] = DEGRADED_STATUS
+            result["feedback_degraded"] = feedback_degraded
         return result
     def feedback_reaction(self, reaction_id: str, *, user_id: str, session_id: str, request: ReactionFeedbackRequest) -> dict[str, Any]:
         owner, session = self._scope_pair(user_id, session_id)
+        recorder = getattr(self.living_context_orchestrator, "record_feedback_for_reaction", None)
+        if not callable(recorder):
+            # Feedback has one writer fence: the Living Context
+            # orchestrator.  A partially assembled ProductExperience must
+            # never fall back to writing the reaction ledger directly.
+            return {
+                "schema_version": PRODUCT_REACTIONS_SCHEMA,
+                "status": "unavailable",
+                "reason": "living_context_orchestrator_unavailable",
+                "scope": {"user_id": owner, "session_id": session},
+                "reaction_id": str(reaction_id),
+                "feedback": None,
+                "updated": {"message": None, "reaction": None, "situation": None},
+                "authority": _authority(),
+            }
         exact_getter = getattr(self.reaction_runtime, "get_reaction", None)
         if callable(exact_getter):
             reaction = exact_getter(reaction_id, owner_id=owner, session_id=session)
@@ -480,24 +607,23 @@ class ProductExperienceService:
         situation = self.living_context.get_situation(str(reaction.get("situation_id") or ""), owner_id=owner, session_id=session)
         if situation is None:
             raise KeyError("reaction Situation is unavailable")
-        current_revision = int(situation["observation_revision"])
-        if int(reaction.get("situation_revision") or 0) != current_revision:
-            raise StateRevisionConflictError("reaction is stale for the current Situation revision")
-        if request.situation_revision != current_revision:
+        reaction_revision = int(reaction.get("situation_revision") or 0)
+        if request.situation_revision != reaction_revision:
             raise StateRevisionConflictError("reaction Situation revision does not match")
-        payload = {
-            "feedback_id": f"product_feedback_{reaction_id}_{request.label}_{request.situation_revision}",
-            "owner_id": owner,
-            "session_id": session,
-            "situation_id": reaction["situation_id"],
-            "reaction_id": reaction_id,
-            "label": request.label,
-            "category": request.category or reaction.get("category") or "general",
-            "remind_before_seconds": request.remind_before_seconds,
-            "evidence_refs": list(request.evidence_refs),
-            "now": _now().isoformat(),
-        }
-        result = self.reaction_runtime.record_feedback(payload)
+        feedback_now = _now()
+        result = recorder(
+            owner_id=owner,
+            session_id=session,
+            reaction_id=reaction_id,
+            situation_revision=reaction_revision,
+            label=request.label,
+            remind_before_seconds=request.remind_before_seconds,
+            evidence_refs=list(request.evidence_refs),
+            feedback_id=f"product_feedback_{reaction_id}_{request.label}_{request.situation_revision}",
+            now=feedback_now,
+        )
+        if not isinstance(result, dict):
+            result = {"status": "unavailable", "reason": "feedback_writer_returned_invalid_result"}
         result["authority"] = _authority()
         return result
     def sources(self, *, user_id: str, session_id: str) -> dict[str, Any]:
@@ -624,6 +750,11 @@ class ProductExperienceService:
         recent_terminal = [item for item in projected if item["status"] in TERMINAL_STATUSES][:5]
         question_result = self.questions(user_id=owner, session_id=session, limit=bound)
         reaction_result = self.reactions(user_id=owner, session_id=session, limit=bound, visible_dispositions={"suggest", "wait"})
+        # The latest reaction is the right focus/diagnostic signal, but a
+        # later silent cooldown row is not a dismissal of an already-admitted
+        # suggestion.  Suggestions therefore come from their own lifecycle
+        # selector and are not derived from ``reaction_result.items``.
+        suggestion_result = self.suggestions(user_id=owner, session_id=session, limit=bound)
         current_reactions = self.reactions(user_id=owner, session_id=session, limit=max(bound, 50))
         attention = self._attention_rows(active, current_reactions.get("items", []), limit=bound)
         deadlines = [item for item in active if item.get("deadline_at")]
@@ -644,8 +775,8 @@ class ProductExperienceService:
                 unknowns.append({"situation_id": item["situation_id"], "statement": unknown})
         goal = self._goal_for_scope(owner, session)
         legacy = self._legacy_sections(owner, session, bound) if not active and situation_status in {"success", "empty"} else {"status": "not_primary", "items": []}
-        degraded = situation_status in {"fail_closed", DEGRADED_STATUS} or question_result["status"] in {"fail_closed", DEGRADED_STATUS} or reaction_result["status"] in {"fail_closed", DEGRADED_STATUS} or legacy.get("status") in {"fail_closed", DEGRADED_STATUS}
-        status = "degraded" if degraded else "success" if active or question_result["items"] or reaction_result["items"] or attention else "empty"
+        degraded = situation_status in {"fail_closed", DEGRADED_STATUS} or question_result["status"] in {"fail_closed", DEGRADED_STATUS} or reaction_result["status"] in {"fail_closed", DEGRADED_STATUS} or suggestion_result["status"] in {"fail_closed", DEGRADED_STATUS} or legacy.get("status") in {"fail_closed", DEGRADED_STATUS}
+        status = "degraded" if degraded else "success" if active or question_result["items"] or reaction_result["items"] or suggestion_result["items"] or attention else "empty"
         result = {
             "schema_version": PRODUCT_TODAY_SCHEMA,
             "status": status,
@@ -665,7 +796,7 @@ class ProductExperienceService:
             "deadlines": deadlines[:bound],
             "unknowns": unknowns[:bound],
             "questions": question_result,
-            "suggestions": [item for item in reaction_result["items"] if item["disposition"] == "suggest"],
+            "suggestions": suggestion_result["items"],
             "reactions": reaction_result,
             "attention": attention,
             "waiting": [item for item in reaction_result["items"] if item.get("disposition") == "wait"],
@@ -676,7 +807,7 @@ class ProductExperienceService:
                 "deadlines": "success" if deadlines else "empty",
                 "unknowns": "success" if unknowns else "empty",
                 "questions": question_result["status"],
-                "suggestions": "success" if any(item["disposition"] == "suggest" for item in reaction_result["items"]) else "empty",
+                "suggestions": suggestion_result["status"] if suggestion_result["status"] not in {"success", "empty"} else "success" if suggestion_result["items"] else "empty",
                 "attention": "success" if attention else "empty",
             },
             "freshness": self._projection_freshness(),
@@ -866,6 +997,102 @@ class ProductExperienceService:
         rows.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
         return rows
 
+    def _current_reaction_rows(
+        self,
+        owner: str,
+        session: str,
+        current_revisions: Mapping[str, int],
+    ) -> list[dict[str, Any]]:
+        """Select one exact server reaction per current Situation revision.
+
+        A ledger can retain several policy-boundary rows for one revision.
+        Product projections must not expose an older ``suggest`` after the
+        authoritative row has become ``silent``/``ignore``.  The exact
+        runtime selector is therefore required; history-page fallback would
+        reintroduce stale controls.
+        """
+
+        getter = getattr(self.reaction_runtime, "get_current_reaction", None)
+        if not callable(getter):
+            raise LivingReactionStorageError("current reaction selector is unavailable")
+        selected: list[dict[str, Any]] = []
+        for situation_id, revision in current_revisions.items():
+            if not situation_id:
+                continue
+            row = getter(
+                owner_id=owner,
+                session_id=session,
+                situation_id=str(situation_id),
+                situation_revision=int(revision),
+            )
+            if isinstance(row, dict):
+                # The reaction ledger is the product authority.  Do not read
+                # Product Conversation here: a corrupt optional chat ledger
+                # must not make a valid Situation/Today projection throw.
+                selected.append(deepcopy(row))
+        selected.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
+        return selected
+
+    def _decorate_reaction_feedback(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        owner: str,
+        session: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        """Attach durable feedback state without depending on Product Chat.
+
+        The reaction runtime remains the sole authority for whether a control
+        is still actionable.  If its feedback index cannot be read, retain
+        the reaction rows but fail closed for the affordance and surface a
+        bounded degraded marker to the caller.
+        """
+
+        projected = [deepcopy(row) for row in rows]
+        try:
+            reader = getattr(self.reaction_runtime, "read_state", None)
+            if not callable(reader):
+                raise LivingReactionStorageError("reaction feedback reader is unavailable")
+            state = reader()
+            feedback = state.get("feedback") if isinstance(state, Mapping) else None
+            if not isinstance(feedback, Mapping):
+                raise LivingReactionStorageError("reaction feedback index is invalid")
+            by_reaction: dict[str, Mapping[str, Any]] = {}
+            for row in feedback.values():
+                if not isinstance(row, Mapping):
+                    continue
+                semantics = row.get("semantics")
+                if not isinstance(semantics, Mapping):
+                    continue
+                if str(semantics.get("owner_id") or "") != owner or str(semantics.get("session_id") or "") != session:
+                    continue
+                reaction_id = str(semantics.get("reaction_id") or "")
+                if not reaction_id:
+                    continue
+                prior = by_reaction.get(reaction_id)
+                if prior is None or str(row.get("created_at") or "") > str(prior.get("created_at") or ""):
+                    by_reaction[reaction_id] = row
+            for row in projected:
+                feedback_row = by_reaction.get(str(row.get("reaction_id") or ""))
+                if feedback_row is None:
+                    row["feedback_available"] = True
+                    row.pop("feedback_label", None)
+                    row.pop("feedback_at", None)
+                    continue
+                semantics = feedback_row.get("semantics") or {}
+                row["feedback_available"] = False
+                row["feedback_label"] = str(semantics.get("label") or "") or None
+                row["feedback_at"] = str(feedback_row.get("created_at") or "") or None
+            return projected, None
+        except Exception:
+            for row in projected:
+                # Unknown feedback state must not reopen an already-recorded
+                # control after refresh.
+                row["feedback_available"] = False
+                row.pop("feedback_label", None)
+                row.pop("feedback_at", None)
+            return projected, _degraded_meta("reaction_feedback_state_integrity_unavailable")
+
     @staticmethod
     def _attention_rows(
         situations: list[dict[str, Any]],
@@ -875,10 +1102,12 @@ class ProductExperienceService:
     ) -> list[dict[str, Any]]:
         """Build the server-owned Today attention ranking.
 
-        Attention is a compact projection of independent signals rather than
-        a second notification ledger: deadline proximity, material change,
-        unresolved unknowns, and the current reaction for the exact Situation
-        revision. Suggestions remain separately filtered to ``suggest``.
+        Attention is a compact projection of admitted typed signals rather
+        than a second notification ledger: deadline proximity, material
+        change, or a current ``suggest`` reaction for the exact Situation
+        revision. Unresolved unknowns may annotate an admitted row but do not
+        admit attention by themselves; ``wait`` is likewise not an admission
+        signal. Suggestions remain separately filtered to ``suggest``.
         """
 
         rows = reactions if isinstance(reactions, list) else []
@@ -919,7 +1148,11 @@ class ProductExperienceService:
             material = bool(str(situation.get("material_change") or "").strip())
             unknown = [str(item) for item in (situation.get("unknown") or []) if str(item).strip()]
             reaction = by_situation.get(situation_id)
-            reaction_rank = float(reaction.get("rank") or 0.0) if reaction else 0.0
+            reaction_disposition = str((reaction or {}).get("disposition") or "").strip().lower()
+            current_suggest = reaction_disposition == "suggest"
+            reaction_rank = float(reaction.get("rank") or 0.0) if current_suggest else 0.0
+            if not deadline_score and not material and not current_suggest:
+                continue
             score = min(1.0, round(
                 0.42 * deadline_score
                 + 0.24 * (1.0 if material else 0.0)
@@ -927,6 +1160,10 @@ class ProductExperienceService:
                 + 0.18 * max(0.0, min(1.0, reaction_rank)),
                 4,
             ))
+            if score <= 0.0 and current_suggest:
+                # A current ``suggest`` is itself an admitted typed signal;
+                # do not require an optional producer rank to be non-zero.
+                score = 0.18
             if score <= 0.0:
                 continue
             signals: list[str] = []
@@ -936,7 +1173,7 @@ class ProductExperienceService:
                 signals.append("material_change")
             if unknown:
                 signals.append("unknown")
-            if reaction is not None:
+            if current_suggest:
                 signals.append("current_reaction")
             why_now = str((reaction or {}).get("why_now") or "").strip()
             if not why_now:
@@ -944,8 +1181,13 @@ class ProductExperienceService:
                     why_now = "A relevant deadline is close enough to affect the next step."
                 elif material:
                     why_now = "A material change was recorded for this Situation."
+                elif current_suggest:
+                    why_now = "A current suggestion is available for this Situation."
                 else:
-                    why_now = "An unresolved unknown may affect the current understanding."
+                    # Admission above guarantees that one of the typed
+                    # signals is present. Keep this defensive fallback
+                    # neutral if malformed input reaches this projection.
+                    why_now = "A current signal may affect the next step."
             attention.append({
                 "situation_id": situation_id,
                 "revision": int(situation.get("revision") or 1),

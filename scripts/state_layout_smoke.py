@@ -15,7 +15,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.agency_core import AgencyCore  # noqa: E402
-from core.world_state import WorldStateStore  # noqa: E402
+from core.world_state import StateNestedRootError, WorldStateStore  # noqa: E402
+from scripts.repair_nested_state_root import (  # noqa: E402
+    NestedStateRepairError,
+    PRESERVED_RUNTIME_ARTIFACT_DIRS,
+    repair_nested_state_root,
+)
 from routers.debug_audit import CoreModelConfigRequest, build_debug_audit_router  # noqa: E402
 from runtime.active_loop import ActiveRuntimeLoop  # noqa: E402
 from runtime.retention_policy import RetentionPolicy  # noqa: E402
@@ -124,6 +129,106 @@ def main() -> None:
         policy.enforce()
         after_enforce = len(store.path_for("action_record.jsonl").read_text(encoding="utf-8").splitlines())
         expect(after_enforce <= 3, "retention enforce keeps audit log within limit", after_enforce)
+
+        guard_root = Path(tmp) / "guard-state"
+        guard_store = WorldStateStore(guard_root)
+        try:
+            WorldStateStore(guard_root / "runtime")
+            raise AssertionError("nested runtime root was accepted")
+        except StateNestedRootError as exc:
+            expect("canonical state root" in str(exc), "canonical layout partition is rejected", exc)
+        try:
+            WorldStateStore(guard_root / "runtime", read_only=True)
+            raise AssertionError("read-only nested runtime root was accepted")
+        except StateNestedRootError:
+            expect(True, "read-only canonical layout partition is rejected")
+
+        temporary_parent = Path(tmp) / "ordinary-temp-parent"
+        temporary_runtime = temporary_parent / "runtime"
+        ordinary_store = WorldStateStore(temporary_runtime)
+        expect(ordinary_store.root == temporary_runtime, "ordinary temp runtime subroot remains valid")
+
+        repair_root = Path(tmp) / "repair-state"
+        WorldStateStore(repair_root)
+        # This fixture is inspected as if the API process had already exited;
+        # the in-process store used to seed defaults otherwise owns the lease.
+        (repair_root / ".veyra-writer.lock").unlink(missing_ok=True)
+        accidental_root = repair_root / "runtime"
+        nested_runtime = accidental_root / "runtime"
+        nested_runtime.mkdir(parents=True)
+        nested_payload = {"status": "nested-only", "_state_revision": 7}
+        (nested_runtime / "task_state.json").write_text(json.dumps(nested_payload), encoding="utf-8")
+        (repair_root / "runtime" / "task_state.json").unlink(missing_ok=True)
+        for directory, name in (
+            ("config", "agent_config.json"),
+            ("user", "user_world.json"),
+            ("local", "local_world.json"),
+            ("logs", "event_log.jsonl"),
+            ("external", "external_world.json"),
+        ):
+            path = accidental_root / directory / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}\n", encoding="utf-8")
+        for directory in PRESERVED_RUNTIME_ARTIFACT_DIRS:
+            artifact = accidental_root / directory
+            artifact.mkdir(parents=True, exist_ok=True)
+            (artifact / "sentinel.txt").write_text("preserve\n", encoding="utf-8")
+
+        dry_run = repair_nested_state_root(repair_root)
+        expect(dry_run.get("status") == "dry_run", "nested-root repair defaults to dry-run")
+        expect(not dry_run.get("conflicts"), "preserved runtime artifacts do not block repair", dry_run.get("conflicts"))
+        expect((nested_runtime / "task_state.json").exists(), "dry-run leaves nested runtime unchanged")
+        expect(not (repair_root / ".recovery-backups").exists(), "dry-run does not create a backup")
+        expect(
+            not any(
+                any(item.startswith(f"{directory}/") for directory in PRESERVED_RUNTIME_ARTIFACT_DIRS)
+                for item in dry_run.get("backup_files", [])
+            ),
+            "preserved runtime artifacts are excluded from backup",
+        )
+
+        (repair_root / ".veyra-writer.lock").write_text(
+            json.dumps({"pid": os.getpid(), "state_root": str(repair_root)}),
+            encoding="utf-8",
+        )
+        try:
+            repair_nested_state_root(repair_root, apply=True)
+            raise AssertionError("active canonical writer was not rejected")
+        except NestedStateRepairError:
+            expect(True, "active canonical writer blocks repair")
+        finally:
+            (repair_root / ".veyra-writer.lock").unlink()
+
+        canonical_runtime = repair_root / "runtime"
+        (canonical_runtime / "task_state.json").write_text(
+            json.dumps({"status": "different", "_state_revision": 8}),
+            encoding="utf-8",
+        )
+        try:
+            repair_nested_state_root(repair_root, apply=True)
+            raise AssertionError("runtime content conflict was not rejected")
+        except NestedStateRepairError:
+            expect(True, "runtime content conflict blocks repair")
+        (canonical_runtime / "task_state.json").unlink()
+
+        applied = repair_nested_state_root(repair_root, apply=True)
+        backup_path = Path(str(applied["backup_path"]))
+        expect(applied.get("status") == "applied", "nested-root repair applies after preflight")
+        expect((canonical_runtime / "task_state.json").read_text(encoding="utf-8") == json.dumps(nested_payload), "nested runtime JSON promoted")
+        expect((backup_path / "runtime" / "task_state.json").exists(), "repair backup contains nested runtime JSON")
+        expect((backup_path / "manifest.json").exists(), "repair writes manifest")
+        expect(not (accidental_root / "config").exists(), "generated accidental config removed")
+        expect(not (accidental_root / "user").exists(), "generated accidental user removed")
+        expect(not (accidental_root / "local").exists(), "generated accidental local removed")
+        expect(not (accidental_root / "logs").exists(), "generated accidental logs removed")
+        expect(not (accidental_root / "external").exists(), "generated accidental external removed")
+        for directory in PRESERVED_RUNTIME_ARTIFACT_DIRS:
+            expect(
+                (accidental_root / directory / "sentinel.txt").exists(),
+                f"preserved runtime artifact {directory} remains",
+            )
+        idempotent = repair_nested_state_root(repair_root, apply=True)
+        expect(idempotent.get("status") == "clean", "repair is idempotent")
 
     print("state_layout_smoke passed")
 

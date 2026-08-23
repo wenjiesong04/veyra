@@ -167,6 +167,19 @@ def candidate(fixture: dict[str, object], catalog: list[dict[str, object]], *, d
             "evidence_kind": fixture["source"],
             "why_now": "The missing observation changes the next judgment.",
             "urgency": 0.8,
+            "observation_requirement": (
+                {
+                    "coverage": "current",
+                    "metrics": ["weather_description", "temperature_2m"],
+                }
+                if fixture["source"] == "weather"
+                else {
+                    "coverage": "window" if fixture["source"] == "calendar" else "results",
+                    "metrics": ["events"] if fixture["source"] == "calendar" else ["results"],
+                }
+                if fixture["source"] == "calendar" or fixture["source"] == "public_web"
+                else None
+            ),
             "allowed_source_classes": [fixture["source"]],
             "fallback_reaction": "read",
             "question": fixture["question"],
@@ -363,20 +376,38 @@ def main() -> int:
         # also derive a bounded request for that exact Need.  Reporting a read
         # for an underivable request would strand the Need: the read never runs
         # and the user is never asked.
-        weather_need = {"allowed_source_classes": ["weather"], "evidence_kind": "weather", "blocked_judgment": "conditions at the reported place"}
-        placed = {"semantic": {"entities": [{"kind": "place", "value": "Shanghai", "epistemic_status": "reported"}]}}
+        weather_need = {
+            "allowed_source_classes": ["weather"],
+            "evidence_kind": "weather",
+            "blocked_judgment": "conditions at the reported place",
+            "observation_requirement": {
+                "coverage": "current",
+                "metrics": ["weather_description", "temperature_2m"],
+            },
+            "evidence_target": {
+                "location": "Shanghai",
+                "observation_requirement": {
+                    "coverage": "current",
+                    "metrics": ["weather_description", "temperature_2m"],
+                },
+            },
+        }
+        placed = {"semantic": {"entities": [{"kind": "place", "value": "Shanghai", "epistemic_status": "reported", "provenance_scope": "span", "source_quote": {"text": "Shanghai", "start": 0, "end": 8}}]}}
         unplaced = {"semantic": {"entities": []}}
         inferred_place = {"semantic": {"entities": [{"kind": "place", "value": "Shanghai", "epistemic_status": "inferred"}]}}
+        weather_need_without_target = {
+            key: value for key, value in weather_need.items() if key != "evidence_target"
+        }
         expect(
             orchestrator.source_policy.can_resolve_parameters("weather", situation=placed, need=weather_need, now=clock()),
             "a reported place resolves a bounded weather request",
         )
         expect(
-            not orchestrator.source_policy.can_resolve_parameters("weather", situation=unplaced, need=weather_need, now=clock()),
+            not orchestrator.source_policy.can_resolve_parameters("weather", situation=unplaced, need=weather_need_without_target, now=clock()),
             "no stated place leaves the weather request underivable",
         )
         expect(
-            not orchestrator.source_policy.can_resolve_parameters("weather", situation=inferred_place, need=weather_need, now=clock()),
+            not orchestrator.source_policy.can_resolve_parameters("weather", situation=inferred_place, need=weather_need_without_target, now=clock()),
             "an inferred place is not a weather source target",
         )
 

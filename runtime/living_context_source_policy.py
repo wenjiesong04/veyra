@@ -15,6 +15,8 @@ from interface.living_source_contract import (
     canonical_utc,
     make_binding_id,
 )
+from interface.living_source_registry import capability_registry
+from interface.living_source_payload import weather_target
 
 
 SOURCE_ORDER = ("calendar", "weather", "public_web")
@@ -38,6 +40,27 @@ class LivingContextSourcePolicy:
             if source in allowed:
                 return source
         return None
+
+    @staticmethod
+    def watch_cadence_seconds(
+        source: str,
+        *,
+        need: Mapping[str, Any] | None = None,
+    ) -> int | None:
+        """Return provider cadence after the typed refresh policy gate."""
+
+        capability = capability_registry().get(str(source or "").strip())
+        if capability is None or capability.watch_cadence_seconds is None:
+            return None
+        requirement = need.get("observation_requirement") if isinstance(need, Mapping) else None
+        if isinstance(requirement, Mapping) and str(requirement.get("coverage") or "").strip().lower() == "current":
+            # Current observations follow the provider freshness TTL; a
+            # generic watch cadence is only a policy for repeated windows.
+            return None
+        target = need.get("evidence_target") if isinstance(need, Mapping) else None
+        if str(source or "").strip().lower() == "weather" and isinstance(target, Mapping) and not str(target.get("target_date") or "").strip():
+            return None
+        return capability.watch_cadence_seconds
 
     def can_resolve_parameters(
         self,
@@ -113,18 +136,26 @@ class LivingContextSourcePolicy:
             )
             return {"window_start": canonical_utc(now), "window_end": canonical_utc(end)}
         if source == "weather":
-            entities = semantic.get("entities") if isinstance(semantic.get("entities"), list) else []
-            for entity in entities:
-                if not isinstance(entity, Mapping):
-                    continue
-                if str(entity.get("kind") or "").lower() != "place":
-                    continue
-                # An inferred place is not an external source target.
-                if str(entity.get("epistemic_status") or "reported").lower() != "reported":
-                    continue
-                value = " ".join(str(entity.get("value") or "").split())[:160]
-                if value:
-                    return {"location": value}
+            # New Needs carry a typed evidence_target.  It is the sole source
+            # of truth for a forecast day; no free-text blocked judgment or
+            # keyword/regex extraction is allowed to manufacture a target.
+            raw_target = need.get("evidence_target")
+            if isinstance(raw_target, Mapping):
+                target = weather_target(
+                    raw_target.get("location"),
+                    raw_target.get("target_date"),
+                )
+                if target is not None:
+                    selected = {"location": target["location"]}
+                    if target.get("target_date"):
+                        selected["target_date"] = target["target_date"]
+                    return selected
+
+            # A new readable Need without a server-derived typed target is
+            # intentionally not source-readable.  Legacy rows remain visible
+            # and can be migrated by a dedicated exact-state repair, but this
+            # generic policy must not reconstruct a target from entities or
+            # display prose at read time.
             return None
         if source == "public_web":
             title = " ".join(str(semantic.get("title") or semantic.get("label") or "").split())
@@ -133,6 +164,40 @@ class LivingContextSourcePolicy:
             return {"query": query, "max_results": 5} if query else None
         # Agent research is intentionally not a source policy outcome in V1.
         return None
+
+    @staticmethod
+    def _place_source_parameter_is_eligible(
+        entity: Mapping[str, Any],
+    ) -> bool:
+        """Accept reported spans or inferred model-attributed tentative input."""
+
+        value = str(entity.get("value") or "").strip()
+        if not value:
+            return False
+        scope = str(entity.get("provenance_scope") or "")
+        if scope == "span":
+            quote = entity.get("source_quote")
+            return bool(
+                str(entity.get("epistemic_status") or "").lower() == "reported"
+                and isinstance(quote, Mapping)
+                and quote.get("text") == entity.get("value")
+                and type(quote.get("start")) is int
+                and type(quote.get("end")) is int
+                and quote.get("start", -1) >= 0
+                and quote.get("end", 0) > quote.get("start", 0)
+            )
+        if scope == "model_attributed":
+            # This is only a tentative parameter for a read-only, separately
+            # consented weather lookup. It never becomes a reported fact or
+            # grants authority to any other source/effect.
+            return (
+                str(entity.get("epistemic_status") or "").lower() == "inferred"
+                and isinstance(entity.get("source_event_id"), str)
+                and bool(str(entity.get("source_event_id") or "").strip())
+                and entity.get("source_quote") is None
+            )
+        # Legacy bare reported entities have no admissible source provenance.
+        return False
 
     @staticmethod
     def _future_bound(now: datetime, *values: Any) -> datetime:
@@ -159,6 +224,11 @@ class LivingContextSourcePolicy:
             situation.get("deadline_at"),
             need.get("expires_at"),
         )
+        if str(need.get("observation_mode") or "once").strip().lower() == "watch":
+            # A provider horizon may be longer than its receipt cache TTL.
+            # Keep a watch binding valid across that typed boundary; the
+            # current Need generation/status remains the authority at read.
+            return min(end, now + MAX_WINDOW)
         return min(end, now + DEFAULT_BINDING_TTL)
 
     @staticmethod

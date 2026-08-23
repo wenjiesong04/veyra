@@ -166,6 +166,7 @@ COGNITIVE_CAPABILITY_SMOKES = [
 ]
 
 PRODUCT_CAPABILITY_SMOKES = [
+    "conversation_ingress_smoke.py",
     "product_conversation_smoke.py",
     "product_experience_smoke.py",
     "information_need_adversarial_smoke.py",
@@ -179,8 +180,11 @@ PRODUCT_CAPABILITY_SMOKES = [
     "living_context_understanding_smoke.py",
     "v1_living_context_generalization_smoke.py",
     "living_reaction_smoke.py",
+    "living_reaction_backend_smoke.py",
     "living_reaction_retention_smoke.py",
+    "living_cognitive_suggestion_smoke.py",
     "living_source_smoke.py",
+    "weather_coverage_smoke.py",
     "living_source_core_integration_smoke.py",
     "living_source_adversarial_smoke.py",
     "living_source_place_entity_smoke.py",

@@ -319,6 +319,13 @@ class SemanticPolicyCompiler:
                         }
                     )
                     signals.append(f"semantic_policy:probe_{probe}_authorized")
+                elif self._observation_required(act):
+                    requires_clarification = True
+                    clarification_reason = (
+                        clarification_reason
+                        or "fresh evidence is requested but no concrete observer is specified"
+                    )
+                    signals.append("semantic_policy:unresolved_observer")
 
         ambiguity_act_ids = {
             str(act_id)
@@ -1191,18 +1198,11 @@ class SemanticPolicyCompiler:
         target = _as_dict(act.get("target"))
         target_type = _token(target.get("type"))
         arguments = _as_dict(act.get("arguments"))
-        requires_observation = (
-            evidence_need not in {"", "context", "none", "unknown"}
-            or operation.startswith("query_current")
-            or operation.startswith("query_fresh")
-            or operation in {"query_runtime_status", "query_status"}
-        )
-        if not requires_observation:
+        if not self._observation_required(act):
             return None, None
         if (
             target_type in {"url", "web_page", "web_url", "webpage"}
             or operation in {"fetch_url", "open_url", "query_url", "read_url"}
-            or operation.startswith(("fetch_url_", "open_url_", "query_url_", "read_url_"))
             or evidence_need in {"external_url", "fresh_external_url", "url"}
             or bool(str(arguments.get("url") or "").strip())
         ):
@@ -1221,7 +1221,6 @@ class SemanticPolicyCompiler:
             return "time", "time_probe"
         if (
             operation in {"external_search", "search_external", "web_search"}
-            or operation.startswith(("external_search_", "search_external_", "web_search_"))
             or target_type in {"search", "search_query", "web_search"}
             or evidence_need
             in {
@@ -1231,53 +1230,158 @@ class SemanticPolicyCompiler:
             }
         ):
             return "search_probe", "web_search"
-        # ``external`` and ``fresh_external`` describe an evidence class, not
-        # a concrete capability request.  Treating either value as search
-        # authority caused questions about private project context to trigger
-        # blind public-web lookups.  Search therefore requires an explicit
-        # structured operation, target type, or search-specific evidence need.
-        # Never scan serialized control objects.  A field name such as
-        # ``anchor_candidate_token`` contains ``date`` and previously selected
-        # time_probe for unrelated project questions.  Only semantic values
-        # may participate in the legacy compatibility fallback below.
-        # Evidence classes and free-form goals describe uncertainty, not the
-        # concrete observer that may resolve it.  Keeping them out of the
-        # compatibility selector prevents generic ``fresh_runtime`` or
-        # ``fresh_local`` model output from becoming an unrelated system
-        # probe.  Only structural target/operation values reach this legacy
-        # path; specific evidence enums were handled above.
-        evidence = _joined(
-            target_type,
-            target.get("value"),
-            operation,
-        )
-        if not evidence:
-            return None, None
-        if _contains(evidence, "weather", "天气", "气温", "temperature"):
-            return "weather_probe", "weather_probe"
-        if _contains(evidence, "openclaw"):
-            return "openclaw", "openclaw_probe"
-        if _contains(evidence, "hermes"):
-            return "hermes", "hermes_probe"
-        if _contains(evidence, "mcp"):
-            return "mcp", "mcp_probe"
-        if _contains(evidence, "git", "working tree", "工作区", "脏文件", "未提交"):
+
+        # Local observers are selected only from typed contract values.  These
+        # branches intentionally use exact operation/target/evidence tokens;
+        # free-form goal text and target prose never participate in capability
+        # selection.
+        if (
+            operation in {"query_git_status", "query_current_git_status"}
+            or target_type in {"git", "git_workspace", "git_status"}
+            or evidence_need in {"git_status", "fresh_git", "local_git_status"}
+        ):
             return "git", "git_probe"
-        if _contains(evidence, "port", "端口"):
+        if (
+            operation in {"query_port_status", "query_port_occupancy"}
+            or target_type in {"port", "port_status"}
+            or evidence_need in {"port", "fresh_port", "local_port_status"}
+            or arguments.get("port") is not None
+        ):
             return "port", "port_probe"
-        if _contains(evidence, "process", "进程"):
+        if (
+            operation in {
+                "query_current_process_status",
+                "query_process_status",
+                "query_processes",
+            }
+            or target_type in {"process", "process_status"}
+            or evidence_need in {"process", "fresh_process", "local_process_status"}
+        ):
             return "process", "process_probe"
-        if _contains(evidence, "runtime", "process", "port", "service status", "运行态", "进程", "端口", "服务状态"):
+        target_value = _token(target.get("value"))
+        runtime_target = _token(
+            arguments.get("runtime")
+            or arguments.get("platform")
+            or arguments.get("service")
+            or target_value
+        )
+        if (
+            operation in {"query_openclaw_status", "diagnose_openclaw"}
+            or target_type in {"openclaw", "openclaw_runtime"}
+            or (target_type == "runtime" and runtime_target == "openclaw")
+        ):
+            return "openclaw", "openclaw_probe"
+        if (
+            operation in {"query_hermes_status", "diagnose_hermes"}
+            or target_type in {"hermes", "hermes_runtime"}
+            or (target_type == "runtime" and runtime_target == "hermes")
+        ):
+            return "hermes", "hermes_probe"
+        if (
+            operation in {"query_mcp_status", "diagnose_mcp"}
+            or target_type in {"mcp", "mcp_runtime"}
+            or (target_type == "runtime" and runtime_target == "mcp")
+        ):
+            return "mcp", "mcp_probe"
+        if (
+            operation in {"query_runtime_status", "query_system_status", "query_status"}
+            or target_type in {"runtime", "system", "system_status"}
+            or evidence_need in {"runtime", "fresh_runtime", "system_status", "local_status"}
+        ):
             return "system", "system_probe"
-        if _contains(evidence, "clock", "current time", "date", "time", "today", "日期", "几点", "时间", "今天"):
-            return "time", "time_probe"
-        if _contains(evidence, "url", "web page", "网页", "链接"):
-            return "web", "web_url_probe"
-        # Public search has no lexical compatibility fallback.  Model-written
-        # goal/target prose such as "latest external evidence" is not an
-        # executable capability contract; only the structured search branch
-        # above may authorize ``search_probe``.
+        # Evidence classes and free-form goals describe uncertainty, not the
+        # concrete observer that may resolve it.  There is intentionally no
+        # lexical fallback here: a capability is granted only by the typed
+        # evidence_need/target.type/operation branches above.  This keeps a
+        # model-written goal such as "check the runtime" from becoming a
+        # system or process probe unless the semantic frame names that
+        # observer explicitly.
         return None, None
+
+    @staticmethod
+    def _observation_required(act: dict[str, Any]) -> bool:
+        evidence_need = _token(act.get("evidence_need"))
+        operation = _token(act.get("operation"))
+        target = _as_dict(act.get("target"))
+        target_type = _token(target.get("type"))
+        typed_observer_targets = {
+            "clock",
+            "date",
+            "git",
+            "git_status",
+            "git_workspace",
+            "mcp",
+            "mcp_runtime",
+            "openclaw",
+            "openclaw_runtime",
+            "port",
+            "port_status",
+            "process",
+            "process_status",
+            "runtime",
+            "runtime_status",
+            "search",
+            "search_query",
+            "system",
+            "system_status",
+            "time",
+            "url",
+            "web_page",
+            "web_url",
+            "webpage",
+            "web_search",
+            "weather",
+            "temperature",
+            "hermes",
+            "hermes_runtime",
+        }
+        typed_observer_operations = {
+            "diagnose_hermes",
+            "diagnose_mcp",
+            "diagnose_openclaw",
+            "external_search",
+            "fetch_url",
+            "inspect_runtime_status",
+            "open_url",
+            "query_current_date",
+            "query_current_git_status",
+            "query_current_process_status",
+            "query_current_time",
+            "query_current_weather",
+            "query_git_status",
+            "query_hermes_status",
+            "query_mcp_status",
+            "query_openclaw_status",
+            "query_port_occupancy",
+            "query_port_status",
+            "query_process_status",
+            "query_processes",
+            "query_runtime_status",
+            "query_status",
+            "query_system_status",
+            "query_url",
+            "query_weather",
+            "read_url",
+            "search_external",
+            "web_search",
+        }
+        generic_typed_observation_operations = {
+            "check",
+            "fetch",
+            "inspect",
+            "observe",
+            "query",
+            "read",
+            "refresh",
+        }
+        return (
+            evidence_need not in {"", "context", "none", "unknown"}
+            or operation in typed_observer_operations
+            or (
+                target_type in typed_observer_targets
+                and operation in generic_typed_observation_operations
+            )
+        )
 
     def _arguments_for_act(self, act: dict[str, Any], probe: str) -> dict[str, Any]:
         target = _as_dict(act.get("target"))

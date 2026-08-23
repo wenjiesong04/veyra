@@ -265,7 +265,15 @@ def build_product_router(*, service: ProductExperienceService) -> APIRouter:
         limit: int = Query(default=20, ge=1, le=200),
     ) -> dict[str, Any]:
         try:
-            return await _product_reactions(user_id, session_id, situation_id, situation_revision, limit, {"suggest"})
+            result = await run_in_threadpool(
+                service.suggestions,
+                user_id=user_id,
+                session_id=session_id,
+                situation_id=situation_id,
+                situation_revision=situation_revision,
+                limit=limit,
+            )
+            return _typed_degraded(result)
         except Exception as exc:
             _raise_runtime_error(exc)
         raise AssertionError("unreachable")

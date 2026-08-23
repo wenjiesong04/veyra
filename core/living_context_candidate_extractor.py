@@ -51,6 +51,12 @@ CANDIDATE_EXTRACTOR_SYSTEM = (
     "lifecycle=emerging|active|waiting|resolved|expired|contradicted|archived; "
     "progress.status=unknown|not_started|in_progress|blocked|waiting|completed; "
     "evidence_kind=user|calendar|email|message|weather|public_web|agent|time|other; "
+    "observation_mode=once|watch; use once for one answer and watch only when "
+    "the user wants the evidence observed again as it changes; "
+    "readable Needs must also provide observation_requirement={coverage,metrics,target_date?} "
+    "using exact typed coverage and metric enums; "
+    "target_date is an ISO calendar date allowed only when coverage=forecast_day; "
+    "current coverage must omit target_date. "
     "allowed_source_classes is a list containing only "
     "user|calendar|email|message|weather|public_web|agent|time|other; "
     "fallback_reaction and requested_reaction=ask|read|wait|silent; "
@@ -61,7 +67,8 @@ CANDIDATE_EXTRACTOR_SYSTEM = (
     "strings. timeline is always a JSON list of at most twelve objects with "
     "statement, occurred_at, source_quote, and material; use an empty list "
     "when the user turn provides no timeline item. Every "
-    "InformationNeed must contain blocked_judgment, evidence_kind, why_now, "
+    "InformationNeed must contain blocked_judgment, evidence_kind, observation_mode, why_now, "
+    "and for readable sources observation_requirement, "
     "a JSON-number urgency from 0 to 1, one to three relevant "
     "allowed_source_classes, "
     "fallback_reaction, and a string question. If those fields cannot all be "
@@ -84,9 +91,8 @@ CANDIDATE_EXTRACTOR_SYSTEM = (
     "source_quote must be an exact Python-character slice "
     "of user_message. source_quote is optional for create/update; omit it "
     "instead of approximating text or indices. When emitting a Need, do not "
-    "rebuild an active open_need whose blocked_judgment is exactly the same, even "
-    "when evidence_kind changes; retain one exact endpoint. Answering one sub-Need "
-    "remains an update/nonterminal Situation change; resolve only when the user "
+    "rebuild a previously answered Need without current catalog bindings. "
+    "Answering one sub-Need remains an update/nonterminal Situation change; resolve only when the user "
     "explicitly declares the entire Situation or goal finished. "
     "Do not emit feedback, semantic frames, tokens not supplied by the "
     "catalog, URLs, paths, commands, tools, routes, risk, authority, or "
@@ -110,6 +116,9 @@ CANDIDATE_EXTRACTOR_REPAIR_SYSTEM = (
     "lifecycle=emerging|active|waiting|resolved|expired|contradicted|archived; "
     "progress.status=unknown|not_started|in_progress|blocked|waiting|completed; "
     "evidence_kind=user|calendar|email|message|weather|public_web|agent|time|other; "
+    "observation_mode=once|watch; readable Needs also require "
+    "observation_requirement={coverage,metrics,target_date?} with exact typed enums; "
+    "target_date is an ISO calendar date only for coverage=forecast_day; current omits it; "
     "allowed_source_classes is a list containing only "
     "user|calendar|email|message|weather|public_web|agent|time|other; "
     "fallback_reaction and requested_reaction=ask|read|wait|silent; "
@@ -124,7 +133,8 @@ CANDIDATE_EXTRACTOR_REPAIR_SYSTEM = (
     "list from the original user_message; never repeat a scalar, mapping, "
     "oversized list, or invalid row. Use [] when no valid timeline item is "
     "grounded in the user message. "
-    "Every InformationNeed must contain blocked_judgment, evidence_kind, "
+    "Every InformationNeed must contain blocked_judgment, evidence_kind, observation_mode, "
+    "and for readable sources observation_requirement, "
     "why_now, a JSON-number urgency from 0 to 1, one to three relevant "
     "allowed_source_classes, "
     "fallback_reaction, and a string question; otherwise emit needs=[]. A "
@@ -211,6 +221,11 @@ _NEED_KEYS = frozenset(
     {
         "blocked_judgment",
         "evidence_kind",
+        "observation_mode",
+        "observation_requirement",
+        "coverage",
+        "target_date",
+        "metrics",
         "why_now",
         "urgency",
         "expires_at",
@@ -265,6 +280,11 @@ _CANDIDATE_PROJECTION_KEYS = frozenset(
         "material",
         "blocked_judgment",
         "evidence_kind",
+        "observation_mode",
+        "observation_requirement",
+        "coverage",
+        "target_date",
+        "metrics",
         "why_now",
         "urgency",
         "expires_at",
@@ -359,6 +379,8 @@ def extract_living_context_candidate(
             "need_contract": {
                 "blocked_judgment": "non-empty string",
                 "evidence_kind": "one exact evidence_kind enum",
+                "observation_mode": "once for one answer; watch only for repeated observation requested by the user",
+                "observation_requirement": "object {coverage,metrics,target_date?}; target_date is canonical YYYY-MM-DD only for forecast_day",
                 "why_now": "non-empty string",
                 "urgency": "JSON number 0..1",
                 "expires_at": "timezone-aware string or null",

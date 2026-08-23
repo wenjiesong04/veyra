@@ -37,6 +37,7 @@ def build_living_context_composition(
     source_policy: LivingContextSourcePolicy | None = None,
     source_providers: Mapping[str, Any] | None = None,
     conversation_runtime: Any | None = None,
+    quiet_hours_resolver: Callable[[str, str, datetime], bool] | None = None,
 ) -> LivingContextComposition:
     """Construct core/reaction/source once and expose only the facade."""
 
@@ -72,6 +73,7 @@ def build_living_context_composition(
         source,
         source_policy=policy,
         clock=selected_clock,
+        quiet_hours_resolver=quiet_hours_resolver,
         conversation_runtime=conversation_runtime,
     )
     return LivingContextComposition(

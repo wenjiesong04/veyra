@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
 
@@ -47,6 +48,7 @@ class SituationStateRepository:
         "verified_success",
     })
     ACTIVE_SEMANTIC_LIFECYCLES = frozenset({"emerging", "active", "waiting"})
+    PROVENANCE_SCOPES = frozenset({"span", "model_attributed"})
 
     def __init__(
         self,
@@ -369,13 +371,24 @@ class SituationStateRepository:
                 raise ValueError(f"semantic {name} must include a timezone")
             return parsed.astimezone(timezone.utc).isoformat()
 
-        def records(name: str, limit: int) -> list[dict[str, Any]]:
+        def records(
+            name: str,
+            limit: int,
+            *,
+            provenance: bool = False,
+        ) -> list[dict[str, Any]]:
             raw = value.get(name)
             if raw is None:
                 return []
             if not isinstance(raw, list):
                 raise TypeError(f"semantic {name} must be a list")
-            return [self._bounded(item) for item in raw[:limit] if isinstance(item, dict)]
+            bounded = [self._bounded(item) for item in raw[:limit] if isinstance(item, dict)]
+            if provenance:
+                return [
+                    self._normalize_provenance_record(item)
+                    for item in bounded
+                ]
+            return bounded
 
         unknown_raw = value.get("unknown") or []
         if not isinstance(unknown_raw, list):
@@ -404,19 +417,21 @@ class SituationStateRepository:
         for item in entities_raw[:8]:
             if not isinstance(item, dict):
                 raise TypeError("semantic entity must be an object")
-            kind = str(item.get("kind") or "").lower()
-            entity_value = str(item.get("value") or "")[:240]
-            if kind not in {"place", "person", "organization", "item", "other"} or not entity_value:
-                raise ValueError("semantic entity is invalid")
-            epi = str(item.get("epistemic_status") or "reported").lower()
-            if epi not in {"reported", "inferred"}:
-                raise ValueError("semantic entity epistemic status is invalid")
-            entities.append({"kind": kind, "value": entity_value, "epistemic_status": epi, **(
-                {"source_quote": self._bounded(item["source_quote"])} if isinstance(item.get("source_quote"), dict) else {}
-            )})
+            entities.append(self._normalize_entity_record(item))
         next_step_status = str(value.get("next_step_epistemic_status") or "inferred").lower()
         if next_step_status not in {"reported", "inferred"}:
             raise ValueError("semantic next_step epistemic status is invalid")
+        raw_material_revision = value.get("material_revision", 0)
+        if (
+            isinstance(raw_material_revision, bool)
+            or not isinstance(raw_material_revision, int)
+            or raw_material_revision < 0
+        ):
+            raise ValueError("semantic material_revision is invalid")
+        raw_material_digest = value.get("material_digest")
+        material_digest = None if raw_material_digest in (None, "") else str(raw_material_digest)
+        if material_digest is not None and not re.fullmatch(r"[0-9a-f]{64}", material_digest):
+            raise ValueError("semantic material_digest is invalid")
         return {
             "title": text("title", 240),
             "label": text("label", 240),
@@ -427,16 +442,62 @@ class SituationStateRepository:
             "deadline_at": timestamp("deadline_at"),
             "progress": {"status": progress_status, "value": progress_value},
             "entities": entities,
-            "known": records("known", 12),
+            "known": records("known", 12, provenance=True),
             "unknown": unknown,
             "assumptions": records("assumptions", 8),
             "timeline": records("timeline", self.max_history_per_situation),
             "evidence": records("evidence", 16),
+            "source_observation_digests": self._normalize_source_observation_digests(
+                value.get("source_observation_digests")
+            ),
+            "source_material_digests": self._normalize_source_material_digests(
+                value.get("source_material_digests")
+            ),
+            "material_revision": raw_material_revision,
+            "material_digest": material_digest,
             "material_change": text("material_change", 480),
             "next_observation_at": timestamp("next_observation_at"),
             "next_step": text("next_step", 480),
             "next_step_epistemic_status": next_step_status,
         }
+
+    @staticmethod
+    def _normalize_source_observation_digests(value: Any) -> dict[str, str]:
+        """Retain a small, typed material-observation watermark map.
+
+        These are opaque exact digests used to suppress duplicate source
+        observations; they are not model evidence or user-authored semantics.
+        """
+
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise TypeError("semantic source_observation_digests must be an object")
+        result: dict[str, str] = {}
+        for raw_key, raw_digest in list(value.items())[-8:]:
+            key = str(raw_key)
+            digest = str(raw_digest)
+            if not re.fullmatch(r"[0-9a-f]{64}", key) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError("semantic source_observation_digests is invalid")
+            result[key] = digest
+        return result
+
+    @staticmethod
+    def _normalize_source_material_digests(value: Any) -> dict[str, str]:
+        """Retain bounded source/target material watermarks for dedupe."""
+
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise TypeError("semantic source_material_digests must be an object")
+        result: dict[str, str] = {}
+        for raw_key, raw_digest in list(value.items())[-16:]:
+            key = str(raw_key)[:240]
+            digest = str(raw_digest)
+            if not key or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError("semantic source_material_digests is invalid")
+            result[key] = digest
+        return result
 
     def _enforce_capacity(
         self,
@@ -505,6 +566,116 @@ class SituationStateRepository:
             tier = 2
         timestamp = str(row.get("updated_at") or row.get("created_at") or "")
         return tier, timestamp, str(row.get("situation_id") or "")
+
+    @classmethod
+    def _normalize_entity_record(cls, item: dict[str, Any]) -> dict[str, Any]:
+        kind = str(item.get("kind") or "").lower()
+        entity_value = str(item.get("value") or "")[:240]
+        if kind not in {"place", "person", "organization", "item", "other"} or not entity_value:
+            raise ValueError("semantic entity is invalid")
+        normalized = cls._normalize_provenance_record(
+            {
+                **item,
+                "kind": kind,
+                "value": entity_value,
+                "epistemic_status": str(item.get("epistemic_status") or "reported").lower(),
+            },
+            required_fields=("kind", "value"),
+        )
+        if (
+            normalized.get("provenance_scope") == "span"
+            and normalized.get("source_quote", {}).get("text") != entity_value
+        ):
+            raise ValueError("span entity provenance must quote the entity value")
+        return normalized
+
+    @classmethod
+    def _normalize_provenance_record(
+        cls,
+        item: dict[str, Any],
+        *,
+        required_fields: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Preserve only strictly shaped provenance fields.
+
+        Legacy records may omit provenance entirely; a source policy must not
+        treat those bare records as executable.  Once a scope is present, its
+        required fields and epistemic status are validated here so malformed
+        state cannot silently become a source target after restart.
+        """
+
+        result: dict[str, Any] = (
+            cls._bounded(item)
+            if not required_fields
+            else {key: item[key] for key in required_fields if key in item}
+        )
+        if "statement" in item:
+            result["statement"] = str(item.get("statement") or "")[:480]
+        epi = str(item.get("epistemic_status") or "reported").lower()
+        if epi not in {"reported", "inferred"}:
+            raise ValueError("semantic provenance epistemic status is invalid")
+        result["epistemic_status"] = epi
+
+        quote = item.get("source_quote")
+        if quote is not None:
+            result["source_quote"] = cls._normalize_provenance_quote(quote)
+        else:
+            result.pop("source_quote", None)
+
+        source_event_id = item.get("source_event_id")
+        if source_event_id is not None:
+            if not isinstance(source_event_id, str) or not source_event_id.strip():
+                raise ValueError("semantic provenance source_event_id is invalid")
+            result["source_event_id"] = source_event_id[:240]
+        recorded_at = item.get("recorded_at")
+        if recorded_at is not None:
+            if not isinstance(recorded_at, str) or not recorded_at.strip():
+                raise ValueError("semantic provenance recorded_at is invalid")
+            try:
+                parsed_recorded_at = datetime.fromisoformat(recorded_at.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError("semantic provenance recorded_at is invalid") from exc
+            if parsed_recorded_at.tzinfo is None or parsed_recorded_at.utcoffset() is None:
+                raise ValueError("semantic provenance recorded_at must include a timezone")
+            result["recorded_at"] = recorded_at[:80]
+
+        scope = item.get("provenance_scope")
+        if scope is None:
+            return result
+        if not isinstance(scope, str) or scope not in cls.PROVENANCE_SCOPES:
+            raise ValueError("semantic provenance scope is invalid")
+        result["provenance_scope"] = scope
+        if scope == "span":
+            if "source_quote" not in result:
+                raise ValueError("span provenance requires source_quote")
+            if "source_event_id" not in result:
+                raise ValueError("span provenance requires source_event_id")
+        elif scope == "model_attributed":
+            if epi != "inferred":
+                raise ValueError("model_attributed provenance requires inferred status")
+            if "source_event_id" not in result or "source_quote" in result:
+                raise ValueError("model_attributed provenance requires source_event_id without source_quote")
+        return result
+
+    @staticmethod
+    def _normalize_provenance_quote(value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != {"text", "start", "end"}:
+            raise ValueError("semantic provenance source_quote is invalid")
+        text = value.get("text")
+        start = value.get("start")
+        end = value.get("end")
+        if (
+            not isinstance(text, str)
+            or not text
+            or len(text) > 480
+            or type(start) is not int
+            or type(end) is not int
+            or start < 0
+            or end <= start
+            or end > 100_000
+        ):
+            raise ValueError("semantic provenance source_quote is invalid")
+        return {"text": text, "start": start, "end": end}
 
     @staticmethod
     def _bounded(value: Any, depth: int = 0) -> Any:

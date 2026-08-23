@@ -482,7 +482,14 @@ living_context_composition = build_living_context_composition(
     weather_probe=awareness_loop.probes.get("weather_probe"),
     search_probe=awareness_loop.probes.get("search_probe"),
     conversation_runtime=product_conversation_runtime,
+    quiet_hours_resolver=awareness_loop.event_awareness.suggestion_outbox.in_quiet_hours,
 )
+# Background cognition owns candidate formation; Living Context owns the
+# exact Situation binding and record-only Product reaction.  Keep the call
+# compatible with older runtimes while the cognitive-loop contract rolls out.
+set_v1_suggestion_handler = getattr(read_only_cognitive_loop, "set_v1_suggestion_handler", None)
+if callable(set_v1_suggestion_handler):
+    set_v1_suggestion_handler(living_context_composition.orchestrator.record_cognitive_suggestion)
 awareness_loop.attach_living_context_runtime(living_context_composition.orchestrator)
 active_loop.attach_living_context(living_context_composition.orchestrator)
 runtime_cron = Cron(state_store=state_store, active_loop=active_loop, commitment_push=commitment_push)
@@ -1183,6 +1190,222 @@ app.include_router(
 )
 
 
+def _foreground_message_id(request: MessageRequest) -> str:
+    selected = str(request.message_id or "").strip()
+    return selected or f"msg_{os.urandom(12).hex()}"
+
+
+def _bind_foreground_admission(request: MessageRequest, admission: dict[str, Any]) -> MessageRequest:
+    updates: dict[str, Any] = {}
+    message_id = str(admission.get("message_id") or "").strip()
+    conversation_id = str(admission.get("conversation_id") or "").strip()
+    canonical_session_id = str(admission.get("session_id") or "").strip()
+    if message_id and message_id != str(request.message_id or "").strip():
+        updates["message_id"] = message_id
+    if conversation_id and conversation_id != str(request.conversation_id or "").strip():
+        updates["conversation_id"] = conversation_id
+    if canonical_session_id and canonical_session_id != str(request.session_id or "").strip():
+        updates["session_id"] = canonical_session_id
+    return request.model_copy(update=updates) if updates else request
+
+
+def _conversation_record_metadata(
+    request: MessageRequest,
+    *,
+    event_id: str | None = None,
+    canonical_channel: str | None = None,
+) -> dict[str, Any]:
+    # User-message idempotency includes metadata. Keep this object stable
+    # between admission and the later assistant append.
+    metadata = {
+        # Intake owns the alias mapping.  Persist the canonical channel so
+        # an admission through http/web and its completion through api/console
+        # address the same Product Conversation digest.
+        "channel": str(canonical_channel or request.channel or "api").strip().lower(),
+        "record_only": True,
+    }
+    normalized_event_id = str(event_id or "").strip()
+    if normalized_event_id:
+        metadata["event_id"] = normalized_event_id
+    return metadata
+
+
+def _record_foreground_completion(admission: dict[str, Any], result: Any) -> dict[str, Any]:
+    """Persist the assistant tail before the channel can deliver it.
+
+    User admission is deliberately a separate, already durable phase.  This
+    hook is the only server-owned completion path: retries reuse the same
+    message identity and Product Conversation idempotency appends the
+    assistant tail at most once.
+    """
+
+    event = admission.get("event")
+    if not hasattr(event, "payload") or not hasattr(event, "source"):
+        raise TypeError("accepted admission has no normalized event")
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    internal = payload.get("metadata", {}).get("_internal") if isinstance(payload.get("metadata"), dict) else None
+    internal = internal if isinstance(internal, dict) else {}
+    conversation_id = str(
+        admission.get("conversation_id")
+        or internal.get("conversation_id")
+        or ""
+    ).strip()
+    if not conversation_id:
+        # Non-product channel consumers may intentionally not have a
+        # conversation ledger.  Cognition and delivery remain valid there.
+        return {}
+    messages = result.ordered_messages() if hasattr(result, "ordered_messages") else []
+    responses = [
+        str(item.get("message") or "").strip()
+        for item in messages
+        if isinstance(item, dict) and str(item.get("message") or "").strip()
+    ]
+    living = result.artifacts.get("living_context") if isinstance(getattr(result, "artifacts", None), dict) else None
+    situation = living.get("situation") if isinstance(living, dict) else None
+    situation_id = str(situation.get("situation_id") or "").strip() if isinstance(situation, dict) else ""
+    event_id = str(getattr(event, "event_id", "") or "").strip()
+    completion_metadata: dict[str, Any] = {
+        "channel": str(event.source.channel or "api"),
+        "record_only": True,
+    }
+    if event_id:
+        completion_metadata["event_id"] = event_id
+    recorded = product_conversation_runtime.record_foreground_completion(
+        owner_id=str(admission.get("user_id") or event.source.user_id),
+        session_id=str(admission.get("session_id") or event.source.session_id),
+        text=str(payload.get("text") or ""),
+        message_id=str(admission.get("message_id") or ""),
+        responses=responses,
+        conversation_id=conversation_id,
+        situation_id=situation_id or None,
+        metadata=completion_metadata,
+    )
+    completion_result: dict[str, Any] = {
+        "status": recorded.get("status"),
+        "conversation_id": recorded.get("conversation_id") or conversation_id,
+        "message_count": len(recorded.get("messages") or []),
+        "assistant_message_count": int(recorded.get("assistant_message_count") or 0),
+        "record_only": True,
+    }
+    # The runtime keeps any binding digests in a server-only diagnostic.  The
+    # public completion envelope carries only the bounded code/status so a
+    # browser or channel never receives Situation/conversation identities.
+    diagnostic = recorded.get("diagnostic")
+    if isinstance(diagnostic, dict) and diagnostic.get("code") == "conversation_binding_mismatch":
+        completion_result["diagnostic"] = {
+            "code": "conversation_binding_mismatch",
+            "status": "assistant_recorded_on_admitted_conversation",
+        }
+    return completion_result
+
+
+intake_gateway.set_completion_hook(_record_foreground_completion)
+
+
+async def _admit_foreground_user(request: MessageRequest) -> dict[str, Any]:
+    """Gate, canonicalize, reserve, then persist the user turn before cognition."""
+
+    try:
+        admission = await run_in_threadpool(
+            intake_gateway.admit_message,
+            text=request.text,
+            channel=request.channel,
+            user_id=request.user_id,
+            session_id=request.session_id,
+            message_id=request.message_id or _foreground_message_id(request),
+            metadata=request.metadata,
+        )
+    except Exception as exc:
+        return {
+            "status": "blocked",
+            "reason": "intake_admission_failed",
+            "error_type": type(exc).__name__,
+        }
+    if admission.get("status") != "accepted":
+        return admission
+
+    message_id = str(admission.get("message_id") or "")
+    canonical_session_id = str(admission.get("session_id") or "")
+    admission_event = admission.get("event")
+    event_id = str(getattr(admission_event, "event_id", "") or "").strip()
+    try:
+        recorded = await run_in_threadpool(
+            product_conversation_runtime.record_foreground_turn,
+            owner_id=request.user_id,
+            session_id=canonical_session_id,
+            text=request.text,
+            message_id=message_id,
+            responses=[],
+            conversation_id=request.conversation_id,
+            metadata=_conversation_record_metadata(
+                request,
+                event_id=event_id,
+                canonical_channel=str(admission.get("channel") or request.channel),
+            ),
+        )
+    except Exception as exc:
+        await run_in_threadpool(intake_gateway.release_admission, admission, exc)
+        return {
+            "status": "blocked",
+            "reason": "conversation_admission_failed",
+            "channel": admission.get("channel"),
+            "session_id": canonical_session_id,
+            "message_id": message_id,
+            "error_type": type(exc).__name__,
+        }
+
+    conversation_id = str(recorded.get("conversation_id") or "").strip()
+    if not conversation_id:
+        error = RuntimeError("conversation admission returned no conversation_id")
+        await run_in_threadpool(intake_gateway.release_admission, admission, error)
+        return {
+            "status": "blocked",
+            "reason": "conversation_admission_failed",
+            "channel": admission.get("channel"),
+            "session_id": canonical_session_id,
+            "message_id": message_id,
+        }
+
+    admission["conversation_id"] = conversation_id
+    admission["conversation_recording"] = {
+        "status": recorded.get("status"),
+        "message_count": len(recorded.get("messages") or []),
+        "record_only": True,
+    }
+    intake_gateway.attach_conversation_metadata(
+        admission,
+        conversation_id=conversation_id,
+    )
+    if recorded.get("status") == "duplicate":
+        completed = product_conversation_runtime.has_foreground_completion(
+            conversation_id,
+            owner_id=request.user_id,
+            session_id=canonical_session_id,
+            message_id=message_id,
+        )
+        if not completed:
+            # The user-first admission already exists, but cognition may have
+            # failed before any assistant response was persisted.  Reuse this
+            # exact admission and allow the deterministic retry to continue.
+            return admission
+        # The product ledger already owns this message identity.  Keep the
+        # intake reservation as the stable correlation/audit record and do not
+        # run cognition a second time.
+        await run_in_threadpool(
+            intake_gateway.finalize_admission_without_cognition,
+            admission,
+            status="duplicate",
+        )
+        admission["status"] = "duplicate"
+        event = admission.get("event")
+        admission["previous"] = {
+            "event_id": getattr(event, "event_id", None),
+            "session_id": canonical_session_id,
+            "status": "duplicate",
+        }
+    return admission
+
+
 def _public_message_result(receipt: dict[str, Any]) -> dict[str, Any]:
     if receipt.get("status") == "duplicate":
         return {"event_id": receipt.get("previous", {}).get("event_id"), "route": "duplicate", "status": "duplicate", "response": "Duplicate message ignored.", "risk_level": "R0", "artifacts": receipt}
@@ -1196,82 +1419,49 @@ def _public_message_result(receipt: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-async def _receive_message(request: MessageRequest) -> dict[str, Any]:
-    receipt = await run_in_threadpool(
-        intake_gateway.receive_message,
-        text=request.text,
-        channel=request.channel,
-        user_id=request.user_id,
-        session_id=request.session_id,
-        message_id=request.message_id,
-        metadata=request.metadata,
-    )
-    if receipt.get("status") != "delivered":
-        return receipt
-    loop_result = receipt.get("loop_result")
-    if not isinstance(loop_result, dict):
-        return receipt
-    living = (
-        loop_result.get("artifacts", {}).get("living_context")
-        if isinstance(loop_result.get("artifacts"), dict)
-        else None
-    )
-    situation = living.get("situation") if isinstance(living, dict) else None
-    situation_id = (
-        str(situation.get("situation_id") or "") or None
-        if isinstance(situation, dict)
-        else None
-    )
-    response_values: list[str] = []
-    messages = loop_result.get("messages")
-    if isinstance(messages, list):
-        for item in messages:
-            if isinstance(item, dict) and str(item.get("message") or "").strip():
-                response_values.append(str(item["message"]))
-    if not response_values and str(loop_result.get("response") or "").strip():
-        response_values.append(str(loop_result["response"]))
-    try:
-        record_kwargs = {
-            "owner_id": request.user_id,
-            "session_id": str(receipt.get("session_id") or request.session_id),
-            "text": request.text,
-            "message_id": str(receipt.get("message_id") or request.message_id or receipt.get("event", {}).get("event_id") or ""),
-            "responses": response_values,
-            "conversation_id": request.conversation_id,
-            "situation_id": situation_id,
-            "metadata": {"channel": request.channel, "event_id": receipt.get("event", {}).get("event_id")},
-        }
-        recorded = await run_in_threadpool(
-            product_conversation_runtime.record_foreground_turn,
-            **record_kwargs,
-        )
-        receipt["conversation_id"] = recorded.get("conversation_id")
-        receipt["conversation_recording"] = {
-            "status": recorded.get("status"),
-            "message_count": len(recorded.get("messages") or []),
-            "record_only": True,
-        }
-        loop_result["conversation_id"] = recorded.get("conversation_id")
-    except Exception as exc:
-        # Conversation recording is durable product evidence, but it must not
-        # turn an already completed Veyra response into an execution failure.
-        receipt["conversation_recording"] = {
-            "status": "degraded",
-            "reason": "conversation_recording_failed",
-            "error_type": type(exc).__name__,
-            "record_only": True,
-        }
+async def _receive_message(
+    request: MessageRequest,
+    *,
+    admission: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    intake_kwargs: dict[str, Any] = {
+        "text": request.text,
+        "channel": request.channel,
+        "user_id": request.user_id,
+        "session_id": request.session_id,
+        "message_id": request.message_id,
+        "metadata": request.metadata,
+    }
+    if admission is not None:
+        intake_kwargs["admission"] = admission
+    receipt = await run_in_threadpool(intake_gateway.receive_message, **intake_kwargs)
     return receipt
 
 
 @app.post("/events/message")
 async def message(request: MessageRequest):
-    return _public_message_result(await _receive_message(request))
+    admission = await _admit_foreground_user(request)
+    bound = _bind_foreground_admission(request, admission)
+    return _public_message_result(await _receive_message(bound, admission=admission))
 
 
 def _sse_frame(event_type: str, seq: int, payload: dict[str, Any]) -> str:
     event = {"schema_version": "veyra.message-stream.v1", "seq": seq, "type": event_type, "payload": payload}
     return f"id: {seq}\nevent: {event_type}\ndata: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
+
+
+def _consume_background_message_task(task: asyncio.Task[Any]) -> None:
+    """Consume a detached message task's terminal result after disconnect."""
+
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        # The request connection is already gone.  The task's own durable
+        # paths have recorded/released their state; consuming the exception
+        # prevents an unhandled-task warning without cancelling the work.
+        pass
 
 
 @app.post("/events/message/stream")
@@ -1281,15 +1471,20 @@ async def message_stream(request: MessageRequest):
     This is intentionally a connection-scoped stream. It exposes accepted and
     processing phases, then the same verified final result as /events/message;
     it never fabricates token deltas or exposes model chain-of-thought. Durable
-    The verified final turn is appended to the Product Conversation ledger;
-    this transport stream itself remains connection-scoped.
+    The user turn is admitted to the Product Conversation ledger before
+    cognition starts, so a refresh can restore it if the model stalls.
     """
-    task = asyncio.create_task(_receive_message(request))
+    admission = await _admit_foreground_user(request)
+    bound = _bind_foreground_admission(request, admission)
+    task = asyncio.create_task(_receive_message(bound, admission=admission))
 
     async def events():
         seq = 0
         seq += 1
-        yield _sse_frame("accepted", seq, {"status": "accepted"})
+        accepted = {"status": "accepted"}
+        if admission.get("status") in {"accepted", "duplicate"} and bound.conversation_id:
+            accepted["conversation_id"] = bound.conversation_id
+        yield _sse_frame("accepted", seq, accepted)
         seq += 1
         yield _sse_frame("phase", seq, {"phase": "processing", "status": "running"})
         try:
@@ -1301,7 +1496,7 @@ async def message_stream(request: MessageRequest):
                     seq += 1
                     yield _sse_frame("heartbeat", seq, {"phase": "processing", "status": "running"})
         except asyncio.CancelledError:
-            task.cancel()
+            task.add_done_callback(_consume_background_message_task)
             raise
         except Exception:
             seq += 1

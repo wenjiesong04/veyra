@@ -78,6 +78,22 @@ class LivingReactionRuntime:
             self._ensure_state(state, archive=archive)
             policy = self._effective_policy(state, reaction)
             temporal = temporal_phase(reaction, policy)
+            # These boundaries are derived from the server-owned effect under
+            # the same state read as ``policy``.  A client cannot keep a
+            # silent reaction idempotent forever by replaying an old
+            # ``feedback_policy`` snapshot: crossing either expiry produces
+            # a new evaluation identity and allows the candidate to be
+            # reconsidered.
+            cooldown_active = self._policy_window_active(
+                policy,
+                reaction.now,
+                keys=("cooldown_until", "next_allowed_at"),
+            )
+            suppression_active = self._policy_window_active(
+                policy,
+                reaction.now,
+                keys=("suppression_until",),
+            )
             evaluated = replace(
                 reaction,
                 feedback_policy={
@@ -85,9 +101,35 @@ class LivingReactionRuntime:
                     "policy_revision": int(policy.get("policy_revision", 0) or 0),
                     "temporal_phase": temporal["phase"],
                     "evaluation_boundary": temporal["evaluation_boundary"],
+                    "cooldown_active": cooldown_active,
+                    "suppression_active": suppression_active,
                 },
             )
             decision = decide_reaction(evaluated, feedback_policy=policy)
+            # A candidate that already produced a user-facing suggestion keeps
+            # its own replay identity across the cooldown boundary.  This
+            # prevents an exact retry from manufacturing a second message
+            # when the server-computed ``cooldown_active`` bit changes, while
+            # still allowing a candidate that was silent during cooldown to
+            # be evaluated again after expiry.
+            if reaction.attention_trigger == "cognitive_hypothesis" and reaction.attention_candidate_id:
+                prior_candidate = next(
+                    (
+                        row
+                        for row in list(state["reactions"].values()) + list(archive["reactions"].values())
+                        if isinstance(row, Mapping)
+                        and str(row.get("owner_id") or "") == reaction.owner_id
+                        and str(row.get("session_id") or "") == reaction.session_id
+                        and str(row.get("situation_id") or "") == reaction.situation.situation_id
+                        and int(row.get("situation_revision") or 0) == reaction.situation.revision
+                        and str(row.get("attention_candidate_id") or "") == reaction.attention_candidate_id
+                        and str(row.get("attention_trigger") or "") == "cognitive_hypothesis"
+                    ),
+                    None,
+                )
+                if isinstance(prior_candidate, Mapping) and str(prior_candidate.get("disposition") or "") == "suggest":
+                    result.update(status="duplicate", decision=copy.deepcopy(dict(prior_candidate)))
+                    return state
             existing_id = state["idempotency_index"].get(decision.idempotency_key)
             if not existing_id:
                 archived = next(
@@ -116,6 +158,15 @@ class LivingReactionRuntime:
             state["idempotency_index"][decision.idempotency_key] = decision.reaction_id
             state["metrics"]["reaction_count"] = len(state["reactions"])
             state["metrics"]["disposition_counts"][decision.disposition] += 1
+            if (
+                decision.disposition == "suggest"
+                and reaction.attention_trigger == "cognitive_hypothesis"
+            ):
+                self._persist_cognitive_cooldown(
+                    state,
+                    reaction=reaction,
+                    decision=persisted,
+                )
             self._compact_state(state, archive)
             result.update(status="recorded", decision=copy.deepcopy(persisted))
             return state
@@ -126,85 +177,125 @@ class LivingReactionRuntime:
     react = evaluate
     decide = evaluate
 
-    def record_feedback(self, value: FeedbackCommand | Mapping[str, Any]) -> dict[str, Any]:
+    def record_feedback(
+        self,
+        value: FeedbackCommand | Mapping[str, Any],
+        *,
+        apply_situation_effect: bool = True,
+        historical_evaluation: bool = False,
+    ) -> dict[str, Any]:
+        """Record feedback, optionally as a descriptive historical evaluation.
+
+        ``useful``/``not_useful`` can be attached to an older Product Chat
+        message.  That signal is valuable for calibration, but it must not
+        rewrite the current Situation's cooldown or suppression policy.  The
+        normal path keeps the existing control aftereffects; the historical
+        path writes the same feedback record with an explicit no-op
+        aftereffect and does not touch category policy samples.
+        """
+
+        if not isinstance(apply_situation_effect, bool) or not isinstance(historical_evaluation, bool):
+            raise ValueError("feedback effect flags must be boolean")
         feedback = value if isinstance(value, FeedbackCommand) else FeedbackCommand.from_mapping(value)
         if feedback.label not in FEEDBACK_LABELS:
             raise LivingReactionValidationError("feedback label is unsupported")
+        feedback_value = feedback
         result: dict[str, Any] = {}
 
         def update(state: dict[str, Any]) -> dict[str, Any]:
+            nonlocal feedback_value
             archive = self._archive_snapshot()
             self._ensure_state(state, archive=archive)
-            current = state["feedback"].get(feedback.feedback_id)
+            current = state["feedback"].get(feedback_value.feedback_id)
             if current is None:
-                current = archive["feedback"].get(feedback.feedback_id)
-            semantics = feedback.semantics()
+                current = archive["feedback"].get(feedback_value.feedback_id)
+            reaction = state["reactions"].get(feedback_value.reaction_id) or archive["reactions"].get(feedback_value.reaction_id)
+            if not isinstance(reaction, dict):
+                raise LivingReactionConflict("feedback target reaction does not exist")
+            for key in ("owner_id", "session_id", "situation_id"):
+                if str(reaction[key]) != str(getattr(feedback_value, key)):
+                    raise LivingReactionConflict(f"feedback {key} does not match reaction scope")
+            # The reaction row is the only category authority.  A direct
+            # ledger caller may still carry a legacy/client category field,
+            # but it is normalised away before semantics/idempotency are
+            # persisted so it cannot create a second learning bucket.
+            server_category = str(reaction.get("category") or "general").strip()[:120] or "general"
+            if feedback_value.category != server_category:
+                feedback_value = replace(feedback_value, category=server_category)
+            semantics = feedback_value.semantics()
             if current is not None:
                 if not isinstance(current, dict) or current.get("semantics") != semantics:
                     raise LivingReactionConflict("feedback_id is already bound to different semantics")
                 result.update(status="duplicate", feedback=copy.deepcopy(current))
                 return state
-            reaction = state["reactions"].get(feedback.reaction_id) or archive["reactions"].get(feedback.reaction_id)
-            if not isinstance(reaction, dict):
-                raise LivingReactionConflict("feedback target reaction does not exist")
-            for key in ("owner_id", "session_id", "situation_id"):
-                if str(reaction[key]) != str(getattr(feedback, key)):
-                    raise LivingReactionConflict(f"feedback {key} does not match reaction scope")
             if len(state["feedback"]) >= self.HOT_FEEDBACK:
                 self._compact_state(state, archive, feedback_target=self.HOT_FEEDBACK - 1)
             if len(state["feedback"]) >= self.HOT_FEEDBACK:
                 raise LivingReactionStorageError("living reaction feedback hot capacity exhausted")
 
-            now = feedback.now
-            scope = self._scope_key(feedback.owner_id, feedback.session_id, feedback.situation_id)
+            now = feedback_value.now
+            scope = self._scope_key(feedback_value.owner_id, feedback_value.session_id, feedback_value.situation_id)
             old_effect = copy.deepcopy(state["situation_effects"].get(scope) or {})
-            new_effect = apply_feedback_effect(
-                old_effect,
-                feedback.label,
-                now=now,
-                remind_before_seconds=feedback.remind_before_seconds,
-            )
-            new_effect["policy_revision"] = int(old_effect.get("policy_revision", 0) or 0) + 1
-            new_effect["scope"] = scope
-            if scope not in state["situation_effects"] and len(state["situation_effects"]) >= self.MAX_SITUATION_EFFECTS:
-                raise LivingReactionStorageError("living reaction situation-effect capacity exhausted")
-            state["situation_effects"][scope] = new_effect
-
-            category = str(feedback.category or reaction["category"] or "general").strip()[:120] or "general"
-            sample = self._record_category_sample(
-                state,
-                owner_id=feedback.owner_id,
-                category=category,
-                label=feedback.label,
-                situation_id=feedback.situation_id,
-                feedback_id=feedback.feedback_id,
-                reaction_id=feedback.reaction_id,
-            )
-            cross = self._maybe_revise_category_policy(
-                state,
-                owner_id=feedback.owner_id,
-                category=category,
-                label=feedback.label,
-                sample=sample,
-                now=now,
-            )
+            if apply_situation_effect and not historical_evaluation:
+                new_effect = apply_feedback_effect(
+                    old_effect,
+                    feedback_value.label,
+                    now=now,
+                    remind_before_seconds=feedback_value.remind_before_seconds,
+                )
+                new_effect["policy_revision"] = int(old_effect.get("policy_revision", 0) or 0) + 1
+                new_effect["scope"] = scope
+                if scope not in state["situation_effects"] and len(state["situation_effects"]) >= self.MAX_SITUATION_EFFECTS:
+                    raise LivingReactionStorageError("living reaction situation-effect capacity exhausted")
+                state["situation_effects"][scope] = new_effect
+                category = str(reaction["category"] or "general").strip()[:120] or "general"
+                sample = self._record_category_sample(
+                    state,
+                    owner_id=feedback_value.owner_id,
+                    category=category,
+                    label=feedback_value.label,
+                    situation_id=feedback_value.situation_id,
+                    feedback_id=feedback_value.feedback_id,
+                    reaction_id=feedback_value.reaction_id,
+                )
+                cross = self._maybe_revise_category_policy(
+                    state,
+                    owner_id=feedback_value.owner_id,
+                    category=category,
+                    label=feedback_value.label,
+                    sample=sample,
+                    now=now,
+                )
+            else:
+                # Historical evaluation is intentionally descriptive.  Keep
+                # the existing effect byte-for-byte and do not feed this
+                # sample into cross-Situation policy learning.
+                new_effect = copy.deepcopy(old_effect)
+                cross = {
+                    "status": "historical_evaluation",
+                    "effect_applied": False,
+                    "category_policy_changed": False,
+                }
             record = {
                 "schema_version": "veyra.living_reaction_feedback.v1",
-                "feedback_id": feedback.feedback_id,
+                "feedback_id": feedback_value.feedback_id,
                 "semantics": semantics,
                 "created_at": time_iso(now),
-                "evidence_refs": list(feedback.evidence_refs) or [feedback.reaction_id],
+                "evidence_refs": list(feedback_value.evidence_refs) or [feedback_value.reaction_id],
                 "aftereffects": {
                     "current_situation": {
                         "scope": scope,
                         "old": old_effect,
                         "new": copy.deepcopy(new_effect),
+                        "effect_applied": bool(apply_situation_effect and not historical_evaluation),
                     },
                     "cross_situation": cross,
                 },
+                "historical_evaluation": bool(historical_evaluation),
+                "control_effect_applied": bool(apply_situation_effect and not historical_evaluation),
                 "authority": self._authority(),
             }
-            state["feedback"][feedback.feedback_id] = record
+            state["feedback"][feedback_value.feedback_id] = record
             state["metrics"]["feedback_count"] = len(state["feedback"])
             self._compact_state(state, archive)
             result.update(status="recorded", feedback=copy.deepcopy(record))
@@ -340,6 +431,92 @@ class LivingReactionRuntime:
             return None
         return copy.deepcopy(row)
 
+    def list_active_suggestions(
+        self,
+        *,
+        owner_id: str,
+        session_id: str,
+        situation_ids: set[str] | None = None,
+        limit: int = 20,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read the durable suggestion cards that are still actionable.
+
+        A reaction ledger records every policy tick, including ``silent``
+        cooldown rows.  Those rows are useful history, but they are not a
+        lifecycle transition for a previously admitted suggestion.  Product
+        Suggestions therefore use a separate read selector: the newest
+        ``suggest`` for each exact Situation supersedes older suggestions;
+        ask/read/wait/silent rows do not.  Any feedback, explicit expiration,
+        or a caller-supplied terminal Situation removes that card.
+
+        The selector is deliberately read-only.  It validates the same hot
+        state/archive pair as the rest of the runtime and applies owner /
+        session filtering before grouping, so it cannot become a cross-scope
+        catalog or mutate the reaction ledger.
+        """
+
+        selected_limit = max(1, min(100, int(limit)))
+        current = now or self._clock()
+        if current.tzinfo is None or current.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        current = current.astimezone(timezone.utc)
+        state = self.state_store.read_json(self.STATE_FILE)
+        archive = self._archive_snapshot()
+        self._ensure_state(state, archive=archive)
+        combined = {**archive["reactions"], **state["reactions"]}
+        feedback_rows = {**archive["feedback"], **state["feedback"]}
+        feedback_reactions = {
+            str((row.get("semantics") or {}).get("reaction_id") or "")
+            for row in feedback_rows.values()
+            if isinstance(row, Mapping)
+            and isinstance(row.get("semantics"), Mapping)
+            and str((row.get("semantics") or {}).get("owner_id") or "") == str(owner_id)
+            and str((row.get("semantics") or {}).get("session_id") or "") == str(session_id)
+        }
+
+        def sort_key(row: Mapping[str, Any]) -> tuple[str, str]:
+            return (str(row.get("created_at") or ""), str(row.get("reaction_id") or ""))
+
+        latest_by_situation: dict[str, dict[str, Any]] = {}
+        for row in combined.values():
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("owner_id") or "") != str(owner_id) or str(row.get("session_id") or "") != str(session_id):
+                continue
+            situation_id = str(row.get("situation_id") or "")
+            if not situation_id or situation_ids is not None and situation_id not in situation_ids:
+                continue
+            if str(row.get("disposition") or "") != "suggest":
+                continue
+            previous = latest_by_situation.get(situation_id)
+            if previous is None or sort_key(row) > sort_key(previous):
+                latest_by_situation[situation_id] = dict(row)
+
+        active: list[dict[str, Any]] = []
+        for row in latest_by_situation.values():
+            reaction_id = str(row.get("reaction_id") or "")
+            if not reaction_id or reaction_id in feedback_reactions:
+                continue
+            expiration = row.get("expires_at")
+            timing = row.get("timing")
+            if expiration is None and isinstance(timing, Mapping):
+                expiration = timing.get("expires_at")
+            if isinstance(expiration, str) and expiration.strip():
+                try:
+                    expires_at = parse_time(expiration, field_name="reaction.expires_at")
+                except LivingReactionValidationError:
+                    # An invalid optional expiration cannot silently turn a
+                    # suggestion into an active card.  The ledger row remains
+                    # available in history, while the product catalog fails
+                    # closed for that row.
+                    continue
+                if expires_at <= current:
+                    continue
+            active.append(copy.deepcopy(row))
+        active.sort(key=sort_key, reverse=True)
+        return active[:selected_limit]
+
     def read_state(self) -> dict[str, Any]:
         state = self.state_store.read_json(self.STATE_FILE)
         archive = self._archive_snapshot()
@@ -359,6 +536,25 @@ class LivingReactionRuntime:
             return self.archive.read()
         except (LivingReactionArchiveError, TypeError, ValueError) as exc:
             raise LivingReactionStorageError(str(exc)) from exc
+
+    @staticmethod
+    def _policy_window_active(
+        policy: Mapping[str, Any],
+        now: datetime,
+        *,
+        keys: tuple[str, ...],
+    ) -> bool:
+        """Evaluate a server-owned policy window at the current tick."""
+
+        for key in keys:
+            value = policy.get(key)
+            try:
+                parsed = parse_time(value, field_name=f"policy.{key}")
+            except LivingReactionValidationError:
+                continue
+            if parsed > now:
+                return True
+        return False
 
     @staticmethod
     def _merge_archived_rows(
@@ -500,8 +696,75 @@ class LivingReactionRuntime:
         situation_policy = state["situation_effects"].get(scope)
         if isinstance(situation_policy, Mapping) and not self._expired(situation_policy.get("expires_at"), now):
             selected.update(situation_policy)
-        selected.update(reaction.feedback_policy)
+        # ``ReactionInput.feedback_policy`` is an internal projection hint,
+        # not an authority seam.  Cooldowns, suppression and policy revision
+        # must come only from the server-owned reaction state above; otherwise
+        # a replay could supply an old/new timestamp and alter its own
+        # idempotency boundary.
         return normalise_policy(selected)
+
+    def _persist_cognitive_cooldown(
+        self,
+        state: dict[str, Any],
+        *,
+        reaction: ReactionInput,
+        decision: Mapping[str, Any],
+    ) -> None:
+        """Persist the interruption boundary for one cognitive suggestion.
+
+        The boundary belongs to the exact Situation scope, not to the
+        ephemeral hypothesis.  It is intentionally written only after the
+        suggestion row has been admitted to the reaction ledger.  Feedback
+        later updates the same effect and therefore remains the authoritative
+        override.
+        """
+
+        scope = self._scope_key(
+            reaction.owner_id,
+            reaction.session_id,
+            reaction.situation.situation_id,
+        )
+        existing = state["situation_effects"].get(scope)
+        effect = copy.deepcopy(existing) if isinstance(existing, Mapping) else {}
+        now = reaction.now.astimezone(timezone.utc)
+        current_until = self._later_time(
+            effect.get("cooldown_until"),
+            effect.get("next_allowed_at"),
+        )
+        decision_cooldown = decision.get("cooldown") if isinstance(decision.get("cooldown"), Mapping) else {}
+        candidate_until = self._parse_optional(decision_cooldown.get("until"))
+        selected_until = max((item for item in (current_until, candidate_until) if item is not None), default=None)
+        if selected_until is None:
+            selected_until = now + timedelta(seconds=3600)
+        effect.update(
+            {
+                "scope": scope,
+                "cooldown_until": time_iso(selected_until),
+                "next_allowed_at": time_iso(selected_until),
+                "last_attention_trigger": "cognitive_hypothesis",
+                "last_attention_candidate_id": reaction.attention_candidate_id,
+                "updated_at": time_iso(now),
+                "policy_revision": int(effect.get("policy_revision") or 0) + 1,
+            }
+        )
+        if scope not in state["situation_effects"] and len(state["situation_effects"]) >= self.MAX_SITUATION_EFFECTS:
+            raise LivingReactionStorageError("living reaction situation-effect capacity exhausted")
+        state["situation_effects"][scope] = effect
+
+    @staticmethod
+    def _parse_optional(value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = parse_time(value, field_name="reaction policy time")
+        except LivingReactionValidationError:
+            return None
+        return parsed
+
+    @classmethod
+    def _later_time(cls, *values: Any) -> datetime | None:
+        parsed = [item for item in (cls._parse_optional(value) for value in values) if item is not None]
+        return max(parsed) if parsed else None
 
     @staticmethod
     def _expired(value: Any, now: datetime) -> bool:
@@ -576,6 +839,7 @@ class LivingReactionRuntime:
         old_policy = normalise_policy(state["category_policies"].get(key) or {})
         new_policy = apply_feedback_effect(old_policy, label, now=now)
         new_policy.pop("cooldown_until", None)
+        new_policy.pop("next_allowed_at", None)
         new_policy.pop("suppression_until", None)
         new_policy.pop("updated_at", None)
         new_policy["owner_id"] = owner_id
@@ -716,6 +980,14 @@ class LivingReactionRuntime:
                 raise LivingReactionStorageError("living reaction suggested_next_step is invalid")
             if row.get("disposition") not in REACTION_DISPOSITIONS:
                 raise LivingReactionStorageError("living reaction disposition is invalid")
+            trigger = row.get("attention_trigger", "none")
+            if trigger not in {"none", "material_observation", "cognitive_hypothesis"}:
+                raise LivingReactionStorageError("living reaction attention trigger is invalid")
+            candidate_id = row.get("attention_candidate_id")
+            if candidate_id is not None and (not isinstance(candidate_id, str) or not candidate_id):
+                raise LivingReactionStorageError("living reaction attention candidate is invalid")
+            if trigger == "cognitive_hypothesis" and not candidate_id:
+                raise LivingReactionStorageError("cognitive reaction is missing attention candidate")
             revision = row.get("situation_revision")
             if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
                 raise LivingReactionStorageError("living reaction situation revision is invalid")

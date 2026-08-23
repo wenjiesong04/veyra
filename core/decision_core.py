@@ -4,7 +4,7 @@ import re
 from dataclasses import replace
 from typing import Any
 
-from core.capability_registry import CapabilityRegistry
+from core.capability_registry import CapabilityRegistry, PROBE_CAPABILITIES
 from core.cognition_pipeline import CognitionPipeline, use_model_first_pipeline
 from core.model_driven_decision_core import ModelDrivenDecisionCore
 from core.definitions import RiskLevel, classify_text_risk
@@ -185,20 +185,52 @@ class DecisionCore:
             return self.model_driven.enrich(text, finalized, event=event)
         contract_base = self._rule_decide(text, attention_focus, event=event)
         contract_base = self._apply_understanding_guardrails(text, contract_base, understanding)
-        if self._adapter_contract_route_is_deterministic(contract_base):
-            deterministic_signal = {
-                Route.PROBE: "policy:required_probe_preserved",
-                Route.AGENT: "policy:rule_agent_route_preserved",
-                Route.SKILL: "policy:rule_skill_route_preserved",
-                Route.ASK_USER: "policy:rule_ask_user_route_preserved",
-            }.get(contract_base.route)
-            if deterministic_signal and deterministic_signal not in contract_base.signals:
-                contract_base.signals.append(deterministic_signal)
-            finalized = finish(self._with_turn_understanding(contract_base, understanding))
+        typed_fast_path = self._typed_semantic_route_is_complete(
+            understanding,
+            event=event,
+        )
+        if typed_fast_path:
+            typed_candidate = self._with_turn_understanding(contract_base, understanding)
+            typed_candidate.signals = self._dedupe(
+                [*(typed_candidate.signals or []), "policy:typed_semantic_fast_path"]
+            )
+            typed_assist = dict(typed_candidate.model_assist or {})
+            typed_assist["typed_policy_fast_path"] = True
+            # Only a validated, single ``assertion`` act is a pure state
+            # statement.  Keep this as a typed contract bit rather than
+            # re-deriving it from the user's surface text downstream.  A
+            # question/request may still use the typed route, but it must keep
+            # its normal primary answer and any Living Context follow-up.
+            frame = understanding.semantic_frame
+            typed_assist["typed_state_assertion_fast_path"] = bool(
+                frame is not None
+                and frame.resolver_status in {"resolved"}
+                and len(frame.acts) == 1
+                and frame.acts[0].kind == "assertion"
+                and not frame.relations
+                and not frame.ambiguities
+            )
+            typed_candidate.model_assist = typed_assist
+            finalized = finish(typed_candidate)
             return self.model_driven.enrich(text, finalized, event=event)
-        if self._should_trust_rule_understanding(understanding):
-            finalized = finish(self._with_turn_understanding(contract_base, understanding))
-            return self.model_driven.enrich(text, finalized, event=event)
+        semantic_planner_required = self._semantic_frame_requires_planner(
+            understanding,
+        )
+        deterministic_signal = {
+            Route.PROBE: "policy:required_probe_preserved",
+            Route.AGENT: "policy:rule_agent_route_preserved",
+            Route.SKILL: "policy:rule_skill_route_preserved",
+            Route.ASK_USER: "policy:rule_ask_user_route_preserved",
+        }.get(contract_base.route)
+        if not semantic_planner_required:
+            if self._adapter_contract_route_is_deterministic(contract_base):
+                if deterministic_signal and deterministic_signal not in contract_base.signals:
+                    contract_base.signals.append(deterministic_signal)
+                finalized = finish(self._with_turn_understanding(contract_base, understanding))
+                return self.model_driven.enrich(text, finalized, event=event)
+            if self._should_trust_rule_understanding(understanding):
+                finalized = finish(self._with_turn_understanding(contract_base, understanding))
+                return self.model_driven.enrich(text, finalized, event=event)
         if use_model_first_pipeline(self.reasoning):
             pipeline = CognitionPipeline(self.reasoning, self.state_store, self.capabilities)
             pipeline_decision = pipeline.run(
@@ -212,6 +244,15 @@ class DecisionCore:
                 pipeline_decision = self._apply_understanding_guardrails(text, pipeline_decision, understanding)
                 finalized = finish(self._with_turn_understanding(pipeline_decision, understanding))
                 return self.model_driven.enrich(text, finalized, event=event)
+        if semantic_planner_required:
+            # With no usable planner result, retain the existing deterministic
+            # adapter floor as a degraded fallback.  Configured planners get
+            # the first opportunity above for unresolved or parameter-
+            # incomplete semantic turns.
+            if deterministic_signal and deterministic_signal not in contract_base.signals:
+                contract_base.signals.append(deterministic_signal)
+            finalized = finish(self._with_turn_understanding(contract_base, understanding))
+            return self.model_driven.enrich(text, finalized, event=event)
         base = self._rule_decide(text, attention_focus, event=event)
         base = self._apply_understanding_guardrails(text, base, understanding)
         base = self._with_turn_understanding(base, understanding)
@@ -432,6 +473,8 @@ class DecisionCore:
             and decision.selected_probe != "search_probe"
             and (decision.freshness_required or decision.needs_probe)
             and "policy:required_probe_preserved" in (decision.signals or [])
+            and policy.preferred_route == Route.PROBE.value
+            and policy.selected_probe == decision.selected_probe
             and not false_positive_action_words
         )
         safety_locked = decision.route in {Route.BLOCK, Route.HUMAN_REVIEW, Route.ROLLBACK}
@@ -543,11 +586,10 @@ class DecisionCore:
             reason = "semantic frame explicitly authorizes governed execution"
         else:
             if required_rule_probe:
-                # A semantic frame may narrow an effectful route, but it must
-                # not turn a Veyra-owned freshness invariant into an answer
-                # from stale context.  This preserves only an already-selected
-                # deterministic read-only Probe; it never creates a new tool,
-                # Agent, or side-effect authority from user text.
+                # Preserve a deterministic freshness Probe only when the
+                # validated semantic policy selects the same observer.  A raw
+                # text freshness marker is not capability authority and must
+                # not override a typed direct-answer policy.
                 route = Route.PROBE
                 capability = "probe"
                 probe_capability = (
@@ -703,6 +745,90 @@ class DecisionCore:
             "runtime_evidence",
             "governed_execution",
         }
+
+    def _typed_semantic_route_is_complete(
+        self,
+        understanding: TurnUnderstanding | None,
+        *,
+        event: VeyraEvent | None = None,
+    ) -> bool:
+        """Return whether the typed policy can take the foreground fast path.
+
+        Understanding has already paid the model cost for this turn.  Once its
+        strict semantic frame compiles to an unambiguous no-effect answer or a
+        parameter-complete native read, asking the planner to rediscover the
+        same route only adds latency and another place for route drift.  Any
+        effect, ambiguity, missing parameter, or non-read route deliberately
+        falls through to the normal planner.
+        """
+
+        frame = getattr(understanding, "semantic_frame", None) if understanding is not None else None
+        if frame is None or understanding is None:
+            return False
+        policy = self.semantic_policy.compile(
+            frame,
+            current_user_id=str(event.source.user_id or "") if event is not None else "",
+        )
+        if policy.resolver_status not in {"complete", "resolved", "validated"}:
+            return False
+        if (
+            policy.requires_clarification
+            or policy.allowed_effects
+            or len(frame.acts) != 1
+            or frame.relations
+            or frame.ambiguities
+            or any(
+                str(getattr(act.referent, "status", "")) in {"ambiguous", "unresolved"}
+                for act in frame.acts
+            )
+        ):
+            return False
+
+        if policy.preferred_route == Route.DIRECT_ANSWER.value:
+            return True
+
+        if (
+            policy.preferred_route != Route.PROBE.value
+            or not policy.selected_probe
+            or len(policy.probe_requests) != 1
+        ):
+            return False
+        if not self._typed_probe_arguments_complete(policy.selected_probe, policy.capability_arguments):
+            return False
+        capability = PROBE_CAPABILITIES.get(policy.selected_probe)
+        if not capability or capability not in policy.allowed_capabilities:
+            return False
+        return True
+
+    def _semantic_frame_requires_planner(
+        self,
+        understanding: TurnUnderstanding | None,
+    ) -> bool:
+        """Keep non-fast-path semantic turns eligible for normal planning.
+
+        This is intentionally evaluated only after governance locks and the
+        typed direct/probe fast path.  It therefore does not weaken any
+        deterministic risk lock; it only prevents a semantic frame that needs
+        planning from taking the old adapter shortcut.
+        """
+
+        frame = getattr(understanding, "semantic_frame", None) if understanding is not None else None
+        return frame is not None
+
+    @staticmethod
+    def _typed_probe_arguments_complete(probe: str, arguments: dict[str, Any]) -> bool:
+        required = {
+            "weather_probe": "location",
+            "search_probe": "query",
+            "web": "url",
+            "port": "port",
+        }.get(str(probe or "").strip())
+        if required is None:
+            return True
+        value = arguments.get(required)
+        if required == "port":
+            return isinstance(value, int) and not isinstance(value, bool)
+        return bool(str(value or "").strip())
 
     def _adapter_contract_route_is_deterministic(self, decision: Decision) -> bool:
         """Skip model planning when the receiver is fixed by Veyra's adapter contract."""

@@ -909,15 +909,17 @@ def main() -> int:
         "日历",
         "网页",
     ]
-    evidence_alias_candidate, evidence_alias_issues, _ = parse_living_context_candidate_detailed(
+    evidence_alias_candidate, evidence_alias_issues, evidence_alias_report = parse_living_context_candidate_detailed(
         evidence_alias_sources,
     )
     expect(
         evidence_alias_candidate is not None
         and not evidence_alias_issues
         and evidence_alias_candidate.needs[0].allowed_source_classes
-        == ["user", "calendar", "public_web"],
-        "Need source classes reuse exact evidence-kind aliases",
+        == ["user"]
+        and "needs[0].allowed_source_classes:from_evidence_kind"
+        in evidence_alias_report.get("repaired_fields", []),
+        "Need source classes reuse the typed evidence-kind endpoint",
     )
     transport_alias_source = copy.deepcopy(candidate_payload(category="travel"))
     transport_alias_source["needs"][0]["allowed_source_classes"] = ["user_message"]
@@ -951,11 +953,11 @@ def main() -> int:
     expect(
         mixed_source_result.candidate is not None
         and mixed_source_result.candidate.needs[0].allowed_source_classes
-        == ["calendar", "user"]
+        == ["user"]
         and mixed_source_result.metrics.get("dropped_unsupported_count") == 1
         and "needs[0].allowed_source_classes"
         in mixed_source_result.metrics.get("normalized_fields", []),
-        "registered source classes survive a stable intersection with unknown values dropped",
+        "typed Need source class wins after unknown values are dropped",
     )
 
     alias_mixed_source_candidate = copy.deepcopy(candidate_payload(category="travel"))

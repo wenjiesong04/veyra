@@ -10,7 +10,12 @@ if str(ROOT) not in sys.path:
 
 from core.decision_core import DecisionCore  # noqa: E402
 from core.reasoning_core import CoreReasoning  # noqa: E402
-from core.understanding_core import UnderstandingCore  # noqa: E402
+from core.understanding_core import (  # noqa: E402
+    SEMANTIC_DISCOURSE_KIND_CONTRACT,
+    TURN_UNDERSTANDING_REPAIR_SYSTEM,
+    TURN_UNDERSTANDING_SYSTEM,
+    UnderstandingCore,
+)
 from core.world_state import WorldStateStore  # noqa: E402
 from interface.event_schema import EventSource, EventType, VeyraEvent  # noqa: E402
 
@@ -28,7 +33,27 @@ def expect(condition: bool, message: str, detail: object = None) -> None:
         raise AssertionError(f"{message}: {detail!r}")
 
 
+def check_semantic_kind_prompt_contract() -> None:
+    """Ensure both Understanding passes carry the typed foreground contract."""
+
+    for name, prompt in (
+        ("initial", TURN_UNDERSTANDING_SYSTEM),
+        ("repair", TURN_UNDERSTANDING_REPAIR_SYSTEM),
+    ):
+        expect(
+            SEMANTIC_DISCOURSE_KIND_CONTRACT in prompt,
+            f"{name} Understanding prompt carries the assertion contract",
+        )
+        expect(
+            'kind="assertion"' in prompt
+            and "must not be marked assertion" in prompt
+            and "existing open-world kind" in prompt,
+            f"{name} Understanding prompt distinguishes assertions from requests",
+        )
+
+
 def main() -> int:
+    check_semantic_kind_prompt_contract()
     with TemporaryDirectory(prefix="veyra-understanding-smoke-") as tmp:
         store = WorldStateStore(Path(tmp) / "state")
         reasoning = CoreReasoning(store)

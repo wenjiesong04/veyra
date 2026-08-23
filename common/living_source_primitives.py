@@ -44,7 +44,10 @@ SOURCE_PARAMETER_KEYS: dict[str, frozenset[str]] = {
     "user_answer": frozenset(),
     # Calendar selection is server configuration, not a caller/model input.
     "calendar": frozenset({"window_start", "window_end"}),
-    "weather": frozenset({"location"}),
+    # ``target_date`` is optional: its absence means a current observation;
+    # its presence selects one typed forecast day.  It is still server-bound
+    # through SourceNeedBinding and never accepted from a provider/caller.
+    "weather": frozenset({"location", "target_date"}),
     "public_web": frozenset({"query", "max_results"}),
     "agent_research": frozenset({"topic"}),
 }
@@ -197,6 +200,9 @@ class SourceCapability:
     enabled: bool = True
     default_ttl_seconds: int = 900
     max_timeout_seconds: float = 5.0
+    # Provider-owned cadence for an explicitly watch-mode Need. ``None``
+    # means the source has no automatic refresh policy.
+    watch_cadence_seconds: int | None = None
     allowed_parameter_keys: tuple[str, ...] = ()
     authority: SourceAuthority = field(default_factory=SourceAuthority)
 
@@ -212,6 +218,12 @@ class SourceCapability:
             raise LivingSourceContractError("source TTL is out of range")
         if isinstance(self.max_timeout_seconds, bool) or not 0.05 <= float(self.max_timeout_seconds) <= 60.0:
             raise LivingSourceContractError("source timeout is out of range")
+        if self.watch_cadence_seconds is not None and (
+            isinstance(self.watch_cadence_seconds, bool)
+            or not isinstance(self.watch_cadence_seconds, int)
+            or not 60 <= self.watch_cadence_seconds <= 604800
+        ):
+            raise LivingSourceContractError("source watch cadence is out of range")
         allowed = set(self.allowed_parameter_keys)
         if not allowed.issubset(SOURCE_PARAMETER_KEYS[self.source]):
             raise LivingSourceContractError("source capability parameter mapping is invalid")
@@ -226,6 +238,7 @@ class SourceCapability:
             "enabled": self.enabled,
             "default_ttl_seconds": self.default_ttl_seconds,
             "max_timeout_seconds": self.max_timeout_seconds,
+            "watch_cadence_seconds": self.watch_cadence_seconds,
             "allowed_parameter_keys": list(self.allowed_parameter_keys),
             "authority": self.authority.to_dict(),
         }

@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+from interface.living_reaction_contract import stable_digest
+
 
 def _text(value: Any, fallback: str = "", *, limit: int = 640) -> str:
     selected = value.strip() if isinstance(value, str) else fallback
@@ -164,6 +166,26 @@ def question_projection(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def reaction_projection(item: dict[str, Any]) -> dict[str, Any]:
+    raw_facts = item.get("fact_vs_inference") if isinstance(item.get("fact_vs_inference"), dict) else {}
+    facts = [str(value)[:640] for value in (raw_facts.get("facts") or [])[:8] if str(value).strip()]
+    inferences = [str(value)[:640] for value in (raw_facts.get("inferences") or [])[:8] if str(value).strip()]
+    feedback_token = item.get("reaction_token") or item.get("feedback_token")
+    if not feedback_token and item.get("reaction_id"):
+        raw_revision = item.get("policy_revision")
+        policy_revision = raw_revision if isinstance(raw_revision, int) and not isinstance(raw_revision, bool) and raw_revision > 0 else 1
+        feedback_token = "rxn_" + stable_digest(
+            "veyra.living_reaction.catalog.v1",
+            {
+                "reaction_id": item.get("reaction_id"),
+                "situation_revision": item.get("situation_revision"),
+                "policy_revision": policy_revision,
+            },
+        )[:32]
+    feedback_available = item.get("feedback_available")
+    if not isinstance(feedback_available, bool):
+        feedback_available = True
+    feedback_label = _text(item.get("feedback_label"), limit=40) or None
+    feedback_at = _text(item.get("feedback_at"), limit=80) or None
     return {
         "reaction_id": str(item.get("reaction_id")),
         "situation_id": str(item.get("situation_id")),
@@ -177,8 +199,19 @@ def reaction_projection(item: dict[str, Any]) -> dict[str, Any]:
         "recommendation": _text(item.get("suggested_next_step"), limit=1000),
         "rank": item.get("rank") if isinstance(item.get("rank"), (int, float)) and not isinstance(item.get("rank"), bool) else 0.0,
         "reason": _text(item.get("reason"), limit=480),
+        "attention_trigger": _text(item.get("attention_trigger"), "none", limit=64),
+        "attention_candidate_id": _text(item.get("attention_candidate_id"), "attention_candidate_id", limit=240) or None,
         "timing": dict(item.get("timing")) if isinstance(item.get("timing"), dict) else {},
-        "feedback": {"available": True},
+        "fact_vs_inference": {"facts": facts, "inferences": inferences},
+        "feedback_token": str(feedback_token) if feedback_token else None,
+        "feedback": {
+            "available": feedback_available,
+            "token": str(feedback_token) if feedback_token else None,
+            "label": feedback_label,
+            "at": feedback_at,
+        },
+        "record_only": True,
+        "external_delivery": False,
         "authority": {"execution_allowed": False, "tool_allowed": False, "agent_allowed": False, "capability_grant_allowed": False, "route_change_allowed": False, "external_delivery_allowed": False},
     }
 

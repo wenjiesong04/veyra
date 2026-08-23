@@ -32,6 +32,22 @@ STATE_CONFIG = "config"
 STATE_LOGS = "logs"
 STATE_SCHEMA_VERSION = 2
 
+# These directories belong to the state-root layout.  A path such as
+# ``state/runtime`` is not an independent state root: it is the runtime
+# partition of ``state``.  Keep this list deliberately structural (rather
+# than looking at arbitrary filenames) so a normal temporary directory named
+# ``runtime`` remains a valid test/application root.
+STATE_ROOT_LAYOUT_DIRS = frozenset(
+    {
+        STATE_RUNTIME,
+        STATE_CONFIG,
+        STATE_WORLD_USER,
+        STATE_WORLD_LOCAL,
+        STATE_LOGS,
+        STATE_WORLD_EXTERNAL,
+    }
+)
+
 JSONL_FILES = [
     "event_log.jsonl",
     "action_record.jsonl",
@@ -260,6 +276,58 @@ class StateReadOnlyError(RuntimeError):
     """Raised when a read-only state view is asked to mutate local state."""
 
 
+class StateNestedRootError(RuntimeError):
+    """Raised when a state partition is accidentally selected as the root."""
+
+    def __init__(self, selected_root: Path, canonical_root: Path, marker: str) -> None:
+        self.selected_root = selected_root
+        self.canonical_root = canonical_root
+        self.marker = marker
+        super().__init__(
+            f"refusing nested state root {selected_root}: it is the '{selected_root.name}' "
+            f"layout directory inside canonical state root {canonical_root} "
+            f"(detected {marker}); select {canonical_root} instead"
+        )
+
+
+def _state_root_marker(root: Path) -> str | None:
+    """Return the marker proving *root* is an existing Veyra state root.
+
+    The schema path is treated as a structural marker even if its contents are
+    currently damaged; a damaged canonical root is still not safe to migrate
+    into.  A writer lock is intentionally treated as a strong marker even when
+    stale.  A stale lock still identifies a directory that has been used as a
+    state root and must not be migrated into by a child process.
+    """
+
+    schema_path = root / STATE_CONFIG / "state_schema.json"
+    if schema_path.is_file():
+        return "config/state_schema.json"
+
+    lock_path = root / ".veyra-writer.lock"
+    if lock_path.is_file():
+        return ".veyra-writer.lock"
+    return None
+
+
+def _guard_selected_state_root(selected_root: Path) -> None:
+    """Reject selecting a canonical state partition as an independent root.
+
+    This runs before directory creation, writer lease acquisition, and legacy
+    migration.  It is also called for read-only stores, because opening a
+    nested root read-only would still expose an invalid view of canonical
+    state and could hide the actual writer/reader topology.
+    """
+
+    resolved = selected_root.expanduser().resolve()
+    if resolved.name not in STATE_ROOT_LAYOUT_DIRS:
+        return
+    canonical_root = resolved.parent
+    marker = _state_root_marker(canonical_root)
+    if marker:
+        raise StateNestedRootError(resolved, canonical_root, marker)
+
+
 def _release_writer_leases() -> None:
     if fcntl is None:
         return
@@ -295,6 +363,7 @@ class WorldStateStore:
         if exclusive_writer and read_only:
             raise ValueError("exclusive_writer and read_only cannot both be enabled")
         selected_root = self._selected_root(root)
+        _guard_selected_state_root(Path(selected_root))
         self.root = Path(selected_root)
         if not read_only:
             self.root.mkdir(parents=True, exist_ok=True)

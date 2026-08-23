@@ -13,18 +13,21 @@ import copy
 import hashlib
 import json
 import re
-from datetime import datetime, timezone
-from typing import Any, Callable
+from datetime import date, datetime, timezone
+from typing import Any, Callable, Mapping
 
+from common.reported_time_window import resolve_reported_calendar_date, resolve_reported_window_end
 from core.situation_state_repository import SituationStateRepository
 from core.world_state import StateRevisionConflictError, WorldStateStore
 from core.living_context_need_answer_selector import StandaloneUnknownResolutionBinding
+from core.semantic_frame import TurnSemanticFrame
 from interface.event_schema import EventType, VeyraEvent
 from interface.living_context_contract import (
     CandidateNeed,
     LivingContextCandidate,
     parse_living_context_candidate,
     situation_catalog_projection,
+    stable_evidence_target_digest,
     stable_subject_digest,
 )
 from runtime.information_need_runtime import InformationNeedRuntime
@@ -217,11 +220,7 @@ class LivingContextRuntime:
         # current Need or Unknown token+generation may authorize deletion.
         unknown_resolved_count = 0
         resolved_need_count = 0
-        candidate, deduped_need_count = self._dedupe_active_need_candidates(
-            candidate,
-            situation_id=situation_id,
-            catalog_row=turn_start_catalog_row,
-        )
+        deduped_need_count = 0
         if candidate.disposition == "create":
             subject_key = stable_subject_digest(
                 f"{owner_id}\0{session_id}",
@@ -231,7 +230,6 @@ class LivingContextRuntime:
         else:
             subject_key = str(existing.get("semantic_subject_key") or "")
             operation = candidate.disposition
-        validated_needs = self.needs.validate_candidates(candidate.needs)
         answered_needs: list[dict[str, Any]] = []
         for need_token in candidate.answered_need_tokens:
             need = self.needs.get(
@@ -244,21 +242,17 @@ class LivingContextRuntime:
             answered_needs.append(need)
         if candidate.answered_need_tokens:
             self._validate_need_bindings(candidate, catalog_row)
-        preflight_need_scope(
-            self,
+        semantic_state = self._semantic_snapshot(event, candidate, existing)
+        evidence_targets = self._derive_evidence_targets(
+            candidate=candidate,
+            semantic_state=semantic_state,
+            semantic_frame=getattr(understanding, "semantic_frame", None),
+            situation_id=situation_id,
             owner_id=owner_id,
             session_id=session_id,
-            situation_id=(
-                situation_id
-                or self.situations.semantic_situation_id(
-                    user_id=owner_id,
-                    subject_key=subject_key,
-                )
-            ),
-            needs=validated_needs,
-            answered_needs=answered_needs,
+            source_text=self._event_text(event),
+            current_time=event.timestamp,
         )
-        semantic_state = self._semantic_snapshot(event, candidate, existing)
         standalone_unknown_resolutions = self._validated_standalone_unknown_resolutions(
             event=event,
             understanding=understanding,
@@ -273,13 +267,6 @@ class LivingContextRuntime:
                 for value in semantic_state.get("unknown", [])
                 if str(value) not in resolved_unknowns
             ]
-        unknown_bindings = self._derive_unknown_bindings(
-            candidate=candidate,
-            semantic_state=semantic_state,
-            situation_id=situation_id,
-            owner_id=owner_id,
-            session_id=session_id,
-        )
         if answered_needs:
             # An answered Need may only clear the exact semantic endpoint
             # admitted in its server-owned ``unknown_binding``.  The Need's
@@ -296,6 +283,38 @@ class LivingContextRuntime:
                 for item in semantic_state.get("unknown", [])
                 if str(item) not in resolved_bindings
             ]
+        unknown_bindings = self._derive_unknown_bindings(
+            candidate=candidate,
+            semantic_state=semantic_state,
+            situation_id=situation_id,
+            owner_id=owner_id,
+            session_id=session_id,
+            evidence_targets=evidence_targets,
+        )
+        candidate, evidence_targets, unknown_bindings, deduped_need_count = (
+            self._dedupe_typed_need_candidates(
+                candidate,
+                evidence_targets,
+                unknown_bindings,
+            )
+        )
+        validated_needs = self.needs.validate_candidates(candidate.needs)
+        preflight_need_scope(
+            self,
+            owner_id=owner_id,
+            session_id=session_id,
+            situation_id=(
+                situation_id
+                or self.situations.semantic_situation_id(
+                    user_id=owner_id,
+                    subject_key=subject_key,
+                )
+            ),
+            needs=validated_needs,
+            answered_needs=answered_needs,
+            unknown_bindings=unknown_bindings,
+            evidence_targets=evidence_targets,
+        )
         persisted, current_needs, needs_repaired = self._persist_semantic_and_needs(
             event=event,
             subject_key=subject_key,
@@ -311,6 +330,7 @@ class LivingContextRuntime:
             existing=existing,
             server_command=server_command,
             unknown_bindings=unknown_bindings,
+            evidence_targets=evidence_targets,
             planned_situation_id=(
                 situation_id
                 or self.situations.semantic_situation_id(
@@ -470,70 +490,241 @@ class LivingContextRuntime:
             selected.append(statement)
         return tuple(selected)
 
-    def _dedupe_active_need_candidates(
+    def _derive_evidence_targets(
+        self,
+        *,
+        candidate: LivingContextCandidate,
+        semantic_state: Mapping[str, Any],
+        semantic_frame: TurnSemanticFrame | None = None,
+        situation_id: str | None = None,
+        owner_id: str | None = None,
+        session_id: str | None = None,
+        source_text: str = "",
+        current_time: Any = None,
+    ) -> list[dict[str, Any] | None]:
+        """Derive positional source targets from typed Situation state.
+
+        Model Need prose is intentionally not consulted here. Weather can
+        only bind to one eligible structured place entity. A forecast date
+        comes only from an explicit typed endpoint, one validated semantic
+        frame endpoint, or this candidate's deadline. Ambiguous or missing
+        typed
+        inputs stay unbound so the orchestrator can ask/wait instead of
+        fabricating a provider request.
+        """
+
+        semantic_entities = semantic_state.get("entities")
+        entities = semantic_entities if isinstance(semantic_entities, list) else []
+        places: list[dict[str, Any]] = []
+        for raw in entities:
+            if not isinstance(raw, Mapping) or str(raw.get("kind") or "").lower() != "place":
+                continue
+            value = " ".join(str(raw.get("value") or "").split())[:160]
+            if not value:
+                continue
+            provenance = str(raw.get("provenance_scope") or "")
+            epistemic = str(raw.get("epistemic_status") or "").lower()
+            if provenance == "span":
+                quote = raw.get("source_quote")
+                if epistemic != "reported" or not isinstance(quote, Mapping):
+                    continue
+            elif provenance == "model_attributed":
+                if epistemic != "inferred" or raw.get("source_quote") is not None:
+                    continue
+            else:
+                continue
+            places.append({"value": value, "entity": dict(raw)})
+
+        raw_deadline = semantic_state.get("deadline_at")
+        weather_needs = [need for need in candidate.needs if need.evidence_kind == "weather"]
+
+        # Provider dates come only from the direct user event and the server
+        # reference clock. A semantic frame may corroborate meaning, but it
+        # cannot authorize or invent a forecast day.
+        direct_weather_date = (
+            resolve_reported_calendar_date(source_text, current_time)
+            if len(weather_needs) == 1 and len(places) == 1
+            else None
+        )
+
+        targets: list[dict[str, Any] | None] = []
+        for need in candidate.needs:
+            if need.evidence_kind == "weather":
+                # Multiple candidate places are not safe to collapse into one
+                # provider call.  Keep the Need open for an explicit choice.
+                if len(places) != 1:
+                    targets.append(None)
+                    continue
+                requirement = need.observation_requirement
+                if requirement is None:
+                    # Do not infer required metrics from a question or a
+                    # display blocker.  New weather Needs must carry the
+                    # structured requirement contract.
+                    targets.append(None)
+                    continue
+                selected_date = None
+                if requirement.coverage == "forecast_day":
+                    if direct_weather_date is None:
+                        targets.append(None)
+                        continue
+                    if requirement.target_date is not None and requirement.target_date != direct_weather_date:
+                        targets.append(None)
+                        continue
+                    selected_date = direct_weather_date
+                if requirement.coverage != "forecast_day":
+                    selected_date = None
+                target: dict[str, Any] = {"location": places[0]["value"]}
+                if selected_date:
+                    target["target_date"] = selected_date
+                target["observation_requirement"] = requirement.model_dump(mode="json")
+                targets.append(target)
+                continue
+            if need.evidence_kind == "calendar":
+                requirement = need.observation_requirement
+                targets.append(
+                    {
+                        **({"window_end": raw_deadline} if raw_deadline else {}),
+                        "observation_requirement": requirement.model_dump(mode="json"),
+                    }
+                    if requirement is not None
+                    else None
+                )
+                continue
+            if need.evidence_kind == "public_web":
+                # The public-web adapter currently derives its bounded query
+                # from the server Situation projection.  Keep a typed
+                # requirement sidecar so identity/replay still distinguishes
+                # result coverage from unrelated Needs.
+                requirement = need.observation_requirement
+                targets.append(
+                    {"observation_requirement": requirement.model_dump(mode="json")}
+                    if requirement is not None
+                    else None
+                )
+                continue
+            targets.append(None)
+
+        # A Situation-bound continuation may deliberately omit a repeated
+        # place/date. Reuse only one already durable endpoint for one readable
+        # Need with the same typed source lifecycle. Presentation wording is
+        # never part of this lookup, and any new derived target wins.
+        readable_indexes = [
+            index
+            for index, need in enumerate(candidate.needs)
+            if need.evidence_kind in {"weather", "calendar", "public_web"}
+        ]
+        if (
+            situation_id
+            and owner_id
+            and session_id
+            and len(readable_indexes) == 1
+        ):
+            index = readable_indexes[0]
+            candidate_need = candidate.needs[index]
+            if targets[index] is None:
+                # Reuse is continuation-only. Any current place or date
+                # signal must form a fresh endpoint (or remain unbound when
+                # it is ambiguous), rather than silently inheriting one.
+                candidate_has_place_signal = any(
+                    str(item.kind or "").lower() == "place"
+                    for item in candidate.entities
+                )
+                candidate_has_date_signal = bool(
+                    direct_weather_date
+                    or resolve_reported_window_end(source_text, current_time)
+                )
+                candidate_requirement = (
+                    candidate_need.observation_requirement.model_dump(mode="json")
+                    if candidate_need.observation_requirement is not None
+                    else None
+                )
+                existing = self.needs.list(
+                    owner_id=owner_id,
+                    session_id=session_id,
+                    situation_id=str(situation_id),
+                    limit=self.needs.max_needs_per_situation,
+                )
+                matching = [
+                    row
+                    for row in existing
+                    if (
+                        str(row.get("status") or "") in {"open", "asked", "observing", "waiting"}
+                        or (
+                            str(candidate_need.observation_mode) == "watch"
+                            and str(row.get("status") or "") == "resolved"
+                        )
+                    )
+                    and str(row.get("evidence_kind") or "") == str(candidate_need.evidence_kind)
+                    and str(row.get("observation_mode") or "once") == str(candidate_need.observation_mode)
+                    and row.get("observation_requirement") == candidate_requirement
+                    and isinstance(row.get("evidence_target"), Mapping)
+                    and bool(row.get("evidence_target"))
+                ]
+                if not candidate_has_place_signal and not candidate_has_date_signal and len(matching) == 1:
+                    existing_target = dict(matching[0]["evidence_target"])
+                    if candidate_need.evidence_kind == "weather":
+                        # Historical rows may have carried the requirement as
+                        # a target sidecar. Do not perpetuate that mixed shape:
+                        # weather target identity is location + optional day.
+                        reused_weather_target: dict[str, Any] = {
+                            "location": existing_target.get("location"),
+                        }
+                        if existing_target.get("target_date"):
+                            reused_weather_target["target_date"] = existing_target["target_date"]
+                        targets[index] = reused_weather_target
+                    else:
+                        targets[index] = copy.deepcopy(existing_target)
+        return targets
+
+    def _dedupe_typed_need_candidates(
         self,
         candidate: LivingContextCandidate,
-        *,
-        situation_id: str | None,
-        catalog_row: dict[str, Any] | None,
-    ) -> tuple[LivingContextCandidate, int]:
-        """Drop only exact active Need endpoint duplicates.
+        evidence_targets: list[dict[str, Any] | None],
+        unknown_bindings: Mapping[str, str | None] | None = None,
+    ) -> tuple[LivingContextCandidate, list[dict[str, Any] | None], dict[str, str | None], int]:
+        """Keep one Need per canonical typed target in this candidate.
 
-        ``InformationNeedRuntime`` historically includes ``evidence_kind`` in
-        its stable ID.  That can create a second active Need when a model
-        re-emits the same server-owned endpoint with a different source class.
-        The only durable comparison allowed here is the immutable turn-start
-        catalog row's exact active ``blocked_judgment``.  Same-event duplicate
-        endpoints are also reduced in order, retaining the first candidate.
-        Terminal Needs are absent from ``open_needs`` by design, so the normal
-        generation reopen path remains available.
+        Identity includes the observation mode, source kind, and complete
+        target projection (including observation requirement).  A source-only
+        match is never enough to merge two Needs.
         """
 
         if not candidate.needs:
-            return candidate, 0
-        active_endpoint_ids: dict[str, set[str]] = {}
-        if isinstance(catalog_row, dict):
-            open_needs = catalog_row.get("open_needs")
-            if isinstance(open_needs, list):
-                for raw_need in open_needs:
-                    if not isinstance(raw_need, dict):
-                        continue
-                    if str(raw_need.get("status") or "open") not in {"open", "asked", "observing", "waiting"}:
-                        continue
-                    endpoint = str(raw_need.get("blocked_judgment") or "").strip()
-                    need_token = str(raw_need.get("need_token") or "").strip()
-                    if endpoint:
-                        active_endpoint_ids.setdefault(endpoint, set()).add(need_token)
-
-        retained: list[CandidateNeed] = []
-        retained_endpoints: set[str] = set()
+            return candidate, [], {}, 0
+        retained_needs: list[CandidateNeed] = []
+        retained_targets: list[dict[str, Any] | None] = []
+        retained_bindings: dict[str, str | None] = {}
+        identities: set[str] = set()
         dropped = 0
-        for need in candidate.needs:
-            endpoint = str(need.blocked_judgment or "").strip()
-            candidate_need_id = self.needs.stable_need_id(
-                situation_id=str(situation_id or ""),
+        for index, need in enumerate(candidate.needs):
+            target = evidence_targets[index] if index < len(evidence_targets) else None
+            target_digest = stable_evidence_target_digest(target)
+            unknown_binding = (
+                unknown_bindings.get(need.blocked_judgment)
+                if isinstance(unknown_bindings, Mapping)
+                else None
+            )
+            identity = self.needs.stable_need_id(
+                situation_id="candidate",
                 blocked_judgment=need.blocked_judgment,
                 evidence_kind=need.evidence_kind,
+                evidence_target_digest=target_digest,
+                need_identity_digest=self.needs.need_identity_digest_for_candidate(need, target),
+                unknown_binding_digest=self.needs._unknown_binding_digest(unknown_binding),
+                typed_endpoint=True,
+                observation_mode=need.observation_mode,
             )
-            existing_ids = active_endpoint_ids.get(endpoint, set())
-            duplicate_active_endpoint = bool(
-                endpoint
-                and existing_ids
-                and candidate_need_id not in existing_ids
-            )
-            duplicate_same_turn_endpoint = bool(
-                endpoint
-                and endpoint in retained_endpoints
-            )
-            if duplicate_active_endpoint or duplicate_same_turn_endpoint:
+            if identity in identities:
                 dropped += 1
                 continue
-            retained.append(need)
-            if endpoint:
-                retained_endpoints.add(endpoint)
-        if dropped == 0:
-            return candidate, 0
-        return candidate.model_copy(update={"needs": retained}), dropped
+            identities.add(identity)
+            retained_needs.append(need)
+            retained_targets.append(copy.deepcopy(target) if isinstance(target, Mapping) else None)
+            if isinstance(unknown_bindings, Mapping) and need.blocked_judgment in unknown_bindings:
+                retained_bindings[need.blocked_judgment] = unknown_binding
+        if dropped == 0 and len(retained_targets) == len(evidence_targets):
+            return candidate, evidence_targets, dict(unknown_bindings or {}), 0
+        return candidate.model_copy(update={"needs": retained_needs}), retained_targets, retained_bindings, dropped
 
     @staticmethod
     def _turn_start_catalog_row(
@@ -577,6 +768,7 @@ class LivingContextRuntime:
         existing: dict[str, Any] | None,
         server_command: bool,
         unknown_bindings: dict[str, str | None],
+        evidence_targets: list[dict[str, Any] | None],
         planned_situation_id: str,
         admission_recovery: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
@@ -590,7 +782,13 @@ class LivingContextRuntime:
         with self.state_store.writer_transaction():
             semantic_digest = self.admission.digest(semantic_state)
             need_plan_digest = self.admission.digest(
-                [item.model_dump(mode="json") for item in validated_needs]
+                [
+                    {
+                        "need": item.model_dump(mode="json"),
+                        "evidence_target": copy.deepcopy(evidence_targets[index]),
+                    }
+                    for index, item in enumerate(validated_needs)
+                ]
             )
             answered_generations = {
                 str(item.get("need_id") or ""): int(item.get("generation") or 1)
@@ -751,6 +949,7 @@ class LivingContextRuntime:
                     needs=validated_needs,
                     source_event_id=event.event_id,
                     unknown_bindings=unknown_bindings,
+                    evidence_targets=evidence_targets,
                 )
             if semantic_already_applied:
                 persisted = copy.deepcopy(fresh_existing)
@@ -795,6 +994,7 @@ class LivingContextRuntime:
                         source_event_id=event.event_id,
                         expected_state_revision=expected_need_revision,
                         unknown_bindings=unknown_bindings,
+                        evidence_targets=evidence_targets,
                     )
                     needs_repaired = bool(persisted.get("semantic_replayed"))
                 else:
@@ -873,14 +1073,14 @@ class LivingContextRuntime:
         situation_id: str | None,
         owner_id: str,
         session_id: str,
+        evidence_targets: list[dict[str, Any] | None] | None = None,
     ) -> dict[str, str | None]:
         """Build a server-owned, one-to-one Need -> semantic unknown map.
 
-        The model may phrase the missing fact differently in ``unknown`` and
-        ``blocked_judgment``.  We bind only an exact match or the uniquely
-        attributable single candidate unknown.  Ambiguous rows intentionally
-        remain unbound so a later source receipt preserves the unknown and
-        reports degradation instead of guessing.
+        ``blocked_judgment`` is presentation only and is never compared to an
+        Unknown. Existing bindings survive only when the typed Need endpoint
+        identifies one current row. A new binding is possible only for the
+        unambiguous one-Need/one-current-turn-Unknown shape.
         """
 
         if not candidate.needs:
@@ -888,16 +1088,8 @@ class LivingContextRuntime:
         semantic_unknown = [
             str(item) for item in semantic_state.get("unknown") or [] if str(item).strip()
         ]
-        previous_unknown: set[str] = set()
         existing_needs: list[dict[str, Any]] = []
         if situation_id:
-            previous = self.situations.get_semantic(
-                str(situation_id), user_id=owner_id, session_id=session_id
-            )
-            if isinstance(previous, dict):
-                previous_unknown = {
-                    str(item) for item in (previous.get("semantic") or {}).get("unknown") or []
-                }
             existing_needs = self.needs.list(
                 owner_id=owner_id,
                 session_id=session_id,
@@ -908,62 +1100,66 @@ class LivingContextRuntime:
         candidate_unknown = [
             str(item) for item in candidate.unknown if str(item).strip()
         ]
-        candidate_blocked = {
-            str(need.blocked_judgment) for need in candidate.needs
-        }
         bindings: dict[str, str | None] = {}
         used: set[str] = set()
-        for item in existing_needs:
-            blocked = str(item.get("blocked_judgment") or "")
-            prior_binding = str(item.get("unknown_binding") or "").strip()
-            if (
-                blocked in candidate_blocked
-                and prior_binding
-                and prior_binding in semantic_unknown
-            ):
-                bindings.setdefault(blocked, prior_binding)
+
+        selected_targets = list(evidence_targets or [])
+        if selected_targets and len(selected_targets) != len(candidate.needs):
+            raise ValueError("InformationNeed evidence_targets must align with candidate Needs")
+        if not selected_targets:
+            selected_targets = [None] * len(candidate.needs)
+
+        for index, need in enumerate(candidate.needs):
+            target_digest = stable_evidence_target_digest(selected_targets[index])
+            need_identity_digest = self.needs.need_identity_digest_for_candidate(
+                need,
+                selected_targets[index],
+            )
+            same_source_mode = [
+                row
+                for row in existing_needs
+                if str(row.get("evidence_kind") or "") == str(need.evidence_kind)
+                and str(row.get("observation_mode") or "once") == str(need.observation_mode)
+            ]
+            typed_matches = [
+                row
+                for row in same_source_mode
+                if str(row.get("evidence_target_digest") or "") == str(target_digest or "")
+                and str(row.get("blocked_judgment") or "") == str(need.blocked_judgment)
+                and (
+                    not str(row.get("need_identity_digest") or "").strip()
+                    or str(row.get("need_identity_digest") or "") == need_identity_digest
+                )
+            ]
+            # A legacy binding may only survive an exact legacy identity. A
+            # newly typed target/requirement never inherits an old unknown
+            # merely because source and watch mode happen to match.
+            legacy_matches = [
+                row for row in same_source_mode
+                if not target_digest
+                and need.observation_requirement is None
+                and not str(row.get("evidence_target_digest") or "").strip()
+                and not str(row.get("need_identity_digest") or "").strip()
+                and str(row.get("blocked_judgment") or "") == str(need.blocked_judgment)
+            ]
+            matches = typed_matches
+            if not matches and target_digest and len(legacy_matches) == 1:
+                matches = legacy_matches
+            if len(matches) != 1:
+                continue
+            prior_binding = str(matches[0].get("unknown_binding") or "").strip()
+            if prior_binding and prior_binding in semantic_unknown and prior_binding not in used:
+                bindings[str(need.blocked_judgment)] = prior_binding
                 used.add(prior_binding)
 
-        for need in candidate.needs:
-            blocked = str(need.blocked_judgment)
-            if blocked in bindings:
-                continue
-            # Prefer an exact model-emitted unknown.  The canonical blocked
-            # judgment is appended by the server in ``_semantic_snapshot``;
-            # treating that synthetic value as the model's paraphrase would
-            # leave a second, stale unknown behind after a source receipt.
-            explicit_exact = [
-                value for value in candidate_unknown
-                if value == blocked and value not in used
-            ]
-            exact = explicit_exact or [
-                value for value in semantic_unknown
-                if value == blocked and value not in used
-            ]
-            if len(exact) == 1 and (explicit_exact or not candidate_unknown or blocked in previous_unknown):
-                bindings[blocked] = exact[0]
-                used.add(exact[0])
-
-        # A single newly emitted unknown and a single Need are a safe one-to-one
-        # binding even when their wording differs.  Do not bind an old unknown
-        # that merely happens to be present in the Situation history.
-        if len(candidate.needs) == 1:
+        # A lone Need and one current-turn unknown form an explicit
+        # one-to-one proposal. Multiple candidates remain unbound unless the
+        # structural preservation above already admitted their endpoint.
+        if len(candidate.needs) == 1 and len(candidate_unknown) == 1:
             need = candidate.needs[0]
-            blocked = str(need.blocked_judgment)
-            if blocked not in bindings:
-                fresh = [
-                    value for value in candidate_unknown
-                    if value not in previous_unknown and value not in used
-                ]
-                if len(fresh) == 1:
-                    bindings[blocked] = fresh[0]
-                    used.add(fresh[0])
-                    # The canonical blocked judgment is retained on the Need
-                    # record, while the semantic projection carries one exact
-                    # user-facing unknown for the source receipt to clear.
-                    semantic_state["unknown"] = [
-                        value for value in semantic_unknown if value != blocked
-                    ]
+            transport_key = str(need.blocked_judgment)
+            if transport_key not in bindings and candidate_unknown[0] not in used:
+                bindings[transport_key] = candidate_unknown[0]
 
         return bindings
 
@@ -1112,18 +1308,25 @@ class LivingContextRuntime:
             progress = copy.deepcopy(previous["progress"])
         known = list(previous.get("known") or []) if existing else []
         for item in candidate.known:
-            # A model summary without an exact source slice is an inference.
-            # A source-bound user quote may remain reported, while the
-            # original event observation is always recorded separately as
-            # reported by SemanticSituationRuntime.
-            epistemic_status = (
-                "reported"
-                if item.source_quote is not None and item.epistemic_status == "reported"
-                else "inferred"
+            # A Known statement without an exact user-message span remains a
+            # model attribution. The model's epistemic label alone is never
+            # enough to promote it to reported fact.
+            item_payload = item.model_dump(mode="json")
+            quote_is_valid = self._quote_is_source_bound(item.source_quote, text)
+            if item.source_quote is not None and not quote_is_valid:
+                item_payload["source_quote"] = None
+            is_user_report = (
+                event.type == EventType.USER_MESSAGE
+                and item.epistemic_status == "reported"
             )
+            epistemic_status = "reported" if is_user_report and quote_is_valid else "inferred"
+            if quote_is_valid:
+                item_payload["provenance_scope"] = "span"
+            elif is_user_report:
+                item_payload["provenance_scope"] = "model_attributed"
             known.append(
                 {
-                    **item.model_dump(mode="json"),
+                    **item_payload,
                     "epistemic_status": epistemic_status,
                     "source_event_id": event.event_id,
                     "recorded_at": event.timestamp,
@@ -1161,7 +1364,6 @@ class LivingContextRuntime:
             [
                 *(list(previous.get("unknown") or []) if existing else []),
                 *candidate.unknown,
-                *[item.blocked_judgment for item in candidate.needs],
             ],
             limit=12,
         )
@@ -1169,15 +1371,51 @@ class LivingContextRuntime:
         if candidate.disposition == "resolve":
             lifecycle = "resolved"
         entities = list(previous.get("entities") or []) if existing else []
-        for item in candidate.entities:
-            epistemic_status = (
-                "reported"
-                if item.source_quote is not None and item.epistemic_status == "reported"
-                else "inferred"
+        correction_replaces_places = (
+            candidate.disposition == "correct"
+            and candidate.assertion_mode == "direct_user"
+            and candidate.source_quote is not None
+            and len(candidate.entities) == 1
+            and candidate.entities[0].kind == "place"
+            and self._quote_is_source_bound(
+                candidate.entities[0].source_quote,
+                text,
+                expected_text=candidate.entities[0].value,
             )
+        )
+        if correction_replaces_places:
+            entities = [
+                item
+                for item in entities
+                if not isinstance(item, dict)
+                or str(item.get("kind") or "").lower() != "place"
+            ]
+        for item in candidate.entities:
+            # Entity provenance has two honest tiers: an exact source span is
+            # reported; without one the value remains inferred/model-attributed
+            # and may only be used as a tentative read parameter by a narrowly
+            # typed, separately consented weather source.
+            item_payload = item.model_dump(mode="json")
+            quote_is_valid = self._quote_is_source_bound(
+                item.source_quote,
+                text,
+                expected_text=item.value,
+            )
+            if item.source_quote is not None and not quote_is_valid:
+                item_payload["source_quote"] = None
+            if quote_is_valid:
+                is_user_report = (
+                    event.type == EventType.USER_MESSAGE
+                    and item.epistemic_status == "reported"
+                )
+                epistemic_status = "reported" if is_user_report else "inferred"
+                item_payload["provenance_scope"] = "span"
+            else:
+                epistemic_status = "inferred"
+                item_payload["provenance_scope"] = "model_attributed"
             entities.append(
                 {
-                    **item.model_dump(mode="json"),
+                    **item_payload,
                     "epistemic_status": epistemic_status,
                     "source_event_id": event.event_id,
                     "recorded_at": event.timestamp,
@@ -1236,6 +1474,23 @@ class LivingContextRuntime:
         return str(payload.get("text") or payload.get("message") or "")
 
     @staticmethod
+    def _quote_is_source_bound(
+        quote: Any,
+        source_text: str,
+        *,
+        expected_text: str | None = None,
+    ) -> bool:
+        """Check one supplied quote without deriving or searching a replacement."""
+
+        return bool(
+            quote is not None
+            and source_text
+            and (expected_text is None or quote.text == expected_text)
+            and quote.end <= len(source_text)
+            and source_text[quote.start : quote.end] == quote.text
+        )
+
+    @staticmethod
     def _validate_quotes(candidate: LivingContextCandidate, text: str) -> None:
         if candidate.source_quote is not None:
             if (
@@ -1244,7 +1499,7 @@ class LivingContextRuntime:
                 != candidate.source_quote.text
             ):
                 raise ValueError("living context candidate source_quote is not source-bound")
-        for item in [*candidate.known, *candidate.timeline, *candidate.entities]:
+        for item in [*candidate.known, *candidate.timeline]:
             quote = item.source_quote
             if quote is None:
                 continue

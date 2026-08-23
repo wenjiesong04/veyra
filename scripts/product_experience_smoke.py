@@ -22,6 +22,8 @@ from core.world_state import WorldStateStore  # noqa: E402
 from interface.event_schema import EventSource, EventType, VeyraEvent  # noqa: E402
 from routers.product import build_product_router  # noqa: E402
 from runtime.living_context_runtime import LivingContextRuntime  # noqa: E402
+from runtime.living_context_composition import build_living_context_composition  # noqa: E402
+from runtime.product_conversation_runtime import ProductConversationRuntime  # noqa: E402
 from runtime.product_experience import ProductExperienceService  # noqa: E402
 
 
@@ -146,7 +148,14 @@ def main() -> int:
         store = WorldStateStore(Path(temporary) / "state")
         living = LivingContextRuntime(store)
         owner, session = "owner-a", "session-a"
-        service = ProductExperienceService(store, living_context_runtime=living)
+        conversation_runtime = ProductConversationRuntime(store)
+        composition = build_living_context_composition(store, conversation_runtime=conversation_runtime)
+        service = ProductExperienceService(
+            store,
+            living_context_runtime=composition.core,
+            reaction_runtime=composition.reaction,
+            living_context_orchestrator=composition.orchestrator,
+        )
         outputs: list[dict[str, Any]] = []
         for number in range(1, 4):
             current_event = event(owner, session, number, f"Situation {number} is real.")
@@ -213,8 +222,42 @@ def main() -> int:
         reaction_id = reaction["decision"]["reaction_id"]
         reactions = client.get(f"/product/reactions?user_id={owner}&session_id={session}").json()
         expect(any(item["reaction_id"] == reaction_id and item["what_changed"] and item["why_relevant"] and item["why_now"] and item["recommendation"] for item in reactions["items"]), "reaction exposes what/why/why-now/recommendation")
+        # Product Conversation is an auxiliary display mirror.  A corrupt or
+        # absent mirror must not prevent the reaction ledger from recording
+        # feedback or make Product reads lose the card after refresh.
+        original_feedback_mirror = conversation_runtime.update_reaction_feedback
+        def unavailable_feedback_mirror(*_: Any, **__: Any) -> dict[str, Any]:
+            raise RuntimeError("simulated Product Conversation corruption")
+        conversation_runtime.update_reaction_feedback = unavailable_feedback_mirror  # type: ignore[method-assign]
         feedback = client.post(f"/product/reactions/{reaction_id}/feedback?user_id={owner}&session_id={session}", json={"label": "useful", "situation_revision": current["revision"]})
-        expect(feedback.status_code == 200 and feedback.json()["status"] == "recorded", "typed reaction feedback is accepted")
+        conversation_runtime.update_reaction_feedback = original_feedback_mirror  # type: ignore[method-assign]
+        expect(
+            feedback.status_code == 200
+            and feedback.json()["status"] == "recorded"
+            and feedback.json().get("conversation", {}).get("status") == "degraded",
+            "reaction feedback remains durable when Product Conversation mirror is unavailable",
+        )
+        refreshed_reactions = client.get(f"/product/reactions?user_id={owner}&session_id={session}").json()
+        refreshed_reaction = next(item for item in refreshed_reactions["items"] if item["reaction_id"] == reaction_id)
+        expect(
+            refreshed_reaction["feedback"] == {"available": False, "token": refreshed_reaction["feedback_token"], "label": "useful", "at": refreshed_reaction["feedback"]["at"]}
+            and bool(refreshed_reaction["feedback"]["at"]),
+            "reaction ledger remains the authoritative feedback projection after refresh",
+        )
+        original_message_reader = conversation_runtime.get_reaction_message
+        def corrupt_message_reader(*_: Any, **__: Any) -> dict[str, Any]:
+            raise RuntimeError("simulated incompatible Product Conversation ledger")
+        conversation_runtime.get_reaction_message = corrupt_message_reader  # type: ignore[method-assign]
+        detail_after_conversation_failure = client.get(f"/product/situations/{ids[1]}?user_id={owner}&session_id={session}").json()
+        reaction_after_conversation_failure = client.get(f"/product/reactions?user_id={owner}&session_id={session}").json()
+        today_after_conversation_failure = client.get(f"/product/today?user_id={owner}&session_id={session}").json()
+        conversation_runtime.get_reaction_message = original_message_reader  # type: ignore[method-assign]
+        expect(
+            detail_after_conversation_failure["situation"] is not None
+            and any(item["reaction_id"] == reaction_id for item in reaction_after_conversation_failure["items"])
+            and isinstance(today_after_conversation_failure["situations"], list),
+            "Conversation corruption does not suppress valid Situation, reaction, or Today rows",
+        )
         stale_feedback = client.post(f"/product/reactions/{reaction_id}/feedback?user_id={owner}&session_id={session}", json={"label": "ignore", "situation_revision": current["revision"] + 1})
         expect(stale_feedback.status_code == 409, "feedback revision mismatch fails closed")
         suggestion_situation = service.situation_detail(ids[0], user_id=owner, session_id=session)["situation"]
@@ -233,6 +276,64 @@ def main() -> int:
         today_after_reaction = client.get(f"/product/today?user_id={owner}&session_id={session}").json()
         expect(all(item["disposition"] == "suggest" for item in today_after_reaction["suggestions"]), "Today suggestions exclude ask/read/wait")
         expect(all(item["disposition"] == "wait" for item in today_after_reaction["waiting"]), "Today waiting contains only wait dispositions")
+
+        # A later scheduler tick is a reaction-history row, not a dismissal
+        # of an already admitted suggestion.  The product catalog keeps the
+        # active card until feedback, expiry, or a newer suggestion replaces
+        # it for this exact Situation.
+        silent_after_suggest = service.reaction_runtime.evaluate({
+            "owner_id": owner,
+            "session_id": session,
+            "now": datetime(2026, 8, 17, 13, 1, 30, tzinfo=timezone.utc).isoformat(),
+            "quiet_hours": False,
+            "consent": {"user": True},
+            "source_availability": {"user": True},
+            "situation": {
+                **suggestion_situation,
+                "owner_id": owner,
+                "session_id": session,
+                "revision": suggestion_situation["revision"],
+                "unknown": [],
+                "material_change": {},
+            },
+            "information_need": None,
+        })
+        expect(silent_after_suggest["decision"]["disposition"] == "silent", "post-suggestion scheduler tick is silent history")
+        retained = client.get(f"/product/suggestions?user_id={owner}&session_id={session}&situation_id={ids[0]}").json()
+        expect(
+            any(item["reaction_id"] == suggested["decision"]["reaction_id"] for item in retained["items"]),
+            "silent/cooldown history does not hide an active suggestion",
+        )
+        replaced = service.reaction_runtime.evaluate({
+            "owner_id": owner,
+            "session_id": session,
+            "now": datetime(2026, 8, 17, 13, 2, tzinfo=timezone.utc).isoformat(),
+            "quiet_hours": False,
+            "consent": {"user": True},
+            "source_availability": {"user": True},
+            "situation": {
+                **suggestion_situation,
+                "owner_id": owner,
+                "session_id": session,
+                "revision": suggestion_situation["revision"],
+                "material_change": {"statement": "A newer material signal was recorded.", "revision": 3},
+            },
+            "information_need": None,
+        })
+        replaced_catalog = client.get(f"/product/suggestions?user_id={owner}&session_id={session}&situation_id={ids[0]}").json()
+        expect(
+            replaced["decision"]["disposition"] == "suggest"
+            and [item["reaction_id"] for item in replaced_catalog["items"]] == [replaced["decision"]["reaction_id"]],
+            "new suggestion supersedes the previous active suggestion",
+        )
+        feedback_replaced = client.post(
+            f"/product/reactions/{replaced['decision']['reaction_id']}/feedback?user_id={owner}&session_id={session}",
+            json={"label": "useful", "situation_revision": suggestion_situation["revision"]},
+        )
+        expect(feedback_replaced.status_code == 200, "feedback on the active suggestion is recorded")
+        after_feedback = client.get(f"/product/suggestions?user_id={owner}&session_id={session}&situation_id={ids[0]}").json()
+        expect(after_feedback["items"] == [], "feedback closes the active suggestion without repeating it")
+
         boundary = today_after_reaction["suggestions_boundary"]
         expect(
             boundary["projected_ledger"] == "living_reaction.suggest"
@@ -309,6 +410,17 @@ def main() -> int:
             def list_reactions(self, **_: Any) -> list[dict[str, Any]]:
                 return list(self.rows)
 
+            def get_current_reaction(self, *, owner_id: str, session_id: str, situation_id: str, situation_revision: int) -> dict[str, Any] | None:
+                rows = [
+                    row
+                    for row in self.rows
+                    if row.get("owner_id") == owner_id
+                    and row.get("session_id") == session_id
+                    and row.get("situation_id") == situation_id
+                    and int(row.get("situation_revision") or 0) == situation_revision
+                ]
+                return max(rows, key=lambda row: str(row.get("created_at") or ""), default=None)
+
         current_revision = int(service.situation_detail(ids[0], user_id=owner, session_id=session)["situation"]["revision"])
         paged_rows = [
             {"owner_id": owner, "session_id": session, "situation_id": ids[0], "situation_revision": current_revision - 1, "reaction_id": "stale-suggestion-1", "disposition": "suggest", "category": "test", "created_at": "2026-08-17T15:03:00+00:00", "what_happened": "stale", "why_it_matters": "stale", "why_now": "stale", "suggested_next_step": "stale", "rank": 0.9},
@@ -318,6 +430,10 @@ def main() -> int:
         paged_service = ProductExperienceService(store, living_context_runtime=living, reaction_runtime=PagedReactionRuntime(paged_rows))
         paged_suggestions = paged_service.reactions(user_id=owner, session_id=session, situation_id=ids[0], limit=1, visible_dispositions={"suggest"})
         expect(len(paged_suggestions["items"]) == 1 and paged_suggestions["items"][0]["reaction_id"] == "current-suggestion", "suggestions filter current revision before limiting")
+        switched_rows = paged_rows + [{**paged_rows[-1], "reaction_id": "new-silent", "disposition": "silent", "created_at": "2026-08-17T15:04:00+00:00"}]
+        switched_service = ProductExperienceService(store, living_context_runtime=living, reaction_runtime=PagedReactionRuntime(switched_rows))
+        switched_suggestions = switched_service.reactions(user_id=owner, session_id=session, situation_id=ids[0], limit=10, visible_dispositions={"suggest"})
+        expect(switched_suggestions["items"] == [], "new silent current reaction hides older suggestions")
 
         before = bytes_snapshot(store)
         for path in (
