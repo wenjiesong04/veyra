@@ -4,6 +4,16 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Veyra Console</title>
+    <script>
+      try {
+        const theme = localStorage.getItem("veyra.theme");
+        const language = localStorage.getItem("veyra.language");
+        document.documentElement.dataset.theme = ["light", "dark", "system"].includes(theme) ? theme : "system";
+        document.documentElement.lang = language === "en" ? "en" : language === "zh" ? "zh-CN" : navigator.language;
+      } catch {
+        document.documentElement.dataset.theme = "system";
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

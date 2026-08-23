@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, ArrowUpRight, Clock3, History, Info, MessageCircle, Paperclip, Plus, Send, ShieldCheck, Sparkles, X } from "lucide-react";
-import { getProductConversation, productConversationId, productConversationMessages, streamMessage, type MessageResult, type MessageStreamEvent, type ProductContext, type ProductInputScope, type ProductScope } from "./api";
-import { Disclosure, formatTime, isEnglish, Language, OwnerScope, safeText, sanitizeHistory, Surface } from "./shared";
+import { ArrowLeft, ArrowUpRight, Clock3, History, Info, MessageCircle, Plus, Send, ShieldCheck, Sparkles, X } from "lucide-react";
+import { feedbackProductReaction, getProductConversation, HttpError, productConversationId, productConversationMessages, streamEventConversationId, streamMessage, type MessageResult, type MessageStreamEvent, type ProductContext, type ProductConversationFactInference, type ProductConversationFeedbackLabel, type ProductConversationMetadata, type ProductInputScope, type ProductScope } from "./api";
+import { Disclosure, formatTime, isEnglish, Language, noticeForImagePaste, OwnerScope, safeText, sanitizeHistory, Surface } from "./shared";
 
 export type LocalConversation = {
   id: string;
@@ -26,12 +26,16 @@ type ConversationMessage = {
   createdAt: string;
   ownerId?: string;
   sessionId?: string;
+  kind?: string;
+  source?: string;
+  metadata?: ProductConversationMetadata;
   result?: MessageResult;
   status?: "streaming" | "completed" | "failed";
   error?: string;
 };
 
 const HISTORY_KEY = "veyra.local-conversations.v1";
+const RUNTIME_VERSION_MISMATCH = "Runtime version mismatch:";
 
 export function conversationIdFor(item: LocalConversation): string {
   return item.conversationId || item.id;
@@ -79,7 +83,9 @@ function serverMessageRows(payload: unknown, conversationId: string, scope: Prod
     const sessionId = safeText(recordValue(row, "session_id"), "").trim();
     if ((ownerId && ownerId !== scope.user_id) || (sessionId && sessionId !== scope.session_id)) return;
     const kind = safeText(recordValue(row, "kind", "message_type", "type"), "").toLowerCase();
-    const role = kind === "proactive" ? "proactive" : messageRole(recordValue(row, "role"));
+    const source = safeText(recordValue(row, "source"), "").toLowerCase();
+    const proactive = kind === "proactive" && source === "living_reaction";
+    const role = proactive ? "proactive" : messageRole(recordValue(row, "role"));
     const nested = recordValue(row, "result", "payload");
     const hasResultFields = recordValue(row, "response", "artifacts", "risk_level", "route", "status") !== undefined;
     const result = messageResult(nested) ?? (role !== "user" && hasResultFields ? messageResult(row) : undefined);
@@ -94,6 +100,9 @@ function serverMessageRows(payload: unknown, conversationId: string, scope: Prod
       createdAt: safeText(recordValue(row, "created_at", "timestamp", "updated_at"), new Date(index).toISOString()),
       ownerId: ownerId || scope.user_id,
       sessionId: sessionId || scope.session_id,
+      kind,
+      source,
+      metadata: row.metadata,
       result,
       status: "completed",
     });
@@ -104,6 +113,31 @@ function serverMessageRows(payload: unknown, conversationId: string, scope: Prod
     if (Number.isFinite(left) && Number.isFinite(right) && left !== right) return left - right;
     return 0;
   });
+}
+
+type ConversationFeedbackState = Record<string, ProductConversationFeedbackLabel | undefined>;
+
+const conversationFeedbackChoices: Array<{ label: ProductConversationFeedbackLabel; zh: string; en: string }> = [
+  { label: "useful", zh: "有帮助", en: "Useful" },
+  { label: "not_useful", zh: "没帮助", en: "Not useful" },
+  { label: "too_early", zh: "太早", en: "Too early" },
+  { label: "too_frequent", zh: "太频繁", en: "Too frequent" },
+  { label: "resolved", zh: "已解决", en: "Resolved" },
+];
+
+function factInferenceValues(value: ProductConversationFactInference | undefined, key: "facts" | "inferences"): string[] {
+  return value?.[key]?.filter((item) => typeof item === "string" && item.trim()).slice(0, 8) ?? [];
+}
+
+function FactInferenceDisclosure({ value, language }: { value?: ProductConversationFactInference; language: Language }) {
+  const en = isEnglish(language);
+  const facts = factInferenceValues(value, "facts");
+  const inferences = factInferenceValues(value, "inferences");
+  if (!facts.length && !inferences.length) return null;
+  return <Disclosure title={en ? "Facts and inference" : "事实与推断"}><div className="proactiveEvidenceGrid">
+    {facts.length ? <div><span>{en ? "Facts" : "事实"}</span><ul>{facts.map((item, index) => <li key={`fact-${index}`}>{item}</li>)}</ul></div> : null}
+    {inferences.length ? <div><span>{en ? "Inference" : "推断"}</span><ul>{inferences.map((item, index) => <li key={`inference-${index}`}>{item}</li>)}</ul></div> : null}
+  </div></Disclosure>;
 }
 
 function mergeMessages(current: ConversationMessage[], incoming: ConversationMessage[]): ConversationMessage[] {
@@ -181,6 +215,23 @@ function recoverInterruptedTurns(items: LocalConversation[], en: boolean): Local
   } : item);
 }
 
+function cachedConversationMessages(scope: OwnerScope, conversationId: string, language: Language): ConversationMessage[] {
+  const scoped = conversationScope(scope);
+  const en = isEnglish(language);
+  const cached = recoverInterruptedTurns(readHistory(scope).filter((item) => conversationIdFor(item) === conversationId), en);
+  return cached.flatMap((item) => {
+    const user: ConversationMessage = { messageId: item.id, conversationId, role: "user", text: item.text, createdAt: item.createdAt, ownerId: scoped.user_id, sessionId: scoped.session_id, status: item.status, error: item.error };
+    const assistant = item.result ? [{ messageId: `${item.id}:response`, conversationId, role: "assistant" as const, text: safeText(item.result.response, safeText(item.result.message, "")), createdAt: item.createdAt, ownerId: scoped.user_id, sessionId: scoped.session_id, result: item.result, status: "completed" as const }] : [];
+    return [user, ...assistant];
+  });
+}
+
+function isRuntimeVersionMismatch(error: unknown): boolean {
+  return error instanceof HttpError
+    && error.status === 404
+    && error.message.startsWith(RUNTIME_VERSION_MISMATCH);
+}
+
 function newId(): string {
   return typeof crypto?.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
@@ -219,6 +270,7 @@ function eventPhase(event: MessageStreamEvent): string | undefined {
  */
 export function HomePage({ scope: _scope, productContext, inputScope, language = "zh", onOpenHistory, onStartChat }: { scope: OwnerScope; productContext?: ProductContext | null; inputScope?: ProductInputScope | null; language?: Language; onOpenHistory?: () => void; onStartChat: (text: string) => void }) {
   const [text, setText] = useState("");
+  const [pasteHint, setPasteHint] = useState<string | null>(null);
   const en = isEnglish(language);
   const contextStatus = String(productContext?.status ?? "loading");
   const prompts = useMemo(
@@ -234,6 +286,8 @@ export function HomePage({ scope: _scope, productContext, inputScope, language =
       ? (en ? "This input is paused until the local session link is verified." : "本地 session link 完成验证前，输入已暂停。")
       : contextStatus === "degraded"
         ? (en ? "The local product state is degraded; input stays paused until scope can be verified." : "本机产品状态部分不可用；作用域验证完成前，输入会保持暂停。")
+        : contextStatus === "reconnecting"
+          ? (en ? "Reconnecting to the local product state…" : "正在重新连接本机产品状态…")
         : (en ? "Before we begin, Veyra needs a local connection." : "开始前，Veyra 需要完成本地连接。");
   const submit = (event?: FormEvent) => {
     event?.preventDefault();
@@ -250,8 +304,9 @@ export function HomePage({ scope: _scope, productContext, inputScope, language =
     <p className="welcomeLead">{en ? "I’ll first understand what you’re doing, then decide whether to answer, remember, remind you, or stay quiet." : "我会先了解你正在做什么，再决定是回答、记录、提醒，还是保持安静。"}</p>
     {needsConnection ? <div className="welcomeNote connectionNote"><Info size={15} /><span>{connectionCopy}</span>{contextStatus !== "loading" ? <a href="#/settings">{en ? "Open Settings" : "打开设置"}<ArrowUpRight size={13} /></a> : null}</div> : null}
     <form className="composer" onSubmit={submit}>
-      <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder={en ? "Tell me what you’re working on, or what I should keep in view…" : "告诉我你正在做什么，或希望我关注什么…"} aria-label={en ? "Message" : "输入消息"} rows={2} disabled={needsConnection} />
-      <div className="composerBar"><span className="composerHint"><ShieldCheck size={14} />{inputScope ? (en ? "Local Veyra · actions remain reviewable" : "本机 Veyra · 行动始终可复核") : (en ? "Waiting for the local connection" : "等待本机连接")}</span><div className="composerActions"><button type="button" className="iconButton subtle" title={en ? "Attachments not enabled" : "附件暂未启用"} aria-label={en ? "Attachments not enabled" : "附件暂未启用"} disabled><Paperclip size={17} /></button><button className="sendButton" type="submit" disabled={!text.trim() || !inputScope}><Send size={17} /><span>{en ? "Start conversation" : "开始对话"}</span></button></div></div>
+      <textarea value={text} onChange={(event) => { setText(event.target.value); if (pasteHint) setPasteHint(null); }} onPaste={(event) => { const notice = noticeForImagePaste(event, en); if (notice) setPasteHint(notice); }} placeholder={en ? "Tell me what you’re working on, or what I should keep in view…" : "告诉我你正在做什么，或希望我关注什么…"} aria-label={en ? "Message" : "输入消息"} rows={2} disabled={needsConnection} />
+      {pasteHint ? <p className="composerPasteHint"><Info size={14} />{pasteHint}</p> : null}
+      <div className="composerBar"><span className="composerHint"><ShieldCheck size={14} />{inputScope ? (en ? "Local Veyra · text only · actions remain reviewable" : "本机 Veyra · 只接受文字 · 行动始终可复核") : (en ? "Waiting for the local connection" : "等待本机连接")}</span><div className="composerActions"><button className="sendButton" type="submit" disabled={!text.trim() || !inputScope}><Send size={17} /><span>{en ? "Start conversation" : "开始对话"}</span></button></div></div>
     </form>
     <div className="promptRow" aria-label={en ? "Suggestions" : "引导问题"}>{prompts.map((prompt) => <button key={prompt} type="button" onClick={() => setText(prompt)}><Sparkles size={14} />{prompt}</button>)}</div>
     <div className="conversationFooter"><span>{en ? "A quiet place to begin · server conversation ledger" : "从这里安静地开始 · 会话由服务器账本保存"}</span><button className="textButton" type="button" onClick={onOpenHistory}><History size={14} />{en ? "View history" : "查看会话历史"}<ArrowUpRight size={13} /></button></div>
@@ -266,12 +321,15 @@ export function ChatPage({ scope, inputScope, inputStatus, language = "zh", conv
   const [busy, setBusy] = useState(false);
   const [activePhase, setActivePhase] = useState<string | undefined>();
   const [error, setError] = useState<string | null>(null);
+  const [pasteHint, setPasteHint] = useState<string | null>(null);
+  const [ledgerState, setLedgerState] = useState<"loading" | "ready" | "expired" | "error">(isNewConversation ? "ready" : "loading");
+  const [feedbackByMessage, setFeedbackByMessage] = useState<ConversationFeedbackState>({});
   const [serverConversationId, setServerConversationId] = useState(isNewConversation ? "" : conversationId);
   const messagesRef = useRef<ConversationMessage[]>([]);
   const serverConversationIdRef = useRef(serverConversationId);
-  const createdRouteRef = useRef<string | null>(null);
   const startedPending = useRef<string | null>(null);
   const requestRef = useRef<AbortController | null>(null);
+  const conversationRequestSeq = useRef(0);
   const sessionLinkRequired = inputStatus === "needs_session_link";
   const scoped = conversationScope(scope);
 
@@ -287,10 +345,12 @@ export function ChatPage({ scope, inputScope, inputStatus, language = "zh", conv
     const id = serverConversationIdRef.current;
     if (!id) return;
     requestRef.current?.abort();
+    const requestSeq = ++conversationRequestSeq.current;
     const controller = new AbortController();
     requestRef.current = controller;
     try {
       const payload = await getProductConversation(id, scoped, { signal: controller.signal });
+      if (controller.signal.aborted || requestSeq !== conversationRequestSeq.current) return;
       const envelopeId = productConversationId(payload.conversation) || productConversationId(payload);
       if (envelopeId && envelopeId !== id) throw new Error(en ? "This conversation belongs to another scope." : "这个会话不属于当前 owner/session。");
       const envelope = payload.conversation ?? payload;
@@ -300,19 +360,28 @@ export function ChatPage({ scope, inputScope, inputStatus, language = "zh", conv
       const serverMessages = serverMessageRows(payload, id, scoped);
       setMessageState((current) => mergeMessages(current, serverMessages));
       cacheMessages(serverMessages, scope, id, onHistoryChange);
+      setLedgerState("ready");
       setError(null);
     } catch (caught) {
-      if (controller.signal.aborted) return;
-      const message = caught instanceof Error ? caught.message : (en ? "Conversation could not be loaded." : "会话暂时无法加载。");
-      if (!messagesRef.current.length) {
-        const cached = recoverInterruptedTurns(readHistory(scope).filter((item) => conversationIdFor(item) === id), en);
-        const fallback = cached.flatMap((item) => {
-          const user: ConversationMessage = { messageId: item.id, conversationId: id, role: "user", text: item.text, createdAt: item.createdAt, ownerId: scoped.user_id, sessionId: scoped.session_id, status: item.status };
-          const assistant = item.result ? [{ messageId: `${item.id}:response`, conversationId: id, role: "assistant" as const, text: safeText(item.result.response, safeText(item.result.message, "")), createdAt: item.createdAt, ownerId: scoped.user_id, sessionId: scoped.session_id, result: item.result, status: "completed" as const }] : [];
-          return [user, ...assistant];
-        });
-        if (fallback.length) setMessageState(fallback);
+      if (controller.signal.aborted || requestSeq !== conversationRequestSeq.current) return;
+      // A generic FastAPI 404 means this frontend and backend are different
+      // revisions, not that this particular conversation has expired. Keep
+      // the scoped browser recovery visible while showing a bounded warning.
+      if (isRuntimeVersionMismatch(caught)) {
+        setMessageState((current) => current.length ? current : cachedConversationMessages(scope, id, language));
+        setLedgerState("error");
+        setError(en ? "The local Veyra frontend and backend are on different versions. Cached conversation history is shown when available." : "本机 Veyra 前端与后端版本不匹配；如有可用内容，正在显示本机缓存的会话记录。");
+        return;
       }
+      if (caught instanceof HttpError && caught.status === 404) {
+        setMessageState([]);
+        setLedgerState("expired");
+        setError(null);
+        if (typeof window !== "undefined") window.dispatchEvent(new Event("veyra:refresh-conversations"));
+        return;
+      }
+      const message = caught instanceof Error ? caught.message : (en ? "Conversation could not be loaded." : "会话暂时无法加载。");
+      setLedgerState("error");
       setError(message);
     } finally {
       if (requestRef.current === controller) requestRef.current = null;
@@ -321,19 +390,24 @@ export function ChatPage({ scope, inputScope, inputStatus, language = "zh", conv
 
   useEffect(() => {
     requestRef.current?.abort();
-    if (createdRouteRef.current === conversationId && !isNewConversation) {
-      serverConversationIdRef.current = conversationId;
-      setServerConversationId(conversationId);
-      void refreshConversation();
+    if (isNewConversation) {
+      serverConversationIdRef.current = "";
+      setServerConversationId("");
+      setMessageState([]);
+      setLedgerState("ready");
+      setBusy(false); setActivePhase(undefined); setError(null); setPasteHint(null); setFeedbackByMessage({}); startedPending.current = null;
       return () => requestRef.current?.abort();
     }
-    createdRouteRef.current = null;
-    serverConversationIdRef.current = isNewConversation ? "" : conversationId;
-    setServerConversationId(isNewConversation ? "" : conversationId);
-    messagesRef.current = [];
-    setMessages([]);
-    setBusy(false); setActivePhase(undefined); setError(null); startedPending.current = null;
-    if (!isNewConversation) void refreshConversation();
+    // The summary list is intentionally not consulted for existence: it is a
+    // history projection and may be paginated, delayed, or unavailable.  The
+    // exact owner/session GET below is the sole authority for valid vs 404.
+    serverConversationIdRef.current = conversationId;
+    setServerConversationId(conversationId);
+    // The exact server ledger remains authoritative.  This only keeps a
+    // readable scoped migration/offline copy visible until that read settles.
+    setMessageState(cachedConversationMessages(scope, conversationId, language));
+    setLedgerState("loading");
+    void refreshConversation();
     return () => requestRef.current?.abort();
     // The refresh function intentionally reads refs so route changes cannot
     // apply an old owner/session response to the current conversation.
@@ -341,14 +415,14 @@ export function ChatPage({ scope, inputScope, inputStatus, language = "zh", conv
   }, [scope.userId, scope.sessionId, inputScope?.user_id, inputScope?.session_id, conversationId, isNewConversation]);
 
   useEffect(() => {
-    if (!serverConversationId) return;
+    if (!serverConversationId || ledgerState === "expired") return;
     const refresh = () => void refreshConversation();
     const timer = window.setInterval(refresh, 12_000);
     window.addEventListener("focus", refresh);
     window.addEventListener("veyra:refresh-conversations", refresh);
     return () => { window.clearInterval(timer); window.removeEventListener("focus", refresh); window.removeEventListener("veyra:refresh-conversations", refresh); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serverConversationId, scope.userId, scope.sessionId]);
+  }, [serverConversationId, scope.userId, scope.sessionId, ledgerState]);
 
   useEffect(() => {
     if (historyEpoch > 0) void refreshConversation();
@@ -363,10 +437,20 @@ export function ChatPage({ scope, inputScope, inputStatus, language = "zh", conv
       setError(en ? "Veyra is waiting for a local session link." : "Veyra 正在等待本机 session link。");
       return;
     }
-    setDraft(""); setBusy(true); setError(null); setActivePhase("accepted");
+    setDraft(""); setBusy(true); setError(null); setPasteHint(null); setActivePhase("accepted");
     const optimisticId = newId();
     let activeId = serverConversationIdRef.current;
     const optimisticConversationId = activeId || conversationId;
+    const bindConversation = (nextId: string) => {
+      const id = nextId.trim();
+      if (!id || id === activeId) return;
+      activeId = id;
+      serverConversationIdRef.current = id;
+      setServerConversationId(id);
+      setMessageState((current) => current.map((message) => ({ ...message, conversationId: id })));
+      cacheMessages(messagesRef.current, scope, id, onHistoryChange);
+      onConversationCreated?.(id);
+    };
     try {
       const userMessage: ConversationMessage = { messageId: optimisticId, conversationId: optimisticConversationId, role: "user", text: value, createdAt: new Date().toISOString(), ownerId: scoped.user_id, sessionId: scoped.session_id, status: "streaming" };
       setMessageState((current) => mergeMessages(current, [userMessage]));
@@ -374,15 +458,11 @@ export function ChatPage({ scope, inputScope, inputStatus, language = "zh", conv
       const result = await streamMessage(value, inputScope.user_id, inputScope.session_id, optimisticId, (event) => {
         const phase = eventPhase(event);
         if (phase) setActivePhase(phase);
+        const admitted = streamEventConversationId(event);
+        if (admitted) bindConversation(admitted);
       }, inputScope.channel, activeId || undefined);
       const canonicalConversationId = safeText(result.conversation_id, "").trim();
-      if (canonicalConversationId && canonicalConversationId !== activeId) {
-        activeId = canonicalConversationId;
-        serverConversationIdRef.current = canonicalConversationId;
-        setServerConversationId(canonicalConversationId);
-        createdRouteRef.current = canonicalConversationId;
-        onConversationCreated?.(canonicalConversationId);
-      }
+      if (canonicalConversationId) bindConversation(canonicalConversationId);
       const assistantText = safeText(result.response, safeText(result.message, ""));
       const assistantId = safeText(result.message_id, safeText(result.event_id, "")) || newId();
       setMessageState((current) => {
@@ -413,25 +493,124 @@ export function ChatPage({ scope, inputScope, inputStatus, language = "zh", conv
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingText]);
 
-  const title = messages.find((message) => message.role === "user")?.text || (en ? "New conversation" : "新会话");
+  const handleFeedback = (messageId: string, label: ProductConversationFeedbackLabel, updatedMessage?: ConversationMessage) => {
+    setFeedbackByMessage((current) => ({ ...current, [messageId]: label }));
+    if (updatedMessage) {
+      setMessageState((current) => current.map((item) => item.messageId === messageId ? { ...item, ...updatedMessage, metadata: updatedMessage.metadata ?? item.metadata, status: "completed" as const } : item));
+    } else {
+      void refreshConversation();
+    }
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new Event("veyra:refresh-product"));
+      window.dispatchEvent(new Event("veyra:refresh-conversations"));
+    }
+  };
+
+  const conversationLoading = !isNewConversation && ledgerState === "loading";
+  const title = messages.find((message) => message.role === "user")?.text || (conversationLoading ? (en ? "Loading conversation…" : "正在加载会话…") : (en ? "New conversation" : "新会话"));
   return <div className="chatPage">
     <div className="chatToolbar"><div><span className="eyebrow">{en ? "CONVERSATION" : "对话"}</span><h1>{title.length > 52 ? `${title.slice(0, 52)}…` : title}</h1><p>{en ? "Veyra keeps the conversation readable; execution details stay tucked below each verified response." : "Veyra 会保持对话清晰，执行详情收在每条已验证回应下方。"}</p></div><div className="chatToolbarActions"><button className="ghostButton" type="button" onClick={onNewConversation}><Plus size={15} />{en ? "New conversation" : "新会话"}</button><button className="textButton" type="button" onClick={onOpenHistory}><History size={15} />{en ? "History" : "历史"}</button></div></div>
-    {error ? <div className="conversationError chatLoadError"><Info size={16} /><span>{error}</span></div> : null}
+    {conversationLoading ? <div className="conversationNotice chatLoadError"><Clock3 size={16} className="spinIcon" /><span>{en ? "Loading the server conversation…" : "正在加载服务器会话…"}</span></div> : null}
+    {ledgerState === "expired" ? <div className="conversationError chatLoadError"><Info size={16} /><span>{en ? "This old conversation is no longer available. Open History or start a new conversation." : "旧会话已失效，请打开历史或新建会话。"}</span></div> : null}
+    {error && ledgerState !== "expired" && !conversationLoading ? <div className="conversationError chatLoadError"><Info size={16} /><span>{error}</span></div> : null}
+    {pasteHint ? <div className="conversationError chatLoadError"><Info size={16} /><span>{pasteHint}</span></div> : null}
     <div className="chatThread" aria-live="polite">
-      {!messages.length && !busy ? <div className="chatEmpty"><MessageCircle size={21} /><p>{en ? "This is a new conversation. What should Veyra understand first?" : "这是一个新会话。你希望 Veyra 先了解什么？"}</p></div> : null}
-      {messages.map((message) => <ConversationMessageView key={message.messageId} message={message} language={language} />)}
+      {!conversationLoading && ledgerState === "ready" && !messages.length && !busy ? <div className="chatEmpty"><MessageCircle size={21} /><p>{en ? "This is a new conversation. What should Veyra understand first?" : "这是一个新会话。你希望 Veyra 先了解什么？"}</p></div> : null}
+      {messages.map((message) => <ConversationMessageView key={message.messageId} message={message} language={language} scope={scoped} feedbackLabel={feedbackByMessage[message.messageId]} onFeedback={(label, updatedMessage) => handleFeedback(message.messageId, label, updatedMessage)} onRefresh={refreshConversation} />)}
       {busy ? <div className="streamStatus"><Clock3 size={16} className="spinIcon" /><span>{phaseText(activePhase, en)}</span><small>{en ? "Live lifecycle event · no simulated typing" : "真实生命周期事件 · 不模拟逐字输出"}</small></div> : null}
     </div>
-    <form className="composer chatComposer" onSubmit={(event) => { event.preventDefault(); void submitText(draft); }}><textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={sessionLinkRequired ? (en ? "Waiting for the local session link…" : "等待本地 session link…") : (en ? "Continue the conversation…" : "继续告诉 Veyra…")} aria-label={en ? "Continue the conversation" : "继续对话"} rows={2} disabled={busy || !inputScope || sessionLinkRequired} /><div className="composerBar"><span className="composerHint"><ShieldCheck size={14} />{sessionLinkRequired ? (en ? "Input paused · local session link required" : "输入已暂停 · 需要本地 session link") : inputScope ? (en ? "Local Veyra · actions remain reviewable" : "本机 Veyra · 行动始终可复核") : (en ? "Waiting for the local connection" : "等待本机连接")}</span><div className="composerActions"><button type="button" className="iconButton subtle" disabled aria-label={en ? "Attachments not enabled" : "附件暂未启用"}><Paperclip size={17} /></button><button className="sendButton" type="submit" disabled={busy || !draft.trim() || !inputScope || sessionLinkRequired}>{busy ? <Clock3 size={17} className="spinIcon" /> : <Send size={17} />}<span>{busy ? (en ? "Working…" : "处理中…") : (en ? "Send" : "发送")}</span></button></div></div></form>
+    <form className="composer chatComposer" onSubmit={(event) => { event.preventDefault(); void submitText(draft); }}><textarea value={draft} onChange={(event) => { setDraft(event.target.value); if (pasteHint) setPasteHint(null); }} onPaste={(event) => { const notice = noticeForImagePaste(event, en); if (notice) setPasteHint(notice); }} placeholder={sessionLinkRequired ? (en ? "Waiting for the local session link…" : "等待本地 session link…") : (en ? "Continue the conversation…" : "继续告诉 Veyra…")} aria-label={en ? "Continue the conversation" : "继续对话"} rows={2} disabled={busy || !inputScope || sessionLinkRequired} /><div className="composerBar"><span className="composerHint"><ShieldCheck size={14} />{sessionLinkRequired ? (en ? "Input paused · local session link required" : "输入已暂停 · 需要本地 session link") : inputScope ? (en ? "Local Veyra · text only · actions remain reviewable" : "本机 Veyra · 只接受文字 · 行动始终可复核") : (en ? "Waiting for the local connection" : "等待本机连接")}</span><div className="composerActions"><button className="sendButton" type="submit" disabled={busy || !draft.trim() || !inputScope || sessionLinkRequired}>{busy ? <Clock3 size={17} className="spinIcon" /> : <Send size={17} />}<span>{busy ? (en ? "Working…" : "处理中…") : (en ? "Send" : "发送")}</span></button></div></div></form>
     <div className="chatFooter"><button className="textButton" type="button" onClick={onBackHome ?? onNewConversation}><ArrowLeft size={14} />{en ? "Back to Home" : "回到首页"}</button><span>{en ? "Server conversation ledger · local browser cache is fallback only" : "服务器会话账本为准 · 本机缓存仅作回退"}</span></div>
   </div>;
 }
 
-function ConversationMessageView({ message, language }: { message: ConversationMessage; language: Language }) {
+function ConversationMessageView({ message, language, scope, feedbackLabel, onFeedback, onRefresh }: { message: ConversationMessage; language: Language; scope: ProductScope; feedbackLabel?: ProductConversationFeedbackLabel; onFeedback: (label: ProductConversationFeedbackLabel, updatedMessage?: ConversationMessage) => void; onRefresh?: () => void }) {
   const en = isEnglish(language);
   if (message.role === "user") return <article className="chatTurn"><div className="userBubble"><span className="messageLabel">{en ? "You" : "你"}</span><p>{message.text}</p></div>{message.status === "failed" ? <div className="conversationError turnError"><Info size={16} /><span>{message.error || (en ? "This turn did not complete." : "这一轮没有完成。")}</span></div> : message.status === "streaming" ? <div className="turnPending"><Clock3 size={15} className="spinIcon" />{en ? "Working…" : "处理中…"}</div> : null}</article>;
   const proactive = message.role === "proactive";
-  return <article className={`chatTurn assistantTurn ${proactive ? "proactiveTurn" : ""}`}><div className="assistantMessage"><span className="messageLabel">{proactive ? (en ? "Veyra · proactive" : "Veyra · 主动关注") : (en ? "Veyra" : "Veyra")}</span>{message.result ? <ResponseCard result={message.result} createdAt={message.createdAt} language={language} /> : <p>{message.text}</p>}</div></article>;
+  const metadata = message.metadata;
+  const hypothesis = proactive && metadata?.epistemic_status === "hypothesis";
+  const serverFeedbackLabel = metadata?.feedback_label;
+  const selectedFeedback = feedbackLabel ?? serverFeedbackLabel;
+  return <article className={`chatTurn assistantTurn ${proactive ? "proactiveTurn" : ""}`}><div className="assistantMessage"><span className="messageLabel">{proactive ? (en ? "Veyra · proactive" : "Veyra · 主动关注") : (en ? "Veyra" : "Veyra")}</span>{message.result ? <ResponseCard result={message.result} createdAt={message.createdAt} language={language} /> : <p>{message.text}</p>}{hypothesis ? <div className="proactiveHypothesis">{en ? "Veyra noticed a possible change" : "Veyra 发现的可能变化"}</div> : null}{proactive ? <FactInferenceDisclosure value={metadata?.fact_vs_inference} language={language} /> : null}{proactive ? <ProactiveFeedback message={message} language={language} scope={scope} selected={selectedFeedback} onFeedback={onFeedback} onRefresh={onRefresh} /> : null}</div></article>;
+}
+
+function feedbackResponseMessage(payload: unknown, current: ConversationMessage, scope: ProductScope): ConversationMessage | undefined {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  const root = payload as Record<string, unknown>;
+  const candidates: unknown[] = [];
+  const addMessage = (value: unknown) => { if (value && typeof value === "object" && !Array.isArray(value)) candidates.push(value); };
+  const updated = root.updated;
+  if (updated && typeof updated === "object" && !Array.isArray(updated)) addMessage((updated as Record<string, unknown>).message);
+  addMessage(root.message);
+  const conversation = root.conversation;
+  if (conversation && typeof conversation === "object" && !Array.isArray(conversation)) {
+    const conversationRecord = conversation as Record<string, unknown>;
+    addMessage(conversationRecord.message);
+    if (Array.isArray(conversationRecord.messages)) conversationRecord.messages.forEach(addMessage);
+  }
+  if (Array.isArray(root.messages)) root.messages.forEach(addMessage);
+  for (const candidate of candidates) {
+    const normalized = serverMessageRows({ messages: [candidate] }, current.conversationId, scope)[0];
+    if (normalized && (normalized.messageId === current.messageId || normalized.metadata?.reaction_id === current.metadata?.reaction_id)) return normalized;
+  }
+  return undefined;
+}
+
+function ProactiveFeedback({ message, language, scope, selected, onFeedback, onRefresh }: { message: ConversationMessage; language: Language; scope: ProductScope; selected?: ProductConversationFeedbackLabel; onFeedback: (label: ProductConversationFeedbackLabel, updatedMessage?: ConversationMessage) => void; onRefresh?: () => void }) {
+  const en = isEnglish(language);
+  const metadata = message.metadata;
+  const reactionId = metadata?.reaction_id?.trim() ?? "";
+  const situationId = metadata?.situation_id?.trim() ?? "";
+  const revision = metadata?.situation_revision;
+  const validRevision = typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 1 ? revision : null;
+  const [unavailable, setUnavailable] = useState(false);
+  const available = message.kind === "proactive"
+    && message.source === "living_reaction"
+    && metadata?.feedback_available === true
+    && Boolean(reactionId && situationId)
+    && validRevision !== null
+    && !selected
+    && !unavailable;
+  const choice = conversationFeedbackChoices.find((item) => item.label === selected);
+  // A closed control is only an "already recorded" result when a bounded
+  // label proves it. A stale/missing reaction has no such proof.
+  const feedbackRecorded = Boolean(choice);
+  const feedbackClosed = metadata?.feedback_available === false || feedbackRecorded || unavailable;
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const send = async (label: ProductConversationFeedbackLabel) => {
+    if (busy || selected || validRevision === null) return;
+    setBusy(true); setError(null);
+    try {
+      // The current product endpoint binds owner/session through the scoped
+      // query, reaction through the path, and the Situation CAS through
+      // situation_revision.  Category and learning semantics remain
+      // server-owned; this control submits only the user's choice.
+      const result = await feedbackProductReaction(reactionId, scope, {
+        label,
+        situation_revision: validRevision,
+      });
+      const status = safeText(result.status, "recorded").toLowerCase();
+      if (["failed", "error", "unavailable"].includes(status)) throw new Error(en ? "Feedback is not available for this message." : "这条消息暂时不能记录反馈。");
+      onFeedback(label, feedbackResponseMessage(result, message, scope));
+    } catch (caught) {
+      if (caught instanceof HttpError && (caught.status === 404 || caught.status === 409)) {
+        setUnavailable(true);
+        onRefresh?.();
+        setError(en ? "Feedback is no longer available for this message." : "这条消息的反馈入口已不可用。");
+      } else {
+        setError(safeText(caught instanceof Error ? caught.message : "", en ? "Feedback could not be saved. Try again." : "反馈未保存，请稍后重试。", 240));
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (!available && !feedbackClosed) return null;
+  return <div className="proactiveFeedback" aria-label={en ? "Feedback on this proactive message" : "对这条主动消息的反馈"}>
+    {feedbackRecorded && choice ? <span className="proactiveFeedbackSaved">{en ? `Feedback saved: ${choice.en}` : `已反馈：${choice.zh}`}</span> : feedbackClosed ? <span className="proactiveFeedbackSaved">{en ? "Feedback is unavailable for this message" : "这条消息暂时无法反馈"}</span> : <><span className="proactiveFeedbackPrompt">{en ? "Was this useful?" : "这条提醒有帮助吗？"}</span><div className="proactiveFeedbackButtons">{conversationFeedbackChoices.map((item) => <button key={item.label} type="button" disabled={busy} onClick={() => void send(item.label)}>{en ? item.en : item.zh}</button>)}</div></>}
+    {error ? <span className="proactiveFeedbackError" role="status">{error}</span> : null}
+  </div>;
 }
 
 function ResponseCard({ result, createdAt, language = "zh" }: { result: MessageResult; createdAt: string; language?: Language }) {

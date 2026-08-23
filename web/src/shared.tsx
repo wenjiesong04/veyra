@@ -145,3 +145,14 @@ export function formatTime(value: unknown): string {
   if (Number.isNaN(date.valueOf())) return "";
   return date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
+
+export function noticeForImagePaste(event: { clipboardData: DataTransfer | null; preventDefault: () => void }, en: boolean): string | null {
+  const data = event.clipboardData;
+  if (!data) return null;
+  const hasImage = Array.from(data.items ?? []).some((item) => item.type.startsWith("image/"));
+  if (!hasImage) return null;
+  if (!data.getData("text/plain").trim()) event.preventDefault();
+  return en
+    ? "Veyra currently understands text only. Type the key facts from the image."
+    : "Veyra 目前只理解文字。请把图片里的关键信息打出来发给我。";
+}

@@ -12,13 +12,25 @@ export function detectDesktopRuntime(): boolean {
 export const isDesktopRuntime = detectDesktopRuntime();
 export const desktopApiBase = isDesktopRuntime ? "http://127.0.0.1:8000" : "";
 
+export class HttpError extends Error {
+  readonly status: number;
+  readonly statusText: string;
+
+  constructor(status: number, statusText: string, message: string) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+    this.statusText = statusText;
+  }
+}
+
 export async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
   const headers = new Headers(options?.headers);
   if (options?.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
   const target = url.startsWith("http") ? url : `${desktopApiBase}${url}`;
-  const response = await fetch(target, options ? { ...options, headers } : undefined);
+  const response = await fetch(target, { ...(options ?? {}), headers, cache: options?.cache ?? "no-store" });
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
     try {
@@ -46,7 +58,7 @@ export async function fetchJson<T>(url: string, options?: RequestInit): Promise<
     } catch {
       // keep default status text
     }
-    throw new Error(detail);
+    throw new HttpError(response.status, response.statusText, detail);
   }
   return response.json() as Promise<T>;
 }
@@ -187,7 +199,7 @@ export async function getProductSuggestions(scope: ProductScope, options: { situ
 }
 
 export type ReactionFeedbackLabel = "useful" | "not_useful" | "ignore" | "resolved" | "too_early" | "too_late" | "too_frequent" | "remind_before" | "remind_offset";
-export async function feedbackProductReaction(reactionId: string, scope: ProductScope, body: { label: ReactionFeedbackLabel; situation_revision: number; category?: string; remind_before_seconds?: number; evidence_refs?: string[] }): Promise<Record<string, JsonValue>> {
+export async function feedbackProductReaction(reactionId: string, scope: ProductScope, body: { label: ReactionFeedbackLabel; situation_revision: number; remind_before_seconds?: number; evidence_refs?: string[] }): Promise<Record<string, JsonValue>> {
   return fetchJson(`/product/reactions/${encodeURIComponent(reactionId)}/feedback?${scopedQuery(scope)}`, { method: "POST", body: JSON.stringify(body) });
 }
 
@@ -233,6 +245,34 @@ export type ProductConversationSummary = {
   [key: string]: JsonValue | undefined;
 };
 
+export type ProductConversationCategory = "general" | "personal" | "work" | "education" | "health" | "travel" | "logistics" | "finance" | "other";
+export type ProductConversationEpistemicStatus = "hypothesis" | "reported" | "inferred" | "observed" | "observation" | "unknown";
+export type ProductConversationFactInference = {
+  facts: string[];
+  inferences: string[];
+};
+export type ProductConversationFeedbackLabel = "useful" | "not_useful" | "too_early" | "too_frequent" | "resolved";
+
+/**
+ * Server-owned metadata for a Product Conversation message.
+ *
+ * This is deliberately a small allow-list.  The UI can use the stable
+ * reaction/situation identity and epistemic labels, but it never needs to
+ * retain or display the raw server payload or feedback token.
+ */
+export type ProductConversationMetadata = {
+  reaction_id?: string;
+  situation_id?: string;
+  situation_revision?: number;
+  category?: ProductConversationCategory;
+  fact_vs_inference?: ProductConversationFactInference;
+  feedback_available?: boolean;
+  feedback_label?: ProductConversationFeedbackLabel;
+  feedback_at?: string;
+  epistemic_status?: ProductConversationEpistemicStatus;
+  record_only?: boolean;
+};
+
 export type ProductConversationMessage = {
   message_id?: string;
   id?: string;
@@ -242,10 +282,14 @@ export type ProductConversationMessage = {
   text?: string;
   content?: string;
   response?: string;
+  source?: string;
   created_at?: string;
   updated_at?: string;
   user_id?: string;
   session_id?: string;
+  metadata?: ProductConversationMetadata;
+  result?: JsonValue;
+  payload?: JsonValue;
   [key: string]: JsonValue | undefined;
 };
 
@@ -272,8 +316,76 @@ function productConversationRecord(value: unknown): ProductConversationSummary |
   return isRecord(value) ? value as ProductConversationSummary : null;
 }
 
+const PRODUCT_CONVERSATION_CATEGORIES = new Set<ProductConversationCategory>([
+  "general", "personal", "work", "education", "health", "travel", "logistics", "finance", "other",
+]);
+const PRODUCT_CONVERSATION_EPISTEMIC_STATUS = new Set<ProductConversationEpistemicStatus>([
+  "hypothesis", "reported", "inferred", "observed", "observation", "unknown",
+]);
+const PRODUCT_CONVERSATION_FEEDBACK_LABELS = new Set<ProductConversationFeedbackLabel>([
+  "useful", "not_useful", "too_early", "too_frequent", "resolved",
+]);
+
+function boundedMetadataText(value: unknown, maxLength = 240): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const selected = value.trim().slice(0, maxLength);
+  return selected || undefined;
+}
+
+function boundedMetadataRevision(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isInteger(value) || !Number.isSafeInteger(value) || value < 1) return undefined;
+  return value;
+}
+
+function boundedFactInference(value: unknown): ProductConversationFactInference | undefined {
+  if (!isRecord(value)) return undefined;
+  const values = (candidate: unknown): string[] => Array.isArray(candidate)
+    ? candidate.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 8).map((item) => item.trim().slice(0, 640))
+    : [];
+  return { facts: values(value.facts), inferences: values(value.inferences) };
+}
+
+export function normalizeProductConversationMetadata(value: unknown): ProductConversationMetadata | undefined {
+  if (!isRecord(value)) return undefined;
+  const metadata: ProductConversationMetadata = {};
+  for (const key of ["reaction_id", "situation_id"] as const) {
+    const selected = boundedMetadataText(value[key]);
+    if (selected) metadata[key] = selected;
+  }
+  const revision = boundedMetadataRevision(value.situation_revision);
+  if (revision !== undefined) metadata.situation_revision = revision;
+  if (typeof value.category === "string" && PRODUCT_CONVERSATION_CATEGORIES.has(value.category as ProductConversationCategory)) {
+    metadata.category = value.category as ProductConversationCategory;
+  }
+  const factInference = boundedFactInference(value.fact_vs_inference);
+  if (factInference) metadata.fact_vs_inference = factInference;
+  if (typeof value.feedback_available === "boolean") metadata.feedback_available = value.feedback_available;
+  if (typeof value.feedback_label === "string" && PRODUCT_CONVERSATION_FEEDBACK_LABELS.has(value.feedback_label as ProductConversationFeedbackLabel)) {
+    metadata.feedback_label = value.feedback_label as ProductConversationFeedbackLabel;
+  }
+  const feedbackAt = boundedMetadataText(value.feedback_at, 80);
+  if (feedbackAt) metadata.feedback_at = feedbackAt;
+  if (typeof value.record_only === "boolean") metadata.record_only = value.record_only;
+  if (typeof value.epistemic_status === "string" && PRODUCT_CONVERSATION_EPISTEMIC_STATUS.has(value.epistemic_status as ProductConversationEpistemicStatus)) {
+    metadata.epistemic_status = value.epistemic_status as ProductConversationEpistemicStatus;
+  }
+  return Object.keys(metadata).length ? metadata : undefined;
+}
+
 function productConversationMessageRecord(value: unknown): ProductConversationMessage | null {
-  return isRecord(value) ? value as ProductConversationMessage : null;
+  if (!isRecord(value)) return null;
+  const message: ProductConversationMessage = {};
+  for (const key of ["message_id", "id", "conversation_id", "role", "kind", "text", "content", "response", "source", "created_at", "updated_at", "user_id", "owner_id", "session_id"] as const) {
+    const selected = boundedMetadataText(value[key], key === "text" || key === "content" || key === "response" ? 20000 : 640);
+    if (selected) message[key] = selected;
+  }
+  if (isRecord(value.result) || Array.isArray(value.result)) message.result = value.result as JsonValue;
+  if (isRecord(value.payload) || Array.isArray(value.payload)) message.payload = value.payload as JsonValue;
+  const nested = normalizeProductConversationMetadata(value.metadata);
+  const direct = normalizeProductConversationMetadata(value);
+  const metadata = nested || direct ? { ...(nested ?? {}), ...(direct ?? {}) } : undefined;
+  if (metadata) message.metadata = metadata;
+  return message;
 }
 
 export function productConversationId(value: unknown): string {
@@ -337,6 +449,12 @@ export type MessageStreamEvent = {
 
 function streamTarget(): string {
   return `${desktopApiBase}/events/message/stream`;
+}
+
+export function streamEventConversationId(event: MessageStreamEvent): string {
+  const payload = event.payload;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "";
+  return safeText((payload as Record<string, JsonValue>).conversation_id, "").trim();
 }
 
 /**

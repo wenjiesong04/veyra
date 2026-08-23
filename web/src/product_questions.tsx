@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Check, Clock3, Eye, MessageCircleQuestion, Send, X } from "lucide-react";
 import { answerProductQuestion, deferProductQuestion, dismissProductQuestion, getProductSources, type ProductContext, type ProductQuestion } from "./api";
 import { dateLabel, productContextReadiness, record, statusLabel, text } from "./product_shared";
-import { ErrorBlock, isEnglish, Language, LoadingBlock, OwnerScope, StatusBadge, Surface } from "./shared";
+import { ErrorBlock, isEnglish, Language, LoadingBlock, noticeForImagePaste, OwnerScope, StatusBadge, Surface } from "./shared";
 import { SourceConsentDialog } from "./source_consent_dialog";
 import {
   SOURCE_CONSENT_COPY,
@@ -110,7 +110,7 @@ export function ProductQuestions({ questions, scope, language = "zh", productCon
         <h3>{text(question.question ?? question.blocked_judgment, en ? "What is still unclear?" : "还有什么没有弄清？")}</h3>
         <p className="productQuestionWhy"><strong>{copy.why}</strong>{text(question.why_now, en ? "The next observation depends on this." : "下一次观察依赖这条信息。")}</p>
         {question.expires_at ? <small className="productMuted">{en ? "Relevant until" : "关注到"} {dateLabel(question.expires_at, en)}</small> : null}
-        <textarea value={drafts[id] ?? ""} onChange={(event) => setDrafts((current) => ({ ...current, [id]: event.target.value }))} placeholder={copy.placeholder} aria-label={text(question.question, copy.title)} rows={2} disabled={Boolean(busy)} />
+        <textarea value={drafts[id] ?? ""} onChange={(event) => setDrafts((current) => ({ ...current, [id]: event.target.value }))} onPaste={(event) => { const notice = noticeForImagePaste(event, en); if (notice) setError(notice); }} placeholder={copy.placeholder} aria-label={text(question.question, copy.title)} rows={2} disabled={Boolean(busy)} />
         <div className="productQuestionActions"><button className="primaryButton small" type="button" onClick={() => void run(question, "answer")} disabled={Boolean(busy) || !text(drafts[id], "").trim()}>{itemBusy && busy?.endsWith(":answer") ? <Clock3 size={14} className="spinIcon" /> : <Send size={14} />}{itemBusy && busy?.endsWith(":answer") ? copy.working : copy.answer}</button><button className="ghostButton small" type="button" onClick={() => void run(question, "defer")} disabled={Boolean(busy)}><Clock3 size={14} />{copy.defer}</button>{isReadableSource(text(question.source, "")) ? <button className="ghostButton small" type="button" onClick={() => void requestLook(text(question.source, "") as ReadableSourceId, text(question.why_now, ""))} disabled={Boolean(busy) || sourceBusy}><Eye size={14} />{localeText(SOURCE_CONSENT_COPY[text(question.source, "") as ReadableSourceId].look, en)}</button> : null}<button className="textButton" type="button" onClick={() => void run(question, "dismiss")} disabled={Boolean(busy)}><X size={14} />{copy.dismiss}</button></div>
         <p className="productQuestionHint"><Check size={13} />{copy.source}</p>
       </article>;

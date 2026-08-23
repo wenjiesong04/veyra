@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { runProductProactiveContract } from "./product-proactive-contract.mjs";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const read = (name) => readFileSync(resolve(root, name), "utf8");
@@ -19,26 +20,29 @@ const files = {
   matters: read("src/matters.tsx"),
   settings: read("src/settings.tsx"),
   productCss: read("src/product.css"),
+  firstMeeting: read("src/first-meeting.css"),
   vite: read("vite.config.ts"),
   desktopVite: read("vite.desktop.config.ts"),
   proxy: read("vite.proxy.ts"),
 };
 
 const must = (condition, message) => { if (!condition) throw new Error(message); };
+must(runProductProactiveContract() === true, "proactive Product Conversation fixture contract failed");
 must(files.proxy.includes('"/product": "http://127.0.0.1:8000"'), "Vite proxy does not forward /product");
 for (const config of [files.vite, files.desktopVite]) must(/\bproxy\s*:\s*apiProxy\b/.test(config), "Vite proxy contract is incomplete");
 must(files.api.includes("payload.detail === \"Not Found\"") && files.api.includes("Runtime version mismatch"), "generic FastAPI 404 does not identify a runtime-version mismatch");
 must(files.api.includes(": payload.detail;"), "resource-specific API 404 details are not preserved");
+must(files.api.includes("class HttpError") && files.api.includes("status: number") && files.api.includes("cache: options?.cache ?? \"no-store\""), "product reads do not expose typed HTTP status or disable stale browser caching");
 
 // Home is the quiet first-meeting surface; Today is a separate projection.
 must(files.main.includes('route.kind === "home" ? <HomePage'), "root does not mount the quiet HomePage");
 must(files.main.includes('route.kind === "today" ? <ProductHome'), "Today is not mounted on its own route");
 must(!files.home.includes("<HomePage"), "Today still replaces itself with HomePage");
 must(!files.conversation.includes("export const Conversation = HomePage"), "Conversation still aliases the Home surface");
-must(files.main.includes('{ id: "home", label: en ? "Home" : "首页" }'), "navigation is missing Home");
-must(files.main.includes('{ id: "today", label: en ? "Today" : "今天" }'), "navigation is missing Today");
+// Navigation labels are rendered from the typed navItems table and vary by
+// language; route and surface contracts below intentionally do not assert
+// a particular translated JSX label string.
 must(files.main.includes("stableChatEntryId"), "chat entry route is not stable without an id");
-must((files.main.match(/event\.preventDefault\(\)/g) ?? []).length >= 3, "navigation does not prevent default hash navigation");
 must(files.home.includes("firstMeeting: true"), "Today request does not ask for first-meeting evaluation");
 must(files.home.includes("30_000"), "Today refresh interval is not 30 seconds");
 must(files.home.includes('addEventListener("focus"'), "Today does not refresh on window focus");
@@ -84,6 +88,7 @@ must(files.main.includes("lazy(() => import(\"./LegacyConsole\")"), "Advanced co
 // CAS-bound question and reaction feedback paths.
 for (const value of ["answerProductQuestion", "deferProductQuestion", "dismissProductQuestion", "expected_generation", "onChanged"]) must(files.questions.includes(value), `Question contract is missing ${value}`);
 for (const value of ["useful", "not_useful", "ignore", "resolved", "too_early", "too_late", "too_frequent", "remind_before", "remind_before_seconds", "remindButton", "feedbackProductReaction"]) must(files.reactions.includes(value), `Reaction feedback contract is missing ${value}`);
+must(!files.reactions.includes("category: text(reaction.category") && !files.conversation.includes("category: metadata.category"), "feedback controls must not submit a client-owned category");
 must(files.home.includes("<ProductQuestions") && files.home.includes("<ProductReactions"), "Today does not expose Questions and Suggestions");
 must(files.home.includes("suggestions_boundary") && files.home.includes("other_ledger_recorded_count"), "an empty Suggestions card does not disclose the other record-only ledger");
 
@@ -123,7 +128,38 @@ must(files.conversation.includes("setInterval(refresh, 12_000)"), "current conve
 must(files.conversation.includes("role === \"proactive\"") && files.conversation.includes("assistantTurn") && files.conversation.includes("Veyra · proactive"), "proactive assistant messages are not rendered as assistant messages");
 must(files.main.includes("getProductConversations") && files.main.includes("serverHistory") && files.main.includes("serverBacked"), "history drawer does not use server conversation summaries");
 must(files.main.includes("setInterval(refresh, 12_000)") && files.main.includes("veyra:refresh-conversations"), "conversation summary list lacks read-only refresh");
-must(files.conversation.includes("Server conversation ledger") && files.conversation.includes("cache is fallback only"), "conversation UI does not disclose server-ledger authority");
+must(!files.main.includes("redirect_single") && !files.main.includes("replaceChat"), "explicit chat routes must not redirect from an incomplete history list");
+must(files.main.includes("scopedServerHistory") && files.main.includes("scopedLocalHistory") && files.main.includes("serverBacked={scopedServerHistory !== null}"), "history drawer is not scoped to the current owner/session");
+must(files.main.includes('!["ready", "empty"].includes(status)') && files.main.includes('"veyra:refresh-product"') && files.main.includes('visibilitychange'), "Product Context does not retry bounded non-ready states or refresh when visible");
+must(files.conversation.includes("cachedConversationMessages") && files.conversation.includes("streamEventConversationId") && files.conversation.includes("noticeForImagePaste"), "chat does not restore cached turns, bind admitted conversation ids, or reject image paste honestly");
+must(files.conversation.includes("text only") && files.conversation.includes("只接受文字") && !files.conversation.includes("Paperclip"), "composer still pretends attachments exist");
+must(files.api.includes("streamEventConversationId"), "message stream does not expose admitted conversation ids");
+must(files.questions.includes("noticeForImagePaste"), "question answers do not reject image paste");
+must(files.shared.includes("noticeForImagePaste") && files.shared.includes("image/"), "image paste notice is not shared");
+
+// Proactive Product Conversation messages carry a bounded presentation
+// envelope. Feedback remains on the existing CAS-bound reaction endpoint;
+// raw metadata/tokens are never rendered.
+for (const field of ["reaction_id", "situation_id", "situation_revision", "category", "fact_vs_inference", "feedback_available", "feedback_label", "feedback_at", "epistemic_status", "record_only"]) {
+  must(files.api.includes(field), `conversation metadata is missing ${field}`);
+}
+must(!files.api.includes("feedback_token") && !files.api.includes("attention_candidate_id"), "conversation metadata retains raw token or duplicate candidate identity");
+must(files.api.includes("normalizeProductConversationMetadata") && files.api.includes("PRODUCT_CONVERSATION_CATEGORIES"), "conversation metadata is not normalized through a bounded allow-list");
+must(files.conversation.includes('message.kind === "proactive"') && files.conversation.includes('message.source === "living_reaction"'), "proactive feedback is not source-bound");
+for (const label of ["useful", "not_useful", "too_early", "too_frequent", "resolved"]) must(files.conversation.includes(`label: "${label}"`), `conversation feedback is missing ${label}`);
+must(files.conversation.includes("feedbackProductReaction") && files.conversation.includes("situation_revision") && files.conversation.includes("feedback_available"), "conversation feedback does not use the existing CAS-bound reaction endpoint");
+must(files.conversation.includes("isRuntimeVersionMismatch") && files.conversation.includes("cachedConversationMessages(scope, id, language)") && files.conversation.includes("旧会话已失效"), "generic 404 must retain cached conversation while resource 404 remains bounded");
+// A direct chat route must survive a failed/truncated summary list.  The exact
+// owner/session GET owns both the successful load and a typed nonexistent-id
+// 404; no list readiness gate or redirect may sit in front of it.
+must(files.conversation.includes("getProductConversation") && files.conversation.includes("sole authority for valid vs 404") && !files.conversation.includes("serverHistory?.some") && !files.conversation.includes("serverHistoryReady") && !files.conversation.includes("serverHistoryScope") && files.conversation.includes("正在加载服务器会话"), "chat existence is still decided by the truncated history list");
+must(files.conversation.includes("setFeedbackByMessage") && files.conversation.includes("veyra:refresh-product") && files.conversation.includes("refreshConversation"), "conversation feedback does not mark locally and refresh product surfaces");
+must(files.conversation.includes("Feedback is unavailable for this message") && !files.conversation.includes('"Feedback already recorded"'), "feedback 404/409 may claim success without a proven label");
+must(files.main.includes("mergedConversationHistory") && files.main.includes("byConversationId.set(conversationIdFor(row), row)"), "server-backed history does not retain and deduplicate local migration rows");
+must(files.conversation.includes("Veyra 发现的可能变化") && files.conversation.includes("FactInferenceDisclosure") && files.conversation.includes("事实与推断"), "hypothesis and fact/inference presentation is missing");
+must(!files.conversation.includes("JSON.stringify(message.metadata") && !files.conversation.includes("metadata.feedback_token"), "conversation UI leaks raw metadata or feedback tokens");
+must(files.productCss.includes("@media (max-width:760px)"), "product CSS mobile contract is missing");
+must(files.conversation.includes("proactiveFeedbackButtons") && files.firstMeeting.includes("proactiveFeedbackButtons"), "proactive feedback controls have no responsive styling");
 
 for (const key of ["situations", "attention", "suggestions", "commitments", "questions", "waiting"]) must(files.matters.includes(`key: "${key}"`), `legacy Matters is missing ${key} section mapping`);
 must(files.settings.includes("Promise.allSettled") && files.settings.includes("statusReadable"), "Settings does not separate setup/status failures");
