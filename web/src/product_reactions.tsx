@@ -34,9 +34,11 @@ export function ProductReactions({ reactions, scope, language = "zh", onChanged,
     try {
       // The reaction row is the authority for category/learning semantics;
       // feedback only submits the user choice and the CAS revision.
-      await feedbackProductReaction(id, { user_id: scope.userId, session_id: scope.sessionId }, { label, situation_revision: revision, ...(seconds === undefined ? {} : { remind_before_seconds: Math.max(0, Math.min(30 * 86400, Math.round(seconds))) }) });
+      const result = await feedbackProductReaction(id, { user_id: scope.userId, session_id: scope.sessionId }, { label, situation_revision: revision, ...(seconds === undefined ? {} : { remind_before_seconds: Math.max(0, Math.min(30 * 86400, Math.round(seconds))) }) });
+      const status = text(result.status, "").toLowerCase();
+      if (!["recorded", "duplicate"].includes(status)) throw new Error(copy.failed);
       setReminderOpen(null); onChanged?.();
-    } catch (caught) { setError(caught instanceof Error ? caught.message : copy.failed); }
+    } catch { setError(copy.failed); }
     finally { setBusy(null); }
   };
   const visible = reactions.filter((reaction) => text(reaction.disposition, "") === "suggest");
