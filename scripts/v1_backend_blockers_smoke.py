@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
 from core.world_state import StateRevisionConflictError, WorldStateStore  # noqa: E402
 from interface.event_schema import EventSource, EventType, VeyraEvent  # noqa: E402
 from interface.living_context_contract import CandidateKnown, CandidateNeed, CandidateNeedReference, ContextQuote, LivingReactionFeedback  # noqa: E402
+from interface.living_source_registry import capability_registry  # noqa: E402
 from interface.living_source_contract import SourceConsent, canonical_utc  # noqa: E402
 from runtime.calendar_source import CalendarSource  # noqa: E402
 from runtime.living_context_composition import build_living_context_composition  # noqa: E402
@@ -65,7 +66,26 @@ class StableProvider:
 
     def read(self, context):
         self.calls += 1
-        return {"status": "ok", "details": {"location": "Shanghai", "current": {"temperature_2m": 20}}}
+        return {
+            "status": "ok",
+            "details": {
+                "location": "Shanghai",
+                "current": {
+                    "temperature_2m": 20,
+                    "weather_description": "clear",
+                },
+            },
+        }
+
+
+def source_watch_advance_seconds(source: str) -> int:
+    """Use the registered provider cadence for a watch-mode retry boundary."""
+
+    capability = capability_registry().get(source)
+    cadence = capability.watch_cadence_seconds if capability is not None else None
+    if cadence is None:
+        raise AssertionError(f"{source} has no registered watch cadence")
+    return int(cadence)
 
 
 def expect(value: bool, label: str) -> None:
@@ -180,7 +200,7 @@ def recurring_and_today_checks(root: Path) -> None:
     catalog = composition.orchestrator.model_catalog(owner_id=owner, session_id=session)
     result = composition.orchestrator.process_user_turn(
         event("recurring-create", owner, session, str(fixture["text"])),
-        type("Understanding", (), {"living_context_candidate": candidate(fixture, catalog), "living_reaction_feedback": None})(),
+        type("Understanding", (), {"living_context_candidate": candidate(fixture, catalog, observation_mode="watch"), "living_reaction_feedback": None})(),
         catalog=catalog,
     )
     situation_id = str(result["situation"]["situation_id"])
@@ -188,7 +208,7 @@ def recurring_and_today_checks(root: Path) -> None:
     first_need = composition.core.needs.list(owner_id=owner, session_id=session, situation_id=situation_id, limit=8)[0]
     expect(first_tick["evaluated_count"] == 1 and first_need["status"] == "resolved", "successful source observation resolves the current Need")
     first_revision = int(result["situation"]["observation_revision"])
-    clock.advance(seconds=901)
+    clock.advance(seconds=source_watch_advance_seconds("weather"))
     second_tick = composition.orchestrator.tick(owner_id=owner, session_id=session)
     second_need = composition.core.needs.list(owner_id=owner, session_id=session, situation_id=situation_id, limit=8)[0]
     expect(provider.calls == 2 and second_need["need_id"] == first_need["need_id"] and second_need["generation"] == 2, "receipt TTL reopens the exact Need for recurring observation")
@@ -319,12 +339,12 @@ def observation_reopen_boundary_checks(root: Path) -> None:
     catalog = corrupt_composition.orchestrator.model_catalog(owner_id=owner, session_id=session)
     created = corrupt_composition.orchestrator.process_user_turn(
         event("observation-corrupt-create", owner, session, str(fixture["text"])),
-        SimpleNamespace(living_context_candidate=candidate(fixture, catalog), living_reaction_feedback=None),
+        SimpleNamespace(living_context_candidate=candidate(fixture, catalog, observation_mode="watch"), living_reaction_feedback=None),
         catalog=catalog,
     )
     situation_id = str(created["situation"]["situation_id"])
     corrupt_composition.orchestrator.tick(owner_id=owner, session_id=session)
-    corrupt_clock.advance(seconds=901)
+    corrupt_clock.advance(seconds=source_watch_advance_seconds("weather"))
     corrupt_store.mutate_json(
         "information_need_state.json",
         lambda state: state.__setitem__("_state_corrupt", True) or state,
@@ -347,11 +367,11 @@ def observation_reopen_boundary_checks(root: Path) -> None:
     source_catalog = source_corrupt_composition.orchestrator.model_catalog(owner_id=source_owner, session_id=source_session)
     source_created = source_corrupt_composition.orchestrator.process_user_turn(
         event("observation-source-corrupt-create", source_owner, source_session, str(source_fixture["text"])),
-        SimpleNamespace(living_context_candidate=candidate(source_fixture, source_catalog), living_reaction_feedback=None),
+        SimpleNamespace(living_context_candidate=candidate(source_fixture, source_catalog, observation_mode="watch"), living_reaction_feedback=None),
         catalog=source_catalog,
     )
     source_corrupt_composition.orchestrator.tick(owner_id=source_owner, session_id=source_session)
-    source_corrupt_clock.advance(seconds=901)
+    source_corrupt_clock.advance(seconds=source_watch_advance_seconds("weather"))
     source_corrupt_store.mutate_json(
         "living_source_state.json",
         lambda state: state.__setitem__("_state_corrupt", True) or state,
@@ -376,12 +396,12 @@ def observation_reopen_boundary_checks(root: Path) -> None:
     race_catalog = race_composition.orchestrator.model_catalog(owner_id=race_owner, session_id=race_session)
     race_created = race_composition.orchestrator.process_user_turn(
         event("observation-race-create", race_owner, race_session, str(race_fixture["text"])),
-        SimpleNamespace(living_context_candidate=candidate(race_fixture, race_catalog), living_reaction_feedback=None),
+        SimpleNamespace(living_context_candidate=candidate(race_fixture, race_catalog, observation_mode="watch"), living_reaction_feedback=None),
         catalog=race_catalog,
     )
     race_situation_id = str(race_created["situation"]["situation_id"])
     race_composition.orchestrator.tick(owner_id=race_owner, session_id=race_session)
-    race_clock.advance(seconds=901)
+    race_clock.advance(seconds=source_watch_advance_seconds("weather"))
     race_situation = race_composition.core.get_situation(race_situation_id, owner_id=race_owner, session_id=race_session)
     original_upsert = race_composition.core.needs.upsert_for_situation
 
@@ -494,7 +514,7 @@ def need_binding_checks(root: Path) -> None:
         needs=[source_need],
         source_event_id="binding-reopen",
     )[0]
-    expect(reopened["generation"] == 2 and reopened.get("unknown_binding") is None, "new Need generation does not inherit an old unknown binding")
+    expect(reopened["generation"] == 2 and reopened.get("unknown_binding") == "旧日程表达", "scheduler Need reopen preserves the server-owned unknown binding")
 
     answer_store = WorldStateStore(root / "answer-binding")
     answer_composition = build_living_context_composition(answer_store)
@@ -612,16 +632,18 @@ def need_binding_checks(root: Path) -> None:
         },
         continuation_catalog,
     )
+    first_need = seed.needs[0].model_copy(update={"unknown_index": 0})
     second_need = seed.needs[0].model_copy(
         update={
             "blocked_judgment": remaining_unknown,
             "question": "网络迁移服务是否已经确认？",
+            "unknown_index": 1,
         }
     )
     seed = seed.model_copy(
         update={
             "unknown": [bound_unknown, remaining_unknown],
-            "needs": [seed.needs[0], second_need],
+            "needs": [first_need, second_need],
         }
     )
     created = continuation.orchestrator.process_user_turn(
@@ -665,7 +687,9 @@ def need_binding_checks(root: Path) -> None:
             "catalog_token": update_row["catalog_token"],
             "create_subject": "",
             "unknown": [remaining_unknown],
-            "needs": [second_need.model_dump(mode="json")],
+            "needs": [
+                second_need.model_copy(update={"unknown_index": 0}).model_dump(mode="json")
+            ],
             "answered_need_tokens": [bound_need["need_id"]],
             "answered_need_bindings": [
                 CandidateNeedReference(
@@ -873,7 +897,7 @@ def need_endpoint_dedupe_checks(root: Path) -> None:
         session_id=create_session,
     )
     create_candidate = candidate(create_fixture, create_catalog)
-    first_need = create_candidate.needs[0]
+    first_need = create_candidate.needs[0].model_copy(update={"unknown_index": 0})
     second_need = first_need.model_copy(
         update={"evidence_kind": "calendar", "allowed_source_classes": ["calendar"]}
     )
@@ -967,8 +991,9 @@ def need_endpoint_dedupe_checks(root: Path) -> None:
         len(before) == 1
         and len(after) == 1
         and after[0]["need_id"] == before[0]["need_id"]
-        and updated["need_candidates_deduped"] == 1,
-        "same active Need endpoint is not admitted as a duplicate record",
+        and after[0]["evidence_kind"] == "calendar"
+        and updated["need_candidates_deduped"] == 0,
+        "same active Need endpoint updates its typed source in place",
     )
 
     # Replaying the same event after its Need becomes terminal must use the
@@ -1528,11 +1553,11 @@ def feedback_revision_checks(root: Path) -> None:
     advance_started = threading.Event()
     advance_done = threading.Event()
 
-    def blocked_record_feedback(payload):
+    def blocked_record_feedback(payload, **kwargs):
         feedback_entered.set()
         if not release_feedback.wait(5):
             raise TimeoutError("feedback fence test did not release reaction writer")
-        return original_record_feedback(payload)
+        return original_record_feedback(payload, **kwargs)
 
     def advance_candidate():
         advance_started.set()

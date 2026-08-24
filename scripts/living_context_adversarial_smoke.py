@@ -583,6 +583,9 @@ def main() -> int:
             and set(projection) == {
                 "owner_id", "session_id", "need_id", "situation_id", "status",
                 "generation", "record_digest", "allowed_source_classes",
+                "evidence_kind", "observation_mode", "observation_requirement",
+                "evidence_target", "evidence_target_digest", "provider_target_digest",
+                "need_identity_digest", "blocked_judgment", "expires_at",
             },
             "Need source projection exposes exact current identity and digest",
         )

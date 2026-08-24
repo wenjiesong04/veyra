@@ -372,23 +372,91 @@ class InformationNeedRuntime:
         """Normalize candidate identity once for preflight and commit."""
 
         rows: dict[str, tuple[CandidateNeed, str, str | None, dict[str, Any] | None]] = {}
-        selected_typed_endpoint = evidence_targets is not None if typed_endpoint is None else bool(typed_endpoint)
         selected_targets = list(evidence_targets or [])
         for index, candidate in enumerate(candidates):
             raw_target = selected_targets[index] if index < len(selected_targets) else None
             evidence_target = copy.deepcopy(dict(raw_target)) if isinstance(raw_target, Mapping) else None
             target_digest = stable_evidence_target_digest(evidence_target)
             unknown_binding = unknown_bindings.get(candidate.blocked_judgment)
-            need_identity_digest = cls.need_identity_digest_for_candidate(
-                candidate,
-                evidence_target,
+            reused_need_id: str | None = None
+            # Scheduler reopen payloads are intentionally small and may omit
+            # the prior typed endpoint. Reuse only one exact structural row;
+            # never select by prose similarity or silently choose among
+            # multiple endpoint generations.
+            if (
+                not target_digest
+                and candidate.observation_requirement is None
+                and not str(unknown_binding or "").strip()
+                and existing_needs
+            ):
+                structural_matches = [
+                    (str(key), row)
+                    for key, row in existing_needs.items()
+                    if str(row.get("situation_id") or "") == str(situation_id)
+                    and str(row.get("evidence_kind") or "") == str(candidate.evidence_kind)
+                    and str(row.get("observation_mode") or "once") == str(candidate.observation_mode)
+                    and str(row.get("blocked_judgment") or "") == str(candidate.blocked_judgment)
+                    and not str(row.get("evidence_target_digest") or "").strip()
+                    and not row.get("evidence_target")
+                    and row.get("observation_requirement") is None
+                ]
+                if len(structural_matches) > 1:
+                    raise InformationNeedEventConflict(
+                        "InformationNeed endpoint reuse is ambiguous"
+                    )
+                if structural_matches:
+                    reused_need_id, existing_row = structural_matches[0]
+                    raw_binding = existing_row.get("unknown_binding")
+                    unknown_binding = (
+                        str(raw_binding).strip()
+                        if raw_binding is not None and str(raw_binding).strip()
+                        else None
+                    )
+            # ``evidence_targets`` is normalized to a positional list by the
+            # public API, including for legacy candidates that have no typed
+            # endpoint.  Infer typedness per Need instead of treating that
+            # transport list as proof of a typed identity.
+            typed_candidate = cls._is_typed_endpoint(candidate, evidence_target, unknown_binding)
+            need_identity_digest = (
+                cls.need_identity_digest_for_candidate(candidate, evidence_target)
+                if typed_candidate
+                else None
             )
-            need_id = cls.stable_need_id(
+            if (
+                reused_need_id is None
+                and unknown_binding
+                and existing_needs
+            ):
+                binding_digest = cls._unknown_binding_digest(unknown_binding)
+                binding_matches = [
+                    (str(key), row)
+                    for key, row in existing_needs.items()
+                    if str(row.get("situation_id") or "") == str(situation_id)
+                    and str(row.get("unknown_binding_digest") or "") == str(binding_digest or "")
+                    and str(row.get("observation_mode") or "once") == str(candidate.observation_mode)
+                ]
+                exact_matches = [
+                    (key, row)
+                    for key, row in binding_matches
+                    if str(row.get("need_identity_digest") or "") == str(need_identity_digest or "")
+                ]
+                if len(exact_matches) > 1:
+                    raise InformationNeedEventConflict(
+                        "InformationNeed typed endpoint reuse is ambiguous"
+                    )
+                if len(exact_matches) == 1:
+                    reused_need_id = exact_matches[0][0]
+                elif len(binding_matches) == 1:
+                    # One current semantic endpoint may change its preferred
+                    # typed source in place. Multiple requirement rows remain
+                    # distinguishable by their exact need_identity_digest.
+                    reused_need_id = binding_matches[0][0]
+            need_id = reused_need_id or cls.stable_need_id(
                 situation_id=situation_id,
                 evidence_target_digest=target_digest,
                 need_identity_digest=need_identity_digest,
                 unknown_binding_digest=cls._unknown_binding_digest(unknown_binding),
-                typed_endpoint=selected_typed_endpoint,
+                typed_endpoint=typed_candidate,
                 evidence_kind=candidate.evidence_kind,
                 blocked_judgment=candidate.blocked_judgment,
                 observation_mode=candidate.observation_mode,
@@ -407,7 +475,7 @@ class InformationNeedRuntime:
                 ]
                 if len(legacy) == 1:
                     need_id = legacy[0][0]
-            digest = cls._candidate_fingerprint(candidate, evidence_target)
+            digest = cls._candidate_fingerprint(candidate, evidence_target, unknown_binding)
             previous = rows.get(need_id)
             if previous is not None and previous[1] != digest:
                 raise InformationNeedEventConflict(
@@ -423,6 +491,28 @@ class InformationNeedRuntime:
                 )
             rows[need_id] = (candidate, digest, unknown_binding, evidence_target)
         return rows
+
+    @staticmethod
+    def _is_typed_endpoint(
+        candidate: CandidateNeed,
+        evidence_target: Mapping[str, Any] | None,
+        unknown_binding: str | None = None,
+    ) -> bool:
+        """Return whether a Need carries an explicit typed endpoint contract.
+
+        The presence of the API's positional ``evidence_targets`` list is not
+        enough: legacy/untyped Needs are deliberately passed through that
+        list with a ``None`` slot.  A concrete target, structured observation
+        requirement, or existing server-owned Unknown binding marks a typed
+        Need; otherwise its durable identity remains the historical
+        blocked-judgment identity.
+        """
+
+        return (
+            bool(evidence_target)
+            or candidate.observation_requirement is not None
+            or bool(str(unknown_binding or "").strip())
+        )
 
     @staticmethod
     def _assert_capacity(
@@ -658,40 +748,55 @@ class InformationNeedRuntime:
         # the only other semantic endpoint.  Display prose never identifies a
         # newly typed Need; it is retained solely for legacy rows without an
         # admitted endpoint.
-        identity = (
-            {
+        selected_typed_endpoint = bool(
+            typed_endpoint
+            or evidence_target_digest
+            or unknown_binding_digest
+            or need_identity_digest
+        )
+        if selected_typed_endpoint and unknown_binding_digest:
+            # The semantic Unknown is the judgment endpoint. Alternate source
+            # proposals for that same endpoint collapse deterministically,
+            # while two different Unknown bindings remain distinct.
+            identity = {
                 "situation_id": str(situation_id),
-                "need_identity_digest": str(need_identity_digest),
+                "unknown_binding_digest": str(unknown_binding_digest),
+                "need_identity_digest": str(need_identity_digest)
+                if need_identity_digest
+                else None,
+                "observation_mode": str(observation_mode or "once"),
             }
-            if need_identity_digest
-            else {
+        elif selected_typed_endpoint and evidence_target_digest:
+            # A concrete provider target is the strongest typed identity. The
+            # requirement digest also distinguishes two Needs that read the
+            # same place/date but require different metrics.
+            identity = {
                 "situation_id": str(situation_id),
+                "need_identity_digest": str(need_identity_digest)
+                if need_identity_digest
+                else None,
                 "evidence_target_digest": str(evidence_target_digest),
                 "evidence_kind": str(evidence_kind),
                 "observation_mode": str(observation_mode or "once"),
             }
-            if evidence_target_digest
-            else {
-                "situation_id": str(situation_id),
-                "unknown_binding_digest": str(unknown_binding_digest),
-                "evidence_kind": str(evidence_kind),
-                "observation_mode": str(observation_mode or "once"),
-            }
-            if unknown_binding_digest
-            else {
+        elif selected_typed_endpoint:
+            # Typed but currently unbound is intentionally bounded to source
+            # class + observation mode. It must not fall back to model prose.
+            identity = {
                 "situation_id": str(situation_id),
                 "evidence_target_digest": None,
                 "evidence_kind": str(evidence_kind),
                 "observation_mode": str(observation_mode or "once"),
             }
-            if typed_endpoint
-            else {
+        else:
+            # Pre-typed/legacy Needs retain their historical identity. This
+            # is also the safe fallback for ordinary user-authored gaps.
+            identity = {
                 "situation_id": str(situation_id),
                 "blocked_judgment": " ".join(str(blocked_judgment).split())[:480],
                 "evidence_kind": str(evidence_kind),
                 "observation_mode": str(observation_mode or "once"),
             }
-        )
         payload = json.dumps(
             identity,
             ensure_ascii=False,
@@ -788,11 +893,15 @@ class InformationNeedRuntime:
         )
         selected_binding_digest = self._unknown_binding_digest(selected_binding)
         current_target = (current or {}).get("evidence_target")
+        preserve_current_target = (
+            isinstance(current_target, Mapping)
+            and str((current or {}).get("evidence_kind") or "") == str(candidate.evidence_kind)
+        )
         selected_target = (
             copy.deepcopy(dict(evidence_target))
             if isinstance(evidence_target, Mapping)
             else copy.deepcopy(current_target)
-            if isinstance(current_target, Mapping)
+            if preserve_current_target
             else None
         )
         selected_target_digest = stable_evidence_target_digest(selected_target)
@@ -804,10 +913,14 @@ class InformationNeedRuntime:
             if isinstance(selected_target, Mapping)
             and str(candidate.evidence_kind) == "weather"
             else (current or {}).get("provider_target_digest")
+            if preserve_current_target
+            else None
         )
-        need_identity_digest = self.need_identity_digest_for_candidate(
-            candidate,
-            selected_target,
+        typed_endpoint = self._is_typed_endpoint(candidate, selected_target, selected_binding)
+        need_identity_digest = (
+            self.need_identity_digest_for_candidate(candidate, selected_target)
+            if typed_endpoint
+            else None
         )
         # Scheduler/reopen candidates built against an older catalog may not
         # carry a newly derived target. Preserve the durable target and mode in
@@ -1129,23 +1242,25 @@ class InformationNeedRuntime:
     def _candidate_fingerprint(
         candidate: CandidateNeed,
         evidence_target: Mapping[str, Any] | None = None,
+        unknown_binding: str | None = None,
     ) -> str:
         payload = {
-                "blocked_judgment": candidate.blocked_judgment,
-                "evidence_kind": candidate.evidence_kind,
-                "observation_mode": candidate.observation_mode,
-                "why_now": candidate.why_now,
-                "urgency": candidate.urgency,
-                "expires_at": candidate.expires_at,
-                "allowed_source_classes": list(candidate.allowed_source_classes),
-                "fallback_reaction": candidate.fallback_reaction,
-                "question": candidate.question,
-                "evidence_target": dict(evidence_target) if isinstance(evidence_target, Mapping) else None,
-                "need_identity_digest": InformationNeedRuntime.need_identity_digest_for_candidate(
-                    candidate,
-                    evidence_target,
-                ),
-            }
+            "blocked_judgment": candidate.blocked_judgment,
+            "evidence_kind": candidate.evidence_kind,
+            "observation_mode": candidate.observation_mode,
+            "why_now": candidate.why_now,
+            "urgency": candidate.urgency,
+            "expires_at": candidate.expires_at,
+            "allowed_source_classes": list(candidate.allowed_source_classes),
+            "fallback_reaction": candidate.fallback_reaction,
+            "question": candidate.question,
+            "evidence_target": dict(evidence_target) if isinstance(evidence_target, Mapping) else None,
+        }
+        if InformationNeedRuntime._is_typed_endpoint(candidate, evidence_target, unknown_binding):
+            payload["need_identity_digest"] = InformationNeedRuntime.need_identity_digest_for_candidate(
+                candidate,
+                evidence_target,
+            )
         requirement = (
             evidence_target.get("observation_requirement")
             if isinstance(evidence_target, Mapping)
@@ -1243,11 +1358,12 @@ class InformationNeedRuntime:
             "fallback_reaction": candidate.fallback_reaction,
             "question": candidate.question,
             "evidence_target": dict(evidence_target) if isinstance(evidence_target, Mapping) else None,
-            "need_identity_digest": InformationNeedRuntime.need_identity_digest_for_candidate(
+        }
+        if InformationNeedRuntime._is_typed_endpoint(candidate, evidence_target, unknown_binding):
+            candidate_payload["need_identity_digest"] = InformationNeedRuntime.need_identity_digest_for_candidate(
                 candidate,
                 evidence_target,
-            ),
-        }
+            )
         requirement = (
             evidence_target.get("observation_requirement")
             if isinstance(evidence_target, Mapping)

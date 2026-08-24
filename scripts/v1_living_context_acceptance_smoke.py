@@ -128,7 +128,13 @@ def event(event_id: str, owner: str, session: str, text: str) -> VeyraEvent:
     )
 
 
-def candidate(fixture: dict[str, object], catalog: list[dict[str, object]], *, deadline: str | None = None) -> LivingContextCandidate:
+def candidate(
+    fixture: dict[str, object],
+    catalog: list[dict[str, object]],
+    *,
+    deadline: str | None = None,
+    observation_mode: str = "once",
+) -> LivingContextCandidate:
     match = next((row for row in catalog if row.get("category") == fixture["category"]), None)
     entities: list[dict[str, object]] = []
     text = str(fixture["text"])
@@ -165,6 +171,7 @@ def candidate(fixture: dict[str, object], catalog: list[dict[str, object]], *, d
         "needs": [{
             "blocked_judgment": fixture["unknown"],
             "evidence_kind": fixture["source"],
+            "observation_mode": observation_mode,
             "why_now": "The missing observation changes the next judgment.",
             "urgency": 0.8,
             "observation_requirement": (

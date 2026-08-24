@@ -38,7 +38,6 @@ from runtime.living_context_commands import (
     command_situation as command_situation_command,
     dedupe_records,
     dedupe_text,
-    preflight_need_scope,
     reaction_hint,
 )
 from runtime.semantic_situation_runtime import SemanticSituationRuntime
@@ -299,22 +298,6 @@ class LivingContextRuntime:
             )
         )
         validated_needs = self.needs.validate_candidates(candidate.needs)
-        preflight_need_scope(
-            self,
-            owner_id=owner_id,
-            session_id=session_id,
-            situation_id=(
-                situation_id
-                or self.situations.semantic_situation_id(
-                    user_id=owner_id,
-                    subject_key=subject_key,
-                )
-            ),
-            needs=validated_needs,
-            answered_needs=answered_needs,
-            unknown_bindings=unknown_bindings,
-            evidence_targets=evidence_targets,
-        )
         persisted, current_needs, needs_repaired = self._persist_semantic_and_needs(
             event=event,
             subject_key=subject_key,
@@ -704,14 +687,33 @@ class LivingContextRuntime:
                 if isinstance(unknown_bindings, Mapping)
                 else None
             )
+            typed_endpoint = self.needs._is_typed_endpoint(
+                need,
+                target,
+                unknown_binding,
+            )
+            need_identity_digest = (
+                self.needs.need_identity_digest_for_candidate(need, target)
+                if typed_endpoint
+                else None
+            )
+            # Alternate source proposals for one semantic Unknown are a
+            # duplicate only when neither proposal carries a distinct typed
+            # target/requirement. Metric-specific Needs retain their complete
+            # typed identity.
+            dedupe_identity_digest = (
+                need_identity_digest
+                if target_digest or need.observation_requirement is not None
+                else None
+            )
             identity = self.needs.stable_need_id(
                 situation_id="candidate",
                 blocked_judgment=need.blocked_judgment,
                 evidence_kind=need.evidence_kind,
                 evidence_target_digest=target_digest,
-                need_identity_digest=self.needs.need_identity_digest_for_candidate(need, target),
+                need_identity_digest=dedupe_identity_digest,
                 unknown_binding_digest=self.needs._unknown_binding_digest(unknown_binding),
-                typed_endpoint=True,
+                typed_endpoint=typed_endpoint,
                 observation_mode=need.observation_mode,
             )
             if identity in identities:
@@ -780,7 +782,15 @@ class LivingContextRuntime:
         """
 
         with self.state_store.writer_transaction():
-            semantic_digest = self.admission.digest(semantic_state)
+            # Bind admission to the exact canonical semantic bytes that the
+            # Situation repository persists. Transaction-only metadata such
+            # as reopen_reason remains available to record_semantic without
+            # making replay depend on a field the repository intentionally
+            # omits from semantic state.
+            canonical_semantic_state = self.situations.repository.normalize_semantic(
+                semantic_state
+            )
+            semantic_digest = self.admission.digest(canonical_semantic_state)
             need_plan_digest = self.admission.digest(
                 [
                     {
@@ -1097,11 +1107,27 @@ class LivingContextRuntime:
                 limit=self.needs.max_needs_per_situation,
             )
 
-        candidate_unknown = [
-            str(item) for item in candidate.unknown if str(item).strip()
-        ]
-        bindings: dict[str, str | None] = {}
-        used: set[str] = set()
+        candidate_unknown_slots = [str(item).strip() for item in candidate.unknown]
+        candidate_unknown = [item for item in candidate_unknown_slots if item]
+        explicit_bindings: dict[str, str] = {}
+        for need in candidate.needs:
+            index = need.unknown_index
+            if index is None:
+                continue
+            if index >= len(candidate_unknown_slots) or not candidate_unknown_slots[index]:
+                raise ValueError("InformationNeed unknown_index is outside candidate.unknown")
+            transport_key = str(need.blocked_judgment)
+            selected_unknown = candidate_unknown_slots[index]
+            prior = explicit_bindings.get(transport_key)
+            if prior is not None and prior != selected_unknown:
+                raise ValueError("InformationNeed cannot bind one proposal to two Unknowns")
+            # Repeated references to one endpoint are tolerated here so the
+            # canonical endpoint deduper can retain the first proposal. The
+            # model contract still asks for one proposal per distinct index.
+            explicit_bindings[transport_key] = selected_unknown
+
+        bindings: dict[str, str | None] = dict(explicit_bindings)
+        used: set[str] = set(explicit_bindings.values())
 
         selected_targets = list(evidence_targets or [])
         if selected_targets and len(selected_targets) != len(candidate.needs):
@@ -1110,10 +1136,15 @@ class LivingContextRuntime:
             selected_targets = [None] * len(candidate.needs)
 
         for index, need in enumerate(candidate.needs):
-            target_digest = stable_evidence_target_digest(selected_targets[index])
-            need_identity_digest = self.needs.need_identity_digest_for_candidate(
-                need,
-                selected_targets[index],
+            if str(need.blocked_judgment) in bindings:
+                continue
+            selected_target = selected_targets[index]
+            target_digest = stable_evidence_target_digest(selected_target)
+            typed_need = bool(selected_target) or need.observation_requirement is not None
+            need_identity_digest = (
+                self.needs.need_identity_digest_for_candidate(need, selected_target)
+                if typed_need
+                else None
             )
             same_source_mode = [
                 row
@@ -1124,12 +1155,9 @@ class LivingContextRuntime:
             typed_matches = [
                 row
                 for row in same_source_mode
-                if str(row.get("evidence_target_digest") or "") == str(target_digest or "")
-                and str(row.get("blocked_judgment") or "") == str(need.blocked_judgment)
-                and (
-                    not str(row.get("need_identity_digest") or "").strip()
-                    or str(row.get("need_identity_digest") or "") == need_identity_digest
-                )
+                if typed_need
+                and str(row.get("evidence_target_digest") or "") == str(target_digest or "")
+                and str(row.get("need_identity_digest") or "") == str(need_identity_digest or "")
             ]
             # A legacy binding may only survive an exact legacy identity. A
             # newly typed target/requirement never inherits an old unknown

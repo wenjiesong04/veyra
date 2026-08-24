@@ -70,9 +70,11 @@ def candidate(
     *,
     digest: str,
     candidate_id: str,
+    material_digest: str,
     owner: str = "cognitive-owner",
     session: str = "cognitive-session",
     revision: int = 1,
+    material_revision: int = 1,
 ) -> dict[str, Any]:
     change_token = "lcchg_" + stable_digest(
         "veyra.cognitive_living_context.change_token.v1",
@@ -80,8 +82,8 @@ def candidate(
             "owner_id": owner,
             "session_id": session,
             "situation_id": "sit_cognitive",
-            "observation_revision": revision,
-            "semantic_digest": digest,
+            "material_revision": material_revision,
+            "material_digest": material_digest,
         },
     )[:32]
     return {
@@ -94,6 +96,8 @@ def candidate(
         "change_token": change_token,
         "cycle_id": "cog_0000000000000001",
         "semantic_digest": digest,
+        "material_revision": material_revision,
+        "material_digest": material_digest,
         "statement": f"A hypothesis from {candidate_id} may affect the next step.",
         "why_now": "The background view changed after the last observation.",
         "suggested_next_step": "Review the smallest useful next step.",
@@ -130,6 +134,12 @@ def build() -> tuple[LivingContextOrchestrator, CoreStub, MutableClock, ProductC
         ],
         "unknown": [],
     }
+    material_digest = stable_digest(
+        "veyra.cognitive_living_context.material.v1",
+        {"checkpoint": "cognitive-smoke", "revision": 1},
+    )
+    semantic["material_revision"] = 1
+    semantic["material_digest"] = material_digest
     row = {
         "record_kind": "semantic_situation",
         "situation_id": "sit_cognitive",
@@ -149,7 +159,12 @@ def build() -> tuple[LivingContextOrchestrator, CoreStub, MutableClock, ProductC
         conversation_runtime=conversations,
     )
     digest = stable_digest("veyra.cognitive_living_context.semantic.v1", semantic)
-    return orchestrator, core, clock, conversations, candidate(digest=digest, candidate_id="candidate-1")
+    return orchestrator, core, clock, conversations, candidate(
+        digest=digest,
+        candidate_id="candidate-1",
+        material_revision=1,
+        material_digest=material_digest,
+    )
 
 
 def main() -> int:

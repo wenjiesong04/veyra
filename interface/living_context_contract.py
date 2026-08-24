@@ -102,6 +102,7 @@ _BOUNDARY_LOCATION_FIELDS = frozenset(
         "next_step",
         "next_step_epistemic_status",
         "needs",
+        "unknown_index",
         "blocked_judgment",
         "evidence_kind",
         "observation_mode",
@@ -348,6 +349,7 @@ _SINGLETON_COLLECTION_ITEM_KEYS: dict[str, frozenset[str]] = {
             "question",
             "observation_mode",
             "observation_requirement",
+            "unknown_index",
         }
     ),
 }
@@ -1159,6 +1161,10 @@ class ObservationRequirement(StrictLivingContextModel):
 
 class CandidateNeed(StrictLivingContextModel):
     blocked_judgment: str = Field(min_length=1, max_length=480)
+    # A model may bind this Need to one exact item in the same candidate's
+    # ``unknown`` array.  The server validates the index and turns the
+    # selected text into its own semantic endpoint; it is never an ID.
+    unknown_index: int | None = Field(default=None, ge=0, le=11)
     evidence_kind: Literal[
         "user",
         "calendar",
@@ -1329,6 +1335,12 @@ class LivingContextCandidate(StrictLivingContextModel):
             or len(self.answered_need_bindings) != len(binding_pairs)
         ):
             raise ValueError("answered_need_bindings must exactly match answered_need_tokens")
+        for need in self.needs:
+            index = need.unknown_index
+            if index is None:
+                continue
+            if index >= len(self.unknown) or not str(self.unknown[index]).strip():
+                raise ValueError("Need unknown_index must reference a non-empty candidate Unknown")
         if self.disposition in {"correct", "resolve"} and self.assertion_mode == "inferred":
             raise ValueError("lifecycle mutation requires a direct user assertion or server command")
         if self.deadline_at and iso_time_or_none(self.deadline_at) is None:

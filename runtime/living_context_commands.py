@@ -554,6 +554,13 @@ def apply_source_receipt(
     if admission_event is not None and str(admission_event.get("phase") or "") == "committed":
         if str(admission_event.get("situation_id") or "") != situation_id:
             raise StateRevisionConflictError("source receipt event is bound to another Situation")
+        semantic = situation.get("semantic") if isinstance(situation.get("semantic"), Mapping) else {}
+        assumptions = semantic.get("assumptions") if isinstance(semantic, Mapping) else []
+        if isinstance(assumptions, list) and any(_is_calendar_attention_marker(item) for item in assumptions):
+            # Preserve the typed Calendar marker on a committed replay.  The
+            # semantic write may have succeeded before reaction/chat delivery,
+            # and the orchestrator uses this marker to repair that mirror.
+            attention_trigger = "material_observation"
         return {
             "status": "replayed",
             "situation": situation,
@@ -653,7 +660,11 @@ def apply_source_receipt(
         and weather_target_key
         and str(prior_weather_digests.get(weather_target_key) or "") == weather_digest
     )
-    observation_key = weather_target_key or str(need.get("evidence_target_digest") or "").strip()
+    observation_key = (
+        weather_target_key
+        or str(need.get("evidence_target_digest") or "").strip()
+        or f"{source}:{need_id}"
+    )
     observation_digest = weather_digest or material_digest
     prior_observation_digest = (
         str(prior_weather_digests.get(observation_key) or "")
@@ -684,7 +695,11 @@ def apply_source_receipt(
         }
         current["material_digest"] = material_digest
         current["material_revision"] = int(current.get("material_revision") or 0) + (1 if material_changed else 0)
-    if calendar_observations and material_changed:
+    # The first actionable typed Calendar observation is itself the baseline
+    # that makes the conflict visible.  It is not a relative change from a
+    # prior Calendar digest, so keep ``material_changed`` false while still
+    # issuing the explicit attention trigger.
+    if calendar_observations and material_observed:
         attention_trigger = "material_observation"
     # Remove the previous source-owned trigger before applying the current
     # receipt.  A normal/empty/unavailable read therefore clears stale
@@ -717,7 +732,7 @@ def apply_source_receipt(
             starts = str(item.get("starts_at") or "").strip()
             if title and starts:
                 known.append({"statement": f"Calendar shows {title} at {starts}"[:480], "epistemic_status": "inferred", "source_event_id": source_event_id, "recorded_at": observed_at})
-        for observation in calendar_observations:
+        for observation in calendar_observations if material_observed else []:
             # The reaction boundary currently accepts legacy assumptions as
             # bounded display strings; keep the durable record concise enough
             # for that projection while the full actionable explanation stays
@@ -743,7 +758,7 @@ def apply_source_receipt(
     current["known"] = dedupe_records(known, key="statement", limit=12)
     current["assumptions"] = dedupe_records(assumptions, key="statement", limit=8)
     timeline = list(current.get("timeline") or [])
-    timeline.append({"statement": f"{source} observation: {receipt_status}"[:480], "occurred_at": observed_at, "source_event_id": source_event_id, "recorded_at": observed_at, "material": bool(calendar_observations) or (source == "weather" and resolves_need and not repeated_weather_observation)})
+    timeline.append({"statement": f"{source} observation: {receipt_status}"[:480], "occurred_at": observed_at, "source_event_id": source_event_id, "recorded_at": observed_at, "material": bool(calendar_observations and material_observed) or (source == "weather" and resolves_need and not repeated_weather_observation)})
     current["timeline"] = dedupe_records(timeline, key="source_event_id", limit=24)
     # A valid empty or failed observation resolves/updates the Need lifecycle,
     # but it is not itself a user-worthy change.  Clearing the latest material
@@ -755,7 +770,7 @@ def apply_source_receipt(
     # ordinary Calendar reads remain quiet.
     current["material_change"] = (
         calendar_observations[0]["statement"]
-        if calendar_observations and material_changed
+        if calendar_observations and material_observed
         else (
             f"Weather observation changed for {str(facts.get('location') or 'the reported place')}"
             if source == "weather" and material_changed

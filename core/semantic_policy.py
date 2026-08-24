@@ -58,6 +58,11 @@ _PROFILE_KINDS = {"profile_update", "self_disclosure", "user_fact"}
 _COMMITMENT_KINDS = {"commitment", "commitment_control", "goal_control", "schedule_control"}
 _PROACTIVE_KINDS = {"proactive_request", "recurring_request", "reminder_request", "subscription_request"}
 
+# These evidence labels describe Veyra's own durable state.  They are used by
+# the state-answer path to bind a response to the server's world-state store;
+# they do not, by themselves, request an external observer or a system probe.
+_SERVER_STATE_EVIDENCE_NEEDS = {"fresh_local", "local_state"}
+
 # Provider-neutral actor vocabulary for an event already authenticated as the
 # current user's turn.  These are structured contract tokens, not free-text
 # aliases.  Third-party, reported, and quoted speakers remain outside the set.
@@ -1284,7 +1289,7 @@ class SemanticPolicyCompiler:
         ):
             return "mcp", "mcp_probe"
         if (
-            operation in {"query_runtime_status", "query_system_status", "query_status"}
+            operation in {"query_runtime_status", "query_system_status"}
             or target_type in {"runtime", "system", "system_status"}
             or evidence_need in {"runtime", "fresh_runtime", "system_status", "local_status"}
         ):
@@ -1357,7 +1362,6 @@ class SemanticPolicyCompiler:
             "query_process_status",
             "query_processes",
             "query_runtime_status",
-            "query_status",
             "query_system_status",
             "query_url",
             "query_weather",
@@ -1373,9 +1377,13 @@ class SemanticPolicyCompiler:
             "query",
             "read",
             "refresh",
+            # The generic status operation only becomes an observer request
+            # when its target type names the observer.  A bare query_status
+            # remains eligible for the server-owned state-answer path.
+            "query_status",
         }
         return (
-            evidence_need not in {"", "context", "none", "unknown"}
+            evidence_need not in {"", "context", "none", "unknown", *_SERVER_STATE_EVIDENCE_NEEDS}
             or operation in typed_observer_operations
             or (
                 target_type in typed_observer_targets
